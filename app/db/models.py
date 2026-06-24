@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
@@ -61,6 +62,48 @@ class UserSecretProfileModel(TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
     owner: Mapped[UserAccountModel] = relationship()
+
+
+class RoleModel(TimestampMixin, Base):
+    __tablename__ = "lt_roles"
+    __table_args__ = (UniqueConstraint("code", name="uq_lt_role_code"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope: Mapped[str] = mapped_column(String(32), nullable=False, default="own", server_default="own")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    permissions_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class StoreModel(TimestampMixin, Base):
+    __tablename__ = "lt_stores"
+    __table_args__ = (
+        UniqueConstraint("owner_username", "store_code", name="uq_lt_store_owner_code"),
+        Index("ix_lt_store_owner_enabled", "owner_username", "enabled"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    store_code: Mapped[str] = mapped_column(String(120), nullable=False)
+    store_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    alias_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    platform: Mapped[str] = mapped_column(String(32), nullable=False, default="rakuten", server_default="rakuten")
+    store_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    contact_name: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    contact_phone: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    rakuten_service_secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    rakuten_license_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    price_multiplier: Mapped[str] = mapped_column(String(32), nullable=False, default="1.00")
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 class CrawlSourceModel(TimestampMixin, Base):
@@ -140,6 +183,59 @@ class ProductModel(TimestampMixin, Base):
     review_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     raw_payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class ListingTaskModel(TimestampMixin, Base):
+    __tablename__ = "lt_listing_tasks"
+    __table_args__ = (
+        Index("ix_lt_listing_task_owner_status", "owner_username", "status"),
+        Index("ix_lt_listing_task_owner_created", "owner_username", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("lt_stores.id", ondelete="SET NULL"))
+    task_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", server_default="queued")
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    product_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+
+
+class ScheduledCrawlModel(TimestampMixin, Base):
+    __tablename__ = "lt_scheduled_crawls"
+    __table_args__ = (
+        Index("ix_lt_schedule_owner_enabled", "owner_username", "enabled"),
+        Index("ix_lt_schedule_owner_next", "owner_username", "next_run_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_id: Mapped[int | None] = mapped_column(ForeignKey("lt_crawl_sources.id", ondelete="SET NULL"))
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    crawl_content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    crawl_condition: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False, default="keyword")
+    target: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60, server_default="60")
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="idle", server_default="idle")
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
 
 class CrawlLogModel(TimestampMixin, Base):

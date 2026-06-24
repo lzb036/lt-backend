@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from urllib.parse import quote
@@ -13,8 +13,19 @@ from bs4 import BeautifulSoup
 from sqlalchemy import select
 
 from app.core.config import settings
+from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
 from app.db.database import session_scope
-from app.db.models import CrawlLogModel, CrawlSourceModel, CrawlTaskModel, ProductModel, make_source_url_hash
+from app.db.models import (
+    CrawlLogModel,
+    CrawlSourceModel,
+    CrawlTaskModel,
+    ListingTaskModel,
+    ProductModel,
+    RoleModel,
+    ScheduledCrawlModel,
+    StoreModel,
+    make_source_url_hash,
+)
 
 RAKUTEN_SEARCH_BASE = "https://search.rakuten.co.jp/search/mall/"
 RAKUTEN_RANKING_BASE = "https://ranking.rakuten.co.jp/search"
@@ -82,6 +93,111 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
     }
 
 
+def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
+    service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
+    license_key = decrypt_text(row.rakuten_license_key_encrypted)
+    return {
+        "id": row.id,
+        "ownerUsername": row.owner_username,
+        "storeCode": row.store_code,
+        "storeName": row.store_name,
+        "aliasName": row.alias_name,
+        "platform": row.platform,
+        "storeUrl": row.store_url,
+        "enabled": bool(row.enabled),
+        "contactName": row.contact_name,
+        "contactPhone": row.contact_phone,
+        "description": row.description,
+        "rakutenServiceSecret": service_secret if reveal else "",
+        "rakutenLicenseKey": license_key if reveal else "",
+        "masked": {
+            "rakutenServiceSecret": mask_secret(service_secret),
+            "rakutenLicenseKey": mask_secret(license_key),
+        },
+        "priceMultiplier": row.price_multiplier,
+        "lastSyncedAt": row.last_synced_at.isoformat(sep=" ") if row.last_synced_at else None,
+        "lastError": row.last_error,
+        "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
+        "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
+    }
+
+
+def scheduled_crawl_to_public(row: ScheduledCrawlModel) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "ownerUsername": row.owner_username,
+        "sourceId": row.source_id,
+        "name": row.name,
+        "crawlContent": row.crawl_content,
+        "crawlCondition": row.crawl_condition,
+        "sourceType": row.source_type,
+        "target": row.target,
+        "enabled": bool(row.enabled),
+        "intervalMinutes": row.interval_minutes,
+        "lastRunAt": row.last_run_at.isoformat(sep=" ") if row.last_run_at else None,
+        "nextRunAt": row.next_run_at.isoformat(sep=" ") if row.next_run_at else None,
+        "status": row.status,
+        "notes": row.notes,
+        "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
+        "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
+    }
+
+
+def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
+    try:
+        product_ids = json.loads(row.product_ids_json or "[]")
+    except ValueError:
+        product_ids = []
+    return {
+        "id": row.id,
+        "ownerUsername": row.owner_username,
+        "storeId": row.store_id,
+        "taskName": row.task_name,
+        "status": row.status,
+        "totalCount": row.total_count,
+        "successCount": row.success_count,
+        "failedCount": row.failed_count,
+        "productIds": product_ids if isinstance(product_ids, list) else [],
+        "message": row.message,
+        "errorDetail": row.error_detail,
+        "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
+        "finishedAt": row.finished_at.isoformat(sep=" ") if row.finished_at else None,
+        "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
+        "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
+    }
+
+
+def role_to_public(row: RoleModel) -> dict[str, Any]:
+    try:
+        permissions = json.loads(row.permissions_json or "[]")
+    except ValueError:
+        permissions = []
+    return {
+        "id": row.id,
+        "name": row.name,
+        "code": row.code,
+        "scope": row.scope,
+        "enabled": bool(row.enabled),
+        "permissions": permissions if isinstance(permissions, list) else [],
+        "notes": row.notes,
+        "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
+        "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
+    }
+
+
+def _product_status_filter(status: str | None) -> str | None:
+    if not status:
+        return None
+    status_map = {
+        "pending": "pending",
+        "approved": "approved",
+        "error": "error",
+        "listed": "listed",
+        "rejected": "rejected",
+    }
+    return status_map.get(status, status)
+
+
 def list_sources(owner_username: str) -> list[dict[str, Any]]:
     with session_scope() as session:
         rows = session.scalars(
@@ -137,12 +253,370 @@ def list_tasks(owner_username: str) -> list[dict[str, Any]]:
 def list_products(owner_username: str, *, status: str | None = None, keyword: str | None = None) -> list[dict[str, Any]]:
     with session_scope() as session:
         query = select(ProductModel).where(ProductModel.owner_username == owner_username)
-        if status:
-            query = query.where(ProductModel.review_status == status)
+        product_status = _product_status_filter(status)
+        if product_status:
+            query = query.where(ProductModel.review_status == product_status)
         if keyword:
             query = query.where(ProductModel.title.like(f"%{keyword}%"))
         rows = session.scalars(query.order_by(ProductModel.created_at.desc()).limit(200)).all()
         return [product_to_public(row) for row in rows]
+
+
+def list_stores(owner_username: str) -> list[dict[str, Any]]:
+    with session_scope() as session:
+        rows = session.scalars(
+            select(StoreModel)
+            .where(StoreModel.owner_username == owner_username)
+            .order_by(StoreModel.created_at.desc())
+        ).all()
+        return [store_to_public(row) for row in rows]
+
+
+def save_store(owner_username: str, payload: Any, store_id: int | None = None) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(StoreModel, store_id) if store_id else None
+        if row is None:
+            row = StoreModel(owner_username=owner_username)
+            session.add(row)
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能修改其他用户的店铺。")
+
+        row.store_code = str(getattr(payload, "storeCode", "") or "").strip()
+        row.store_name = str(getattr(payload, "storeName", "") or "").strip()
+        row.alias_name = str(getattr(payload, "aliasName", "") or "").strip()
+        row.platform = str(getattr(payload, "platform", "") or "rakuten").strip()
+        row.store_url = str(getattr(payload, "storeUrl", "") or "").strip()
+        row.enabled = bool(getattr(payload, "enabled", True))
+        row.contact_name = str(getattr(payload, "contactName", "") or "").strip()
+        row.contact_phone = str(getattr(payload, "contactPhone", "") or "").strip()
+        row.description = str(getattr(payload, "description", "") or "").strip()
+        row.price_multiplier = str(getattr(payload, "priceMultiplier", "") or "1.00").strip()
+
+        service_secret = str(getattr(payload, "rakutenServiceSecret", "") or "").strip()
+        license_key = str(getattr(payload, "rakutenLicenseKey", "") or "").strip()
+        if service_secret:
+            row.rakuten_service_secret_encrypted = encrypt_text(service_secret)
+        if license_key:
+            row.rakuten_license_key_encrypted = encrypt_text(license_key)
+
+        if not row.store_code or not row.store_name:
+            raise RuntimeError("店铺编号和店铺名称不能为空。")
+        session.flush()
+        return store_to_public(row)
+
+
+def delete_store(owner_username: str, store_id: int) -> None:
+    with session_scope() as session:
+        row = session.get(StoreModel, store_id)
+        if row is None:
+            return
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能删除其他用户的店铺。")
+        session.delete(row)
+
+
+def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(StoreModel, store_id)
+        if row is None:
+            raise RuntimeError("店铺不存在。")
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能同步其他用户的店铺。")
+        row.last_synced_at = datetime.now()
+        row.last_error = None
+        session.flush()
+        return store_to_public(row)
+
+
+def list_scheduled_crawls(owner_username: str) -> list[dict[str, Any]]:
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ScheduledCrawlModel)
+            .where(ScheduledCrawlModel.owner_username == owner_username)
+            .order_by(ScheduledCrawlModel.created_at.desc())
+        ).all()
+        return [scheduled_crawl_to_public(row) for row in rows]
+
+
+def save_scheduled_crawl(owner_username: str, payload: Any, schedule_id: int | None = None) -> dict[str, Any]:
+    source_id = getattr(payload, "sourceId", None)
+    with session_scope() as session:
+        row = session.get(ScheduledCrawlModel, schedule_id) if schedule_id else None
+        if row is None:
+            row = ScheduledCrawlModel(owner_username=owner_username)
+            session.add(row)
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能修改其他用户的定时任务。")
+        source = session.get(CrawlSourceModel, source_id) if source_id else None
+        if source is not None:
+            if source.owner_username != owner_username:
+                raise RuntimeError("不能使用其他用户的采集源。")
+            row.source_id = source.id
+            row.source_type = source.source_type
+            row.target = source.target
+        else:
+            row.source_id = None
+            row.source_type = str(getattr(payload, "sourceType", "") or "keyword").strip()
+            row.target = str(getattr(payload, "target", "") or "").strip()
+
+        row.name = str(getattr(payload, "name", "") or "").strip()
+        row.crawl_content = str(getattr(payload, "crawlContent", "") or row.target).strip()
+        row.crawl_condition = str(getattr(payload, "crawlCondition", "") or row.source_type).strip()
+        row.enabled = bool(getattr(payload, "enabled", True))
+        row.interval_minutes = int(getattr(payload, "intervalMinutes", 60) or 60)
+        row.notes = str(getattr(payload, "notes", "") or "").strip()
+        row.status = "idle" if row.enabled else "disabled"
+        row.next_run_at = datetime.now() + timedelta(minutes=row.interval_minutes) if row.enabled else None
+        if not row.name or not row.target:
+            raise RuntimeError("定时任务名称和采集目标不能为空。")
+        session.flush()
+        return scheduled_crawl_to_public(row)
+
+
+def delete_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
+    with session_scope() as session:
+        row = session.get(ScheduledCrawlModel, schedule_id)
+        if row is None:
+            return
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能删除其他用户的定时任务。")
+        session.delete(row)
+
+
+def run_scheduled_crawl(owner_username: str, schedule_id: int) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(ScheduledCrawlModel, schedule_id)
+        if row is None:
+            raise RuntimeError("定时任务不存在。")
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能执行其他用户的定时任务。")
+        row.status = "running"
+        row.last_run_at = datetime.now()
+        session.flush()
+        source_type = row.source_type
+        target = row.target
+
+    task_payload = type("TaskPayload", (), {"sourceId": None, "sourceType": source_type, "target": target, "mode": "scheduled"})()
+    create_task(owner_username, task_payload)
+
+    with session_scope() as session:
+        row = session.get(ScheduledCrawlModel, schedule_id)
+        if row is None:
+            raise RuntimeError("定时任务不存在。")
+        row.status = "idle" if row.enabled else "disabled"
+        row.next_run_at = datetime.now() + timedelta(minutes=row.interval_minutes) if row.enabled else None
+        session.flush()
+        return scheduled_crawl_to_public(row)
+
+
+def update_product_status(owner_username: str, product_ids: list[int], status: str, *, message: str = "") -> list[dict[str, Any]]:
+    if status not in {"pending", "approved", "error", "listed", "rejected"}:
+        raise RuntimeError("商品状态不合法。")
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(product_ids or [-1]),
+            )
+        ).all()
+        if not rows:
+            raise RuntimeError("没有找到可操作的商品。")
+        for row in rows:
+            row.review_status = status
+            if message:
+                row.last_error = message if status in {"error", "rejected"} else None
+        session.flush()
+        return [product_to_public(row) for row in rows]
+
+
+def delete_products(owner_username: str, product_ids: list[int]) -> None:
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(product_ids or [-1]),
+            )
+        ).all()
+        for row in rows:
+            session.delete(row)
+
+
+def list_listing_tasks(owner_username: str) -> list[dict[str, Any]]:
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ListingTaskModel)
+            .where(ListingTaskModel.owner_username == owner_username)
+            .order_by(ListingTaskModel.created_at.desc())
+            .limit(100)
+        ).all()
+        return [listing_task_to_public(row) for row in rows]
+
+
+def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
+    product_ids = [int(value) for value in (getattr(payload, "productIds", None) or [])]
+    store_id = getattr(payload, "storeId", None)
+    task_name = str(getattr(payload, "taskName", "") or "").strip()
+    if not product_ids:
+        raise RuntimeError("请选择要上架的商品。")
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id) if store_id else None
+        if store is not None and store.owner_username != owner_username:
+            raise RuntimeError("不能使用其他用户的店铺。")
+        products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(product_ids),
+            )
+        ).all()
+        if not products:
+            raise RuntimeError("没有找到可上架的商品。")
+        task = ListingTaskModel(
+            id=uuid.uuid4().hex,
+            owner_username=owner_username,
+            store_id=store.id if store else None,
+            task_name=task_name or f"上架任务 {datetime.now():%Y-%m-%d %H:%M}",
+            status="running",
+            total_count=len(products),
+            success_count=0,
+            failed_count=0,
+            product_ids_json=json.dumps([product.id for product in products], ensure_ascii=False),
+            message="正在加入商品池",
+            started_at=datetime.now(),
+        )
+        session.add(task)
+        session.flush()
+        task_id = task.id
+
+    run_listing_task(owner_username, task_id)
+    with session_scope() as session:
+        task = session.get(ListingTaskModel, task_id)
+        return listing_task_to_public(task) if task else {"id": task_id}
+
+
+def run_listing_task(owner_username: str, task_id: str) -> None:
+    with session_scope() as session:
+        task = session.get(ListingTaskModel, task_id)
+        if task is None:
+            return
+        if task.owner_username != owner_username:
+            raise RuntimeError("不能执行其他用户的上架任务。")
+        try:
+            product_ids = json.loads(task.product_ids_json or "[]")
+        except ValueError:
+            product_ids = []
+        products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(product_ids or [-1]),
+            )
+        ).all()
+        success_count = 0
+        failed_count = 0
+        for product in products:
+            if product.review_status in {"approved", "listed"}:
+                product.review_status = "listed"
+                product.last_error = None
+                success_count += 1
+            else:
+                product.review_status = "error"
+                product.last_error = "商品未审核通过，不能上架。"
+                failed_count += 1
+        task.total_count = len(products)
+        task.success_count = success_count
+        task.failed_count = failed_count
+        task.status = "success" if failed_count == 0 else "partial"
+        task.message = f"完成，上架 {success_count} 条，异常 {failed_count} 条"
+        task.finished_at = datetime.now()
+
+
+def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
+    with session_scope() as session:
+        task = session.get(ListingTaskModel, task_id)
+        if task is None:
+            raise RuntimeError("上架任务不存在。")
+        if task.owner_username != owner_username:
+            raise RuntimeError("不能重试其他用户的上架任务。")
+        task.status = "running"
+        task.message = "重新执行中"
+        task.error_detail = None
+        task.started_at = datetime.now()
+        task.finished_at = None
+    run_listing_task(owner_username, task_id)
+    with session_scope() as session:
+        task = session.get(ListingTaskModel, task_id)
+        return listing_task_to_public(task) if task else {"id": task_id}
+
+
+def ensure_default_roles() -> None:
+    defaults = [
+        {
+            "name": "超级管理员",
+            "code": "superadmin",
+            "scope": "all",
+            "permissions": ["users.manage", "roles.manage", "crawler.manage", "products.manage", "stores.manage"],
+            "notes": "系统内置角色，拥有全部管理权限。",
+        },
+        {
+            "name": "运营用户",
+            "code": "operator",
+            "scope": "own",
+            "permissions": ["secrets.manage", "crawler.manage", "products.manage", "stores.manage"],
+            "notes": "默认业务角色，只能处理自己的店铺、密钥、采集任务和商品。",
+        },
+    ]
+    with session_scope() as session:
+        for item in defaults:
+            row = session.scalar(select(RoleModel).where(RoleModel.code == item["code"]))
+            if row is None:
+                row = RoleModel(code=item["code"])
+                session.add(row)
+            row.name = item["name"]
+            row.scope = item["scope"]
+            row.enabled = True
+            row.permissions_json = json.dumps(item["permissions"], ensure_ascii=False)
+            row.notes = item["notes"]
+
+
+def list_roles() -> list[dict[str, Any]]:
+    ensure_default_roles()
+    with session_scope() as session:
+        rows = session.scalars(select(RoleModel).order_by(RoleModel.id.asc())).all()
+        return [role_to_public(row) for row in rows]
+
+
+def save_role(payload: Any, role_id: int | None = None) -> dict[str, Any]:
+    ensure_default_roles()
+    with session_scope() as session:
+        row = session.get(RoleModel, role_id) if role_id else None
+        if row is None:
+            row = RoleModel()
+            session.add(row)
+        code = str(getattr(payload, "code", "") or "").strip()
+        if not code:
+            raise RuntimeError("角色编码不能为空。")
+        if row.code in {"superadmin", "operator"} and code != row.code:
+            raise RuntimeError("内置角色编码不能修改。")
+        row.name = str(getattr(payload, "name", "") or "").strip()
+        row.code = code
+        row.scope = str(getattr(payload, "scope", "") or "own").strip()
+        row.enabled = bool(getattr(payload, "enabled", True))
+        row.permissions_json = json.dumps(getattr(payload, "permissions", None) or [], ensure_ascii=False)
+        row.notes = str(getattr(payload, "notes", "") or "").strip()
+        if not row.name:
+            raise RuntimeError("角色名称不能为空。")
+        session.flush()
+        return role_to_public(row)
+
+
+def delete_role(role_id: int) -> None:
+    ensure_default_roles()
+    with session_scope() as session:
+        row = session.get(RoleModel, role_id)
+        if row is None:
+            return
+        if row.code in {"superadmin", "operator"}:
+            raise RuntimeError("内置角色不能删除。")
+        session.delete(row)
 
 
 def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
@@ -176,6 +650,27 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
     with session_scope() as session:
         task = session.get(CrawlTaskModel, task_public["id"])
         return task_to_public(task) if task else task_public
+
+
+def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
+    with session_scope() as session:
+        task = session.get(CrawlTaskModel, task_id)
+        if task is None:
+            raise RuntimeError("采集任务不存在。")
+        if task.owner_username != owner_username:
+            raise RuntimeError("不能重启其他用户的采集任务。")
+        task.status = "queued"
+        task.total_count = 0
+        task.success_count = 0
+        task.failed_count = 0
+        task.message = "等待重新执行"
+        task.error_detail = None
+        task.started_at = None
+        task.finished_at = None
+    run_task(task_id)
+    with session_scope() as session:
+        task = session.get(CrawlTaskModel, task_id)
+        return task_to_public(task) if task else {"id": task_id}
 
 
 def run_task(task_id: str) -> None:

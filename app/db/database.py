@@ -53,10 +53,12 @@ def init_database() -> None:
     if settings.database_auto_create:
         ensure_mysql_database_exists()
     from app.db import models  # noqa: F401
+    from app.services.crawler_service import ensure_default_roles
     from app.services.user_service import ensure_initial_superadmin
 
     Base.metadata.create_all(bind=engine)
     ensure_initial_superadmin()
+    ensure_default_roles()
 
 
 @contextmanager
