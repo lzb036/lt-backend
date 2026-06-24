@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import secrets
+from typing import Any
+
+from sqlalchemy import select
+
+from app.core.config import settings
+from app.db.database import session_scope
+from app.db.models import UserAccountModel, UserSecretProfileModel
+
+PASSWORD_ITERATIONS = 240000
+
+
+def normalize_username(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def hash_password(password: str, *, salt: bytes | None = None, iterations: int = PASSWORD_ITERATIONS) -> dict[str, Any]:
+    password_salt = salt or secrets.token_bytes(16)
+    password_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), password_salt, iterations)
+    return {
+        "salt_b64": base64.b64encode(password_salt).decode("ascii"),
+        "hash_b64": base64.b64encode(password_hash).decode("ascii"),
+        "iterations": iterations,
+    }
+
+
+def verify_password(password: str, *, salt_b64: str, hash_b64: str, iterations: int) -> bool:
+    try:
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+    except ValueError:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(actual, expected)
+
+
+def account_to_public(row: UserAccountModel) -> dict[str, Any]:
+    return {
+        "username": row.username,
+        "displayName": row.display_name or row.username,
+        "role": row.role,
+        "enabled": bool(row.enabled),
+        "permissions": {
+            "manageUsers": row.role == "superadmin",
+            "manageOwnSecrets": True,
+            "manageCrawler": True,
+        },
+        "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
+        "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
+    }
+
+
+def ensure_initial_superadmin() -> None:
+    username = normalize_username(settings.initial_superadmin_username) or "superadmin"
+    with session_scope() as session:
+        row = session.get(UserAccountModel, username)
+        if row is None:
+            password_record = hash_password(settings.initial_superadmin_password)
+            row = UserAccountModel(
+                username=username,
+                display_name="超级管理员",
+                role="superadmin",
+                enabled=True,
+                password_salt_b64=password_record["salt_b64"],
+                password_hash_b64=password_record["hash_b64"],
+                password_iterations=password_record["iterations"],
+            )
+            session.add(row)
+        row.role = "superadmin"
+        row.enabled = True
+        session.flush()
+
+
+def verify_account_login(username: str, password: str) -> dict[str, Any] | None:
+    ensure_initial_superadmin()
+    normalized_username = normalize_username(username)
+    if not normalized_username:
+        return None
+    with session_scope() as session:
+        row = session.get(UserAccountModel, normalized_username)
+        if row is None or not row.enabled:
+            return None
+        if not verify_password(
+            password,
+            salt_b64=row.password_salt_b64,
+            hash_b64=row.password_hash_b64,
+            iterations=row.password_iterations,
+        ):
+            return None
+        return account_to_public(row)
+
+
+def require_existing_account(username: str) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(UserAccountModel, normalize_username(username))
+        if row is None or not row.enabled:
+            raise RuntimeError("用户不存在或已停用。")
+        return account_to_public(row)
+
+
+def list_users() -> list[dict[str, Any]]:
+    ensure_initial_superadmin()
+    with session_scope() as session:
+        rows = session.scalars(select(UserAccountModel).order_by(UserAccountModel.created_at.asc())).all()
+        return [account_to_public(row) for row in rows]
+
+
+def create_user(username: str, password: str, display_name: str = "") -> dict[str, Any]:
+    username = normalize_username(username)
+    if not username:
+        raise RuntimeError("用户名不能为空。")
+    if len(password) < 6:
+        raise RuntimeError("密码至少需要 6 位。")
+    password_record = hash_password(password)
+    with session_scope() as session:
+        if session.get(UserAccountModel, username) is not None:
+            raise RuntimeError("用户名已存在。")
+        row = UserAccountModel(
+            username=username,
+            display_name=(display_name or username).strip(),
+            role="operator",
+            enabled=True,
+            password_salt_b64=password_record["salt_b64"],
+            password_hash_b64=password_record["hash_b64"],
+            password_iterations=password_record["iterations"],
+        )
+        session.add(row)
+        session.add(UserSecretProfileModel(owner_username=username))
+        session.flush()
+        return account_to_public(row)
+
+
+def update_user(username: str, *, display_name: str | None = None, enabled: bool | None = None) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(UserAccountModel, normalize_username(username))
+        if row is None:
+            raise RuntimeError("用户不存在。")
+        if row.role == "superadmin" and enabled is False:
+            raise RuntimeError("不能停用超级管理员。")
+        if display_name is not None:
+            row.display_name = display_name.strip() or row.username
+        if enabled is not None:
+            row.enabled = bool(enabled)
+        session.flush()
+        return account_to_public(row)
+
+
+def reset_password(username: str, password: str) -> dict[str, Any]:
+    if len(password) < 6:
+        raise RuntimeError("密码至少需要 6 位。")
+    with session_scope() as session:
+        row = session.get(UserAccountModel, normalize_username(username))
+        if row is None:
+            raise RuntimeError("用户不存在。")
+        password_record = hash_password(password)
+        row.password_salt_b64 = password_record["salt_b64"]
+        row.password_hash_b64 = password_record["hash_b64"]
+        row.password_iterations = password_record["iterations"]
+        session.flush()
+        return account_to_public(row)
