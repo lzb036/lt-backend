@@ -132,9 +132,18 @@ def list_products(
     status: str | None = Query(default=None),
     keyword: str | None = Query(default=None),
     storeId: int | None = Query(default=None),
+    listingStatus: str | None = Query(default=None),
     user: dict = Depends(require_authenticated_account),
 ) -> dict:
-    return {"products": crawler_service.list_products(user["username"], status=status, keyword=keyword, store_id=storeId)}
+    return {
+        "products": crawler_service.list_products(
+            user["username"],
+            status=status,
+            keyword=keyword,
+            store_id=storeId,
+            listing_status=listingStatus,
+        )
+    }
 
 
 @router.put("/products/status")

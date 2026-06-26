@@ -664,6 +664,7 @@ def list_products(
     status: str | None = None,
     keyword: str | None = None,
     store_id: int | None = None,
+    listing_status: str | None = None,
 ) -> list[dict[str, Any]]:
     with session_scope() as session:
         query = select(ProductModel).where(ProductModel.owner_username == owner_username)
@@ -672,6 +673,8 @@ def list_products(
             query = query.where(ProductModel.review_status == product_status)
         if store_id is not None:
             query = query.where(ProductModel.store_id == store_id)
+        if listing_status in {"listed", "unlisted"}:
+            query = query.where(ProductModel.rakuten_listing_status == listing_status)
         if keyword:
             query = query.where(
                 ProductModel.title.like(f"%{keyword}%")
