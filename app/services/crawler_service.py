@@ -430,39 +430,61 @@ def first_text_value(value: Any) -> str:
     return ""
 
 
-def first_url_from_keys(source: dict[str, Any], keys: tuple[str, ...]) -> str:
+def first_url_from_keys(source: dict[str, Any], keys: tuple[str, ...], *, shop_code: str = "") -> str:
     for key in keys:
-        url = first_url_value(source.get(key))
+        url = first_url_value(source.get(key), shop_code=shop_code)
         if url:
             return url
     return ""
 
 
-def first_url_value(value: Any) -> str:
+def first_url_value(value: Any, *, shop_code: str = "") -> str:
     if value is None:
         return ""
     if isinstance(value, str):
         text = normalize_text(value)
-        return text if text.startswith(("http://", "https://")) else ""
+        if text.startswith(("http://", "https://")):
+            return text
+        if shop_code and text.startswith("/"):
+            return build_rakuten_cabinet_image_url(shop_code, text)
+        return ""
     if isinstance(value, dict):
-        for key in ("url", "imageUrl", "itemUrl", "itemPageUrl", "value"):
-            url = first_url_value(value.get(key))
+        for key in ("url", "imageUrl", "itemUrl", "itemPageUrl", "location", "value"):
+            url = first_url_value(value.get(key), shop_code=shop_code)
             if url:
                 return url
         for child in value.values():
-            url = first_url_value(child)
+            url = first_url_value(child, shop_code=shop_code)
             if url:
                 return url
     if isinstance(value, list):
         for item in value:
-            url = first_url_value(item)
+            url = first_url_value(item, shop_code=shop_code)
             if url:
                 return url
     return ""
 
 
+def first_rakuten_image_url(item: dict[str, Any], shop_code: str) -> str:
+    for key in ("images", "imageUrl", "imageUrls", "mediumImageUrls", "smallImageUrls"):
+        url = first_url_value(item.get(key), shop_code=shop_code)
+        if url:
+            return url
+    return ""
+
+
+def build_rakuten_cabinet_image_url(shop_code: str, location: str) -> str:
+    normalized_shop_code = normalize_shop_code(shop_code)
+    normalized_location = normalize_text(location).lstrip("/")
+    if not normalized_shop_code or not normalized_location:
+        return ""
+    return f"https://image.rakuten.co.jp/{quote(normalized_shop_code, safe='')}/cabinet/{quote(normalized_location, safe='/')}"
+
+
 def price_from_rakuten_item(item: dict[str, Any]) -> float | None:
     value = first_text_from_keys(item, ("itemPrice", "price", "standardPrice", "displayPrice"))
+    if not value:
+        value = first_variant_price(item)
     if not value:
         return None
     normalized = re.sub(r"[^0-9.]", "", value)
@@ -472,6 +494,32 @@ def price_from_rakuten_item(item: dict[str, Any]) -> float | None:
         return float(normalized)
     except ValueError:
         return None
+
+
+def first_variant_price(item: dict[str, Any]) -> str:
+    variants = item.get("variants")
+    if isinstance(variants, dict):
+        variant_items = variants.values()
+    elif isinstance(variants, list):
+        variant_items = variants
+    else:
+        variant_items = []
+
+    prices: list[float] = []
+    for variant in variant_items:
+        if not isinstance(variant, dict):
+            continue
+        value = first_text_from_keys(variant, ("standardPrice", "price", "displayPrice"))
+        normalized = re.sub(r"[^0-9.]", "", value)
+        if not normalized:
+            continue
+        try:
+            prices.append(float(normalized))
+        except ValueError:
+            continue
+    if not prices:
+        return ""
+    return str(min(prices))
 
 
 def list_sources(owner_username: str) -> list[dict[str, Any]]:
@@ -541,8 +589,12 @@ def list_products(
         if store_id is not None:
             query = query.where(ProductModel.store_id == store_id)
         if keyword:
-            query = query.where(ProductModel.title.like(f"%{keyword}%"))
-        rows = session.scalars(query.order_by(ProductModel.created_at.desc()).limit(200)).all()
+            query = query.where(
+                ProductModel.title.like(f"%{keyword}%")
+                | ProductModel.item_number.like(f"%{keyword}%")
+                | ProductModel.rakuten_manage_number.like(f"%{keyword}%")
+            )
+        rows = session.scalars(query.order_by(ProductModel.created_at.desc())).all()
         return [product_to_public(row) for row in rows]
 
 
@@ -1171,7 +1223,7 @@ def upsert_store_product(session: Any, owner_username: str, store: StoreModel, i
     normalized = {
         "title": title,
         "source_url": source_url,
-        "image_url": first_url_from_keys(item, ("imageUrl", "images", "imageUrls", "mediumImageUrls", "smallImageUrls")),
+        "image_url": first_rakuten_image_url(item, store.store_code),
         "price": price_from_rakuten_item(item),
         "shop_name": store.store_name,
         "item_number": item_number or manage_number,
