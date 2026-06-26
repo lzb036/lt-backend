@@ -27,18 +27,12 @@ class CreateTaskPayload(BaseModel):
 
 
 class StorePayload(BaseModel):
-    storeCode: str = Field(min_length=1)
-    storeName: str = Field(min_length=1)
     aliasName: str = ""
     platform: str = "rakuten"
-    storeUrl: str = ""
     enabled: bool = True
-    contactName: str = ""
-    contactPhone: str = ""
     description: str = ""
     rakutenServiceSecret: str = ""
     rakutenLicenseKey: str = ""
-    priceMultiplier: str = "1.00"
 
 
 class ScheduledCrawlPayload(BaseModel):
@@ -164,14 +158,14 @@ def delete_products(payload: ProductDeletePayload, user: dict = Depends(require_
 
 @router.get("/stores")
 def list_stores(user: dict = Depends(require_authenticated_account)) -> dict:
-    return {"stores": crawler_service.list_stores(user["username"])}
+    return {"stores": crawler_service.list_stores()}
 
 
 @router.post("/stores")
 def create_store(payload: StorePayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         store = crawler_service.save_store(user["username"], payload)
-        return {"store": store, "stores": crawler_service.list_stores(user["username"])}
+        return {"store": store, "stores": crawler_service.list_stores()}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -180,7 +174,7 @@ def create_store(payload: StorePayload, user: dict = Depends(require_authenticat
 def update_store(store_id: int, payload: StorePayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         store = crawler_service.save_store(user["username"], payload, store_id)
-        return {"store": store, "stores": crawler_service.list_stores(user["username"])}
+        return {"store": store, "stores": crawler_service.list_stores()}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -188,8 +182,8 @@ def update_store(store_id: int, payload: StorePayload, user: dict = Depends(requ
 @router.delete("/stores/{store_id}")
 def delete_store(store_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
-        crawler_service.delete_store(user["username"], store_id)
-        return {"stores": crawler_service.list_stores(user["username"])}
+        crawler_service.delete_store(store_id)
+        return {"stores": crawler_service.list_stores()}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -197,8 +191,8 @@ def delete_store(store_id: int, user: dict = Depends(require_authenticated_accou
 @router.post("/stores/{store_id}/sync")
 def sync_store(store_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
-        store = crawler_service.sync_store(user["username"], store_id)
-        return {"store": store, "stores": crawler_service.list_stores(user["username"])}
+        store = crawler_service.sync_store(store_id)
+        return {"store": store, "stores": crawler_service.list_stores()}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

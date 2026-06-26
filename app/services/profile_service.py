@@ -45,7 +45,6 @@ def _profile_to_public(row: UserSecretProfileModel, *, reveal: bool = False) -> 
         "masked": {key: mask_secret(value) for key, value in secrets.items()},
         "ossBucket": row.oss_bucket,
         "ossEndpoint": row.oss_endpoint,
-        "defaultPriceMultiplier": row.default_price_multiplier,
         "autoCrawlEnabled": bool(row.auto_crawl_enabled),
         "autoCrawlIntervalMinutes": row.auto_crawl_interval_minutes,
         "lastVerifiedAt": row.last_verified_at.isoformat(sep=" ") if row.last_verified_at else None,
@@ -77,7 +76,6 @@ def update_profile(username: str, payload: Any) -> dict[str, Any]:
             "logistics_base_url": "logisticsBaseUrl",
             "oss_bucket": "ossBucket",
             "oss_endpoint": "ossEndpoint",
-            "default_price_multiplier": "defaultPriceMultiplier",
             "auto_crawl_enabled": "autoCrawlEnabled",
             "auto_crawl_interval_minutes": "autoCrawlIntervalMinutes",
         }

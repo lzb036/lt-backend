@@ -80,8 +80,8 @@ class RoleModel(TimestampMixin, Base):
 class StoreModel(TimestampMixin, Base):
     __tablename__ = "lt_stores"
     __table_args__ = (
-        UniqueConstraint("owner_username", "store_code", name="uq_lt_store_owner_code"),
-        Index("ix_lt_store_owner_enabled", "owner_username", "enabled"),
+        UniqueConstraint("store_code", name="uq_lt_store_code"),
+        Index("ix_lt_store_enabled", "enabled"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)

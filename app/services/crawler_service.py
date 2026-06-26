@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import re
 import uuid
+import base64
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -29,6 +31,7 @@ from app.db.models import (
 
 RAKUTEN_SEARCH_BASE = "https://search.rakuten.co.jp/search/mall/"
 RAKUTEN_RANKING_BASE = "https://ranking.rakuten.co.jp/search"
+RAKUTEN_SHOP_MASTER_URL = "https://api.rms.rakuten.co.jp/es/1.0/shop/shopMaster"
 
 
 def log_event(owner_username: str, task_id: str | None, level: str, message: str) -> None:
@@ -105,8 +108,6 @@ def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
         "platform": row.platform,
         "storeUrl": row.store_url,
         "enabled": bool(row.enabled),
-        "contactName": row.contact_name,
-        "contactPhone": row.contact_phone,
         "description": row.description,
         "rakutenServiceSecret": service_secret if reveal else "",
         "rakutenLicenseKey": license_key if reveal else "",
@@ -114,7 +115,6 @@ def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
             "rakutenServiceSecret": mask_secret(service_secret),
             "rakutenLicenseKey": mask_secret(license_key),
         },
-        "priceMultiplier": row.price_multiplier,
         "lastSyncedAt": row.last_synced_at.isoformat(sep=" ") if row.last_synced_at else None,
         "lastError": row.last_error,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -198,6 +198,78 @@ def _product_status_filter(status: str | None) -> str | None:
     return status_map.get(status, status)
 
 
+def normalize_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def normalize_shop_code(value: Any) -> str:
+    normalized = normalize_text(value)
+    if not normalized:
+        return ""
+    if normalized.startswith(("http://", "https://")):
+        try:
+            path_parts = [part for part in urlsplit(normalized).path.split("/") if part]
+        except Exception:
+            path_parts = []
+        return normalize_text(path_parts[0])
+    return normalized.strip("/")
+
+
+def build_rakuten_store_url(shop_code: str) -> str:
+    normalized_shop_code = normalize_shop_code(shop_code)
+    if not normalized_shop_code:
+        return ""
+    return f"https://www.rakuten.co.jp/{normalized_shop_code}/"
+
+
+def fetch_rakuten_shop_meta(service_secret: str, license_key: str) -> dict[str, str]:
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 和乐天 Key 不能为空。")
+    authorization = base64.b64encode(f"{service_secret}:{license_key}".encode("utf-8")).decode("ascii")
+    response = requests.get(
+        RAKUTEN_SHOP_MASTER_URL,
+        timeout=settings.crawler_timeout_seconds,
+        headers={
+            "Authorization": f"ESA {authorization}",
+            "Accept": "application/xml, text/xml",
+        },
+    )
+    response.raise_for_status()
+    meta = parse_rakuten_shop_master_xml(response.text)
+    if not meta.get("shopCode") or not meta.get("shopName"):
+        raise RuntimeError("未能从乐天接口读取到店铺编号和店铺名称。")
+    return meta
+
+
+def parse_rakuten_shop_master_xml(xml_text: str) -> dict[str, str]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise RuntimeError("乐天店铺信息返回格式无法解析。") from exc
+
+    shop_meta = {
+        "shopId": "",
+        "shopCode": "",
+        "shopName": "",
+    }
+    shop_name_tags = {"shopName", "shopname", "shop_name", "storeName", "storename", "name", "title"}
+    shop_code_tags = {"url", "shopUrl", "shopURL", "shop_url", "shopCode", "shopcode", "shop_code"}
+    shop_id_tags = {"shopId", "shopid", "shop_id"}
+
+    for element in root.iter():
+        local_name = element.tag.split("}", 1)[-1]
+        text_value = normalize_text(element.text)
+        if not text_value:
+            continue
+        if not shop_meta["shopName"] and local_name in shop_name_tags:
+            shop_meta["shopName"] = text_value
+        if not shop_meta["shopCode"] and local_name in shop_code_tags:
+            shop_meta["shopCode"] = normalize_shop_code(text_value)
+        if not shop_meta["shopId"] and local_name in shop_id_tags:
+            shop_meta["shopId"] = text_value
+    return shop_meta
+
+
 def list_sources(owner_username: str) -> list[dict[str, Any]]:
     with session_scope() as session:
         rows = session.scalars(
@@ -262,11 +334,10 @@ def list_products(owner_username: str, *, status: str | None = None, keyword: st
         return [product_to_public(row) for row in rows]
 
 
-def list_stores(owner_username: str) -> list[dict[str, Any]]:
+def list_stores() -> list[dict[str, Any]]:
     with session_scope() as session:
         rows = session.scalars(
             select(StoreModel)
-            .where(StoreModel.owner_username == owner_username)
             .order_by(StoreModel.created_at.desc())
         ).all()
         return [store_to_public(row) for row in rows]
@@ -278,50 +349,53 @@ def save_store(owner_username: str, payload: Any, store_id: int | None = None) -
         if row is None:
             row = StoreModel(owner_username=owner_username)
             session.add(row)
-        if row.owner_username != owner_username:
-            raise RuntimeError("不能修改其他用户的店铺。")
 
-        row.store_code = str(getattr(payload, "storeCode", "") or "").strip()
-        row.store_name = str(getattr(payload, "storeName", "") or "").strip()
         row.alias_name = str(getattr(payload, "aliasName", "") or "").strip()
         row.platform = str(getattr(payload, "platform", "") or "rakuten").strip()
-        row.store_url = str(getattr(payload, "storeUrl", "") or "").strip()
         row.enabled = bool(getattr(payload, "enabled", True))
-        row.contact_name = str(getattr(payload, "contactName", "") or "").strip()
-        row.contact_phone = str(getattr(payload, "contactPhone", "") or "").strip()
         row.description = str(getattr(payload, "description", "") or "").strip()
-        row.price_multiplier = str(getattr(payload, "priceMultiplier", "") or "1.00").strip()
 
-        service_secret = str(getattr(payload, "rakutenServiceSecret", "") or "").strip()
-        license_key = str(getattr(payload, "rakutenLicenseKey", "") or "").strip()
-        if service_secret:
-            row.rakuten_service_secret_encrypted = encrypt_text(service_secret)
-        if license_key:
-            row.rakuten_license_key_encrypted = encrypt_text(license_key)
+        incoming_service_secret = str(getattr(payload, "rakutenServiceSecret", "") or "").strip()
+        incoming_license_key = str(getattr(payload, "rakutenLicenseKey", "") or "").strip()
+        service_secret = incoming_service_secret or decrypt_text(row.rakuten_service_secret_encrypted)
+        license_key = incoming_license_key or decrypt_text(row.rakuten_license_key_encrypted)
 
-        if not row.store_code or not row.store_name:
-            raise RuntimeError("店铺编号和店铺名称不能为空。")
+        if row.id is None and (not incoming_service_secret or not incoming_license_key):
+            raise RuntimeError("新增店铺时必须填写乐天 Secret 和乐天 Key。")
+        shop_meta = fetch_rakuten_shop_meta(service_secret, license_key)
+        row.store_code = shop_meta["shopCode"]
+        row.store_name = shop_meta["shopName"]
+        if not row.alias_name:
+            row.alias_name = row.store_name
+        row.store_url = build_rakuten_store_url(row.store_code)
+        if incoming_service_secret:
+            row.rakuten_service_secret_encrypted = encrypt_text(incoming_service_secret)
+        if incoming_license_key:
+            row.rakuten_license_key_encrypted = encrypt_text(incoming_license_key)
+        with session.no_autoflush:
+            duplicated_query = select(StoreModel).where(StoreModel.store_code == row.store_code)
+            if row.id is not None:
+                duplicated_query = duplicated_query.where(StoreModel.id != row.id)
+            duplicated_store = session.scalar(duplicated_query)
+        if duplicated_store is not None:
+            raise RuntimeError("店铺编号已存在。")
         session.flush()
         return store_to_public(row)
 
 
-def delete_store(owner_username: str, store_id: int) -> None:
+def delete_store(store_id: int) -> None:
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
             return
-        if row.owner_username != owner_username:
-            raise RuntimeError("不能删除其他用户的店铺。")
         session.delete(row)
 
 
-def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:
+def sync_store(store_id: int) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
             raise RuntimeError("店铺不存在。")
-        if row.owner_username != owner_username:
-            raise RuntimeError("不能同步其他用户的店铺。")
         row.last_synced_at = datetime.now()
         row.last_error = None
         session.flush()
@@ -460,8 +534,6 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
         raise RuntimeError("请选择要上架的商品。")
     with session_scope() as session:
         store = session.get(StoreModel, store_id) if store_id else None
-        if store is not None and store.owner_username != owner_username:
-            raise RuntimeError("不能使用其他用户的店铺。")
         products = session.scalars(
             select(ProductModel).where(
                 ProductModel.owner_username == owner_username,
@@ -561,7 +633,7 @@ def ensure_default_roles() -> None:
             "code": "operator",
             "scope": "own",
             "permissions": ["secrets.manage", "crawler.manage", "products.manage", "stores.manage"],
-            "notes": "默认业务角色，只能处理自己的店铺、密钥、采集任务和商品。",
+            "notes": "默认业务角色，可使用公司共享店铺，处理自己的采集任务和商品。",
         },
     ]
     with session_scope() as session:

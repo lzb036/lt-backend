@@ -25,7 +25,6 @@ class SecretProfileUpdate(BaseModel):
     ossAccessKeySecret: str | None = None
     ossBucket: str | None = None
     ossEndpoint: str | None = None
-    defaultPriceMultiplier: str | None = Field(default=None)
     autoCrawlEnabled: bool | None = None
     autoCrawlIntervalMinutes: int | None = Field(default=None, ge=5, le=1440)
 
