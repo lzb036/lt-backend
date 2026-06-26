@@ -36,6 +36,7 @@ RAKUTEN_RANKING_BASE = "https://ranking.rakuten.co.jp/search"
 RAKUTEN_SHOP_MASTER_URL = "https://api.rms.rakuten.co.jp/es/1.0/shop/shopMaster"
 RAKUTEN_CABINET_USAGE_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/usage/get"
 RAKUTEN_ITEM_SEARCH_URL = "https://api.rms.rakuten.co.jp/es/2.0/items/search"
+RAKUTEN_ITEM_PATCH_URL = "https://api.rms.rakuten.co.jp/es/2.0/items/manage-numbers/{manageNumber}"
 RAKUTEN_ITEM_SEARCH_HITS = 100
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 
@@ -83,6 +84,8 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
 
 
 def product_to_public(row: ProductModel) -> dict[str, Any]:
+    listed_at = product_listed_at_text(row)
+    raw_payload = product_raw_payload(row)
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -99,12 +102,186 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "imageUrl": row.image_url,
         "price": float(row.price) if row.price is not None else None,
         "currency": row.currency,
+        "salesCount": product_sales_count(raw_payload),
         "genreId": row.genre_id,
         "reviewStatus": row.review_status,
         "lastError": row.last_error,
+        "listedAt": listed_at,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
         "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
     }
+
+
+def product_raw_payload(row: ProductModel) -> dict[str, Any]:
+    try:
+        payload = json.loads(row.raw_payload_json or "{}")
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def product_rakuten_created_at(row: ProductModel) -> datetime | None:
+    raw_created = first_text_value(product_raw_payload(row).get("created"))
+    if not raw_created:
+        return None
+    normalized = raw_created.replace("Z", "+00:00")
+    try:
+        value = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return value.replace(tzinfo=None) if value.tzinfo else value
+
+
+def product_listed_at_text(row: ProductModel) -> str | None:
+    value = product_rakuten_created_at(row)
+    return value.isoformat(sep=" ", timespec="seconds") if value else None
+
+
+def product_sales_count(raw_payload: dict[str, Any]) -> int | None:
+    for key in ("salesCount", "salesQuantity", "soldCount", "orderCount", "sales_count", "sold_count"):
+        value = raw_payload.get(key)
+        if value is None:
+            continue
+        try:
+            return int(float(str(value).replace(",", "")))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def product_detail_to_public(row: ProductModel) -> dict[str, Any]:
+    raw_payload = product_raw_payload(row)
+    public = product_to_public(row)
+    public["detail"] = {
+        "manageNumber": first_text_from_keys(raw_payload, ("manageNumber", "itemNumber")) or row.rakuten_manage_number,
+        "itemNumber": first_text_from_keys(raw_payload, ("itemNumber", "manageNumber")) or row.item_number,
+        "title": first_text_from_keys(raw_payload, ("itemName", "title", "name")) or row.title,
+        "tagline": first_text_from_keys(raw_payload, ("tagline", "catchcopy", "catchCopy")),
+        "genreId": first_text_from_keys(raw_payload, ("genreId", "genre_id", "genre")) or row.genre_id,
+        "shopName": row.shop_name,
+        "sourceUrl": row.source_url,
+        "listingStatus": row.rakuten_listing_status,
+        "salesCount": product_sales_count(raw_payload),
+        "created": first_text_from_keys(raw_payload, ("created",)),
+        "updated": first_text_from_keys(raw_payload, ("updated",)),
+        "descriptions": product_descriptions(raw_payload),
+        "images": product_image_urls(raw_payload),
+        "variantSelectors": product_variant_selectors(raw_payload),
+        "variants": product_variants(raw_payload),
+        "raw": raw_payload,
+    }
+    return public
+
+
+def product_descriptions(raw_payload: dict[str, Any]) -> list[dict[str, str]]:
+    fields = (
+        ("商品说明", "description"),
+        ("销售说明", "salesDescription"),
+        ("PC用商品说明", "pcDescription"),
+        ("移动端商品说明", "spDescription"),
+        ("智能手机商品说明", "smartphoneDescription"),
+    )
+    descriptions: list[dict[str, str]] = []
+    for label, key in fields:
+        value = first_text_value(raw_payload.get(key))
+        if value:
+            descriptions.append({"label": label, "value": value})
+    return descriptions
+
+
+def product_image_urls(raw_payload: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            text = normalize_text(value)
+            if text.startswith(("http://", "https://")) and text not in urls:
+                urls.append(text)
+            return
+        if isinstance(value, dict):
+            for key in ("url", "imageUrl", "location", "value"):
+                collect(value.get(key))
+            for child in value.values():
+                collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    for key in ("images", "imageUrl", "imageUrls", "mediumImageUrls", "smallImageUrls"):
+        collect(raw_payload.get(key))
+    return urls[:20]
+
+
+def product_variant_selectors(raw_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    selectors = raw_payload.get("variantSelectors")
+    if not isinstance(selectors, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for selector in selectors:
+        if not isinstance(selector, dict):
+            continue
+        result.append(
+            {
+                "key": first_text_from_keys(selector, ("key", "id", "selectorId")),
+                "name": first_text_from_keys(selector, ("name", "displayName", "label")),
+                "values": selector.get("values") if isinstance(selector.get("values"), list) else [],
+            }
+        )
+    return result
+
+
+def product_variants(raw_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    variants = raw_payload.get("variants")
+    if isinstance(variants, dict):
+        variant_items = variants.items()
+    elif isinstance(variants, list):
+        variant_items = ((first_text_from_keys(item, ("variantId", "skuId", "merchantDefinedSkuId")) if isinstance(item, dict) else "", item) for item in variants)
+    else:
+        return []
+
+    result: list[dict[str, Any]] = []
+    for variant_id, variant in variant_items:
+        if not isinstance(variant, dict):
+            continue
+        selector_values = variant.get("selectorValues")
+        result.append(
+            {
+                "variantId": normalize_text(variant_id) or first_text_from_keys(variant, ("variantId", "skuId")),
+                "merchantDefinedSkuId": first_text_from_keys(variant, ("merchantDefinedSkuId",)),
+                "articleNumber": first_text_value(variant.get("articleNumber")),
+                "standardPrice": first_text_from_keys(variant, ("standardPrice", "price", "displayPrice")),
+                "hidden": variant.get("hidden"),
+                "selectorValues": selector_values if isinstance(selector_values, dict) else {},
+                "specs": variant.get("specs") if isinstance(variant.get("specs"), list) else [],
+                "attributes": variant.get("attributes") if isinstance(variant.get("attributes"), list) else [],
+            }
+        )
+    return result
+
+
+def parse_datetime_filter(value: str | None) -> datetime | None:
+    text = normalize_text(value)
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def matches_listed_at_range(row: ProductModel, listed_at_from: datetime | None, listed_at_to: datetime | None) -> bool:
+    if listed_at_from is None and listed_at_to is None:
+        return True
+    listed_at = product_rakuten_created_at(row)
+    if listed_at is None:
+        return False
+    if listed_at_from is not None and listed_at < listed_at_from:
+        return False
+    if listed_at_to is not None and listed_at > listed_at_to:
+        return False
+    return True
 
 
 def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
@@ -438,6 +615,107 @@ def request_rakuten_items_page(headers: dict[str, str], offset: int) -> dict[str
     raise RuntimeError(f"乐天商品更新失败，读取 offset={offset} 分页时失败：{last_error}")
 
 
+def patch_rakuten_item_listing_status(
+    service_secret: str,
+    license_key: str,
+    manage_number: str,
+    *,
+    listing_status: str,
+) -> None:
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+    normalized_manage_number = normalize_text(manage_number)
+    if not normalized_manage_number:
+        raise RuntimeError("商品管理编号为空，不能更新上架状态。")
+    if listing_status not in {"listed", "unlisted"}:
+        raise RuntimeError("上架状态不合法。")
+
+    visible = listing_status == "listed"
+    payload = {
+        "hideItem": not visible,
+        "features": {
+            "searchVisibility": "ALWAYS_VISIBLE" if visible else "ALWAYS_HIDDEN",
+        },
+    }
+    response = requests.patch(
+        RAKUTEN_ITEM_PATCH_URL.format(manageNumber=quote(normalized_manage_number, safe="")),
+        timeout=settings.crawler_timeout_seconds,
+        headers={
+            "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        json=payload,
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        detail = normalize_text(response.text)
+        message = f"乐天商品 {normalized_manage_number} 状态更新失败"
+        if detail:
+            message = f"{message}：{detail[:500]}"
+        raise RuntimeError(message) from exc
+
+
+def patch_rakuten_item_price(
+    service_secret: str,
+    license_key: str,
+    manage_number: str,
+    raw_payload: dict[str, Any],
+    price: Decimal,
+) -> dict[str, Any]:
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+    normalized_manage_number = normalize_text(manage_number)
+    if not normalized_manage_number:
+        raise RuntimeError("商品管理编号为空，不能修改价格。")
+
+    variants = raw_payload.get("variants")
+    if not isinstance(variants, dict) or not variants:
+        raise RuntimeError("当前商品没有可修改的 SKU 款式价格，不能同步到乐天。")
+
+    price_text = str(int(price)) if price == price.to_integral_value() else format(price, "f")
+    patch_variants: dict[str, dict[str, str]] = {}
+    for variant_id, variant in variants.items():
+        if not isinstance(variant, dict):
+            continue
+        normalized_variant_id = normalize_text(variant_id)
+        if normalized_variant_id:
+            patch_variants[normalized_variant_id] = {"standardPrice": price_text}
+    if not patch_variants:
+        raise RuntimeError("当前商品没有可修改的 SKU 款式价格，不能同步到乐天。")
+
+    response = requests.patch(
+        RAKUTEN_ITEM_PATCH_URL.format(manageNumber=quote(normalized_manage_number, safe="")),
+        timeout=settings.crawler_timeout_seconds,
+        headers={
+            "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        json={"variants": patch_variants},
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        detail = normalize_text(response.text)
+        message = f"乐天商品 {normalized_manage_number} 价格更新失败"
+        if detail:
+            message = f"{message}：{detail[:500]}"
+        raise RuntimeError(message) from exc
+
+    updated_payload = dict(raw_payload)
+    updated_variants = dict(variants)
+    for variant_id, variant in updated_variants.items():
+        if isinstance(variant, dict):
+            next_variant = dict(variant)
+            next_variant["standardPrice"] = price_text
+            updated_variants[variant_id] = next_variant
+    updated_payload["variants"] = updated_variants
+    updated_payload["updated"] = datetime.now().isoformat(timespec="seconds")
+    return updated_payload
+
+
 def parse_rakuten_total_count(payload: dict[str, Any]) -> int | None:
     for key in ("numFound", "totalCount", "total", "count"):
         value = payload.get(key)
@@ -665,9 +943,13 @@ def list_products(
     keyword: str | None = None,
     store_id: int | None = None,
     listing_status: str | None = None,
+    listed_at_from: str | None = None,
+    listed_at_to: str | None = None,
 ) -> list[dict[str, Any]]:
     with session_scope() as session:
         query = select(ProductModel).where(ProductModel.owner_username == owner_username)
+        listed_at_from_value = parse_datetime_filter(listed_at_from)
+        listed_at_to_value = parse_datetime_filter(listed_at_to)
         product_status = _product_status_filter(status)
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
@@ -682,6 +964,12 @@ def list_products(
                 | ProductModel.rakuten_manage_number.like(f"%{keyword}%")
             )
         rows = session.scalars(query.order_by(ProductModel.created_at.desc())).all()
+        if listed_at_from_value is not None or listed_at_to_value is not None:
+            rows = [
+                row
+                for row in rows
+                if matches_listed_at_range(row, listed_at_from_value, listed_at_to_value)
+            ]
         return [product_to_public(row) for row in rows]
 
 
@@ -1051,6 +1339,150 @@ def delete_products(owner_username: str, product_ids: list[int]) -> None:
         ).all()
         for row in rows:
             session.delete(row)
+
+
+def get_product_detail(owner_username: str, product_id: int) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(ProductModel, product_id)
+        if row is None or row.owner_username != owner_username:
+            raise RuntimeError("商品不存在。")
+        return product_detail_to_public(row)
+
+
+def update_store_product_price(owner_username: str, product_id: int, price: Decimal) -> dict[str, Any]:
+    if price <= 0:
+        raise RuntimeError("商品价格必须大于 0。")
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            raise RuntimeError("商品不存在。")
+        if product.review_status != "listed":
+            raise RuntimeError("只有店铺商品可以同步修改乐天价格。")
+        if not product.store_id:
+            raise RuntimeError("商品未关联店铺，不能同步修改乐天价格。")
+        manage_number = normalize_text(product.rakuten_manage_number or product.item_number)
+        if not manage_number:
+            raise RuntimeError("商品缺少商品管理编号，不能同步修改乐天价格。")
+
+        store = session.get(StoreModel, product.store_id)
+        if store is None:
+            raise RuntimeError("商品关联店铺不存在。")
+        if not store.enabled:
+            raise RuntimeError("商品关联店铺已停用，不能同步修改乐天价格。")
+
+        raw_payload = product_raw_payload(product)
+        try:
+            updated_payload = patch_rakuten_item_price(
+                decrypt_text(store.rakuten_service_secret_encrypted),
+                decrypt_text(store.rakuten_license_key_encrypted),
+                manage_number,
+                raw_payload,
+                price,
+            )
+        except Exception as exc:
+            product.last_error = str(exc)
+            raise
+
+        product.price = price
+        product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
+        product.store_last_seen_at = datetime.now()
+        product.last_error = None
+        session.flush()
+        return product_to_public(product)
+
+
+def update_store_products_listing_status(
+    owner_username: str,
+    product_ids: list[int],
+    listing_status: str,
+) -> dict[str, Any]:
+    if listing_status not in {"listed", "unlisted"}:
+        raise RuntimeError("上架状态不合法。")
+    normalized_ids = [int(value) for value in (product_ids or [])]
+    if not normalized_ids:
+        raise RuntimeError("请先选择商品。")
+
+    with session_scope() as session:
+        products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(normalized_ids),
+                ProductModel.review_status == "listed",
+            )
+        ).all()
+        if not products:
+            raise RuntimeError("没有找到可操作的店铺商品。")
+
+        success_ids: list[int] = []
+        errors: list[str] = []
+        credential_cache: dict[int, tuple[str, str]] = {}
+        for product in products:
+            manage_number = normalize_text(product.rakuten_manage_number or product.item_number)
+            if not product.store_id:
+                errors.append(f"{product.title} 未关联店铺")
+                product.last_error = "未关联店铺，不能更新乐天上架状态。"
+                continue
+            if not manage_number:
+                errors.append(f"{product.title} 缺少商品管理编号")
+                product.last_error = "缺少商品管理编号，不能更新乐天上架状态。"
+                continue
+
+            credentials = credential_cache.get(product.store_id)
+            if credentials is None:
+                store = session.get(StoreModel, product.store_id)
+                if store is None:
+                    errors.append(f"{product.title} 关联店铺不存在")
+                    product.last_error = "关联店铺不存在，不能更新乐天上架状态。"
+                    continue
+                if not store.enabled:
+                    errors.append(f"{store.alias_name or store.store_name} 已停用")
+                    product.last_error = "关联店铺已停用，不能更新乐天上架状态。"
+                    continue
+                credentials = (
+                    decrypt_text(store.rakuten_service_secret_encrypted),
+                    decrypt_text(store.rakuten_license_key_encrypted),
+                )
+                credential_cache[product.store_id] = credentials
+
+            try:
+                patch_rakuten_item_listing_status(
+                    credentials[0],
+                    credentials[1],
+                    manage_number,
+                    listing_status=listing_status,
+                )
+            except Exception as exc:
+                error_text = str(exc)
+                product.last_error = error_text
+                errors.append(f"{manage_number}: {error_text}")
+                continue
+
+            product.rakuten_listing_status = listing_status
+            product.last_error = None
+            product.store_product_status = "active"
+            product.store_last_seen_at = datetime.now()
+            success_ids.append(product.id)
+
+        session.flush()
+        rows = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(normalized_ids),
+            )
+        ).all()
+        success_count = len(success_ids)
+        failed_count = len(products) - success_count
+        message = f"完成，成功 {success_count} 个，失败 {failed_count} 个"
+        return {
+            "products": [product_to_public(row) for row in rows],
+            "summary": {
+                "total": len(products),
+                "successCount": success_count,
+                "failedCount": failed_count,
+                "message": message,
+                "errors": errors[:20],
+            },
+        }
 
 
 def list_listing_tasks(owner_username: str) -> list[dict[str, Any]]:

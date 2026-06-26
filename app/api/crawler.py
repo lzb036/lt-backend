@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from decimal import Decimal
 
 from app.core.auth import require_authenticated_account, require_superadmin
 from app.services import crawler_service
@@ -55,6 +56,15 @@ class ProductStatusPayload(BaseModel):
 
 class ProductDeletePayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
+
+
+class ProductListingStatusPayload(BaseModel):
+    productIds: list[int] = Field(default_factory=list)
+    listingStatus: str = Field(pattern="^(listed|unlisted)$")
+
+
+class ProductPricePayload(BaseModel):
+    price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
 
 
 class ListingTaskPayload(BaseModel):
@@ -133,6 +143,8 @@ def list_products(
     keyword: str | None = Query(default=None),
     storeId: int | None = Query(default=None),
     listingStatus: str | None = Query(default=None),
+    listedAtFrom: str | None = Query(default=None),
+    listedAtTo: str | None = Query(default=None),
     user: dict = Depends(require_authenticated_account),
 ) -> dict:
     return {
@@ -142,6 +154,8 @@ def list_products(
             keyword=keyword,
             store_id=storeId,
             listing_status=listingStatus,
+            listed_at_from=listedAtFrom,
+            listed_at_to=listedAtTo,
         )
     }
 
@@ -164,6 +178,41 @@ def update_product_status(payload: ProductStatusPayload, user: dict = Depends(re
 def delete_products(payload: ProductDeletePayload, user: dict = Depends(require_authenticated_account)) -> dict:
     crawler_service.delete_products(user["username"], payload.productIds)
     return {"products": crawler_service.list_products(user["username"])}
+
+
+@router.put("/products/listing-status")
+def update_products_listing_status(
+    payload: ProductListingStatusPayload,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return crawler_service.update_store_products_listing_status(
+            user["username"],
+            payload.productIds,
+            payload.listingStatus,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/products/{product_id}")
+def get_product_detail(product_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
+    try:
+        return {"product": crawler_service.get_product_detail(user["username"], product_id)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/products/{product_id}/price")
+def update_product_price(
+    product_id: int,
+    payload: ProductPricePayload,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return {"product": crawler_service.update_store_product_price(user["username"], product_id, payload.price)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/stores")
