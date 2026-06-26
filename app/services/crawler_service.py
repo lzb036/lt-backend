@@ -595,6 +595,11 @@ def first_variant_price(item: dict[str, Any]) -> str:
 
 
 def rakuten_listing_status_from_item(item: dict[str, Any]) -> str:
+    features = item.get("features")
+    if isinstance(features, dict):
+        search_visibility = normalize_text(features.get("searchVisibility")).upper()
+        if "HIDDEN" in search_visibility:
+            return "unlisted"
     hide_item = item.get("hideItem")
     if isinstance(hide_item, str):
         return "unlisted" if hide_item.strip().lower() in {"1", "true", "yes", "on"} else "listed"
