@@ -103,6 +103,9 @@ class StoreModel(TimestampMixin, Base):
     rakuten_service_secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
     rakuten_license_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
     price_multiplier: Mapped[str] = mapped_column(String(32), nullable=False, default="1.00")
+    cabinet_used_folder_count: Mapped[int | None] = mapped_column(Integer)
+    cabinet_remaining_folder_count: Mapped[int | None] = mapped_column(Integer)
+    cabinet_usage_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     last_error: Mapped[str | None] = mapped_column(Text)
 

@@ -33,6 +33,7 @@ from app.db.models import (
 RAKUTEN_SEARCH_BASE = "https://search.rakuten.co.jp/search/mall/"
 RAKUTEN_RANKING_BASE = "https://ranking.rakuten.co.jp/search"
 RAKUTEN_SHOP_MASTER_URL = "https://api.rms.rakuten.co.jp/es/1.0/shop/shopMaster"
+RAKUTEN_CABINET_USAGE_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/usage/get"
 RAKUTEN_ITEM_SEARCH_URL = "https://api.rms.rakuten.co.jp/es/2.0/items/search"
 RAKUTEN_ITEM_SEARCH_HITS = 100
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
@@ -128,6 +129,9 @@ def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
             "rakutenServiceSecret": mask_secret(service_secret),
             "rakutenLicenseKey": mask_secret(license_key),
         },
+        "cabinetUsedFolderCount": row.cabinet_used_folder_count,
+        "cabinetRemainingFolderCount": row.cabinet_remaining_folder_count,
+        "cabinetUsageCheckedAt": row.cabinet_usage_checked_at.isoformat(sep=" ") if row.cabinet_usage_checked_at else None,
         "lastSyncedAt": row.last_synced_at.isoformat(sep=" ") if row.last_synced_at else None,
         "lastError": row.last_error,
         "availabilityStatus": availability_status,
@@ -268,6 +272,52 @@ def fetch_rakuten_shop_meta(service_secret: str, license_key: str) -> dict[str, 
     if not meta.get("shopCode") or not meta.get("shopName"):
         raise RuntimeError("未能从乐天接口读取到店铺编号和店铺名称。")
     return meta
+
+
+def fetch_rakuten_cabinet_usage(service_secret: str, license_key: str) -> dict[str, int]:
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 和乐天 Key 不能为空。")
+    try:
+        response = requests.get(
+            RAKUTEN_CABINET_USAGE_URL,
+            timeout=settings.crawler_timeout_seconds,
+            headers={
+                "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+                "Accept": "application/xml, text/xml",
+            },
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError("乐天 Cabinet 使用量读取失败，请检查 Secret / Key 权限。") from exc
+    return parse_rakuten_cabinet_usage_xml(response.text)
+
+
+def parse_rakuten_cabinet_usage_xml(xml_text: str) -> dict[str, int]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise RuntimeError("乐天 Cabinet 使用量返回格式无法解析。") from exc
+
+    values = {
+        "usedFolderCount": 0,
+        "remainingFolderCount": 0,
+    }
+    tag_map = {
+        "UseFolderCount": "usedFolderCount",
+        "useFolderCount": "usedFolderCount",
+        "AvailFolderCount": "remainingFolderCount",
+        "availFolderCount": "remainingFolderCount",
+    }
+    for element in root.iter():
+        local_name = element.tag.split("}", 1)[-1]
+        target_key = tag_map.get(local_name)
+        if not target_key:
+            continue
+        try:
+            values[target_key] = int(float(normalize_text(element.text) or 0))
+        except ValueError:
+            values[target_key] = 0
+    return values
 
 
 def parse_rakuten_shop_master_xml(xml_text: str) -> dict[str, str]:
@@ -666,8 +716,16 @@ def verify_store_credentials(row: StoreModel) -> None:
     if not row.alias_name:
         row.alias_name = row.store_name
     row.store_url = build_rakuten_store_url(row.store_code)
+    update_store_cabinet_usage(row, service_secret, license_key)
     row.last_synced_at = datetime.now()
     row.last_error = None
+
+
+def update_store_cabinet_usage(row: StoreModel, service_secret: str, license_key: str) -> None:
+    usage = fetch_rakuten_cabinet_usage(service_secret, license_key)
+    row.cabinet_used_folder_count = usage["usedFolderCount"]
+    row.cabinet_remaining_folder_count = usage["remainingFolderCount"]
+    row.cabinet_usage_checked_at = datetime.now()
 
 
 def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:

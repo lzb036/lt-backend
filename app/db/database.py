@@ -43,6 +43,25 @@ def ensure_schema_compatibility() -> None:
     if not url.drivername.startswith("mysql"):
         return
     with engine.begin() as connection:
+        store_columns = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_stores'
+                    """
+                )
+            ).scalars()
+        )
+        if "cabinet_used_folder_count" not in store_columns:
+            connection.execute(text("ALTER TABLE lt_stores ADD COLUMN cabinet_used_folder_count INT NULL"))
+        if "cabinet_remaining_folder_count" not in store_columns:
+            connection.execute(text("ALTER TABLE lt_stores ADD COLUMN cabinet_remaining_folder_count INT NULL"))
+        if "cabinet_usage_checked_at" not in store_columns:
+            connection.execute(text("ALTER TABLE lt_stores ADD COLUMN cabinet_usage_checked_at DATETIME NULL"))
+
         product_columns = set(
             connection.execute(
                 text(
