@@ -90,6 +90,7 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "storeId": row.store_id,
         "rakutenManageNumber": row.rakuten_manage_number,
         "storeProductStatus": row.store_product_status,
+        "rakutenListingStatus": row.rakuten_listing_status,
         "storeLastSeenAt": row.store_last_seen_at.isoformat(sep=" ") if row.store_last_seen_at else None,
         "title": row.title,
         "sourceUrl": row.source_url,
@@ -591,6 +592,13 @@ def first_variant_price(item: dict[str, Any]) -> str:
     if not prices:
         return ""
     return str(min(prices))
+
+
+def rakuten_listing_status_from_item(item: dict[str, Any]) -> str:
+    hide_item = item.get("hideItem")
+    if isinstance(hide_item, str):
+        return "unlisted" if hide_item.strip().lower() in {"1", "true", "yes", "on"} else "listed"
+    return "unlisted" if bool(hide_item) else "listed"
 
 
 def list_sources(owner_username: str) -> list[dict[str, Any]]:
@@ -1429,6 +1437,7 @@ def upsert_store_product(session: Any, owner_username: str, store: StoreModel, i
         "shop_name": store.store_name,
         "item_number": item_number or manage_number,
         "rakuten_manage_number": manage_number,
+        "rakuten_listing_status": rakuten_listing_status_from_item(item),
         "genre_id": first_text_from_keys(item, ("genreId", "genre_id", "genre")),
         "raw": item,
     }
@@ -1491,6 +1500,7 @@ def upsert_product(
     row.task_id = task_id
     row.store_id = store_id
     row.rakuten_manage_number = rakuten_manage_number
+    row.rakuten_listing_status = str(item.get("rakuten_listing_status") or row.rakuten_listing_status or "")
     row.title = title[:500]
     row.image_url = str(item.get("image_url") or "")
     row.item_number = str(item.get("item_number") or "")

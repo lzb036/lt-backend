@@ -190,6 +190,7 @@ class ProductModel(TimestampMixin, Base):
     genre_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     review_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     store_product_status: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
+    rakuten_listing_status: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
     store_last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     raw_payload_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
     last_error: Mapped[str | None] = mapped_column(Text)

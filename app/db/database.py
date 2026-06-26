@@ -80,6 +80,8 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN rakuten_manage_number VARCHAR(255) NULL"))
         if "store_product_status" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN store_product_status VARCHAR(32) NOT NULL DEFAULT ''"))
+        if "rakuten_listing_status" not in product_columns:
+            connection.execute(text("ALTER TABLE lt_products ADD COLUMN rakuten_listing_status VARCHAR(32) NOT NULL DEFAULT ''"))
         if "store_last_seen_at" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN store_last_seen_at DATETIME NULL"))
 
@@ -91,6 +93,17 @@ def ensure_schema_compatibility() -> None:
                 WHERE store_id IS NOT NULL
                   AND review_status = 'listed'
                   AND (rakuten_manage_number IS NULL OR rakuten_manage_number = '')
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE lt_products
+                SET rakuten_listing_status = 'listed'
+                WHERE store_id IS NOT NULL
+                  AND review_status = 'listed'
+                  AND rakuten_listing_status = ''
                 """
             )
         )
