@@ -27,6 +27,7 @@ from app.db.models import (
     RoleModel,
     ScheduledCrawlModel,
     StoreModel,
+    SyncTaskModel,
     make_source_url_hash,
 )
 
@@ -176,6 +177,26 @@ def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
         "successCount": row.success_count,
         "failedCount": row.failed_count,
         "productIds": product_ids if isinstance(product_ids, list) else [],
+        "message": row.message,
+        "errorDetail": row.error_detail,
+        "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
+        "finishedAt": row.finished_at.isoformat(sep=" ") if row.finished_at else None,
+        "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
+        "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
+    }
+
+
+def sync_task_to_public(row: SyncTaskModel) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "ownerUsername": row.owner_username,
+        "storeId": row.store_id,
+        "storeName": row.store_name,
+        "taskName": row.task_name,
+        "status": row.status,
+        "totalCount": row.total_count,
+        "successCount": row.success_count,
+        "failedCount": row.failed_count,
         "message": row.message,
         "errorDetail": row.error_detail,
         "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
@@ -729,6 +750,15 @@ def update_store_cabinet_usage(row: StoreModel, service_secret: str, license_key
 
 
 def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:
+    task = create_sync_task(owner_username, store_id)
+    return {
+        "store": task.get("store"),
+        "syncTask": task.get("syncTask"),
+        "syncedCount": task.get("syncedCount", 0),
+    }
+
+
+def perform_store_sync(owner_username: str, store_id: int) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
@@ -736,27 +766,140 @@ def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:
         if not row.enabled:
             raise RuntimeError("店铺已停用，不能更新商品。")
         synced_count = 0
-        try:
-            service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
-            license_key = decrypt_text(row.rakuten_license_key_encrypted)
-            verify_store_credentials(row)
-            items = fetch_rakuten_store_items(service_secret, license_key)
-            seen_manage_numbers: set[str] = set()
-            for item in items:
-                manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
-                if manage_number:
-                    seen_manage_numbers.add(manage_number)
-                if upsert_store_product(session, owner_username, row, item):
-                    synced_count += 1
-            mark_missing_store_products_removed(session, row, seen_manage_numbers)
-        except Exception as exc:
-            row.last_synced_at = datetime.now()
-            row.last_error = str(exc)
+        failed_count = 0
+        service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
+        license_key = decrypt_text(row.rakuten_license_key_encrypted)
+        verify_store_credentials(row)
+        items = fetch_rakuten_store_items(service_secret, license_key)
+        seen_manage_numbers: set[str] = set()
+        for item in items:
+            manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
+            if manage_number:
+                seen_manage_numbers.add(manage_number)
+            if upsert_store_product(session, owner_username, row, item):
+                synced_count += 1
+            else:
+                failed_count += 1
+        mark_missing_store_products_removed(session, row, seen_manage_numbers)
         session.flush()
         return {
             "store": store_to_public(row),
+            "totalCount": len(items),
             "syncedCount": synced_count,
+            "failedCount": failed_count,
         }
+
+
+def list_sync_tasks(owner_username: str) -> list[dict[str, Any]]:
+    with session_scope() as session:
+        rows = session.scalars(
+            select(SyncTaskModel)
+            .where(SyncTaskModel.owner_username == owner_username)
+            .order_by(SyncTaskModel.created_at.desc())
+            .limit(100)
+        ).all()
+        return [sync_task_to_public(row) for row in rows]
+
+
+def create_sync_task(owner_username: str, store_id: int) -> dict[str, Any]:
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        if store is None:
+            raise RuntimeError("店铺不存在。")
+        if not store.enabled:
+            raise RuntimeError("店铺已停用，不能同步商品。")
+        task = SyncTaskModel(
+            id=uuid.uuid4().hex,
+            owner_username=owner_username,
+            store_id=store.id,
+            store_name=store.alias_name or store.store_name,
+            task_name=f"商品同步 {store.alias_name or store.store_name} {datetime.now():%Y-%m-%d %H:%M}",
+            status="running",
+            message="正在同步店铺商品",
+            started_at=datetime.now(),
+        )
+        session.add(task)
+        session.flush()
+        task_id = task.id
+
+    run_sync_task(owner_username, task_id)
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        store = session.get(StoreModel, task.store_id) if task and task.store_id else None
+        return {
+            "syncTask": sync_task_to_public(task) if task else {"id": task_id},
+            "store": store_to_public(store) if store else None,
+            "syncedCount": task.success_count if task else 0,
+        }
+
+
+def run_sync_task(owner_username: str, task_id: str) -> None:
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        if task is None:
+            return
+        if task.owner_username != owner_username:
+            raise RuntimeError("不能执行其他用户的同步任务。")
+        task.status = "running"
+        task.message = "正在同步店铺商品"
+        task.error_detail = None
+        task.started_at = datetime.now()
+        task.finished_at = None
+        store_id = task.store_id
+
+    try:
+        if store_id is None:
+            raise RuntimeError("同步任务没有关联店铺。")
+        result = perform_store_sync(owner_username, store_id)
+        total_count = int(result.get("totalCount") or 0)
+        success_count = int(result.get("syncedCount") or 0)
+        failed_count = int(result.get("failedCount") or 0)
+        status = "success" if failed_count == 0 else "partial"
+        message = f"完成，同步 {success_count} 条，异常 {failed_count} 条"
+        error_detail = None
+    except Exception as exc:
+        total_count = 0
+        success_count = 0
+        failed_count = 1
+        status = "failed"
+        message = "同步失败"
+        error_detail = str(exc)
+        with session_scope() as session:
+            task = session.get(SyncTaskModel, task_id)
+            store = session.get(StoreModel, task.store_id) if task and task.store_id else None
+            if store is not None:
+                store.last_synced_at = datetime.now()
+                store.last_error = error_detail
+
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        if task is None:
+            return
+        task.total_count = total_count
+        task.success_count = success_count
+        task.failed_count = failed_count
+        task.status = status
+        task.message = message
+        task.error_detail = error_detail
+        task.finished_at = datetime.now()
+
+
+def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        if task is None:
+            raise RuntimeError("同步任务不存在。")
+        if task.owner_username != owner_username:
+            raise RuntimeError("不能重试其他用户的同步任务。")
+        task.status = "running"
+        task.message = "重新同步中"
+        task.error_detail = None
+        task.started_at = datetime.now()
+        task.finished_at = None
+    run_sync_task(owner_username, task_id)
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        return sync_task_to_public(task) if task else {"id": task_id}
 
 
 def verify_all_stores() -> dict[str, Any]:

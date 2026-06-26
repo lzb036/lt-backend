@@ -161,6 +161,24 @@ def ensure_schema_compatibility() -> None:
                 )
             )
 
+        sync_task_indexes = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT INDEX_NAME
+                    FROM INFORMATION_SCHEMA.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_sync_tasks'
+                    """
+                )
+            ).scalars()
+        )
+        if sync_task_indexes:
+            if "ix_lt_sync_task_owner_status" not in sync_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_status ON lt_sync_tasks (owner_username, status)"))
+            if "ix_lt_sync_task_owner_created" not in sync_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_created ON lt_sync_tasks (owner_username, created_at)"))
+
 
 engine = create_engine(
     settings.database_url,

@@ -198,7 +198,25 @@ def verify_stores(user: dict = Depends(require_authenticated_account)) -> dict:
 def sync_store(store_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         result = crawler_service.sync_store(user["username"], store_id)
-        return {**result, "stores": crawler_service.list_stores()}
+        return {
+            **result,
+            "stores": crawler_service.list_stores(),
+            "syncTasks": crawler_service.list_sync_tasks(user["username"]),
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/sync-tasks")
+def list_sync_tasks(user: dict = Depends(require_authenticated_account)) -> dict:
+    return {"syncTasks": crawler_service.list_sync_tasks(user["username"])}
+
+
+@router.post("/sync-tasks/{task_id}/retry")
+def retry_sync_task(task_id: str, user: dict = Depends(require_authenticated_account)) -> dict:
+    try:
+        task = crawler_service.retry_sync_task(user["username"], task_id)
+        return {"syncTask": task, "syncTasks": crawler_service.list_sync_tasks(user["username"])}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -221,6 +221,32 @@ class ListingTaskModel(TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
 
 
+class SyncTaskModel(TimestampMixin, Base):
+    __tablename__ = "lt_sync_tasks"
+    __table_args__ = (
+        Index("ix_lt_sync_task_owner_status", "owner_username", "status"),
+        Index("ix_lt_sync_task_owner_created", "owner_username", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("lt_stores.id", ondelete="SET NULL"))
+    store_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    task_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", server_default="queued")
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+
+
 class ScheduledCrawlModel(TimestampMixin, Base):
     __tablename__ = "lt_scheduled_crawls"
     __table_args__ = (
