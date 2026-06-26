@@ -37,6 +37,8 @@ RAKUTEN_SHOP_MASTER_URL = "https://api.rms.rakuten.co.jp/es/1.0/shop/shopMaster"
 RAKUTEN_CABINET_USAGE_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/usage/get"
 RAKUTEN_ITEM_SEARCH_URL = "https://api.rms.rakuten.co.jp/es/2.0/items/search"
 RAKUTEN_ITEM_PATCH_URL = "https://api.rms.rakuten.co.jp/es/2.0/items/manage-numbers/{manageNumber}"
+RAKUTEN_CABINET_FILE_SEARCH_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/files/search"
+RAKUTEN_CABINET_FILE_DELETE_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/file/delete"
 RAKUTEN_ITEM_SEARCH_HITS = 100
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 
@@ -210,6 +212,68 @@ def product_image_urls(raw_payload: dict[str, Any]) -> list[str]:
     for key in ("images", "imageUrl", "imageUrls", "mediumImageUrls", "smallImageUrls"):
         collect(raw_payload.get(key))
     return urls[:20]
+
+
+def product_cabinet_file_targets(raw_payload: dict[str, Any], shop_code: str) -> list[dict[str, str]]:
+    normalized_shop_code = normalize_shop_code(shop_code)
+    targets: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def remember(value: Any) -> None:
+        for path in cabinet_paths_from_text(value, normalized_shop_code):
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            targets.append({"filePath": path, "fileName": path.rsplit("/", 1)[-1]})
+
+    def walk(value: Any) -> None:
+        if isinstance(value, str):
+            remember(value)
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(raw_payload)
+    return targets
+
+
+def cabinet_paths_from_text(value: Any, shop_code: str) -> list[str]:
+    text = str(value or "").replace("\\/", "/")
+    if not text:
+        return []
+
+    patterns = [
+        r"https?://image\.rakuten\.co\.jp/([^/]+)/cabinet/[^\"'\s<>]+?\.(?:jpg|jpeg|png|webp|gif)",
+        r"https?://(?:shop|tshop)\.r10s\.jp/([^/]+)/cabinet/[^\"'\s<>]+?\.(?:jpg|jpeg|png|webp|gif)",
+        r"https?://thumbnail\.image\.rakuten\.co\.jp/@0_mall/([^/]+)/cabinet/[^\"'\s<>]+?\.(?:jpg|jpeg|png|webp|gif)",
+        r"@0_mall/([^/]+)/cabinet/[^\"'\s<>]+?\.(?:jpg|jpeg|png|webp|gif)",
+    ]
+    paths: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            matched_shop = normalize_shop_code(match.group(1))
+            if shop_code and matched_shop and matched_shop != shop_code:
+                continue
+            full_match = match.group(0)
+            cabinet_index = full_match.lower().find("/cabinet/")
+            if cabinet_index < 0:
+                cabinet_index = full_match.lower().find("cabinet/")
+            if cabinet_index < 0:
+                continue
+            path = "/" + full_match[cabinet_index:].lstrip("/")
+            path = path.split("?", 1)[0].split("#", 1)[0]
+            if path not in paths:
+                paths.append(path)
+
+    for match in re.finditer(r"(?<![\w/])cabinet/[^\"'\s<>]+?\.(?:jpg|jpeg|png|webp|gif)", text, flags=re.IGNORECASE):
+        path = "/" + match.group(0).split("?", 1)[0].split("#", 1)[0].lstrip("/")
+        if path not in paths:
+            paths.append(path)
+    return paths
 
 
 def product_variant_selectors(raw_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -714,6 +778,168 @@ def patch_rakuten_item_price(
     updated_payload["variants"] = updated_variants
     updated_payload["updated"] = datetime.now().isoformat(timespec="seconds")
     return updated_payload
+
+
+def delete_rakuten_item(service_secret: str, license_key: str, manage_number: str) -> None:
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+    normalized_manage_number = normalize_text(manage_number)
+    if not normalized_manage_number:
+        raise RuntimeError("商品管理编号为空，不能删除乐天商品。")
+
+    response = requests.delete(
+        RAKUTEN_ITEM_PATCH_URL.format(manageNumber=quote(normalized_manage_number, safe="")),
+        timeout=settings.crawler_timeout_seconds,
+        headers={
+            "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+            "Accept": "application/json",
+        },
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        detail = normalize_text(response.text)
+        message = f"乐天商品 {normalized_manage_number} 删除失败"
+        if detail:
+            message = f"{message}：{detail[:500]}"
+        raise RuntimeError(message) from exc
+
+
+def delete_rakuten_cabinet_file(service_secret: str, license_key: str, file_id: int) -> None:
+    xml_body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<request>"
+        "<fileDeleteRequest>"
+        "<file>"
+        f"<fileId>{int(file_id)}</fileId>"
+        "</file>"
+        "</fileDeleteRequest>"
+        "</request>"
+    )
+    response = requests.post(
+        RAKUTEN_CABINET_FILE_DELETE_URL,
+        timeout=settings.crawler_timeout_seconds,
+        headers={
+            "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+            "Accept": "application/xml, text/xml",
+            "Content-Type": "application/xml; charset=utf-8",
+        },
+        data=xml_body.encode("utf-8"),
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        detail = normalize_text(response.text)
+        message = f"R-Cabinet 图片 {file_id} 删除失败"
+        if detail:
+            message = f"{message}：{detail[:500]}"
+        raise RuntimeError(message) from exc
+
+
+def search_rakuten_cabinet_file_ids(
+    service_secret: str,
+    license_key: str,
+    *,
+    file_path: str = "",
+    file_name: str = "",
+) -> list[int]:
+    params: dict[str, Any] = {"offset": 1, "limit": 100}
+    if file_path:
+        params["filePath"] = file_path
+    if file_name:
+        params["fileName"] = file_name
+    response = requests.get(
+        RAKUTEN_CABINET_FILE_SEARCH_URL,
+        timeout=settings.crawler_timeout_seconds,
+        headers={
+            "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+            "Accept": "application/xml, text/xml",
+        },
+        params=params,
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        detail = normalize_text(response.text)
+        message = "R-Cabinet 图片搜索失败"
+        if detail:
+            message = f"{message}：{detail[:500]}"
+        raise RuntimeError(message) from exc
+    return [record["fileId"] for record in parse_cabinet_files_xml(response.text) if record.get("fileId")]
+
+
+def parse_cabinet_file_ids_xml(xml_text: str) -> list[int]:
+    return [record["fileId"] for record in parse_cabinet_files_xml(xml_text) if record.get("fileId")]
+
+
+def search_rakuten_cabinet_files(
+    service_secret: str,
+    license_key: str,
+    *,
+    file_path: str = "",
+    file_name: str = "",
+) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"offset": 1, "limit": 100}
+    if file_path:
+        params["filePath"] = file_path
+    if file_name:
+        params["fileName"] = file_name
+    response = requests.get(
+        RAKUTEN_CABINET_FILE_SEARCH_URL,
+        timeout=settings.crawler_timeout_seconds,
+        headers={
+            "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+            "Accept": "application/xml, text/xml",
+        },
+        params=params,
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        detail = normalize_text(response.text)
+        message = "R-Cabinet 图片搜索失败"
+        if detail:
+            message = f"{message}：{detail[:500]}"
+        raise RuntimeError(message) from exc
+    return parse_cabinet_files_xml(response.text)
+
+
+def parse_cabinet_files_xml(xml_text: str) -> list[dict[str, Any]]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise RuntimeError("R-Cabinet 图片搜索返回格式无法解析。") from exc
+    records: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for element in root.iter():
+        children = list(element)
+        if not children:
+            continue
+        values: dict[str, str] = {}
+        for child in children:
+            local_name = child.tag.split("}", 1)[-1].lower()
+            if local_name in {"fileid", "filename", "filepath", "fileurl", "folderpath"}:
+                values[local_name] = normalize_text(child.text)
+        raw_file_id = values.get("fileid", "")
+        if not raw_file_id:
+            continue
+        try:
+            file_id = int(float(raw_file_id))
+        except ValueError:
+            continue
+        if file_id in seen_ids:
+            continue
+        seen_ids.add(file_id)
+        records.append(
+            {
+                "fileId": file_id,
+                "fileName": values.get("filename", ""),
+                "filePath": values.get("filepath", ""),
+                "fileUrl": values.get("fileurl", ""),
+                "folderPath": values.get("folderpath", ""),
+            }
+        )
+    return records
 
 
 def parse_rakuten_total_count(payload: dict[str, Any]) -> int | None:
@@ -1329,16 +1555,154 @@ def update_product_status(owner_username: str, product_ids: list[int], status: s
         return [product_to_public(row) for row in rows]
 
 
-def delete_products(owner_username: str, product_ids: list[int]) -> None:
+def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, Any]:
+    normalized_ids = [int(value) for value in (product_ids or [])]
+    if not normalized_ids:
+        raise RuntimeError("请先选择商品。")
     with session_scope() as session:
         rows = session.scalars(
             select(ProductModel).where(
                 ProductModel.owner_username == owner_username,
-                ProductModel.id.in_(product_ids or [-1]),
+                ProductModel.id.in_(normalized_ids),
             )
         ).all()
+        if not rows:
+            raise RuntimeError("没有找到可删除的商品。")
+
+        success_count = 0
+        failed_count = 0
+        cabinet_deleted_count = 0
+        deleted_ids: list[int] = []
+        failed_ids: list[int] = []
+        failed_products: list[dict[str, Any]] = []
+        errors: list[str] = []
+        warnings: list[str] = []
+        credential_cache: dict[int, tuple[StoreModel, str, str]] = {}
         for row in rows:
+            if row.review_status == "listed":
+                try:
+                    delete_store_product_from_rakuten(session, row, credential_cache)
+                    cabinet_deleted_count += int(getattr(row, "_deleted_cabinet_count", 0) or 0)
+                except Exception as exc:
+                    failed_count += 1
+                    failed_ids.append(row.id)
+                    error_text = str(exc)
+                    row.last_error = error_text
+                    errors.append(f"{productCodeForError(row)}: {error_text}")
+                    failed_products.append(product_to_public(row))
+                    continue
+                warnings.extend(getattr(row, "_delete_warnings", []) or [])
+            deleted_ids.append(row.id)
             session.delete(row)
+            success_count += 1
+        session.flush()
+        message = f"完成，成功删除 {success_count} 个，失败 {failed_count} 个"
+        if cabinet_deleted_count:
+            message = f"{message}，同步删除图片 {cabinet_deleted_count} 个"
+        return {
+            "deletedIds": deleted_ids,
+            "failedIds": failed_ids,
+            "products": failed_products,
+            "summary": {
+                "total": len(rows),
+                "successCount": success_count,
+                "failedCount": failed_count,
+                "cabinetDeletedCount": cabinet_deleted_count,
+                "message": message,
+                "errors": errors[:20],
+                "warnings": warnings[:20],
+            }
+        }
+
+
+def productCodeForError(row: ProductModel) -> str:
+    return normalize_text(row.rakuten_manage_number or row.item_number or row.title or row.id)
+
+
+def delete_store_product_from_rakuten(
+    session: Any,
+    product: ProductModel,
+    credential_cache: dict[int, tuple[StoreModel, str, str]],
+) -> None:
+    if not product.store_id:
+        raise RuntimeError("商品未关联店铺，不能删除乐天商品。")
+    manage_number = normalize_text(product.rakuten_manage_number or product.item_number)
+    if not manage_number:
+        raise RuntimeError("商品缺少商品管理编号，不能删除乐天商品。")
+
+    credentials = credential_cache.get(product.store_id)
+    if credentials is None:
+        store = session.get(StoreModel, product.store_id)
+        if store is None:
+            raise RuntimeError("商品关联店铺不存在。")
+        if not store.enabled:
+            raise RuntimeError("商品关联店铺已停用，不能删除乐天商品。")
+        credentials = (
+            store,
+            decrypt_text(store.rakuten_service_secret_encrypted),
+            decrypt_text(store.rakuten_license_key_encrypted),
+        )
+        credential_cache[product.store_id] = credentials
+
+    store, service_secret, license_key = credentials
+    raw_payload = product_raw_payload(product)
+    delete_rakuten_item(service_secret, license_key, manage_number)
+    deleted_count, warnings = delete_product_cabinet_images(service_secret, license_key, raw_payload, store.store_code)
+    setattr(product, "_deleted_cabinet_count", deleted_count)
+    setattr(product, "_delete_warnings", warnings)
+
+
+def delete_product_cabinet_images(
+    service_secret: str,
+    license_key: str,
+    raw_payload: dict[str, Any],
+    shop_code: str,
+) -> tuple[int, list[str]]:
+    targets = product_cabinet_file_targets(raw_payload, shop_code)
+    deleted_ids: set[int] = set()
+    warnings: list[str] = []
+    for target in targets:
+        try:
+            file_ids = resolve_cabinet_file_ids(service_secret, license_key, target)
+        except Exception as exc:
+            warnings.append(f"{target.get('filePath') or target.get('fileName')}: {exc}")
+            continue
+        for file_id in file_ids:
+            if file_id in deleted_ids:
+                continue
+            try:
+                delete_rakuten_cabinet_file(service_secret, license_key, file_id)
+                deleted_ids.add(file_id)
+            except Exception as exc:
+                warnings.append(f"R-Cabinet 图片 {file_id}: {exc}")
+    return len(deleted_ids), warnings
+
+
+def resolve_cabinet_file_ids(service_secret: str, license_key: str, target: dict[str, str]) -> list[int]:
+    file_path = normalize_text(target.get("filePath"))
+    file_name = normalize_text(target.get("fileName"))
+    if file_path:
+        records = search_rakuten_cabinet_files(service_secret, license_key, file_path=file_path)
+        exact_ids = [
+            int(record["fileId"])
+            for record in records
+            if normalize_text(record.get("filePath")).lower() == file_path.lower()
+        ]
+        if exact_ids:
+            return exact_ids
+    if file_name:
+        records = search_rakuten_cabinet_files(service_secret, license_key, file_name=file_name)
+        if len(records) == 1:
+            return [int(records[0]["fileId"])]
+        if len(records) > 1 and file_path:
+            exact_ids = [
+                int(record["fileId"])
+                for record in records
+                if normalize_text(record.get("filePath")).lower() == file_path.lower()
+            ]
+            if exact_ids:
+                return exact_ids
+    return []
 
 
 def get_product_detail(owner_username: str, product_id: int) -> dict[str, Any]:

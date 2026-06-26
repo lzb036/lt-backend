@@ -176,8 +176,10 @@ def update_product_status(payload: ProductStatusPayload, user: dict = Depends(re
 
 @router.api_route("/products", methods=["DELETE"])
 def delete_products(payload: ProductDeletePayload, user: dict = Depends(require_authenticated_account)) -> dict:
-    crawler_service.delete_products(user["username"], payload.productIds)
-    return {"products": crawler_service.list_products(user["username"])}
+    try:
+        return crawler_service.delete_products(user["username"], payload.productIds)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.put("/products/listing-status")
