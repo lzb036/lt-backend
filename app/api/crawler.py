@@ -131,9 +131,10 @@ def restart_task(task_id: str, user: dict = Depends(require_authenticated_accoun
 def list_products(
     status: str | None = Query(default=None),
     keyword: str | None = Query(default=None),
+    storeId: int | None = Query(default=None),
     user: dict = Depends(require_authenticated_account),
 ) -> dict:
-    return {"products": crawler_service.list_products(user["username"], status=status, keyword=keyword)}
+    return {"products": crawler_service.list_products(user["username"], status=status, keyword=keyword, store_id=storeId)}
 
 
 @router.put("/products/status")
@@ -188,11 +189,16 @@ def delete_store(store_id: int, user: dict = Depends(require_authenticated_accou
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/stores/verify")
+def verify_stores(user: dict = Depends(require_authenticated_account)) -> dict:
+    return crawler_service.verify_all_stores()
+
+
 @router.post("/stores/{store_id}/sync")
 def sync_store(store_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
-        store = crawler_service.sync_store(store_id)
-        return {"store": store, "stores": crawler_service.list_stores()}
+        result = crawler_service.sync_store(user["username"], store_id)
+        return {**result, "stores": crawler_service.list_stores()}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

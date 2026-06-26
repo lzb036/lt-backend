@@ -5,6 +5,7 @@ import re
 import uuid
 import base64
 import xml.etree.ElementTree as ET
+import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -32,6 +33,9 @@ from app.db.models import (
 RAKUTEN_SEARCH_BASE = "https://search.rakuten.co.jp/search/mall/"
 RAKUTEN_RANKING_BASE = "https://ranking.rakuten.co.jp/search"
 RAKUTEN_SHOP_MASTER_URL = "https://api.rms.rakuten.co.jp/es/1.0/shop/shopMaster"
+RAKUTEN_ITEM_SEARCH_URL = "https://api.rms.rakuten.co.jp/es/2.0/items/search"
+RAKUTEN_ITEM_SEARCH_HITS = 100
+RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 
 
 def log_event(owner_username: str, task_id: str | None, level: str, message: str) -> None:
@@ -81,6 +85,10 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "id": row.id,
         "ownerUsername": row.owner_username,
         "taskId": row.task_id,
+        "storeId": row.store_id,
+        "rakutenManageNumber": row.rakuten_manage_number,
+        "storeProductStatus": row.store_product_status,
+        "storeLastSeenAt": row.store_last_seen_at.isoformat(sep=" ") if row.store_last_seen_at else None,
         "title": row.title,
         "sourceUrl": row.source_url,
         "itemNumber": row.item_number,
@@ -99,6 +107,11 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
 def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
     service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
     license_key = decrypt_text(row.rakuten_license_key_encrypted)
+    availability_status = "unchecked"
+    if row.last_error:
+        availability_status = "error"
+    elif row.last_synced_at:
+        availability_status = "available"
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -117,6 +130,7 @@ def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
         },
         "lastSyncedAt": row.last_synced_at.isoformat(sep=" ") if row.last_synced_at else None,
         "lastError": row.last_error,
+        "availabilityStatus": availability_status,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
         "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
     }
@@ -222,19 +236,34 @@ def build_rakuten_store_url(shop_code: str) -> str:
     return f"https://www.rakuten.co.jp/{normalized_shop_code}/"
 
 
+def build_public_item_page_url(shop_code: str, item_number: str) -> str:
+    normalized_shop_code = normalize_shop_code(shop_code)
+    normalized_item_number = normalize_text(item_number)
+    if not normalized_shop_code or not normalized_item_number:
+        return ""
+    return f"https://item.rakuten.co.jp/{quote(normalized_shop_code, safe='')}/{quote(normalized_item_number, safe='')}/"
+
+
+def build_rakuten_authorization_header(service_secret: str, license_key: str) -> str:
+    authorization = base64.b64encode(f"{service_secret}:{license_key}".encode("utf-8")).decode("ascii")
+    return f"ESA {authorization}"
+
+
 def fetch_rakuten_shop_meta(service_secret: str, license_key: str) -> dict[str, str]:
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 和乐天 Key 不能为空。")
-    authorization = base64.b64encode(f"{service_secret}:{license_key}".encode("utf-8")).decode("ascii")
-    response = requests.get(
-        RAKUTEN_SHOP_MASTER_URL,
-        timeout=settings.crawler_timeout_seconds,
-        headers={
-            "Authorization": f"ESA {authorization}",
-            "Accept": "application/xml, text/xml",
-        },
-    )
-    response.raise_for_status()
+    try:
+        response = requests.get(
+            RAKUTEN_SHOP_MASTER_URL,
+            timeout=settings.crawler_timeout_seconds,
+            headers={
+                "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+                "Accept": "application/xml, text/xml",
+            },
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError("乐天密钥检测失败，请检查 Secret / Key 是否正确。") from exc
     meta = parse_rakuten_shop_master_xml(response.text)
     if not meta.get("shopCode") or not meta.get("shopName"):
         raise RuntimeError("未能从乐天接口读取到店铺编号和店铺名称。")
@@ -268,6 +297,181 @@ def parse_rakuten_shop_master_xml(xml_text: str) -> dict[str, str]:
         if not shop_meta["shopId"] and local_name in shop_id_tags:
             shop_meta["shopId"] = text_value
     return shop_meta
+
+
+def fetch_rakuten_store_items(service_secret: str, license_key: str) -> list[dict[str, Any]]:
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+    headers = {
+        "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+        "Accept": "application/json",
+    }
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    offset = 0
+    total_count: int | None = None
+    while True:
+        payload = request_rakuten_items_page(headers, offset)
+        total_count = total_count if total_count is not None else parse_rakuten_total_count(payload)
+
+        page_items = extract_rakuten_item_candidates(payload)
+        new_count = 0
+        for item in page_items:
+            item_key = normalize_text(
+                first_text_from_keys(item, ("manageNumber", "itemNumber", "itemUrl", "itemPageUrl"))
+            )
+            if not item_key or item_key in seen:
+                continue
+            seen.add(item_key)
+            items.append(item)
+            new_count += 1
+        offset += RAKUTEN_ITEM_SEARCH_HITS
+        if not page_items:
+            break
+        if total_count is not None and offset >= total_count:
+            break
+        if len(page_items) < RAKUTEN_ITEM_SEARCH_HITS:
+            break
+    return items
+
+
+def request_rakuten_items_page(headers: dict[str, str], offset: int) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(RAKUTEN_ITEM_SEARCH_MAX_RETRIES):
+        try:
+            response = requests.get(
+                RAKUTEN_ITEM_SEARCH_URL,
+                timeout=settings.crawler_timeout_seconds,
+                headers=headers,
+                params={"hits": RAKUTEN_ITEM_SEARCH_HITS, "offset": offset},
+            )
+            if response.status_code == 429 and attempt < RAKUTEN_ITEM_SEARCH_MAX_RETRIES - 1:
+                retry_after = response.headers.get("Retry-After")
+                wait_seconds = float(retry_after) if retry_after and retry_after.isdecimal() else 1.5 * (attempt + 1)
+                time.sleep(wait_seconds)
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError("乐天商品接口返回格式无法解析。")
+            return payload
+        except ValueError as exc:
+            raise RuntimeError("乐天商品接口返回格式无法解析。") from exc
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < RAKUTEN_ITEM_SEARCH_MAX_RETRIES - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"乐天商品更新失败，读取 offset={offset} 分页时失败，请检查店铺密钥权限或稍后重试。") from exc
+    raise RuntimeError(f"乐天商品更新失败，读取 offset={offset} 分页时失败：{last_error}")
+
+
+def parse_rakuten_total_count(payload: dict[str, Any]) -> int | None:
+    for key in ("numFound", "totalCount", "total", "count"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def extract_rakuten_item_candidates(payload: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            if is_rakuten_item_candidate(value):
+                candidates.append(value)
+                return
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(payload)
+    return candidates
+
+
+def is_rakuten_item_candidate(value: dict[str, Any]) -> bool:
+    identity = first_text_from_keys(value, ("manageNumber", "itemNumber", "itemUrl", "itemPageUrl"))
+    title = first_text_from_keys(value, ("itemName", "title", "name"))
+    return bool(identity and title)
+
+
+def first_text_from_keys(source: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        text = first_text_value(source.get(key))
+        if text:
+            return text
+    return ""
+
+
+def first_text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return normalize_text(value)
+    if isinstance(value, (int, float, Decimal)):
+        return normalize_text(value)
+    if isinstance(value, dict):
+        for key in ("value", "text", "name", "title", "url"):
+            text = first_text_value(value.get(key))
+            if text:
+                return text
+    if isinstance(value, list):
+        for item in value:
+            text = first_text_value(item)
+            if text:
+                return text
+    return ""
+
+
+def first_url_from_keys(source: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        url = first_url_value(source.get(key))
+        if url:
+            return url
+    return ""
+
+
+def first_url_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = normalize_text(value)
+        return text if text.startswith(("http://", "https://")) else ""
+    if isinstance(value, dict):
+        for key in ("url", "imageUrl", "itemUrl", "itemPageUrl", "value"):
+            url = first_url_value(value.get(key))
+            if url:
+                return url
+        for child in value.values():
+            url = first_url_value(child)
+            if url:
+                return url
+    if isinstance(value, list):
+        for item in value:
+            url = first_url_value(item)
+            if url:
+                return url
+    return ""
+
+
+def price_from_rakuten_item(item: dict[str, Any]) -> float | None:
+    value = first_text_from_keys(item, ("itemPrice", "price", "standardPrice", "displayPrice"))
+    if not value:
+        return None
+    normalized = re.sub(r"[^0-9.]", "", value)
+    if not normalized:
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
 
 
 def list_sources(owner_username: str) -> list[dict[str, Any]]:
@@ -322,12 +526,20 @@ def list_tasks(owner_username: str) -> list[dict[str, Any]]:
         return [task_to_public(row) for row in rows]
 
 
-def list_products(owner_username: str, *, status: str | None = None, keyword: str | None = None) -> list[dict[str, Any]]:
+def list_products(
+    owner_username: str,
+    *,
+    status: str | None = None,
+    keyword: str | None = None,
+    store_id: int | None = None,
+) -> list[dict[str, Any]]:
     with session_scope() as session:
         query = select(ProductModel).where(ProductModel.owner_username == owner_username)
         product_status = _product_status_filter(status)
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
+        if store_id is not None:
+            query = query.where(ProductModel.store_id == store_id)
         if keyword:
             query = query.where(ProductModel.title.like(f"%{keyword}%"))
         rows = session.scalars(query.order_by(ProductModel.created_at.desc()).limit(200)).all()
@@ -391,15 +603,72 @@ def delete_store(store_id: int) -> None:
         session.delete(row)
 
 
-def sync_store(store_id: int) -> dict[str, Any]:
+def verify_store_credentials(row: StoreModel) -> None:
+    service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
+    license_key = decrypt_text(row.rakuten_license_key_encrypted)
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+    shop_meta = fetch_rakuten_shop_meta(service_secret, license_key)
+    row.store_code = shop_meta["shopCode"]
+    row.store_name = shop_meta["shopName"]
+    if not row.alias_name:
+        row.alias_name = row.store_name
+    row.store_url = build_rakuten_store_url(row.store_code)
+    row.last_synced_at = datetime.now()
+    row.last_error = None
+
+
+def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
             raise RuntimeError("店铺不存在。")
-        row.last_synced_at = datetime.now()
-        row.last_error = None
+        if not row.enabled:
+            raise RuntimeError("店铺已停用，不能更新商品。")
+        synced_count = 0
+        try:
+            service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
+            license_key = decrypt_text(row.rakuten_license_key_encrypted)
+            verify_store_credentials(row)
+            items = fetch_rakuten_store_items(service_secret, license_key)
+            seen_manage_numbers: set[str] = set()
+            for item in items:
+                manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
+                if manage_number:
+                    seen_manage_numbers.add(manage_number)
+                if upsert_store_product(session, owner_username, row, item):
+                    synced_count += 1
+            mark_missing_store_products_removed(session, row, seen_manage_numbers)
+        except Exception as exc:
+            row.last_synced_at = datetime.now()
+            row.last_error = str(exc)
         session.flush()
-        return store_to_public(row)
+        return {
+            "store": store_to_public(row),
+            "syncedCount": synced_count,
+        }
+
+
+def verify_all_stores() -> dict[str, Any]:
+    with session_scope() as session:
+        rows = session.scalars(select(StoreModel).order_by(StoreModel.created_at.desc())).all()
+        for row in rows:
+            try:
+                verify_store_credentials(row)
+            except Exception as exc:
+                row.last_synced_at = datetime.now()
+                row.last_error = str(exc)
+        session.flush()
+        stores = [store_to_public(row) for row in rows]
+        return {
+            "stores": stores,
+            "summary": {
+                "total": len(stores),
+                "available": sum(1 for store in stores if store["availabilityStatus"] == "available"),
+                "error": sum(1 for store in stores if store["availabilityStatus"] == "error"),
+                "unchecked": sum(1 for store in stores if store["availabilityStatus"] == "unchecked"),
+            },
+        }
 
 
 def list_scheduled_crawls(owner_username: str) -> list[dict[str, Any]]:
@@ -891,24 +1160,84 @@ def extract_item_number(url: str) -> str:
     return parts[-1][:255] if parts else ""
 
 
-def upsert_product(session: Any, owner_username: str, task_id: str, item: dict[str, Any]) -> bool:
+def upsert_store_product(session: Any, owner_username: str, store: StoreModel, item: dict[str, Any]) -> bool:
+    item_number = first_text_from_keys(item, ("itemNumber", "manageNumber"))
+    manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
+    source_url = (
+        first_url_from_keys(item, ("itemUrl", "itemPageUrl", "url"))
+        or build_public_item_page_url(store.store_code, item_number or manage_number)
+    )
+    title = first_text_from_keys(item, ("itemName", "title", "name"))
+    normalized = {
+        "title": title,
+        "source_url": source_url,
+        "image_url": first_url_from_keys(item, ("imageUrl", "images", "imageUrls", "mediumImageUrls", "smallImageUrls")),
+        "price": price_from_rakuten_item(item),
+        "shop_name": store.store_name,
+        "item_number": item_number or manage_number,
+        "rakuten_manage_number": manage_number,
+        "genre_id": first_text_from_keys(item, ("genreId", "genre_id", "genre")),
+        "raw": item,
+    }
+    return upsert_product(session, owner_username, None, normalized, review_status="listed", store_id=store.id)
+
+
+def mark_missing_store_products_removed(session: Any, store: StoreModel, seen_manage_numbers: set[str]) -> None:
+    if not seen_manage_numbers:
+        return
+    rows = session.scalars(
+        select(ProductModel).where(
+            ProductModel.store_id == store.id,
+            ProductModel.review_status == "listed",
+            ProductModel.rakuten_manage_number.is_not(None),
+            ProductModel.rakuten_manage_number.not_in(seen_manage_numbers),
+        )
+    ).all()
+    for row in rows:
+        row.store_product_status = "removed"
+        row.last_error = "本次更新未从乐天店铺后台返回，可能已在乐天下架或删除。"
+
+
+def upsert_product(
+    session: Any,
+    owner_username: str,
+    task_id: str | None,
+    item: dict[str, Any],
+    *,
+    review_status: str = "pending",
+    store_id: int | None = None,
+) -> bool:
     source_url = str(item.get("source_url") or "").strip()
     title = str(item.get("title") or "").strip()
     if not source_url or not title:
         return False
     source_url_hash = make_source_url_hash(source_url)
-    row = session.scalar(
-        select(ProductModel).where(
-            ProductModel.owner_username == owner_username,
-            ProductModel.source_url_hash == source_url_hash,
+    rakuten_manage_number = str(item.get("rakuten_manage_number") or "").strip() or None
+    row = None
+    if store_id is not None and rakuten_manage_number:
+        row = session.scalar(
+            select(ProductModel).where(
+                ProductModel.store_id == store_id,
+                ProductModel.rakuten_manage_number == rakuten_manage_number,
+            )
         )
-    )
+    if row is None:
+        row = session.scalar(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.source_url_hash == source_url_hash,
+            )
+        )
     if row is None:
         row = ProductModel(owner_username=owner_username, source_url=source_url, source_url_hash=source_url_hash)
         session.add(row)
+    elif store_id is None and row.store_id is not None and row.review_status == "listed":
+        return False
     row.source_url = source_url
     row.source_url_hash = source_url_hash
     row.task_id = task_id
+    row.store_id = store_id
+    row.rakuten_manage_number = rakuten_manage_number
     row.title = title[:500]
     row.image_url = str(item.get("image_url") or "")
     row.item_number = str(item.get("item_number") or "")
@@ -917,7 +1246,10 @@ def upsert_product(session: Any, owner_username: str, task_id: str, item: dict[s
     price = item.get("price")
     row.price = Decimal(str(price)) if price is not None else None
     row.currency = "JPY"
-    row.review_status = "pending"
+    row.review_status = review_status
+    if store_id is not None and review_status == "listed":
+        row.store_product_status = "active"
+        row.store_last_seen_at = datetime.now()
     row.raw_payload_json = json.dumps(item.get("raw") or item, ensure_ascii=False)
     row.last_error = None
     return True

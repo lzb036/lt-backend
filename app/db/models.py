@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -160,8 +161,10 @@ class ProductModel(TimestampMixin, Base):
     __tablename__ = "lt_products"
     __table_args__ = (
         UniqueConstraint("owner_username", "source_url_hash", name="uq_lt_product_owner_source_url_hash"),
+        UniqueConstraint("store_id", "rakuten_manage_number", name="uq_lt_product_store_manage_number"),
         Index("ix_lt_product_owner_status", "owner_username", "review_status"),
         Index("ix_lt_product_owner_title", "owner_username", "title"),
+        Index("ix_lt_product_store_status", "store_id", "store_product_status"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -171,9 +174,11 @@ class ProductModel(TimestampMixin, Base):
         nullable=False,
     )
     task_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("lt_crawl_tasks.id", ondelete="SET NULL"))
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("lt_stores.id", ondelete="SET NULL"))
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
     source_url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    rakuten_manage_number: Mapped[str | None] = mapped_column(String(255))
     item_number: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     shop_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     image_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -181,7 +186,9 @@ class ProductModel(TimestampMixin, Base):
     currency: Mapped[str] = mapped_column(String(16), nullable=False, default="JPY")
     genre_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     review_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
-    raw_payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    store_product_status: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
+    store_last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    raw_payload_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
