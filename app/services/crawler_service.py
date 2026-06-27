@@ -13,7 +13,7 @@ from urllib.parse import quote, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.config import settings
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
@@ -41,11 +41,52 @@ RAKUTEN_CABINET_FILE_SEARCH_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/
 RAKUTEN_CABINET_FILE_DELETE_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/file/delete"
 RAKUTEN_ITEM_SEARCH_HITS = 100
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
+DEFAULT_PAGE_SIZE = 30
+MAX_PAGE_SIZE = 500
 
 
 def log_event(owner_username: str, task_id: str | None, level: str, message: str) -> None:
     with session_scope() as session:
         session.add(CrawlLogModel(owner_username=owner_username, task_id=task_id, level=level, message=message))
+
+
+def normalize_page_params(page: int | None, page_size: int | None) -> tuple[int, int | None]:
+    normalized_page = max(1, int(page or 1))
+    normalized_page_size = min(MAX_PAGE_SIZE, max(1, int(page_size or 0))) if page_size else None
+    return normalized_page, normalized_page_size
+
+
+def paginate_query(
+    session: Any,
+    query: Any,
+    *,
+    order_by: Any | tuple[Any, ...],
+    page: int | None,
+    page_size: int | None,
+    response_key: str,
+    serializer: Any,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    normalized_page, normalized_page_size = normalize_page_params(page, page_size)
+    order_values = order_by if isinstance(order_by, tuple) else (order_by,)
+    if not normalized_page_size:
+        rows = session.scalars(query.order_by(*order_values)).all()
+        return [serializer(row) for row in rows]
+
+    total = int(session.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0)
+    if total:
+        max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+        normalized_page = min(normalized_page, max_page)
+    rows = session.scalars(
+        query.order_by(*order_values)
+        .offset((normalized_page - 1) * normalized_page_size)
+        .limit(normalized_page_size)
+    ).all()
+    return {
+        response_key: [serializer(row) for row in rows],
+        "total": total,
+        "page": normalized_page,
+        "pageSize": normalized_page_size,
+    }
 
 
 def source_to_public(row: CrawlSourceModel) -> dict[str, Any]:
@@ -1110,14 +1151,18 @@ def rakuten_listing_status_from_item(item: dict[str, Any]) -> str:
     return "unlisted" if bool(hide_item) else "listed"
 
 
-def list_sources(owner_username: str) -> list[dict[str, Any]]:
+def list_sources(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
-        rows = session.scalars(
-            select(CrawlSourceModel)
-            .where(CrawlSourceModel.owner_username == owner_username)
-            .order_by(CrawlSourceModel.created_at.desc())
-        ).all()
-        return [source_to_public(row) for row in rows]
+        query = select(CrawlSourceModel).where(CrawlSourceModel.owner_username == owner_username)
+        return paginate_query(
+            session,
+            query,
+            order_by=CrawlSourceModel.created_at.desc(),
+            page=page,
+            page_size=page_size,
+            response_key="sources",
+            serializer=source_to_public,
+        )
 
 
 def save_source(owner_username: str, payload: Any, source_id: int | None = None) -> dict[str, Any]:
@@ -1151,15 +1196,32 @@ def delete_source(owner_username: str, source_id: int) -> None:
         session.delete(row)
 
 
-def list_tasks(owner_username: str) -> list[dict[str, Any]]:
+def list_tasks(
+    owner_username: str,
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    target: str | None = None,
+    status: str | None = None,
+    source_type: str | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
-        rows = session.scalars(
-            select(CrawlTaskModel)
-            .where(CrawlTaskModel.owner_username == owner_username)
-            .order_by(CrawlTaskModel.created_at.desc())
-            .limit(100)
-        ).all()
-        return [task_to_public(row) for row in rows]
+        query = select(CrawlTaskModel).where(CrawlTaskModel.owner_username == owner_username)
+        if target:
+            query = query.where(CrawlTaskModel.target.like(f"%{target}%"))
+        if status:
+            query = query.where(CrawlTaskModel.status == status)
+        if source_type:
+            query = query.where(CrawlTaskModel.source_type == source_type)
+        return paginate_query(
+            session,
+            query,
+            order_by=CrawlTaskModel.created_at.desc(),
+            page=page,
+            page_size=page_size,
+            response_key="tasks",
+            serializer=task_to_public,
+        )
 
 
 def list_products(
@@ -1171,11 +1233,16 @@ def list_products(
     listing_status: str | None = None,
     listed_at_from: str | None = None,
     listed_at_to: str | None = None,
-) -> list[dict[str, Any]]:
+    page: int | None = None,
+    page_size: int | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         query = select(ProductModel).where(ProductModel.owner_username == owner_username)
         listed_at_from_value = parse_datetime_filter(listed_at_from)
         listed_at_to_value = parse_datetime_filter(listed_at_to)
+        needs_listed_at_filter = listed_at_from_value is not None or listed_at_to_value is not None
+        normalized_page = max(1, int(page or 1))
+        normalized_page_size = min(500, max(1, int(page_size or 0))) if page_size else None
         product_status = _product_status_filter(status)
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
@@ -1189,23 +1256,57 @@ def list_products(
                 | ProductModel.item_number.like(f"%{keyword}%")
                 | ProductModel.rakuten_manage_number.like(f"%{keyword}%")
             )
+        if normalized_page_size and not needs_listed_at_filter:
+            total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
+            if total:
+                max_page = max(1, (int(total) + normalized_page_size - 1) // normalized_page_size)
+                normalized_page = min(normalized_page, max_page)
+            rows = session.scalars(
+                query.order_by(ProductModel.created_at.desc())
+                .offset((normalized_page - 1) * normalized_page_size)
+                .limit(normalized_page_size)
+            ).all()
+            return {
+                "products": [product_to_public(row) for row in rows],
+                "total": int(total),
+                "page": normalized_page,
+                "pageSize": normalized_page_size,
+            }
+
         rows = session.scalars(query.order_by(ProductModel.created_at.desc())).all()
-        if listed_at_from_value is not None or listed_at_to_value is not None:
+        if needs_listed_at_filter:
             rows = [
                 row
                 for row in rows
                 if matches_listed_at_range(row, listed_at_from_value, listed_at_to_value)
             ]
+        if normalized_page_size:
+            total = len(rows)
+            if total:
+                max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+                normalized_page = min(normalized_page, max_page)
+            start = (normalized_page - 1) * normalized_page_size
+            return {
+                "products": [product_to_public(row) for row in rows[start:start + normalized_page_size]],
+                "total": total,
+                "page": normalized_page,
+                "pageSize": normalized_page_size,
+            }
         return [product_to_public(row) for row in rows]
 
 
-def list_stores() -> list[dict[str, Any]]:
+def list_stores(*, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
-        rows = session.scalars(
-            select(StoreModel)
-            .order_by(StoreModel.created_at.desc())
-        ).all()
-        return [store_to_public(row) for row in rows]
+        query = select(StoreModel)
+        return paginate_query(
+            session,
+            query,
+            order_by=StoreModel.created_at.desc(),
+            page=page,
+            page_size=page_size,
+            response_key="stores",
+            serializer=store_to_public,
+        )
 
 
 def save_store(owner_username: str, payload: Any, store_id: int | None = None) -> dict[str, Any]:
@@ -1320,15 +1421,18 @@ def perform_store_sync(owner_username: str, store_id: int) -> dict[str, Any]:
         }
 
 
-def list_sync_tasks(owner_username: str) -> list[dict[str, Any]]:
+def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
-        rows = session.scalars(
-            select(SyncTaskModel)
-            .where(SyncTaskModel.owner_username == owner_username)
-            .order_by(SyncTaskModel.created_at.desc())
-            .limit(100)
-        ).all()
-        return [sync_task_to_public(row) for row in rows]
+        query = select(SyncTaskModel).where(SyncTaskModel.owner_username == owner_username)
+        return paginate_query(
+            session,
+            query,
+            order_by=SyncTaskModel.created_at.desc(),
+            page=page,
+            page_size=page_size,
+            response_key="syncTasks",
+            serializer=sync_task_to_public,
+        )
 
 
 def create_sync_task(owner_username: str, store_id: int) -> dict[str, Any]:
@@ -1454,14 +1558,18 @@ def verify_all_stores() -> dict[str, Any]:
         }
 
 
-def list_scheduled_crawls(owner_username: str) -> list[dict[str, Any]]:
+def list_scheduled_crawls(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
-        rows = session.scalars(
-            select(ScheduledCrawlModel)
-            .where(ScheduledCrawlModel.owner_username == owner_username)
-            .order_by(ScheduledCrawlModel.created_at.desc())
-        ).all()
-        return [scheduled_crawl_to_public(row) for row in rows]
+        query = select(ScheduledCrawlModel).where(ScheduledCrawlModel.owner_username == owner_username)
+        return paginate_query(
+            session,
+            query,
+            order_by=ScheduledCrawlModel.created_at.desc(),
+            page=page,
+            page_size=page_size,
+            response_key="schedules",
+            serializer=scheduled_crawl_to_public,
+        )
 
 
 def save_scheduled_crawl(owner_username: str, payload: Any, schedule_id: int | None = None) -> dict[str, Any]:
@@ -1849,15 +1957,18 @@ def update_store_products_listing_status(
         }
 
 
-def list_listing_tasks(owner_username: str) -> list[dict[str, Any]]:
+def list_listing_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
-        rows = session.scalars(
-            select(ListingTaskModel)
-            .where(ListingTaskModel.owner_username == owner_username)
-            .order_by(ListingTaskModel.created_at.desc())
-            .limit(100)
-        ).all()
-        return [listing_task_to_public(row) for row in rows]
+        query = select(ListingTaskModel).where(ListingTaskModel.owner_username == owner_username)
+        return paginate_query(
+            session,
+            query,
+            order_by=ListingTaskModel.created_at.desc(),
+            page=page,
+            page_size=page_size,
+            response_key="listingTasks",
+            serializer=listing_task_to_public,
+        )
 
 
 def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
@@ -1983,11 +2094,19 @@ def ensure_default_roles() -> None:
             row.notes = item["notes"]
 
 
-def list_roles() -> list[dict[str, Any]]:
+def list_roles(*, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     ensure_default_roles()
     with session_scope() as session:
-        rows = session.scalars(select(RoleModel).order_by(RoleModel.id.asc())).all()
-        return [role_to_public(row) for row in rows]
+        query = select(RoleModel)
+        return paginate_query(
+            session,
+            query,
+            order_by=RoleModel.id.asc(),
+            page=page,
+            page_size=page_size,
+            response_key="roles",
+            serializer=role_to_public,
+        )
 
 
 def save_role(payload: Any, role_id: int | None = None) -> dict[str, Any]:

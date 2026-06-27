@@ -6,17 +6,47 @@ import hmac
 import secrets
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.config import settings
 from app.db.database import session_scope
 from app.db.models import UserAccountModel, UserSecretProfileModel
 
 PASSWORD_ITERATIONS = 240000
+MAX_PAGE_SIZE = 500
 
 
 def normalize_username(value: Any) -> str:
     return str(value or "").strip()
+
+
+def normalize_page_params(page: int | None, page_size: int | None) -> tuple[int, int | None]:
+    normalized_page = max(1, int(page or 1))
+    normalized_page_size = min(MAX_PAGE_SIZE, max(1, int(page_size or 0))) if page_size else None
+    return normalized_page, normalized_page_size
+
+
+def paginate_query(session: Any, query: Any, *, page: int | None, page_size: int | None) -> list[dict[str, Any]] | dict[str, Any]:
+    normalized_page, normalized_page_size = normalize_page_params(page, page_size)
+    if not normalized_page_size:
+        rows = session.scalars(query.order_by(UserAccountModel.created_at.asc())).all()
+        return [account_to_public(row) for row in rows]
+
+    total = int(session.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0)
+    if total:
+        max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+        normalized_page = min(normalized_page, max_page)
+    rows = session.scalars(
+        query.order_by(UserAccountModel.created_at.asc())
+        .offset((normalized_page - 1) * normalized_page_size)
+        .limit(normalized_page_size)
+    ).all()
+    return {
+        "users": [account_to_public(row) for row in rows],
+        "total": total,
+        "page": normalized_page,
+        "pageSize": normalized_page_size,
+    }
 
 
 def hash_password(password: str, *, salt: bytes | None = None, iterations: int = PASSWORD_ITERATIONS) -> dict[str, Any]:
@@ -103,11 +133,10 @@ def require_existing_account(username: str) -> dict[str, Any]:
         return account_to_public(row)
 
 
-def list_users() -> list[dict[str, Any]]:
+def list_users(*, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     ensure_initial_superadmin()
     with session_scope() as session:
-        rows = session.scalars(select(UserAccountModel).order_by(UserAccountModel.created_at.asc())).all()
-        return [account_to_public(row) for row in rows]
+        return paginate_query(session, select(UserAccountModel), page=page, page_size=page_size)
 
 
 def create_user(username: str, password: str, display_name: str = "") -> dict[str, Any]:

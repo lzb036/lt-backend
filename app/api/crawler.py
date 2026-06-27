@@ -83,15 +83,22 @@ class RolePayload(BaseModel):
 
 
 @router.get("/sources")
-def list_sources(user: dict = Depends(require_authenticated_account)) -> dict:
-    return {"sources": crawler_service.list_sources(user["username"])}
+def list_sources(
+    page: int | None = Query(default=None, ge=1),
+    pageSize: int | None = Query(default=None, ge=1, le=500),
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    result = crawler_service.list_sources(user["username"], page=page, page_size=pageSize)
+    if isinstance(result, dict):
+        return result
+    return {"sources": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
 
 
 @router.post("/sources")
 def create_source(payload: CrawlSourcePayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         source = crawler_service.save_source(user["username"], payload)
-        return {"source": source, "sources": crawler_service.list_sources(user["username"])}
+        return {"source": source}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -100,7 +107,7 @@ def create_source(payload: CrawlSourcePayload, user: dict = Depends(require_auth
 def update_source(source_id: int, payload: CrawlSourcePayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         source = crawler_service.save_source(user["username"], payload, source_id)
-        return {"source": source, "sources": crawler_service.list_sources(user["username"])}
+        return {"source": source}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -109,21 +116,38 @@ def update_source(source_id: int, payload: CrawlSourcePayload, user: dict = Depe
 def delete_source(source_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         crawler_service.delete_source(user["username"], source_id)
-        return {"sources": crawler_service.list_sources(user["username"])}
+        return {"deleted": True}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/tasks")
-def list_tasks(user: dict = Depends(require_authenticated_account)) -> dict:
-    return {"tasks": crawler_service.list_tasks(user["username"])}
+def list_tasks(
+    page: int | None = Query(default=None, ge=1),
+    pageSize: int | None = Query(default=None, ge=1, le=500),
+    target: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    sourceType: str | None = Query(default=None),
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    result = crawler_service.list_tasks(
+        user["username"],
+        page=page,
+        page_size=pageSize,
+        target=target,
+        status=status,
+        source_type=sourceType,
+    )
+    if isinstance(result, dict):
+        return result
+    return {"tasks": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
 
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskPayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         task = crawler_service.create_task(user["username"], payload)
-        return {"task": task, "tasks": crawler_service.list_tasks(user["username"])}
+        return {"task": task}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -132,7 +156,7 @@ def create_task(payload: CreateTaskPayload, user: dict = Depends(require_authent
 def restart_task(task_id: str, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         task = crawler_service.run_existing_task(user["username"], task_id)
-        return {"task": task, "tasks": crawler_service.list_tasks(user["username"])}
+        return {"task": task}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -145,18 +169,28 @@ def list_products(
     listingStatus: str | None = Query(default=None),
     listedAtFrom: str | None = Query(default=None),
     listedAtTo: str | None = Query(default=None),
+    page: int | None = Query(default=None, ge=1),
+    pageSize: int | None = Query(default=None, ge=1, le=500),
     user: dict = Depends(require_authenticated_account),
 ) -> dict:
+    result = crawler_service.list_products(
+        user["username"],
+        status=status,
+        keyword=keyword,
+        store_id=storeId,
+        listing_status=listingStatus,
+        listed_at_from=listedAtFrom,
+        listed_at_to=listedAtTo,
+        page=page,
+        page_size=pageSize,
+    )
+    if isinstance(result, dict):
+        return result
     return {
-        "products": crawler_service.list_products(
-            user["username"],
-            status=status,
-            keyword=keyword,
-            store_id=storeId,
-            listing_status=listingStatus,
-            listed_at_from=listedAtFrom,
-            listed_at_to=listedAtTo,
-        )
+        "products": result,
+        "total": len(result),
+        "page": 1,
+        "pageSize": len(result) or 30,
     }
 
 
@@ -218,15 +252,22 @@ def update_product_price(
 
 
 @router.get("/stores")
-def list_stores(user: dict = Depends(require_authenticated_account)) -> dict:
-    return {"stores": crawler_service.list_stores()}
+def list_stores(
+    page: int | None = Query(default=None, ge=1),
+    pageSize: int | None = Query(default=None, ge=1, le=500),
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    result = crawler_service.list_stores(page=page, page_size=pageSize)
+    if isinstance(result, dict):
+        return result
+    return {"stores": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
 
 
 @router.post("/stores")
 def create_store(payload: StorePayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         store = crawler_service.save_store(user["username"], payload)
-        return {"store": store, "stores": crawler_service.list_stores()}
+        return {"store": store}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -235,7 +276,7 @@ def create_store(payload: StorePayload, user: dict = Depends(require_authenticat
 def update_store(store_id: int, payload: StorePayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         store = crawler_service.save_store(user["username"], payload, store_id)
-        return {"store": store, "stores": crawler_service.list_stores()}
+        return {"store": store}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -244,7 +285,7 @@ def update_store(store_id: int, payload: StorePayload, user: dict = Depends(requ
 def delete_store(store_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         crawler_service.delete_store(store_id)
-        return {"stores": crawler_service.list_stores()}
+        return {"deleted": True}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -258,39 +299,49 @@ def verify_stores(user: dict = Depends(require_authenticated_account)) -> dict:
 def sync_store(store_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         result = crawler_service.sync_store(user["username"], store_id)
-        return {
-            **result,
-            "stores": crawler_service.list_stores(),
-            "syncTasks": crawler_service.list_sync_tasks(user["username"]),
-        }
+        return result
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/sync-tasks")
-def list_sync_tasks(user: dict = Depends(require_authenticated_account)) -> dict:
-    return {"syncTasks": crawler_service.list_sync_tasks(user["username"])}
+def list_sync_tasks(
+    page: int | None = Query(default=None, ge=1),
+    pageSize: int | None = Query(default=None, ge=1, le=500),
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    result = crawler_service.list_sync_tasks(user["username"], page=page, page_size=pageSize)
+    if isinstance(result, dict):
+        return result
+    return {"syncTasks": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
 
 
 @router.post("/sync-tasks/{task_id}/retry")
 def retry_sync_task(task_id: str, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         task = crawler_service.retry_sync_task(user["username"], task_id)
-        return {"syncTask": task, "syncTasks": crawler_service.list_sync_tasks(user["username"])}
+        return {"syncTask": task}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/schedules")
-def list_schedules(user: dict = Depends(require_authenticated_account)) -> dict:
-    return {"schedules": crawler_service.list_scheduled_crawls(user["username"])}
+def list_schedules(
+    page: int | None = Query(default=None, ge=1),
+    pageSize: int | None = Query(default=None, ge=1, le=500),
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    result = crawler_service.list_scheduled_crawls(user["username"], page=page, page_size=pageSize)
+    if isinstance(result, dict):
+        return result
+    return {"schedules": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
 
 
 @router.post("/schedules")
 def create_schedule(payload: ScheduledCrawlPayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         schedule = crawler_service.save_scheduled_crawl(user["username"], payload)
-        return {"schedule": schedule, "schedules": crawler_service.list_scheduled_crawls(user["username"])}
+        return {"schedule": schedule}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -303,7 +354,7 @@ def update_schedule(
 ) -> dict:
     try:
         schedule = crawler_service.save_scheduled_crawl(user["username"], payload, schedule_id)
-        return {"schedule": schedule, "schedules": crawler_service.list_scheduled_crawls(user["username"])}
+        return {"schedule": schedule}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -312,7 +363,7 @@ def update_schedule(
 def delete_schedule(schedule_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         crawler_service.delete_scheduled_crawl(user["username"], schedule_id)
-        return {"schedules": crawler_service.list_scheduled_crawls(user["username"])}
+        return {"deleted": True}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -321,21 +372,28 @@ def delete_schedule(schedule_id: int, user: dict = Depends(require_authenticated
 def run_schedule(schedule_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         schedule = crawler_service.run_scheduled_crawl(user["username"], schedule_id)
-        return {"schedule": schedule, "schedules": crawler_service.list_scheduled_crawls(user["username"])}
+        return {"schedule": schedule}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/listing-tasks")
-def list_listing_tasks(user: dict = Depends(require_authenticated_account)) -> dict:
-    return {"listingTasks": crawler_service.list_listing_tasks(user["username"])}
+def list_listing_tasks(
+    page: int | None = Query(default=None, ge=1),
+    pageSize: int | None = Query(default=None, ge=1, le=500),
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    result = crawler_service.list_listing_tasks(user["username"], page=page, page_size=pageSize)
+    if isinstance(result, dict):
+        return result
+    return {"listingTasks": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
 
 
 @router.post("/listing-tasks")
 def create_listing_task(payload: ListingTaskPayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         task = crawler_service.create_listing_task(user["username"], payload)
-        return {"listingTask": task, "listingTasks": crawler_service.list_listing_tasks(user["username"])}
+        return {"listingTask": task}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -344,21 +402,28 @@ def create_listing_task(payload: ListingTaskPayload, user: dict = Depends(requir
 def retry_listing_task(task_id: str, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         task = crawler_service.retry_listing_task(user["username"], task_id)
-        return {"listingTask": task, "listingTasks": crawler_service.list_listing_tasks(user["username"])}
+        return {"listingTask": task}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/roles")
-def list_roles(_: dict = Depends(require_superadmin)) -> dict:
-    return {"roles": crawler_service.list_roles()}
+def list_roles(
+    page: int | None = Query(default=None, ge=1),
+    pageSize: int | None = Query(default=None, ge=1, le=500),
+    _: dict = Depends(require_superadmin),
+) -> dict:
+    result = crawler_service.list_roles(page=page, page_size=pageSize)
+    if isinstance(result, dict):
+        return result
+    return {"roles": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
 
 
 @router.post("/roles")
 def create_role(payload: RolePayload, _: dict = Depends(require_superadmin)) -> dict:
     try:
         role = crawler_service.save_role(payload)
-        return {"role": role, "roles": crawler_service.list_roles()}
+        return {"role": role}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -367,7 +432,7 @@ def create_role(payload: RolePayload, _: dict = Depends(require_superadmin)) -> 
 def update_role(role_id: int, payload: RolePayload, _: dict = Depends(require_superadmin)) -> dict:
     try:
         role = crawler_service.save_role(payload, role_id)
-        return {"role": role, "roles": crawler_service.list_roles()}
+        return {"role": role}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -376,6 +441,6 @@ def update_role(role_id: int, payload: RolePayload, _: dict = Depends(require_su
 def delete_role(role_id: int, _: dict = Depends(require_superadmin)) -> dict:
     try:
         crawler_service.delete_role(role_id)
-        return {"roles": crawler_service.list_roles()}
+        return {"deleted": True}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
