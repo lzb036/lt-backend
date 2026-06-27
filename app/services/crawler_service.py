@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from html import unescape
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -34,6 +34,7 @@ from app.db.models import (
 
 RAKUTEN_SEARCH_BASE = "https://search.rakuten.co.jp/search/mall/"
 RAKUTEN_RANKING_BASE = "https://ranking.rakuten.co.jp/search"
+RAKUTEN_REALTIME_RANKING_URL = "https://ranking.rakuten.co.jp/realtime/"
 RAKUTEN_SHOP_MASTER_URL = "https://api.rms.rakuten.co.jp/es/1.0/shop/shopMaster"
 RAKUTEN_CABINET_USAGE_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/usage/get"
 RAKUTEN_ITEM_SEARCH_URL = "https://api.rms.rakuten.co.jp/es/2.0/items/search"
@@ -45,6 +46,8 @@ RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
+RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集只支持以下三种格式：完整乐天商品链接、带参数的乐天商品链接、店铺编码/商品编号。"
+RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺 URL 代码、店铺 URL 或 sid。"
 
 
 def log_event(owner_username: str, task_id: str | None, level: str, message: str) -> None:
@@ -625,6 +628,157 @@ def build_public_item_page_url(shop_code: str, item_number: str) -> str:
     if not normalized_shop_code or not normalized_item_number:
         return ""
     return f"https://item.rakuten.co.jp/{quote(normalized_shop_code, safe='')}/{quote(normalized_item_number, safe='')}/"
+
+
+def parse_rakuten_product_target(target: str) -> tuple[str, str] | None:
+    normalized = normalize_text(target)
+    if not normalized:
+        return None
+    if normalized.startswith(("http://", "https://")):
+        try:
+            parsed = urlsplit(normalized)
+        except Exception:
+            return None
+        if parsed.netloc.lower() != "item.rakuten.co.jp":
+            return None
+        parts = [unquote(part.strip()) for part in parsed.path.split("/") if part.strip()]
+        if len(parts) < 2:
+            return None
+        shop_code, item_number = parts[0], parts[1]
+    else:
+        parts = [unquote(part.strip()) for part in normalized.strip("/").split("/") if part.strip()]
+        if len(parts) != 2:
+            return None
+        shop_code, item_number = parts
+    if not shop_code or not item_number:
+        return None
+    if any(part.startswith(("http:", "https:")) for part in (shop_code, item_number)):
+        return None
+    return shop_code, item_number
+
+
+def normalize_rakuten_product_target(target: str) -> str:
+    parsed = parse_rakuten_product_target(target)
+    if parsed is None:
+        raise RuntimeError(RAKUTEN_PRODUCT_TARGET_ERROR)
+    shop_code, item_number = parsed
+    return build_public_item_page_url(shop_code, item_number)
+
+
+def normalize_rakuten_shop_target(target: str) -> str:
+    normalized = normalize_text(target)
+    if re.fullmatch(r"[0-9]+", normalized):
+        return normalized
+    if not normalized.startswith(("http://", "https://")):
+        return normalized
+    try:
+        parsed = urlsplit(normalized)
+    except Exception as exc:
+        raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR) from exc
+    if parsed.netloc.lower() == "search.rakuten.co.jp" and parsed.path.rstrip("/").endswith("/search/mall"):
+        params = parse_qs(parsed.query)
+        return (
+            normalize_text((params.get("sn") or [""])[0])
+            or normalize_text((params.get("su") or [""])[0])
+            or normalize_text((params.get("sid") or [""])[0])
+        )
+    if parsed.netloc.lower() in {"www.rakuten.co.jp", "item.rakuten.co.jp"}:
+        parts = [unquote(part.strip()) for part in parsed.path.split("/") if part.strip()]
+        if parts:
+            return normalize_text(parts[0])
+    raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR)
+
+
+def resolve_rakuten_shop_search_keyword(target: str) -> str:
+    normalized = normalize_rakuten_shop_target(target)
+    if not normalized:
+        raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR)
+    if re.fullmatch(r"[0-9]+", normalized):
+        display_name = fetch_rakuten_shop_display_name_by_sid(normalized)
+        return display_name or normalized
+    if looks_like_rakuten_shop_code(normalized):
+        display_name = fetch_rakuten_shop_display_name_by_code(normalized)
+        return display_name or normalized
+    return normalized
+
+
+def looks_like_rakuten_shop_code(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,80}", normalize_text(value)))
+
+
+def fetch_rakuten_shop_display_name_by_code(shop_code: str) -> str:
+    normalized_shop_code = normalize_shop_code(shop_code)
+    if not normalized_shop_code:
+        return ""
+    try:
+        html = fetch_html(build_rakuten_store_url(normalized_shop_code))
+    except requests.RequestException:
+        return ""
+    return parse_rakuten_shop_display_name(html)
+
+
+def fetch_rakuten_shop_display_name_by_sid(sid: str) -> str:
+    normalized_sid = normalize_text(sid)
+    if not normalized_sid:
+        return ""
+    try:
+        html = fetch_html(f"{RAKUTEN_SEARCH_BASE}?sid={quote(normalized_sid)}")
+    except requests.RequestException:
+        return ""
+    return parse_rakuten_search_shop_name(html) or parse_rakuten_shop_display_name(html)
+
+
+def parse_rakuten_shop_display_name(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    h1 = soup.select_one("h1")
+    if h1:
+        display_name = normalize_text(h1.get_text(" ", strip=True))
+        if display_name:
+            return display_name
+    og_title = soup.select_one("meta[property='og:title'], meta[name='og:title']")
+    if og_title:
+        display_name = shop_name_from_title(str(og_title.get("content") or ""))
+        if display_name:
+            return display_name
+    if soup.title:
+        display_name = shop_name_from_title(soup.title.get_text(" ", strip=True))
+        if display_name:
+            return display_name
+    return ""
+
+
+def parse_rakuten_search_shop_name(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    for selector in ("h1, h2", "a"):
+        for node in soup.select(selector):
+            text = normalize_text(node.get_text(" ", strip=True))
+            if text and not is_generic_rakuten_shop_label(text) and len(text) <= 80:
+                return text
+    return ""
+
+
+def is_generic_rakuten_shop_label(value: str) -> bool:
+    normalized = normalize_text(value)
+    return normalized in {
+        "ログイン",
+        "会員登録",
+        "買い物かご",
+        "閲覧履歴",
+        "お気に入り",
+        "ショップへ問い合わせ",
+        "すべてのショップ",
+        "ショップ内から探す",
+    }
+
+
+def shop_name_from_title(title: str) -> str:
+    normalized = normalize_text(title)
+    if not normalized:
+        return ""
+    match = re.search(r"楽天市場\s*[|｜]\s*(.+?)(?:\s*[-－|｜]\s*.+)?$", normalized)
+    if match:
+        return normalize_text(match.group(1))
+    return ""
 
 
 def build_rakuten_authorization_header(service_secret: str, license_key: str) -> str:
@@ -1345,6 +1499,8 @@ def save_source(owner_username: str, payload: Any, source_id: int | None = None)
         row.name = str(getattr(payload, "name", "") or "").strip()
         row.source_type = str(getattr(payload, "sourceType", "") or "keyword").strip()
         row.target = str(getattr(payload, "target", "") or "").strip()
+        if row.source_type == "product_url":
+            row.target = normalize_rakuten_product_target(row.target)
         row.enabled = bool(getattr(payload, "enabled", True))
         row.schedule_enabled = bool(getattr(payload, "scheduleEnabled", False))
         row.interval_minutes = int(getattr(payload, "intervalMinutes", 60) or 60)
@@ -1761,6 +1917,8 @@ def save_scheduled_crawl(owner_username: str, payload: Any, schedule_id: int | N
             row.source_id = None
             row.source_type = str(getattr(payload, "sourceType", "") or "keyword").strip()
             row.target = str(getattr(payload, "target", "") or "").strip()
+            if row.source_type == "product_url":
+                row.target = normalize_rakuten_product_target(row.target)
 
         row.name = str(getattr(payload, "name", "") or "").strip()
         row.crawl_content = str(getattr(payload, "crawlContent", "") or row.target).strip()
@@ -2406,6 +2564,8 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
             target = source.target
         if not source_type or not target:
             raise RuntimeError("采集类型和目标不能为空。")
+        if source_type == "product_url":
+            target = normalize_rakuten_product_target(target)
         task = CrawlTaskModel(
             id=uuid.uuid4().hex,
             owner_username=owner_username,
@@ -2491,10 +2651,67 @@ def run_task(task_id: str) -> None:
 
 def collect_items(source_type: str, target: str) -> list[dict[str, Any]]:
     if source_type == "product_url":
-        return [collect_product_detail(target)]
+        return [collect_product_detail(normalize_rakuten_product_target(target))]
+    limit = 30
+    if source_type == "shop":
+        target, limit, period = parse_ranking_target(strip_shop_ranking_prefix(target))
+        target = resolve_rakuten_shop_search_keyword(target)
+    elif source_type == "ranking":
+        target, limit, period = parse_ranking_target(target)
+    else:
+        period = "daily"
     url = build_source_url(source_type, target)
+    if source_type in {"ranking", "shop"}:
+        url = build_ranking_source_url(target, period)
     html = fetch_html(url)
-    return parse_search_items(html, url)[:30]
+    items = parse_search_items(html, url)
+    if source_type in {"ranking", "shop"} and period == "realtime":
+        keyword = normalize_text(target).lower()
+        items = [item for item in items if keyword in normalize_text(item.get("title")).lower()]
+    return items[:limit]
+
+
+def strip_shop_ranking_prefix(target: str) -> str:
+    normalized = normalize_text(target)
+    if normalized.startswith("店铺:") or normalized.startswith("店铺："):
+        return normalized.split(":", 1)[1] if ":" in normalized else normalized.split("：", 1)[1]
+    return normalized
+
+
+def parse_ranking_target(target: str) -> tuple[str, int, str]:
+    normalized = normalize_text(target)
+    limit = 30
+    match = re.search(r"(?:^|\s)前\s*([0-9]{1,3})\s*$", normalized)
+    if match:
+        limit = int(match.group(1))
+        normalized = normalized[: match.start()].strip()
+    period = "daily"
+    period_match = re.search(r"(?:^|\s)(实时|实时榜|日榜|每日|每日榜|周榜|週間|週間榜|月榜|月間|月間榜)\s*$", normalized)
+    if period_match:
+        period_label = period_match.group(1)
+        normalized = normalized[: period_match.start()].strip()
+        if period_label in {"实时", "实时榜"}:
+            period = "realtime"
+        elif period_label in {"周榜", "週間", "週間榜"}:
+            period = "weekly"
+        elif period_label in {"月榜", "月間", "月間榜"}:
+            period = "monthly"
+        else:
+            period = "daily"
+    return normalized, min(100, max(1, limit)), period
+
+
+def build_ranking_source_url(keyword: str, period: str) -> str:
+    normalized_keyword = normalize_text(keyword)
+    if period == "realtime":
+        return RAKUTEN_REALTIME_RANKING_URL
+    if period == "monthly":
+        ptn = "3"
+    elif period == "weekly":
+        ptn = "2"
+    else:
+        ptn = "1"
+    return f"{RAKUTEN_RANKING_BASE}?stx={quote(normalized_keyword)}&srt=1&ptn={ptn}"
 
 
 def build_source_url(source_type: str, target: str) -> str:
@@ -2553,7 +2770,8 @@ def parse_search_items(html: str, page_url: str) -> list[dict[str, Any]]:
 
 
 def collect_product_detail(url: str) -> dict[str, Any]:
-    html = fetch_html(url)
+    normalized_url = normalize_rakuten_product_target(url)
+    html = fetch_html(normalized_url)
     soup = BeautifulSoup(html, "lxml")
     title = ""
     title_node = soup.select_one("h1") or soup.select_one("title")
@@ -2565,14 +2783,14 @@ def collect_product_detail(url: str) -> dict[str, Any]:
         image = str(image_node.get("src") or "")
     text = soup.get_text(" ", strip=True)
     return {
-        "title": title[:500] or url,
-        "source_url": url,
+        "title": title[:500] or normalized_url,
+        "source_url": normalized_url,
         "image_url": image,
         "price": extract_price(text),
         "shop_name": "",
-        "item_number": extract_item_number(url),
+        "item_number": extract_item_number(normalized_url),
         "genre_id": "",
-        "raw": {"url": url},
+        "raw": {"url": normalized_url},
     }
 
 
@@ -2589,6 +2807,9 @@ def extract_price(text: str) -> float | None:
 
 
 def extract_item_number(url: str) -> str:
+    parsed_target = parse_rakuten_product_target(url)
+    if parsed_target is not None:
+        return parsed_target[1][:255]
     parts = [part for part in url.rstrip("/").split("/") if part]
     return parts[-1][:255] if parts else ""
 
