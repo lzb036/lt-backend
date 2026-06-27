@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 import time
 from datetime import datetime, timedelta
 from decimal import Decimal
+from html import unescape
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -43,6 +44,7 @@ RAKUTEN_ITEM_SEARCH_HITS = 100
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
+IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
 
 
 def log_event(owner_username: str, task_id: str | None, level: str, message: str) -> None:
@@ -129,6 +131,10 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
 def product_to_public(row: ProductModel) -> dict[str, Any]:
     listed_at = product_listed_at_text(row)
     raw_payload = product_raw_payload(row)
+    price_range = price_range_from_rakuten_item(raw_payload)
+    fallback_price = float(row.price) if row.price is not None else None
+    price_min = price_range[0] if price_range else fallback_price
+    price_max = price_range[1] if price_range else fallback_price
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -143,7 +149,9 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "itemNumber": row.item_number,
         "shopName": row.shop_name,
         "imageUrl": row.image_url,
-        "price": float(row.price) if row.price is not None else None,
+        "price": price_min,
+        "priceMin": price_min,
+        "priceMax": price_max,
         "currency": row.currency,
         "salesCount": product_sales_count(raw_payload),
         "genreId": row.genre_id,
@@ -194,6 +202,7 @@ def product_sales_count(raw_payload: dict[str, Any]) -> int | None:
 
 def product_detail_to_public(row: ProductModel) -> dict[str, Any]:
     raw_payload = product_raw_payload(row)
+    shop_code = product_shop_code(row, raw_payload)
     public = product_to_public(row)
     public["detail"] = {
         "manageNumber": first_text_from_keys(raw_payload, ("manageNumber", "itemNumber")) or row.rakuten_manage_number,
@@ -208,7 +217,7 @@ def product_detail_to_public(row: ProductModel) -> dict[str, Any]:
         "created": first_text_from_keys(raw_payload, ("created",)),
         "updated": first_text_from_keys(raw_payload, ("updated",)),
         "descriptions": product_descriptions(raw_payload),
-        "images": product_image_urls(raw_payload),
+        "images": product_image_urls(raw_payload, shop_code=shop_code),
         "variantSelectors": product_variant_selectors(raw_payload),
         "variants": product_variants(raw_payload),
         "raw": raw_payload,
@@ -217,29 +226,64 @@ def product_detail_to_public(row: ProductModel) -> dict[str, Any]:
 
 
 def product_descriptions(raw_payload: dict[str, Any]) -> list[dict[str, str]]:
+    descriptions: list[dict[str, str]] = []
+    seen_values: set[str] = set()
+
+    def append(label: str, value: Any) -> None:
+        text = first_text_value(value)
+        if not text or text in seen_values:
+            return
+        seen_values.add(text)
+        descriptions.append({"label": label, "value": text})
+
+    product_description = raw_payload.get("productDescription")
+    if isinstance(product_description, dict):
+        append("PC商品说明", product_description.get("pc"))
+        append("移动端商品说明", product_description.get("sp"))
+        append("智能手机商品说明", product_description.get("smartphone"))
+        append("商品说明", product_description.get("value"))
+    else:
+        append("商品说明", product_description)
+
     fields = (
         ("商品说明", "description"),
-        ("销售说明", "salesDescription"),
         ("PC用商品说明", "pcDescription"),
         ("移动端商品说明", "spDescription"),
         ("智能手机商品说明", "smartphoneDescription"),
     )
-    descriptions: list[dict[str, str]] = []
     for label, key in fields:
-        value = first_text_value(raw_payload.get(key))
-        if value:
-            descriptions.append({"label": label, "value": value})
+        append(label, raw_payload.get(key))
+    if not descriptions:
+        append("销售说明", raw_payload.get("salesDescription"))
     return descriptions
 
 
-def product_image_urls(raw_payload: dict[str, Any]) -> list[str]:
+def product_shop_code(row: ProductModel, raw_payload: dict[str, Any]) -> str:
+    for value in (
+        row.image_url,
+        row.source_url,
+        first_text_from_keys(raw_payload, ("shopCode", "shop_code", "shopUrl", "shop_url")),
+    ):
+        shop_code = normalize_shop_code(value)
+        if shop_code:
+            return shop_code
+    return ""
+
+
+def product_image_urls(raw_payload: dict[str, Any], *, shop_code: str = "") -> list[str]:
     urls: list[str] = []
+
+    def remember(value: Any) -> None:
+        url = normalize_product_image_url(value, shop_code=shop_code)
+        if url and url not in urls:
+            urls.append(url)
 
     def collect(value: Any) -> None:
         if isinstance(value, str):
-            text = normalize_text(value)
-            if text.startswith(("http://", "https://")) and text not in urls:
-                urls.append(text)
+            text = unescape(str(value or "")).replace("\\/", "/")
+            remember(text)
+            for match in re.findall(r"https?://[^\s\"'<>)]+'?", text):
+                remember(match)
             return
         if isinstance(value, dict):
             for key in ("url", "imageUrl", "location", "value"):
@@ -250,9 +294,36 @@ def product_image_urls(raw_payload: dict[str, Any]) -> list[str]:
             for child in value:
                 collect(child)
 
-    for key in ("images", "imageUrl", "imageUrls", "mediumImageUrls", "smallImageUrls"):
-        collect(raw_payload.get(key))
-    return urls[:20]
+    collect(raw_payload)
+    return urls
+
+
+def normalize_product_image_url(value: Any, *, shop_code: str = "") -> str:
+    text = unescape(str(value or "")).replace("\\/", "/").strip().strip("'\"")
+    if not text.startswith(("http://", "https://")):
+        if not shop_code:
+            return ""
+        if not re.search(r"\.(apng|avif|bmp|gif|jpe?g|png|webp)(?:$|[?#])", text, flags=re.I):
+            return ""
+        normalized_location = text.lstrip("/")
+        if normalized_location.startswith("cabinet/"):
+            normalized_location = normalized_location.removeprefix("cabinet/")
+        text = build_rakuten_cabinet_image_url(shop_code, normalized_location)
+    text = text.rstrip(".,;")
+    try:
+        path = urlsplit(text).path.lower()
+    except Exception:
+        return ""
+    if not re.search(r"\.(apng|avif|bmp|gif|jpe?g|png|webp)$", path):
+        return ""
+    filename = path.rsplit("/", 1)[-1]
+    if is_ignored_cabinet_image_filename(filename):
+        return ""
+    return text
+
+
+def is_ignored_cabinet_image_filename(value: str) -> bool:
+    return value.strip().lower().rsplit("/", 1)[-1] in IGNORED_CABINET_IMAGE_FILENAMES
 
 
 def product_cabinet_file_targets(raw_payload: dict[str, Any], shop_code: str) -> list[dict[str, str]]:
@@ -263,6 +334,8 @@ def product_cabinet_file_targets(raw_payload: dict[str, Any], shop_code: str) ->
     def remember(value: Any) -> None:
         for path in cabinet_paths_from_text(value, normalized_shop_code):
             if not path or path in seen:
+                continue
+            if is_ignored_cabinet_image_filename(path):
                 continue
             seen.add(path)
             targets.append({"filePath": path, "fileName": path.rsplit("/", 1)[-1]})
@@ -279,6 +352,8 @@ def product_cabinet_file_targets(raw_payload: dict[str, Any], shop_code: str) ->
                 walk(child)
 
     walk(raw_payload)
+    for url in product_image_urls(raw_payload, shop_code=shop_code):
+        remember(url)
     return targets
 
 
@@ -821,6 +896,87 @@ def patch_rakuten_item_price(
     return updated_payload
 
 
+def patch_rakuten_item_detail(
+    service_secret: str,
+    license_key: str,
+    manage_number: str,
+    raw_payload: dict[str, Any],
+    *,
+    title: str,
+    tagline: str,
+    variants: list[Any],
+) -> dict[str, Any]:
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+    normalized_manage_number = normalize_text(manage_number)
+    if not normalized_manage_number:
+        raise RuntimeError("商品管理编号为空，不能同步修改乐天商品。")
+
+    normalized_title = normalize_text(title)
+    if not normalized_title:
+        raise RuntimeError("商品标题不能为空。")
+
+    raw_variants = raw_payload.get("variants")
+    if not isinstance(raw_variants, dict) or not raw_variants:
+        raise RuntimeError("当前商品没有可修改的 SKU 款式，不能同步到乐天。")
+
+    patch_variants: dict[str, dict[str, Any]] = {}
+    for variant in variants:
+        variant_id = normalize_text(getattr(variant, "variantId", ""))
+        if not variant_id or variant_id not in raw_variants:
+            raise RuntimeError(f"SKU {variant_id or '-'} 不存在，不能同步修改。")
+        standard_price = getattr(variant, "standardPrice", None)
+        if standard_price is None or standard_price <= 0:
+            raise RuntimeError(f"SKU {variant_id} 价格必须大于 0。")
+        if standard_price != standard_price.to_integral_value():
+            raise RuntimeError(f"SKU {variant_id} 价格必须为日元整数。")
+        patch_variants[variant_id] = {
+            "standardPrice": str(int(standard_price)),
+            "hidden": bool(getattr(variant, "hidden", False)),
+        }
+
+    if not patch_variants:
+        raise RuntimeError("请至少保留一个可修改的 SKU 款式。")
+
+    payload = {
+        "title": normalized_title,
+        "tagline": str(tagline or "").strip(),
+        "variants": patch_variants,
+    }
+    response = requests.patch(
+        RAKUTEN_ITEM_PATCH_URL.format(manageNumber=quote(normalized_manage_number, safe="")),
+        timeout=settings.crawler_timeout_seconds,
+        headers={
+            "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        json=payload,
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        detail = normalize_text(response.text)
+        message = f"乐天商品 {normalized_manage_number} 详情更新失败"
+        if detail:
+            message = f"{message}：{detail[:500]}"
+        raise RuntimeError(message) from exc
+
+    updated_payload = dict(raw_payload)
+    updated_payload["title"] = normalized_title
+    updated_payload["tagline"] = str(tagline or "").strip()
+    updated_variants = dict(raw_variants)
+    for variant_id, variant_patch in patch_variants.items():
+        current_variant = raw_variants.get(variant_id)
+        if isinstance(current_variant, dict):
+            next_variant = dict(current_variant)
+            next_variant.update(variant_patch)
+            updated_variants[variant_id] = next_variant
+    updated_payload["variants"] = updated_variants
+    updated_payload["updated"] = datetime.now().isoformat(timespec="seconds")
+    return updated_payload
+
+
 def delete_rakuten_item(service_secret: str, license_key: str, manage_number: str) -> None:
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
@@ -1099,9 +1255,7 @@ def build_rakuten_cabinet_image_url(shop_code: str, location: str) -> str:
 
 
 def price_from_rakuten_item(item: dict[str, Any]) -> float | None:
-    value = first_text_from_keys(item, ("itemPrice", "price", "standardPrice", "displayPrice"))
-    if not value:
-        value = first_variant_price(item)
+    value = first_text_from_keys(item, ("itemPrice", "price", "standardPrice", "displayPrice")) or first_variant_price(item)
     if not value:
         return None
     normalized = re.sub(r"[^0-9.]", "", value)
@@ -1113,7 +1267,17 @@ def price_from_rakuten_item(item: dict[str, Any]) -> float | None:
         return None
 
 
-def first_variant_price(item: dict[str, Any]) -> str:
+def price_range_from_rakuten_item(item: dict[str, Any]) -> tuple[float, float] | None:
+    prices = variant_prices(item)
+    if prices:
+        return min(prices), max(prices)
+    price = price_from_rakuten_item(item)
+    if price is None:
+        return None
+    return price, price
+
+
+def variant_prices(item: dict[str, Any]) -> list[float]:
     variants = item.get("variants")
     if isinstance(variants, dict):
         variant_items = variants.values()
@@ -1134,6 +1298,11 @@ def first_variant_price(item: dict[str, Any]) -> str:
             prices.append(float(normalized))
         except ValueError:
             continue
+    return prices
+
+
+def first_variant_price(item: dict[str, Any]) -> str:
+    prices = variant_prices(item)
     if not prices:
         return ""
     return str(min(prices))
@@ -1789,28 +1958,62 @@ def delete_product_cabinet_images(
 def resolve_cabinet_file_ids(service_secret: str, license_key: str, target: dict[str, str]) -> list[int]:
     file_path = normalize_text(target.get("filePath"))
     file_name = normalize_text(target.get("fileName"))
-    if file_path:
-        records = search_rakuten_cabinet_files(service_secret, license_key, file_path=file_path)
-        exact_ids = [
-            int(record["fileId"])
-            for record in records
-            if normalize_text(record.get("filePath")).lower() == file_path.lower()
-        ]
-        if exact_ids:
-            return exact_ids
     if file_name:
         records = search_rakuten_cabinet_files(service_secret, license_key, file_name=file_name)
-        if len(records) == 1:
-            return [int(records[0]["fileId"])]
-        if len(records) > 1 and file_path:
-            exact_ids = [
-                int(record["fileId"])
-                for record in records
-                if normalize_text(record.get("filePath")).lower() == file_path.lower()
-            ]
+        if file_path:
+            exact_ids = [int(record["fileId"]) for record in records if cabinet_record_matches_target(record, file_path)]
             if exact_ids:
                 return exact_ids
+        if len(records) == 1:
+            return [int(records[0]["fileId"])]
+    if file_path:
+        try:
+            records = search_rakuten_cabinet_files(service_secret, license_key, file_path=file_path)
+        except RuntimeError:
+            records = []
+        exact_ids = [int(record["fileId"]) for record in records if cabinet_record_matches_target(record, file_path)]
+        if exact_ids:
+            return exact_ids
     return []
+
+
+def cabinet_record_matches_target(record: dict[str, Any], file_path: str) -> bool:
+    expected = normalize_cabinet_path(file_path)
+    for value in (
+        record.get("fileUrl"),
+        cabinet_record_path(record),
+        record.get("filePath"),
+    ):
+        if normalize_cabinet_path(value) == expected:
+            return True
+    return False
+
+
+def cabinet_record_path(record: dict[str, Any]) -> str:
+    file_name = normalize_text(record.get("fileName"))
+    folder_path = normalize_text(record.get("folderPath"))
+    if folder_path and file_name:
+        return f"/cabinet/{folder_path.strip('/')}/{file_name}"
+    return normalize_text(record.get("filePath"))
+
+
+def normalize_cabinet_path(value: Any) -> str:
+    text = normalize_text(value).replace("\\/", "/")
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://")):
+        try:
+            text = urlsplit(text).path
+        except Exception:
+            return ""
+    cabinet_index = text.lower().find("/cabinet/")
+    if cabinet_index >= 0:
+        text = text[cabinet_index:]
+    elif text.lower().startswith("cabinet/"):
+        text = "/" + text
+    elif not text.startswith("/"):
+        text = "/" + text
+    return "/" + text.lstrip("/").split("?", 1)[0].split("#", 1)[0].lower()
 
 
 def get_product_detail(owner_username: str, product_id: int) -> dict[str, Any]:
@@ -1824,6 +2027,9 @@ def get_product_detail(owner_username: str, product_id: int) -> dict[str, Any]:
 def update_store_product_price(owner_username: str, product_id: int, price: Decimal) -> dict[str, Any]:
     if price <= 0:
         raise RuntimeError("商品价格必须大于 0。")
+    if price != price.to_integral_value():
+        raise RuntimeError("乐天商品价格必须为日元整数，不能包含小数。")
+    normalized_price = price.to_integral_value()
     with session_scope() as session:
         product = session.get(ProductModel, product_id)
         if product is None or product.owner_username != owner_username:
@@ -1849,18 +2055,61 @@ def update_store_product_price(owner_username: str, product_id: int, price: Deci
                 decrypt_text(store.rakuten_license_key_encrypted),
                 manage_number,
                 raw_payload,
-                price,
+                normalized_price,
             )
         except Exception as exc:
             product.last_error = str(exc)
             raise
 
-        product.price = price
+        product.price = normalized_price
         product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
         product.store_last_seen_at = datetime.now()
         product.last_error = None
         session.flush()
         return product_to_public(product)
+
+
+def update_store_product_detail(owner_username: str, product_id: int, payload: Any) -> dict[str, Any]:
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            raise RuntimeError("商品不存在。")
+        if product.review_status != "listed":
+            raise RuntimeError("只有店铺商品可以同步修改乐天商品详情。")
+        if not product.store_id:
+            raise RuntimeError("商品未关联店铺，不能同步修改乐天商品详情。")
+        manage_number = normalize_text(product.rakuten_manage_number or product.item_number)
+        if not manage_number:
+            raise RuntimeError("商品缺少商品管理编号，不能同步修改乐天商品详情。")
+
+        store = session.get(StoreModel, product.store_id)
+        if store is None:
+            raise RuntimeError("商品关联店铺不存在。")
+        if not store.enabled:
+            raise RuntimeError("商品关联店铺已停用，不能同步修改乐天商品详情。")
+
+        raw_payload = product_raw_payload(product)
+        try:
+            updated_payload = patch_rakuten_item_detail(
+                decrypt_text(store.rakuten_service_secret_encrypted),
+                decrypt_text(store.rakuten_license_key_encrypted),
+                manage_number,
+                raw_payload,
+                title=getattr(payload, "title", ""),
+                tagline=getattr(payload, "tagline", ""),
+                variants=list(getattr(payload, "variants", []) or []),
+            )
+        except Exception as exc:
+            product.last_error = str(exc)
+            raise
+
+        product.title = first_text_from_keys(updated_payload, ("itemName", "title", "name")) or product.title
+        product.price = price_from_rakuten_item(updated_payload)
+        product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
+        product.store_last_seen_at = datetime.now()
+        product.last_error = None
+        session.flush()
+        return product_detail_to_public(product)
 
 
 def update_store_products_listing_status(

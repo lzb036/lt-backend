@@ -67,6 +67,18 @@ class ProductPricePayload(BaseModel):
     price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
 
 
+class ProductVariantEditPayload(BaseModel):
+    variantId: str = Field(min_length=1)
+    standardPrice: Decimal = Field(gt=0, max_digits=12, decimal_places=0)
+    hidden: bool = False
+
+
+class ProductDetailEditPayload(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    tagline: str = ""
+    variants: list[ProductVariantEditPayload] = Field(default_factory=list)
+
+
 class ListingTaskPayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
     storeId: int | None = None
@@ -247,6 +259,18 @@ def update_product_price(
 ) -> dict:
     try:
         return {"product": crawler_service.update_store_product_price(user["username"], product_id, payload.price)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/products/{product_id}/detail")
+def update_product_detail(
+    product_id: int,
+    payload: ProductDetailEditPayload,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return {"product": crawler_service.update_store_product_detail(user["username"], product_id, payload)}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
