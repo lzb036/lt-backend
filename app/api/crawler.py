@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import requests
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from decimal import Decimal
 
@@ -311,6 +313,68 @@ def update_product_local_detail(
 ) -> dict:
     try:
         return {"product": crawler_service.update_product_local_detail(user["username"], product_id, payload)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/products/{product_id}/images/{image_index}/download")
+def download_product_image(
+    product_id: int,
+    image_index: int,
+    user: dict = Depends(require_authenticated_account),
+):
+    try:
+        info = crawler_service.product_image_download_info(user["username"], product_id, image_index)
+        headers = {"Content-Disposition": f'attachment; filename="{info["filename"]}"'}
+        if info["type"] == "local":
+            return FileResponse(info["path"], media_type=info["mediaType"], filename=info["filename"])
+        response = requests.get(
+            info["url"],
+            timeout=crawler_service.settings.crawler_timeout_seconds,
+            headers={"User-Agent": crawler_service.settings.crawler_user_agent},
+            stream=True,
+        )
+        response.raise_for_status()
+
+        def stream_content():
+            size = 0
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > crawler_service.MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES:
+                    response.close()
+                    raise RuntimeError("图片文件过大，已停止下载。")
+                yield chunk
+
+        return StreamingResponse(stream_content(), media_type=info["mediaType"], headers=headers)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=400, detail="图片下载失败，请稍后重试。") from exc
+
+
+@router.post("/products/{product_id}/images/{image_index}/replace")
+def replace_product_image(
+    product_id: int,
+    image_index: int,
+    file: UploadFile = File(...),
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return {"product": crawler_service.replace_product_image(user["username"], product_id, image_index, file)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/products/{product_id}/images/{image_index}")
+def delete_product_image(
+    product_id: int,
+    image_index: int,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return {"product": crawler_service.delete_product_image(user["username"], product_id, image_index)}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
