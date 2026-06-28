@@ -6,6 +6,7 @@ import uuid
 import base64
 import xml.etree.ElementTree as ET
 import time
+import threading
 from datetime import datetime, timedelta
 from decimal import Decimal
 from html import unescape
@@ -47,7 +48,9 @@ DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
 RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集只支持以下三种格式：完整乐天商品链接、带参数的乐天商品链接、店铺编码/商品编号。"
-RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺 URL 代码、店铺 URL 或 sid。"
+RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺url代码、店铺url或sid。"
+SCHEDULE_RUN_LOCK = threading.Lock()
+SCHEDULE_RUNNER_STARTED = False
 
 
 def log_event(owner_username: str, task_id: str | None, level: str, message: str) -> None:
@@ -174,20 +177,24 @@ def product_raw_payload(row: ProductModel) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def product_rakuten_created_at(row: ProductModel) -> datetime | None:
-    raw_created = first_text_value(product_raw_payload(row).get("created"))
-    if not raw_created:
+def parse_rakuten_datetime_value(value: Any) -> datetime | None:
+    text = first_text_value(value)
+    if not text:
         return None
-    normalized = raw_created.replace("Z", "+00:00")
+    normalized = text.replace("Z", "+00:00")
     try:
-        value = datetime.fromisoformat(normalized)
+        parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return None
-    return value.replace(tzinfo=None) if value.tzinfo else value
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def product_rakuten_created_at(row: ProductModel) -> datetime | None:
+    return row.listed_at or parse_rakuten_datetime_value(product_raw_payload(row).get("created"))
 
 
 def product_listed_at_text(row: ProductModel) -> str | None:
-    value = product_rakuten_created_at(row)
+    value = row.listed_at or product_rakuten_created_at(row)
     return value.isoformat(sep=" ", timespec="seconds") if value else None
 
 
@@ -454,17 +461,36 @@ def parse_datetime_filter(value: str | None) -> datetime | None:
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
-def matches_listed_at_range(row: ProductModel, listed_at_from: datetime | None, listed_at_to: datetime | None) -> bool:
-    if listed_at_from is None and listed_at_to is None:
-        return True
-    listed_at = product_rakuten_created_at(row)
-    if listed_at is None:
-        return False
-    if listed_at_from is not None and listed_at < listed_at_from:
-        return False
-    if listed_at_to is not None and listed_at > listed_at_to:
-        return False
-    return True
+def normalize_schedule_time(value: Any) -> str:
+    text = normalize_text(value) or "09:00"
+    match = re.fullmatch(r"([0-9]{1,2}):([0-9]{1,2})(?::[0-9]{1,2})?", text)
+    if not match:
+        raise RuntimeError("定时执行时间格式不正确。")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise RuntimeError("定时执行时间不合法。")
+    return f"{hour:02d}:{minute:02d}"
+
+
+def next_daily_run_at(schedule_time: str, *, now: datetime | None = None) -> datetime:
+    reference = now or datetime.now()
+    normalized = normalize_schedule_time(schedule_time)
+    hour, minute = [int(part) for part in normalized.split(":", 1)]
+    candidate = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= reference:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def ranking_period_label(value: Any) -> str:
+    period = normalize_text(value) or "daily"
+    return {
+        "realtime": "实时",
+        "daily": "日榜",
+        "weekly": "周榜",
+        "monthly": "月榜",
+    }.get(period, "日榜")
 
 
 def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
@@ -514,6 +540,7 @@ def scheduled_crawl_to_public(row: ScheduledCrawlModel) -> dict[str, Any]:
         "target": row.target,
         "enabled": bool(row.enabled),
         "intervalMinutes": row.interval_minutes,
+        "scheduleTime": row.schedule_time,
         "lastRunAt": row.last_run_at.isoformat(sep=" ") if row.last_run_at else None,
         "nextRunAt": row.next_run_at.isoformat(sep=" ") if row.next_run_at else None,
         "status": row.status,
@@ -1529,15 +1556,26 @@ def list_tasks(
     target: str | None = None,
     status: str | None = None,
     source_type: str | None = None,
+    mode: str | None = None,
+    created_at_from: str | None = None,
+    created_at_to: str | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         query = select(CrawlTaskModel).where(CrawlTaskModel.owner_username == owner_username)
+        created_at_from_value = parse_datetime_filter(created_at_from)
+        created_at_to_value = parse_datetime_filter(created_at_to)
         if target:
             query = query.where(CrawlTaskModel.target.like(f"%{target}%"))
         if status:
             query = query.where(CrawlTaskModel.status == status)
         if source_type:
             query = query.where(CrawlTaskModel.source_type == source_type)
+        if mode:
+            query = query.where(CrawlTaskModel.mode == mode)
+        if created_at_from_value is not None:
+            query = query.where(CrawlTaskModel.created_at >= created_at_from_value)
+        if created_at_to_value is not None:
+            query = query.where(CrawlTaskModel.created_at <= created_at_to_value)
         return paginate_query(
             session,
             query,
@@ -1558,6 +1596,10 @@ def list_products(
     listing_status: str | None = None,
     listed_at_from: str | None = None,
     listed_at_to: str | None = None,
+    price_min: Decimal | None = None,
+    price_max: Decimal | None = None,
+    collected_at_from: str | None = None,
+    collected_at_to: str | None = None,
     page: int | None = None,
     page_size: int | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -1565,7 +1607,8 @@ def list_products(
         query = select(ProductModel).where(ProductModel.owner_username == owner_username)
         listed_at_from_value = parse_datetime_filter(listed_at_from)
         listed_at_to_value = parse_datetime_filter(listed_at_to)
-        needs_listed_at_filter = listed_at_from_value is not None or listed_at_to_value is not None
+        collected_at_from_value = parse_datetime_filter(collected_at_from)
+        collected_at_to_value = parse_datetime_filter(collected_at_to)
         normalized_page = max(1, int(page or 1))
         normalized_page_size = min(500, max(1, int(page_size or 0))) if page_size else None
         product_status = _product_status_filter(status)
@@ -1576,12 +1619,27 @@ def list_products(
         if listing_status in {"listed", "unlisted"}:
             query = query.where(ProductModel.rakuten_listing_status == listing_status)
         if keyword:
-            query = query.where(
-                ProductModel.title.like(f"%{keyword}%")
-                | ProductModel.item_number.like(f"%{keyword}%")
-                | ProductModel.rakuten_manage_number.like(f"%{keyword}%")
-            )
-        if normalized_page_size and not needs_listed_at_filter:
+            if product_status == "listed":
+                query = query.where(
+                    ProductModel.title.like(f"%{keyword}%")
+                    | ProductModel.item_number.like(f"%{keyword}%")
+                    | ProductModel.rakuten_manage_number.like(f"%{keyword}%")
+                )
+            else:
+                query = query.where(ProductModel.title.like(f"%{keyword}%"))
+        if price_min is not None:
+            query = query.where(ProductModel.price >= price_min)
+        if price_max is not None:
+            query = query.where(ProductModel.price <= price_max)
+        if collected_at_from_value is not None:
+            query = query.where(ProductModel.created_at >= collected_at_from_value)
+        if collected_at_to_value is not None:
+            query = query.where(ProductModel.created_at <= collected_at_to_value)
+        if listed_at_from_value is not None:
+            query = query.where(ProductModel.listed_at >= listed_at_from_value)
+        if listed_at_to_value is not None:
+            query = query.where(ProductModel.listed_at <= listed_at_to_value)
+        if normalized_page_size:
             total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
             if total:
                 max_page = max(1, (int(total) + normalized_page_size - 1) // normalized_page_size)
@@ -1599,24 +1657,6 @@ def list_products(
             }
 
         rows = session.scalars(query.order_by(ProductModel.created_at.desc())).all()
-        if needs_listed_at_filter:
-            rows = [
-                row
-                for row in rows
-                if matches_listed_at_range(row, listed_at_from_value, listed_at_to_value)
-            ]
-        if normalized_page_size:
-            total = len(rows)
-            if total:
-                max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
-                normalized_page = min(normalized_page, max_page)
-            start = (normalized_page - 1) * normalized_page_size
-            return {
-                "products": [product_to_public(row) for row in rows[start:start + normalized_page_size]],
-                "total": total,
-                "page": normalized_page,
-                "pageSize": normalized_page_size,
-            }
         return [product_to_public(row) for row in rows]
 
 
@@ -1885,7 +1925,10 @@ def verify_all_stores() -> dict[str, Any]:
 
 def list_scheduled_crawls(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
-        query = select(ScheduledCrawlModel).where(ScheduledCrawlModel.owner_username == owner_username)
+        query = select(ScheduledCrawlModel).where(
+            ScheduledCrawlModel.owner_username == owner_username,
+            ScheduledCrawlModel.source_type == "shop",
+        )
         return paginate_query(
             session,
             query,
@@ -1898,7 +1941,6 @@ def list_scheduled_crawls(owner_username: str, *, page: int | None = None, page_
 
 
 def save_scheduled_crawl(owner_username: str, payload: Any, schedule_id: int | None = None) -> dict[str, Any]:
-    source_id = getattr(payload, "sourceId", None)
     with session_scope() as session:
         row = session.get(ScheduledCrawlModel, schedule_id) if schedule_id else None
         if row is None:
@@ -1906,28 +1948,26 @@ def save_scheduled_crawl(owner_username: str, payload: Any, schedule_id: int | N
             session.add(row)
         if row.owner_username != owner_username:
             raise RuntimeError("不能修改其他用户的定时任务。")
-        source = session.get(CrawlSourceModel, source_id) if source_id else None
-        if source is not None:
-            if source.owner_username != owner_username:
-                raise RuntimeError("不能使用其他用户的采集源。")
-            row.source_id = source.id
-            row.source_type = source.source_type
-            row.target = source.target
-        else:
-            row.source_id = None
-            row.source_type = str(getattr(payload, "sourceType", "") or "keyword").strip()
-            row.target = str(getattr(payload, "target", "") or "").strip()
-            if row.source_type == "product_url":
-                row.target = normalize_rakuten_product_target(row.target)
 
-        row.name = str(getattr(payload, "name", "") or "").strip()
-        row.crawl_content = str(getattr(payload, "crawlContent", "") or row.target).strip()
-        row.crawl_condition = str(getattr(payload, "crawlCondition", "") or row.source_type).strip()
+        raw_target = str(getattr(payload, "target", "") or "").strip()
+        normalized_target = normalize_rakuten_shop_target(raw_target)
+        if not normalized_target:
+            raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR)
+        schedule_time = normalize_schedule_time(getattr(payload, "scheduleTime", "09:00"))
+        period_label = ranking_period_label(getattr(payload, "rankingPeriod", "daily"))
+
+        row.source_id = None
+        row.source_type = "shop"
+        row.target = f"店铺:{normalized_target} {period_label} 全部"
+        row.name = str(getattr(payload, "name", "") or "").strip() or f"{normalized_target} 每日定时采集"
+        row.crawl_content = normalized_target
+        row.crawl_condition = "店铺采集"
         row.enabled = bool(getattr(payload, "enabled", True))
-        row.interval_minutes = int(getattr(payload, "intervalMinutes", 60) or 60)
+        row.interval_minutes = 1440
+        row.schedule_time = schedule_time
         row.notes = str(getattr(payload, "notes", "") or "").strip()
         row.status = "idle" if row.enabled else "disabled"
-        row.next_run_at = datetime.now() + timedelta(minutes=row.interval_minutes) if row.enabled else None
+        row.next_run_at = next_daily_run_at(row.schedule_time) if row.enabled else None
         if not row.name or not row.target:
             raise RuntimeError("定时任务名称和采集目标不能为空。")
         session.flush()
@@ -1965,9 +2005,62 @@ def run_scheduled_crawl(owner_username: str, schedule_id: int) -> dict[str, Any]
         if row is None:
             raise RuntimeError("定时任务不存在。")
         row.status = "idle" if row.enabled else "disabled"
-        row.next_run_at = datetime.now() + timedelta(minutes=row.interval_minutes) if row.enabled else None
+        row.next_run_at = next_daily_run_at(row.schedule_time) if row.enabled else None
         session.flush()
         return scheduled_crawl_to_public(row)
+
+
+def run_due_scheduled_crawls_once() -> int:
+    if not SCHEDULE_RUN_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        now = datetime.now()
+        with session_scope() as session:
+            rows = session.scalars(
+                select(ScheduledCrawlModel).where(
+                    ScheduledCrawlModel.enabled.is_(True),
+                    ScheduledCrawlModel.source_type == "shop",
+                    ScheduledCrawlModel.next_run_at.is_not(None),
+                    ScheduledCrawlModel.next_run_at <= now,
+                    ScheduledCrawlModel.status != "running",
+                )
+            ).all()
+            due_items = [(row.owner_username, row.id) for row in rows]
+            for row in rows:
+                row.status = "running"
+                row.last_run_at = now
+                row.next_run_at = next_daily_run_at(row.schedule_time, now=now)
+
+        for owner_username, schedule_id in due_items:
+            try:
+                run_scheduled_crawl(owner_username, schedule_id)
+            except Exception as exc:
+                with session_scope() as session:
+                    row = session.get(ScheduledCrawlModel, schedule_id)
+                    if row is not None:
+                        row.status = "failed"
+                        row.notes = str(exc)
+            time.sleep(0.1)
+        return len(due_items)
+    finally:
+        SCHEDULE_RUN_LOCK.release()
+
+
+def start_schedule_runner(interval_seconds: int = 60) -> None:
+    global SCHEDULE_RUNNER_STARTED
+    if SCHEDULE_RUNNER_STARTED:
+        return
+    SCHEDULE_RUNNER_STARTED = True
+
+    def loop() -> None:
+        while True:
+            try:
+                run_due_scheduled_crawls_once()
+            except Exception:
+                pass
+            time.sleep(max(10, interval_seconds))
+
+    threading.Thread(target=loop, name="lt-schedule-runner", daemon=True).start()
 
 
 def update_product_status(owner_username: str, product_ids: list[int], status: str, *, message: str = "") -> list[dict[str, Any]]:
@@ -2220,6 +2313,7 @@ def update_store_product_price(owner_username: str, product_id: int, price: Deci
             raise
 
         product.price = normalized_price
+        product.listed_at = parse_rakuten_datetime_value(updated_payload.get("created")) or product.listed_at
         product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
         product.store_last_seen_at = datetime.now()
         product.last_error = None
@@ -2263,6 +2357,7 @@ def update_store_product_detail(owner_username: str, product_id: int, payload: A
 
         product.title = first_text_from_keys(updated_payload, ("itemName", "title", "name")) or product.title
         product.price = price_from_rakuten_item(updated_payload)
+        product.listed_at = parse_rakuten_datetime_value(updated_payload.get("created")) or product.listed_at
         product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
         product.store_last_seen_at = datetime.now()
         product.last_error = None
@@ -2652,7 +2747,7 @@ def run_task(task_id: str) -> None:
 def collect_items(source_type: str, target: str) -> list[dict[str, Any]]:
     if source_type == "product_url":
         return [collect_product_detail(normalize_rakuten_product_target(target))]
-    limit = 30
+    limit: int | None = 30
     if source_type == "shop":
         target, limit, period = parse_ranking_target(strip_shop_ranking_prefix(target))
         target = resolve_rakuten_shop_search_keyword(target)
@@ -2668,7 +2763,7 @@ def collect_items(source_type: str, target: str) -> list[dict[str, Any]]:
     if source_type in {"ranking", "shop"} and period == "realtime":
         keyword = normalize_text(target).lower()
         items = [item for item in items if keyword in normalize_text(item.get("title")).lower()]
-    return items[:limit]
+    return items if limit is None else items[:limit]
 
 
 def strip_shop_ranking_prefix(target: str) -> str:
@@ -2678,9 +2773,13 @@ def strip_shop_ranking_prefix(target: str) -> str:
     return normalized
 
 
-def parse_ranking_target(target: str) -> tuple[str, int, str]:
+def parse_ranking_target(target: str) -> tuple[str, int | None, str]:
     normalized = normalize_text(target)
-    limit = 30
+    limit: int | None = 30
+    all_match = re.search(r"(?:^|\s)(全部|全量)\s*$", normalized)
+    if all_match:
+        limit = None
+        normalized = normalized[: all_match.start()].strip()
     match = re.search(r"(?:^|\s)前\s*([0-9]{1,3})\s*$", normalized)
     if match:
         limit = int(match.group(1))
@@ -2698,7 +2797,7 @@ def parse_ranking_target(target: str) -> tuple[str, int, str]:
             period = "monthly"
         else:
             period = "daily"
-    return normalized, min(100, max(1, limit)), period
+    return normalized, None if limit is None else min(100, max(1, limit)), period
 
 
 def build_ranking_source_url(keyword: str, period: str) -> str:
@@ -2906,6 +3005,8 @@ def upsert_product(
     if store_id is not None and review_status == "listed":
         row.store_product_status = "active"
         row.store_last_seen_at = datetime.now()
-    row.raw_payload_json = json.dumps(item.get("raw") or item, ensure_ascii=False)
+    raw_payload = item.get("raw") or item
+    row.listed_at = parse_rakuten_datetime_value(raw_payload.get("created") if isinstance(raw_payload, dict) else None) or row.listed_at
+    row.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
     row.last_error = None
     return True

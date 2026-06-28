@@ -43,8 +43,10 @@ class ScheduledCrawlPayload(BaseModel):
     crawlCondition: str = ""
     sourceType: str = Field(default="keyword", pattern="^(keyword|shop|ranking|product_url)$")
     target: str = ""
+    rankingPeriod: str = Field(default="daily", pattern="^(realtime|daily|weekly|monthly)$")
     enabled: bool = True
     intervalMinutes: int = Field(default=60, ge=5, le=1440)
+    scheduleTime: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
     notes: str = ""
 
 
@@ -140,6 +142,9 @@ def list_tasks(
     target: str | None = Query(default=None),
     status: str | None = Query(default=None),
     sourceType: str | None = Query(default=None),
+    mode: str | None = Query(default=None),
+    createdAtFrom: str | None = Query(default=None),
+    createdAtTo: str | None = Query(default=None),
     user: dict = Depends(require_authenticated_account),
 ) -> dict:
     result = crawler_service.list_tasks(
@@ -149,6 +154,9 @@ def list_tasks(
         target=target,
         status=status,
         source_type=sourceType,
+        mode=mode,
+        created_at_from=createdAtFrom,
+        created_at_to=createdAtTo,
     )
     if isinstance(result, dict):
         return result
@@ -181,6 +189,10 @@ def list_products(
     listingStatus: str | None = Query(default=None),
     listedAtFrom: str | None = Query(default=None),
     listedAtTo: str | None = Query(default=None),
+    priceMin: Decimal | None = Query(default=None, ge=0),
+    priceMax: Decimal | None = Query(default=None, ge=0),
+    collectedAtFrom: str | None = Query(default=None),
+    collectedAtTo: str | None = Query(default=None),
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
     user: dict = Depends(require_authenticated_account),
@@ -193,6 +205,10 @@ def list_products(
         listing_status=listingStatus,
         listed_at_from=listedAtFrom,
         listed_at_to=listedAtTo,
+        price_min=priceMin,
+        price_max=priceMax,
+        collected_at_from=collectedAtFrom,
+        collected_at_to=collectedAtTo,
         page=page,
         page_size=pageSize,
     )

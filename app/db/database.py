@@ -82,6 +82,8 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN store_product_status VARCHAR(32) NOT NULL DEFAULT ''"))
         if "rakuten_listing_status" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN rakuten_listing_status VARCHAR(32) NOT NULL DEFAULT ''"))
+        if "listed_at" not in product_columns:
+            connection.execute(text("ALTER TABLE lt_products ADD COLUMN listed_at DATETIME NULL"))
         if "store_last_seen_at" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN store_last_seen_at DATETIME NULL"))
 
@@ -118,6 +120,20 @@ def ensure_schema_compatibility() -> None:
                 """
             )
         )
+        connection.execute(
+            text(
+                """
+                UPDATE lt_products
+                SET listed_at = STR_TO_DATE(
+                    LEFT(REPLACE(JSON_UNQUOTE(JSON_EXTRACT(raw_payload_json, '$.created')), 'T', ' '), 19),
+                    '%Y-%m-%d %H:%i:%s'
+                )
+                WHERE listed_at IS NULL
+                  AND JSON_VALID(raw_payload_json)
+                  AND JSON_UNQUOTE(JSON_EXTRACT(raw_payload_json, '$.created')) IS NOT NULL
+                """
+            )
+        )
 
         raw_payload_type = connection.execute(
             text(
@@ -149,6 +165,15 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("CREATE INDEX ix_lt_product_owner_store ON lt_products (owner_username, store_id)"))
         if "ix_lt_product_store_status" not in product_indexes:
             connection.execute(text("CREATE INDEX ix_lt_product_store_status ON lt_products (store_id, store_product_status)"))
+        if "ix_lt_product_store_listing_listed" not in product_indexes:
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX ix_lt_product_store_listing_listed
+                    ON lt_products (store_id, review_status, rakuten_listing_status, listed_at)
+                    """
+                )
+            )
 
         product_unique_constraints = set(
             connection.execute(
@@ -191,6 +216,21 @@ def ensure_schema_compatibility() -> None:
                 connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_status ON lt_sync_tasks (owner_username, status)"))
             if "ix_lt_sync_task_owner_created" not in sync_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_created ON lt_sync_tasks (owner_username, created_at)"))
+
+        schedule_columns = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_scheduled_crawls'
+                    """
+                )
+            ).scalars()
+        )
+        if schedule_columns and "schedule_time" not in schedule_columns:
+            connection.execute(text("ALTER TABLE lt_scheduled_crawls ADD COLUMN schedule_time VARCHAR(5) NOT NULL DEFAULT '09:00'"))
 
 
 engine = create_engine(

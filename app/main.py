@@ -9,6 +9,7 @@ from app.api.profile import router as profile_router
 from app.api.users import router as users_router
 from app.core.config import settings
 from app.db.database import init_database
+from app.services.crawler_service import start_schedule_runner
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
 
@@ -30,6 +31,7 @@ app.include_router(crawler_router, prefix="/api")
 @app.on_event("startup")
 def startup() -> None:
     init_database()
+    start_schedule_runner()
 
 
 @app.get("/")

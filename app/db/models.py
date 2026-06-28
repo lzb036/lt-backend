@@ -168,6 +168,7 @@ class ProductModel(TimestampMixin, Base):
         Index("ix_lt_product_owner_status", "owner_username", "review_status"),
         Index("ix_lt_product_owner_title", "owner_username", "title"),
         Index("ix_lt_product_store_status", "store_id", "store_product_status"),
+        Index("ix_lt_product_store_listing_listed", "store_id", "review_status", "rakuten_listing_status", "listed_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -191,6 +192,7 @@ class ProductModel(TimestampMixin, Base):
     review_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     store_product_status: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
     rakuten_listing_status: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
+    listed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     store_last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     raw_payload_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -269,6 +271,7 @@ class ScheduledCrawlModel(TimestampMixin, Base):
     target: Mapped[str] = mapped_column(Text, nullable=False, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
     interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60, server_default="60")
+    schedule_time: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00", server_default="09:00")
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="idle", server_default="idle")
