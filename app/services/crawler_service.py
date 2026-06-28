@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from html import unescape
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -47,10 +47,16 @@ RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
-RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集只支持以下三种格式：完整乐天商品链接、带参数的乐天商品链接、店铺编码/商品编号。"
+RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集支持普通乐天商品链接、Rakuten Fashion 商品链接、带参数链接、店铺编码/商品编号。"
 RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺url代码、店铺url或sid。"
+RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
 SCHEDULE_RUN_LOCK = threading.Lock()
 SCHEDULE_RUNNER_STARTED = False
+
+
+def dispatch_crawl_task(task_id: str) -> None:
+    worker = threading.Thread(target=run_task, args=(task_id,), daemon=True)
+    worker.start()
 
 
 def log_event(owner_username: str, task_id: str | None, level: str, message: str) -> None:
@@ -255,6 +261,14 @@ def product_descriptions(raw_payload: dict[str, Any]) -> list[dict[str, str]]:
     else:
         append("商品说明", product_description)
 
+    raw_descriptions = raw_payload.get("descriptions")
+    if isinstance(raw_descriptions, list):
+        for index, item in enumerate(raw_descriptions, start=1):
+            if isinstance(item, dict):
+                append(first_text_from_keys(item, ("label", "name")) or f"商品说明 {index}", item.get("value"))
+            else:
+                append(f"商品说明 {index}", item)
+
     fields = (
         ("商品说明", "description"),
         ("PC用商品说明", "pcDescription"),
@@ -321,7 +335,8 @@ def normalize_product_image_url(value: Any, *, shop_code: str = "") -> str:
         text = build_rakuten_cabinet_image_url(shop_code, normalized_location)
     text = text.rstrip(".,;")
     try:
-        path = urlsplit(text).path.lower()
+        parsed = urlsplit(text)
+        path = parsed.path.lower()
     except Exception:
         return ""
     if not re.search(r"\.(apng|avif|bmp|gif|jpe?g|png|webp)$", path):
@@ -329,7 +344,7 @@ def normalize_product_image_url(value: Any, *, shop_code: str = "") -> str:
     filename = path.rsplit("/", 1)[-1]
     if is_ignored_cabinet_image_filename(filename):
         return ""
-    return text
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
 
 def is_ignored_cabinet_image_filename(value: str) -> bool:
@@ -414,7 +429,7 @@ def product_variant_selectors(raw_payload: dict[str, Any]) -> list[dict[str, Any
             {
                 "key": first_text_from_keys(selector, ("key", "id", "selectorId")),
                 "name": first_text_from_keys(selector, ("name", "displayName", "label")),
-                "values": selector.get("values") if isinstance(selector.get("values"), list) else [],
+                "values": selector_values_to_public(selector.get("values")),
             }
         )
     return result
@@ -444,8 +459,21 @@ def product_variants(raw_payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "selectorValues": selector_values if isinstance(selector_values, dict) else {},
                 "specs": variant.get("specs") if isinstance(variant.get("specs"), list) else [],
                 "attributes": variant.get("attributes") if isinstance(variant.get("attributes"), list) else [],
+                "material": first_text_from_keys(variant, ("material",)),
             }
         )
+    return result
+
+
+def selector_values_to_public(values: Any) -> list[Any]:
+    if not isinstance(values, list):
+        return []
+    result: list[Any] = []
+    for item in values:
+        if isinstance(item, dict):
+            result.append(first_text_from_keys(item, ("label", "value", "name")) or item)
+        else:
+            result.append(item)
     return result
 
 
@@ -657,6 +685,38 @@ def build_public_item_page_url(shop_code: str, item_number: str) -> str:
     return f"https://item.rakuten.co.jp/{quote(normalized_shop_code, safe='')}/{quote(normalized_item_number, safe='')}/"
 
 
+def is_rakuten_product_url(value: str) -> bool:
+    normalized = normalize_text(value)
+    if not normalized.startswith(("http://", "https://")):
+        return False
+    try:
+        parsed = urlsplit(normalized)
+    except Exception:
+        return False
+    hostname = parsed.netloc.lower()
+    if hostname == "item.rakuten.co.jp":
+        return parse_rakuten_product_target(normalized) is not None
+    if hostname == "brandavenue.rakuten.co.jp":
+        return parse_rakuten_fashion_product_code(normalized) != ""
+    return False
+
+
+def parse_rakuten_fashion_product_code(target: str) -> str:
+    normalized = normalize_text(target)
+    if not normalized.startswith(("http://", "https://")):
+        return ""
+    try:
+        parsed = urlsplit(normalized)
+    except Exception:
+        return ""
+    if parsed.netloc.lower() != "brandavenue.rakuten.co.jp":
+        return ""
+    parts = [unquote(part.strip()) for part in parsed.path.split("/") if part.strip()]
+    if len(parts) >= 2 and parts[0] == "item":
+        return normalize_text(parts[1])
+    return ""
+
+
 def parse_rakuten_product_target(target: str) -> tuple[str, str] | None:
     normalized = normalize_text(target)
     if not normalized:
@@ -685,6 +745,10 @@ def parse_rakuten_product_target(target: str) -> tuple[str, str] | None:
 
 
 def normalize_rakuten_product_target(target: str) -> str:
+    normalized = normalize_text(target)
+    fashion_code = parse_rakuten_fashion_product_code(normalized)
+    if fashion_code:
+        return f"https://brandavenue.rakuten.co.jp/item/{quote(fashion_code, safe='')}/"
     parsed = parse_rakuten_product_target(target)
     if parsed is None:
         raise RuntimeError(RAKUTEN_PRODUCT_TARGET_ERROR)
@@ -1158,6 +1222,64 @@ def patch_rakuten_item_detail(
     return updated_payload
 
 
+def patch_local_item_detail(raw_payload: dict[str, Any], *, title: str, tagline: str, variants: list[Any]) -> dict[str, Any]:
+    normalized_title = normalize_text(title)
+    if not normalized_title:
+        raise RuntimeError("商品标题不能为空。")
+
+    updated_payload = dict(raw_payload)
+    updated_payload["title"] = normalized_title
+    updated_payload["itemName"] = normalized_title
+    updated_payload["tagline"] = str(tagline or "").strip()
+
+    raw_variants = updated_payload.get("variants")
+    variant_updates: dict[str, Any] = {}
+    for variant in variants:
+        variant_id = normalize_text(getattr(variant, "variantId", ""))
+        standard_price = getattr(variant, "standardPrice", None)
+        if not variant_id:
+            continue
+        if standard_price is None or standard_price <= 0:
+            raise RuntimeError(f"SKU {variant_id} 价格必须大于 0。")
+        if standard_price != standard_price.to_integral_value():
+            raise RuntimeError(f"SKU {variant_id} 价格必须为日元整数。")
+        variant_updates[variant_id] = {
+            "standardPrice": str(int(standard_price)),
+            "price": str(int(standard_price)),
+            "hidden": bool(getattr(variant, "hidden", False)),
+        }
+
+    if isinstance(raw_variants, dict):
+        updated_variants = dict(raw_variants)
+        for variant_id, variant_patch in variant_updates.items():
+            current_variant = updated_variants.get(variant_id)
+            if isinstance(current_variant, dict):
+                next_variant = dict(current_variant)
+                next_variant.update(variant_patch)
+                updated_variants[variant_id] = next_variant
+        updated_payload["variants"] = updated_variants
+    elif isinstance(raw_variants, list):
+        updated_variants = []
+        for index, current_variant in enumerate(raw_variants):
+            if not isinstance(current_variant, dict):
+                updated_variants.append(current_variant)
+                continue
+            variant_id = first_text_from_keys(current_variant, ("variantId", "skuId", "merchantDefinedSkuId")) or f"sku-{index + 1}"
+            next_variant = dict(current_variant)
+            if variant_id in variant_updates:
+                next_variant.update(variant_updates[variant_id])
+            updated_variants.append(next_variant)
+        updated_payload["variants"] = updated_variants
+    elif variant_updates:
+        updated_payload["variants"] = {
+            variant_id: {"variantId": variant_id, **variant_patch}
+            for variant_id, variant_patch in variant_updates.items()
+        }
+
+    updated_payload["updated"] = datetime.now().isoformat(timespec="seconds")
+    return updated_payload
+
+
 def delete_rakuten_item(service_secret: str, license_key: str, manage_number: str) -> None:
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
@@ -1587,6 +1709,48 @@ def list_tasks(
         )
 
 
+def normalize_task_ids(task_ids: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for value in task_ids or []:
+        task_id = str(value or "").strip()
+        if task_id and task_id not in normalized:
+            normalized.append(task_id)
+    if not normalized:
+        raise RuntimeError("请选择要删除的任务。")
+    return normalized
+
+
+def delete_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
+    normalized_ids = normalize_task_ids(task_ids)
+    with session_scope() as session:
+        rows = session.scalars(
+            select(CrawlTaskModel).where(
+                CrawlTaskModel.owner_username == owner_username,
+                CrawlTaskModel.id.in_(normalized_ids),
+            )
+        ).all()
+        found_ids = {row.id for row in rows}
+        products = session.scalars(select(ProductModel).where(ProductModel.task_id.in_(list(found_ids)))).all() if found_ids else []
+        for product in products:
+            product.task_id = None
+        logs = session.scalars(
+            select(CrawlLogModel).where(
+                CrawlLogModel.owner_username == owner_username,
+                CrawlLogModel.task_id.in_(list(found_ids)),
+            )
+        ).all() if found_ids else []
+        for log in logs:
+            log.task_id = None
+        for row in rows:
+            session.delete(row)
+        deleted_ids = [row.id for row in rows]
+        return {
+            "deletedIds": deleted_ids,
+            "failedIds": [task_id for task_id in normalized_ids if task_id not in found_ids],
+            "deletedCount": len(deleted_ids),
+        }
+
+
 def list_products(
     owner_username: str,
     *,
@@ -1798,6 +1962,26 @@ def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: 
             response_key="syncTasks",
             serializer=sync_task_to_public,
         )
+
+
+def delete_sync_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
+    normalized_ids = normalize_task_ids(task_ids)
+    with session_scope() as session:
+        rows = session.scalars(
+            select(SyncTaskModel).where(
+                SyncTaskModel.owner_username == owner_username,
+                SyncTaskModel.id.in_(normalized_ids),
+            )
+        ).all()
+        found_ids = {row.id for row in rows}
+        for row in rows:
+            session.delete(row)
+        deleted_ids = [row.id for row in rows]
+        return {
+            "deletedIds": deleted_ids,
+            "failedIds": [task_id for task_id in normalized_ids if task_id not in found_ids],
+            "deletedCount": len(deleted_ids),
+        }
 
 
 def create_sync_task(owner_username: str, store_id: int) -> dict[str, Any]:
@@ -2075,6 +2259,10 @@ def update_product_status(owner_username: str, product_ids: list[int], status: s
         ).all()
         if not rows:
             raise RuntimeError("没有找到可操作的商品。")
+        if status == "error":
+            invalid_rows = [row for row in rows if row.review_status != "pending"]
+            if invalid_rows:
+                raise RuntimeError("只有待审核商品可以标记异常。")
         for row in rows:
             row.review_status = status
             if message:
@@ -2365,6 +2553,28 @@ def update_store_product_detail(owner_username: str, product_id: int, payload: A
         return product_detail_to_public(product)
 
 
+def update_product_local_detail(owner_username: str, product_id: int, payload: Any) -> dict[str, Any]:
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            raise RuntimeError("商品不存在。")
+        if product.review_status == "listed":
+            raise RuntimeError("店铺商品请使用同步修改。")
+
+        updated_payload = patch_local_item_detail(
+            product_raw_payload(product),
+            title=getattr(payload, "title", ""),
+            tagline=getattr(payload, "tagline", ""),
+            variants=list(getattr(payload, "variants", []) or []),
+        )
+        product.title = first_text_from_keys(updated_payload, ("itemName", "title", "name")) or product.title
+        product.price = price_from_rakuten_item(updated_payload)
+        product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
+        product.last_error = None
+        session.flush()
+        return product_detail_to_public(product)
+
+
 def update_store_products_listing_status(
     owner_username: str,
     product_ids: list[int],
@@ -2471,6 +2681,26 @@ def list_listing_tasks(owner_username: str, *, page: int | None = None, page_siz
             response_key="listingTasks",
             serializer=listing_task_to_public,
         )
+
+
+def delete_listing_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
+    normalized_ids = normalize_task_ids(task_ids)
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ListingTaskModel).where(
+                ListingTaskModel.owner_username == owner_username,
+                ListingTaskModel.id.in_(normalized_ids),
+            )
+        ).all()
+        found_ids = {row.id for row in rows}
+        for row in rows:
+            session.delete(row)
+        deleted_ids = [row.id for row in rows]
+        return {
+            "deletedIds": deleted_ids,
+            "failedIds": [task_id for task_id in normalized_ids if task_id not in found_ids],
+            "deletedCount": len(deleted_ids),
+        }
 
 
 def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
@@ -2675,10 +2905,8 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
         session.flush()
         task_public = task_to_public(task)
 
-    run_task(task_public["id"])
-    with session_scope() as session:
-        task = session.get(CrawlTaskModel, task_public["id"])
-        return task_to_public(task) if task else task_public
+    dispatch_crawl_task(task_public["id"])
+    return task_public
 
 
 def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
@@ -2696,10 +2924,39 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
         task.error_detail = None
         task.started_at = None
         task.finished_at = None
-    run_task(task_id)
+    dispatch_crawl_task(task_id)
     with session_scope() as session:
         task = session.get(CrawlTaskModel, task_id)
         return task_to_public(task) if task else {"id": task_id}
+
+
+def collected_item_error(item: dict[str, Any]) -> str | None:
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    detail_error = str(raw.get("detailError") or "").strip()
+    if detail_error:
+        name = str(item.get("title") or item.get("source_url") or "商品").strip()
+        return f"{name}: {detail_error}"
+    if raw.get("detailCollected") is False:
+        name = str(item.get("title") or item.get("source_url") or "商品").strip()
+        return f"{name}: 商品详情采集失败。"
+    return None
+
+
+def summarize_task_errors(errors: list[str], limit: int = 20) -> str | None:
+    unique_errors: list[str] = []
+    seen: set[str] = set()
+    for error in errors:
+        normalized = str(error or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_errors.append(normalized)
+    if not unique_errors:
+        return None
+    visible_errors = unique_errors[:limit]
+    if len(unique_errors) > limit:
+        visible_errors.append(f"另有 {len(unique_errors) - limit} 条错误未显示。")
+    return "\n".join(visible_errors)
 
 
 def run_task(task_id: str) -> None:
@@ -2722,15 +2979,35 @@ def run_task(task_id: str) -> None:
                 return
             task.total_count = len(items)
             success_count = 0
+            failed_count = 0
+            saved_count = 0
+            errors: list[str] = []
+            if not items:
+                errors.append("未采集到商品，请检查采集内容、榜单时间或乐天页面结构。")
             for item in items:
-                if upsert_product(session, owner_username, task_id, item):
+                item_error = collected_item_error(item)
+                saved = upsert_product(session, owner_username, task_id, item)
+                if saved:
+                    saved_count += 1
+                if saved and item_error is None:
                     success_count += 1
+                    continue
+                failed_count += 1
+                if item_error:
+                    errors.append(item_error)
+                elif not saved:
+                    name = str(item.get("title") or item.get("source_url") or "商品").strip()
+                    errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
             task.success_count = success_count
-            task.failed_count = max(0, len(items) - success_count)
-            task.status = "success" if task.failed_count == 0 else "partial"
+            task.failed_count = failed_count
+            if not items:
+                task.status = "failed"
+            else:
+                task.status = "success" if failed_count == 0 else "partial"
             task.finished_at = datetime.now()
-            task.message = f"完成，采集 {len(items)} 条，保存 {success_count} 条"
-        log_event(owner_username, task_id, "info", f"任务完成，保存 {success_count} 条商品")
+            task.message = f"完成，采集 {len(items)} 条，完整 {success_count} 条，异常 {failed_count} 条，入库 {saved_count} 条"
+            task.error_detail = summarize_task_errors(errors)
+        log_event(owner_username, task_id, "info", f"任务完成，完整 {success_count} 条，异常 {failed_count} 条，入库 {saved_count} 条商品")
     except Exception as exc:
         with session_scope() as session:
             task = session.get(CrawlTaskModel, task_id)
@@ -2763,7 +3040,34 @@ def collect_items(source_type: str, target: str) -> list[dict[str, Any]]:
     if source_type in {"ranking", "shop"} and period == "realtime":
         keyword = normalize_text(target).lower()
         items = [item for item in items if keyword in normalize_text(item.get("title")).lower()]
-    return items if limit is None else items[:limit]
+    limited_items = items if limit is None else items[:limit]
+    return enrich_collected_items_with_detail(limited_items)
+
+
+def enrich_collected_items_with_detail(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enriched_items: list[dict[str, Any]] = []
+    for item in items:
+        source_url = normalize_text(item.get("source_url"))
+        if not source_url:
+            enriched_items.append(item)
+            continue
+        try:
+            detail = collect_product_detail(source_url)
+        except Exception as exc:
+            fallback = dict(item)
+            raw = fallback.get("raw") if isinstance(fallback.get("raw"), dict) else {}
+            fallback["raw"] = {**raw, "detailError": str(exc), "detailCollected": False}
+            enriched_items.append(fallback)
+            continue
+        raw = detail.get("raw") if isinstance(detail.get("raw"), dict) else {}
+        list_raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        detail["raw"] = {**raw, "listPage": list_raw.get("pageUrl"), "detailCollected": True}
+        if not detail.get("price"):
+            detail["price"] = item.get("price")
+        if not detail.get("image_url"):
+            detail["image_url"] = item.get("image_url")
+        enriched_items.append(detail)
+    return enriched_items
 
 
 def strip_shop_ranking_prefix(target: str) -> str:
@@ -2833,7 +3137,7 @@ def fetch_html(url: str) -> str:
         headers={"User-Agent": settings.crawler_user_agent},
     )
     response.raise_for_status()
-    response.encoding = response.apparent_encoding or response.encoding
+    response.encoding = response.encoding or response.apparent_encoding
     return response.text
 
 
@@ -2841,10 +3145,10 @@ def parse_search_items(html: str, page_url: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "lxml")
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for link in soup.select("a[href*='item.rakuten.co.jp']"):
-        href = str(link.get("href") or "").split("?")[0]
+    for link in soup.select("a[href*='item.rakuten.co.jp'], a[href*='brandavenue.rakuten.co.jp/item/']"):
+        href = normalize_product_href(str(link.get("href") or ""), page_url)
         title = " ".join(link.get_text(" ", strip=True).split())
-        if not href or href in seen or len(title) < 4:
+        if not href or href in seen:
             continue
         seen.add(href)
         container = link.find_parent(["div", "li", "article"]) or link
@@ -2852,10 +3156,12 @@ def parse_search_items(html: str, page_url: str) -> list[dict[str, Any]]:
         image_node = container.select_one("img")
         if image_node:
             image = str(image_node.get("src") or image_node.get("data-src") or "")
+        if not title:
+            title = normalize_text(image_node.get("alt") if image_node else "")
         price = extract_price(container.get_text(" ", strip=True))
         items.append(
             {
-                "title": title[:500],
+                "title": (title or href)[:500],
                 "source_url": href,
                 "image_url": image,
                 "price": price,
@@ -2868,29 +3174,726 @@ def parse_search_items(html: str, page_url: str) -> list[dict[str, Any]]:
     return items
 
 
+def normalize_product_href(href: str, page_url: str) -> str:
+    normalized = normalize_text(href)
+    if not normalized:
+        return ""
+    absolute = urljoin(page_url, normalized)
+    if is_rakuten_product_url(absolute):
+        try:
+            return normalize_rakuten_product_target(absolute)
+        except RuntimeError:
+            return absolute.split("?", 1)[0]
+    return ""
+
+
 def collect_product_detail(url: str) -> dict[str, Any]:
     normalized_url = normalize_rakuten_product_target(url)
     html = fetch_html(normalized_url)
     soup = BeautifulSoup(html, "lxml")
-    title = ""
-    title_node = soup.select_one("h1") or soup.select_one("title")
-    if title_node:
-        title = " ".join(title_node.get_text(" ", strip=True).split())
-    image = ""
-    image_node = soup.select_one("img[src*='image.rakuten.co.jp'], img[src*='thumbnail.image.rakuten.co.jp']")
-    if image_node:
-        image = str(image_node.get("src") or "")
-    text = soup.get_text(" ", strip=True)
+    if parse_rakuten_fashion_product_code(normalized_url):
+        return collect_rakuten_fashion_product_detail(normalized_url, html, soup)
+    return collect_rakuten_market_product_detail(normalized_url, html, soup)
+
+
+def collect_rakuten_market_product_detail(normalized_url: str, html: str, soup: BeautifulSoup) -> dict[str, Any]:
+    if is_blocked_or_empty_rakuten_html(html):
+        raise RuntimeError("乐天商品详情页返回拦截页，无法通过后端 HTTP 直接采集。")
+    json_ld = extract_json_ld_objects(soup)
+    product_json = first_json_ld_by_type(json_ld, "Product")
+    embedded_item = extract_rakuten_market_item_info(soup)
+    breadcrumbs = extract_breadcrumbs_from_json_ld(json_ld)
+    if isinstance(embedded_item.get("breadcrumbs"), list):
+        breadcrumbs = embedded_item["breadcrumbs"] or breadcrumbs
+    meta = extract_page_meta(soup)
+    json_title = first_text_from_keys(product_json, ("name", "itemName", "title")) if product_json else ""
+    title = (
+        first_text_from_keys(embedded_item, ("title", "itemName", "name"))
+        or json_title
+        or first_meta_text(meta, "og:title")
+        or page_title(soup)
+    )
+    parsed_target = parse_rakuten_product_target(normalized_url)
+    shop_code = parsed_target[0] if parsed_target else ""
+    item_number = extract_item_number(normalized_url)
+    image_urls = market_item_image_urls(embedded_item, shop_code=shop_code, item_number=item_number)
+    if not image_urls and product_json:
+        image_urls = product_image_urls(product_json)
+    if not image_urls:
+        image_urls = extract_image_urls_from_soup(soup, shop_code=shop_code, item_number=item_number)
+    image_urls = unique_texts(image_urls)
+    descriptions = market_product_descriptions(product_json, soup, embedded_item)
+    offers = product_json.get("offers") if isinstance(product_json, dict) else None
+    variants = market_item_variants(embedded_item) or variants_from_json_ld_offers(offers)
+    price = price_from_rakuten_item({"variants": variants}) or price_from_rakuten_item(embedded_item)
+    if price is None and isinstance(product_json, dict):
+        price = price_from_rakuten_item(product_json)
+    if price is None:
+        price = extract_price(soup.get_text(" ", strip=True))
+    if not title or title == normalized_url:
+        raise RuntimeError("未能从乐天商品详情页解析到商品标题，可能页面被拦截或页面模板不支持。")
+    if not image_urls and price is None and not descriptions:
+        raise RuntimeError("未能从乐天商品详情页解析到有效商品数据，可能页面被拦截或页面模板不支持。")
+    raw = {
+        "sourceType": "rakuten_market_public",
+        "url": normalized_url,
+        "canonicalUrl": canonical_url(soup) or normalized_url,
+        "title": title,
+        "name": title,
+        "itemName": title,
+        "itemNumber": extract_item_number(normalized_url),
+        "manageNumber": first_text_from_keys(embedded_item, ("manageNumber",)) or item_number,
+        "shopCode": shop_code,
+        "shopName": infer_market_shop_name(soup, embedded_item, shop_code=shop_code),
+        "genreId": first_text_from_keys(embedded_item, ("rCategoryId", "genreId")),
+        "price": price,
+        "standardPrice": price,
+        "images": image_urls,
+        "productDescription": descriptions[0]["value"] if descriptions else "",
+        "descriptions": descriptions,
+        "variantSelectors": market_variant_selectors(embedded_item) or variant_selectors_from_variants(variants),
+        "variants": variants,
+        "embeddedItem": embedded_item,
+        "jsonLd": json_ld,
+        "breadcrumbs": breadcrumbs,
+        "meta": meta,
+        "collectedAt": datetime.now().isoformat(timespec="seconds"),
+    }
     return {
         "title": title[:500] or normalized_url,
         "source_url": normalized_url,
-        "image_url": image,
-        "price": extract_price(text),
-        "shop_name": "",
-        "item_number": extract_item_number(normalized_url),
-        "genre_id": "",
-        "raw": {"url": normalized_url},
+        "image_url": image_urls[0] if image_urls else "",
+        "price": price,
+        "shop_name": raw["shopName"],
+        "item_number": raw["itemNumber"],
+        "genre_id": raw["genreId"],
+        "raw": raw,
     }
+
+
+def collect_rakuten_fashion_product_detail(normalized_url: str, html: str, soup: BeautifulSoup) -> dict[str, Any]:
+    json_ld = extract_json_ld_objects(soup)
+    product_json = first_json_ld_by_type(json_ld, "Product")
+    breadcrumbs = extract_breadcrumbs_from_json_ld(json_ld)
+    meta = extract_page_meta(soup)
+    state = extract_initial_state(html)
+    product = {}
+    if isinstance(state.get("itemDetail"), dict):
+        item_data = state["itemDetail"].get("data")
+        if isinstance(item_data, dict) and isinstance(item_data.get("product"), dict):
+            product = item_data["product"]
+    brand_info = state.get("brandInfo", {}).get("data") if isinstance(state.get("brandInfo"), dict) else None
+    brand_info = brand_info if isinstance(brand_info, dict) else {}
+    model_code = first_text_from_keys(product, ("model_cd",)) or parse_rakuten_fashion_product_code(normalized_url)
+    title = (
+        first_text_from_keys(product, ("product_name", "itemName", "title", "name"))
+        or first_text_from_keys(product_json, ("name",)) if isinstance(product_json, dict) else ""
+    ) or page_title(soup)
+    image_urls = rakuten_fashion_image_urls(product)
+    if isinstance(product_json, dict):
+        image_urls.extend(product_image_urls(product_json))
+    image_urls.extend(extract_image_urls_from_soup(soup))
+    image_urls = unique_texts(image_urls)
+    descriptions = rakuten_fashion_descriptions(product, brand_info, product_json)
+    variants = rakuten_fashion_variants(product)
+    price = (
+        numeric_price(first_text_from_keys(product, ("selling_price_no_format", "selling_price")))
+        or price_from_rakuten_item({"variants": variants})
+        or price_from_rakuten_item(product)
+        or extract_price(soup.get_text(" ", strip=True))
+    )
+    genre_id = first_text_from_keys(product.get("rms_info", {}) if isinstance(product.get("rms_info"), dict) else {}, ("genre_id", "genreId"))
+    raw = {
+        "sourceType": "rakuten_fashion_public",
+        "url": normalized_url,
+        "canonicalUrl": canonical_url(soup) or normalized_url,
+        "title": title,
+        "name": title,
+        "itemName": title,
+        "modelCode": model_code,
+        "itemNumber": model_code,
+        "manageNumber": model_code,
+        "brandNo": first_text_from_keys(product, ("brand_no",)),
+        "externalCode": first_text_from_keys(product, ("external_cd",)),
+        "brand": first_text_from_keys(product, ("brand_name",)) or first_text_from_keys(brand_info, ("brand_name",)),
+        "brandKana": first_text_from_keys(product, ("brand_name_kana",)) or first_text_from_keys(brand_info, ("brand_name_kana",)),
+        "makerName": first_text_from_keys(product, ("maker_name",)),
+        "shopName": first_text_from_keys(product, ("site_name",)) or "Rakuten Fashion",
+        "genreId": genre_id,
+        "categoryLName": first_text_from_keys(product, ("category_l_name",)),
+        "categoryMName": first_text_from_keys(product, ("category_m_name",)),
+        "categoryLCode": first_text_from_keys(product, ("category_l_cd",)),
+        "categoryMCode": first_text_from_keys(product, ("category_m_cd",)),
+        "price": price,
+        "fixedPrice": first_text_from_keys(product, ("fixed_price_no_format", "fixed_price")),
+        "sellingPrice": first_text_from_keys(product, ("selling_price_no_format", "selling_price")),
+        "discountRate": product.get("discount_rate"),
+        "currency": "JPY",
+        "images": image_urls,
+        "productDescription": {"pc": first_text_from_keys(product, ("product_exp",))},
+        "descriptions": descriptions,
+        "variantSelectors": variant_selectors_from_variants(variants),
+        "variants": variants,
+        "inventory": product.get("rms_info", {}).get("inventory_list") if isinstance(product.get("rms_info"), dict) else [],
+        "favoriteCount": first_text_from_keys(product, ("favorite_count",)),
+        "saleStatus": product.get("sale_status"),
+        "saleComment": first_text_from_keys(product, ("sale_comment",)),
+        "soldout": product.get("soldout_flg"),
+        "soldoutPart": product.get("soldout_part_flg"),
+        "preorder": product.get("preorder_flg"),
+        "material": rakuten_fashion_first_sku_value(product, "material"),
+        "origin": first_text_from_keys(product, ("natives",)),
+        "rmsInfo": product.get("rms_info") if isinstance(product.get("rms_info"), dict) else {},
+        "coupons": product.get("coupon_list") if isinstance(product.get("coupon_list"), list) else [],
+        "brandInfo": brand_info,
+        "jsonLd": json_ld,
+        "breadcrumbs": breadcrumbs,
+        "meta": meta,
+        "sourceProduct": product,
+        "collectedAt": datetime.now().isoformat(timespec="seconds"),
+    }
+    return {
+        "title": title[:500] or normalized_url,
+        "source_url": normalized_url,
+        "image_url": image_urls[0] if image_urls else "",
+        "price": price,
+        "shop_name": raw["brand"] or raw["shopName"],
+        "item_number": model_code,
+        "genre_id": genre_id,
+        "raw": raw,
+    }
+
+
+def extract_initial_state(html: str) -> dict[str, Any]:
+    match = re.search(r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*\nwindow\.__REWIRED_SCHEMAS__", html, re.S)
+    if not match:
+        return {}
+    try:
+        state = json.loads(match.group(1))
+    except ValueError:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def is_blocked_or_empty_rakuten_html(html: str) -> bool:
+    text = normalize_text(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
+    if not text:
+        return True
+    if len(html or "") < 300 and re.fullmatch(r"Reference\s+#.+", text):
+        return True
+    return False
+
+
+def extract_rakuten_market_item_info(soup: BeautifulSoup) -> dict[str, Any]:
+    for script in soup.find_all("script"):
+        text = script.string or script.get_text() or ""
+        if '"itemInfoSku"' not in text or '"variantSelectors"' not in text:
+            continue
+        stripped = text.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except ValueError:
+            continue
+        for path in (("api", "data", "itemInfoSku"), ("newApi", "itemInfoSku")):
+            value: Any = payload
+            for key in path:
+                if not isinstance(value, dict):
+                    value = None
+                    break
+                value = value.get(key)
+            if isinstance(value, dict):
+                return value
+    return {}
+
+
+def extract_json_ld_objects(soup: BeautifulSoup) -> list[dict[str, Any]]:
+    objects: list[dict[str, Any]] = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        text = script.string or script.get_text() or ""
+        try:
+            value = json.loads(text)
+        except ValueError:
+            continue
+        for item in flatten_json_ld(value):
+            if isinstance(item, dict):
+                objects.append(item)
+    return objects
+
+
+def flatten_json_ld(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        result: list[Any] = []
+        for item in value:
+            result.extend(flatten_json_ld(item))
+        return result
+    if isinstance(value, dict) and isinstance(value.get("@graph"), list):
+        return flatten_json_ld(value.get("@graph"))
+    return [value]
+
+
+def first_json_ld_by_type(objects: list[dict[str, Any]], target_type: str) -> dict[str, Any]:
+    for item in objects:
+        item_type = item.get("@type")
+        if isinstance(item_type, list) and target_type in item_type:
+            return item
+        if item_type == target_type:
+            return item
+    return {}
+
+
+def extract_breadcrumbs_from_json_ld(objects: list[dict[str, Any]]) -> list[dict[str, str]]:
+    breadcrumb = first_json_ld_by_type(objects, "BreadcrumbList")
+    values = breadcrumb.get("itemListElement") if isinstance(breadcrumb, dict) else None
+    result: list[dict[str, str]] = []
+    if not isinstance(values, list):
+        return result
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        child = item.get("item") if isinstance(item.get("item"), dict) else {}
+        result.append(
+            {
+                "name": first_text_from_keys(child, ("name",)) or first_text_from_keys(item, ("name",)),
+                "url": first_text_from_keys(child, ("@id", "url")),
+            }
+        )
+    return [item for item in result if item.get("name") or item.get("url")]
+
+
+def extract_page_meta(soup: BeautifulSoup) -> dict[str, str]:
+    meta: dict[str, str] = {}
+    for node in soup.select("meta"):
+        key = normalize_text(node.get("property") or node.get("name"))
+        content = normalize_text(node.get("content"))
+        if key and content and key not in meta:
+            meta[key] = content
+    return meta
+
+
+def first_meta_text(meta: dict[str, str], key: str) -> str:
+    return normalize_text(meta.get(key))
+
+
+def page_title(soup: BeautifulSoup) -> str:
+    title_node = soup.select_one("h1") or soup.select_one("title")
+    return normalize_text(title_node.get_text(" ", strip=True) if title_node else "")
+
+
+def canonical_url(soup: BeautifulSoup) -> str:
+    node = soup.find("link", rel="canonical")
+    return normalize_text(node.get("href") if node else "")
+
+
+def infer_market_shop_name(soup: BeautifulSoup, embedded_item: dict[str, Any] | None = None, shop_code: str = "") -> str:
+    if embedded_item:
+        shop_status = embedded_item.get("shopStatus")
+        if isinstance(shop_status, dict):
+            name = first_text_from_keys(shop_status, ("shopName", "name"))
+            if name:
+                return name
+    if soup.title:
+        title = normalize_text(soup.title.get_text(" ", strip=True))
+        if "：" in title:
+            candidate = title.rsplit("：", 1)[-1].strip()
+            if candidate and candidate != "楽天市場":
+                return candidate
+    for selector in ("meta[property='og:site_name']", "#shopName", ".shopName"):
+        node = soup.select_one(selector)
+        value = normalize_text(node.get("content") if node and node.name == "meta" else node.get_text(" ", strip=True) if node else "")
+        if value and value != "楽天市場":
+            return value
+    return normalize_shop_code(shop_code)
+
+
+def market_product_descriptions(
+    product_json: dict[str, Any],
+    soup: BeautifulSoup,
+    embedded_item: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    descriptions: list[dict[str, str]] = []
+    description = first_text_from_keys(product_json, ("description",)) if isinstance(product_json, dict) else ""
+    if description:
+        descriptions.append({"label": "商品说明", "value": description})
+    if embedded_item:
+        embedded_descriptions = (
+            ("商品说明", embedded_item.get("newProductDescription")),
+            ("PC商品说明", (embedded_item.get("pcFields") or {}).get("productDescription") if isinstance(embedded_item.get("pcFields"), dict) else None),
+            ("销售说明", embedded_item.get("salesDescription")),
+        )
+        for label, value in embedded_descriptions:
+            html_value = normalize_detail_html(value)
+            if html_value and all(item["value"] != html_value for item in descriptions):
+                descriptions.append({"label": label, "value": html_value})
+    for selector, label in (
+        ("#itemCaption", "商品说明"),
+        ("#itemDescription", "商品详情"),
+        ("[class*='description']", "商品说明"),
+    ):
+        node = soup.select_one(selector)
+        if node:
+            html_value = normalize_detail_html(str(node))
+            if html_value and all(item["value"] != html_value for item in descriptions):
+                descriptions.append({"label": label, "value": html_value})
+    return descriptions
+
+
+def market_item_image_urls(item: dict[str, Any], *, shop_code: str, item_number: str) -> list[str]:
+    urls: list[str] = []
+    media = item.get("media") if isinstance(item.get("media"), dict) else {}
+    pc_fields = item.get("pcFields") if isinstance(item.get("pcFields"), dict) else {}
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            url = normalize_product_image_url(value, shop_code=shop_code)
+            if is_relevant_market_item_image(url, shop_code=shop_code, item_number=item_number) and url not in urls:
+                urls.append(url)
+            return
+        if isinstance(value, dict):
+            for key in ("location", "url", "imageUrl", "src"):
+                collect(value.get(key))
+            for child in value.values():
+                collect(child)
+            return
+        if isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    collect(pc_fields.get("images"))
+    collect(media.get("images"))
+    collect(media.get("skuImages"))
+    collect(item.get("picImageUrl"))
+    for sku in item.get("sku") if isinstance(item.get("sku"), list) else []:
+        if isinstance(sku, dict):
+            collect(sku.get("images"))
+    for description in (item.get("newProductDescription"), item.get("salesDescription")):
+        for match in re.findall(r"https?://[^\s\"'<>)]*\.(?:apng|avif|bmp|gif|jpe?g|png|webp)(?:\?[^\"'<>)]*)?", str(description or ""), flags=re.I):
+            collect(match)
+    return urls
+
+
+def is_relevant_market_item_image(url: str, *, shop_code: str, item_number: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return False
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    normalized_shop = normalize_shop_code(shop_code).lower()
+    if host == "r.r10s.jp":
+        return False
+    if normalized_shop and normalized_shop not in path and normalized_shop not in host:
+        return False
+    item_tokens = item_number_image_tokens(item_number)
+    if item_tokens:
+        return any(token in path for token in item_tokens)
+    if "/cabinet/" in path and normalized_shop and (normalized_shop in path or normalized_shop in host):
+        return True
+    if host in {"image.rakuten.co.jp", "tshop.r10s.jp", "cabinet.rms.rakuten.co.jp"}:
+        return True
+    return False
+
+
+def item_number_image_tokens(item_number: str) -> list[str]:
+    normalized = normalize_text(item_number).lower()
+    tokens = [normalized] if normalized else []
+    for part in re.split(r"[^a-z0-9]+", normalized):
+        if len(part) >= 4 and part not in tokens:
+            tokens.append(part)
+    return tokens
+
+
+def market_item_variants(item: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    skus = item.get("sku")
+    if not isinstance(skus, list):
+        return {}
+    selectors = item.get("variantSelectors") if isinstance(item.get("variantSelectors"), list) else []
+    purchase_info = item.get("purchaseInfo") if isinstance(item.get("purchaseInfo"), dict) else {}
+    purchase_skus = purchase_info.get("sku") if isinstance(purchase_info.get("sku"), list) else []
+    purchase_by_variant = {
+        first_text_from_keys(row, ("variantId",)): row for row in purchase_skus if isinstance(row, dict)
+    }
+    inventories = purchase_info.get("variantMappedInventories") if isinstance(purchase_info.get("variantMappedInventories"), list) else []
+    inventory_by_variant = {
+        first_text_from_keys(row, ("sku",)): row for row in inventories if isinstance(row, dict)
+    }
+    result: dict[str, dict[str, Any]] = {}
+    for index, sku in enumerate(skus, start=1):
+        if not isinstance(sku, dict):
+            continue
+        variant_id = first_text_from_keys(sku, ("variantId",)) or f"sku-{index}"
+        purchase_row = purchase_by_variant.get(variant_id, {})
+        inventory_row = inventory_by_variant.get(variant_id, {})
+        purchase_sku = purchase_row.get("newPurchaseSku") if isinstance(purchase_row.get("newPurchaseSku"), dict) else {}
+        selector_values = market_selector_values(sku.get("selectorValues"), selectors)
+        price = (
+            first_text_from_keys(sku, ("taxIncludedPrice", "standardPrice", "price"))
+            or first_text_from_keys(purchase_row, ("taxIncludedPrice", "standardPrice", "price"))
+        )
+        result[variant_id] = {
+            "variantId": variant_id,
+            "merchantDefinedSkuId": first_text_from_keys(sku, ("merchantDefinedSkuId",)),
+            "articleNumber": first_text_value(sku.get("articleNumber")),
+            "standardPrice": price,
+            "hidden": bool(sku.get("hidden")),
+            "selectorValues": selector_values,
+            "specs": market_named_values(sku.get("specs")),
+            "attributes": market_named_values(sku.get("attributes")),
+            "inventoryId": first_text_from_keys(inventory_row, ("inventoryId",)),
+            "material": first_attribute_value(sku.get("attributes"), ("素材", "素材（生地・毛糸）")),
+            "images": product_image_urls({"images": sku.get("images")}),
+            "referencePrice": first_text_from_keys(sku.get("referencePrice", {}) if isinstance(sku.get("referencePrice"), dict) else {}, ("value",)),
+        }
+    return result
+
+
+def market_variant_selectors(item: dict[str, Any]) -> list[dict[str, Any]]:
+    selectors = item.get("variantSelectors") if isinstance(item.get("variantSelectors"), list) else []
+    result: list[dict[str, Any]] = []
+    for index, selector in enumerate(selectors, start=1):
+        if not isinstance(selector, dict):
+            continue
+        key = first_text_from_keys(selector, ("key",)) or f"k{index}"
+        result.append(
+            {
+                "key": key,
+                "name": first_text_from_keys(selector, ("label", "name", "displayName")) or key,
+                "values": selector_values_to_public(selector.get("values")),
+            }
+        )
+    return result
+
+
+def market_selector_values(values: Any, selectors: list[Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if not isinstance(values, list):
+        return result
+    for index, value in enumerate(values):
+        selector = selectors[index] if index < len(selectors) and isinstance(selectors[index], dict) else {}
+        key = first_text_from_keys(selector, ("key",)) or f"k{index + 1}"
+        result[key] = first_text_value(value)
+    return result
+
+
+def market_named_values(values: Any) -> list[dict[str, str]]:
+    if not isinstance(values, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        name = first_text_from_keys(item, ("title", "name", "label"))
+        value = first_text_from_keys(item, ("value", "text"))
+        if name or value:
+            result.append({"name": name, "value": value})
+    return result
+
+
+def first_attribute_value(values: Any, labels: tuple[str, ...]) -> str:
+    if not isinstance(values, list):
+        return ""
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        title = first_text_from_keys(item, ("title", "name", "label"))
+        if any(label in title for label in labels):
+            return first_text_from_keys(item, ("value", "text"))
+    return ""
+
+
+def variants_from_json_ld_offers(offers: Any) -> dict[str, dict[str, Any]]:
+    offer_items = offers if isinstance(offers, list) else [offers] if isinstance(offers, dict) else []
+    variants: dict[str, dict[str, Any]] = {}
+    for index, offer in enumerate(offer_items, start=1):
+        if not isinstance(offer, dict):
+            continue
+        sku = first_text_from_keys(offer, ("sku", "mpn")) or f"sku-{index}"
+        variants[sku] = {
+            "variantId": sku,
+            "merchantDefinedSkuId": sku,
+            "standardPrice": first_text_from_keys(offer, ("price",)),
+            "hidden": "OutOfStock" in first_text_from_keys(offer, ("availability",)),
+            "selectorValues": {},
+            "images": [first_text_from_keys(offer, ("image",))] if first_text_from_keys(offer, ("image",)) else [],
+            "availability": first_text_from_keys(offer, ("availability",)),
+            "itemCondition": first_text_from_keys(offer, ("itemCondition",)),
+        }
+    return variants
+
+
+def rakuten_fashion_image_urls(product: dict[str, Any]) -> list[str]:
+    filenames: list[str] = []
+
+    def remember_filename(value: Any) -> None:
+        text = normalize_text(value)
+        if not text or not re.search(r"\.(?:jpe?g|png|webp|gif)$", text, flags=re.I):
+            return
+        if text not in filenames:
+            filenames.append(text)
+
+    for key in ("product_img_path",):
+        remember_filename(product.get(key))
+    sku_images = product.get("product_sku_img_path")
+    if isinstance(sku_images, dict):
+        for value in sku_images.values():
+            remember_filename(value)
+    sku_sub_images = product.get("product_sku_img_path_sub")
+    if isinstance(sku_sub_images, list):
+        for value in sku_sub_images:
+            remember_filename(value)
+    model_info = product.get("product_sku_img_model_info")
+    if isinstance(model_info, dict):
+        for key in model_info.keys():
+            remember_filename(key)
+    return unique_texts([rakuten_fashion_image_url(filename) for filename in filenames])
+
+
+def rakuten_fashion_image_url(filename: str) -> str:
+    normalized = normalize_text(filename).lower()
+    match = re.search(r"([a-z0-9]+)-", normalized)
+    directory = ""
+    if match:
+        code = match.group(1)
+        directory = code[-3:]
+    if not directory:
+        directory = "000"
+    return f"{RAKUTEN_FASHION_IMAGE_BASE}/{directory}/{normalized}"
+
+
+def rakuten_fashion_descriptions(
+    product: dict[str, Any],
+    brand_info: dict[str, Any],
+    product_json: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    descriptions: list[dict[str, str]] = []
+    product_exp = first_text_from_keys(product, ("product_exp",))
+    if product_exp:
+        descriptions.append({"label": "商品说明", "value": normalize_detail_html(product_exp)})
+    json_description = first_text_from_keys(product_json or {}, ("description",))
+    if json_description and all(item["value"] != json_description for item in descriptions):
+        descriptions.append({"label": "结构化商品说明", "value": json_description})
+    brand_exp = first_text_from_keys(brand_info, ("brand_exp",))
+    if brand_exp:
+        descriptions.append({"label": "品牌说明", "value": normalize_detail_html(brand_exp)})
+    return descriptions
+
+
+def rakuten_fashion_variants(product: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    skus = product.get("product_sku")
+    if not isinstance(skus, list):
+        return {}
+    variants: dict[str, dict[str, Any]] = {}
+    for index, sku in enumerate(skus, start=1):
+        if not isinstance(sku, dict):
+            continue
+        inventory = sku.get("inventory_info") if isinstance(sku.get("inventory_info"), dict) else {}
+        variant_id = first_text_from_keys(sku, ("inventory_id",)) or first_text_from_keys(inventory, ("variant_id", "inventory_id")) or f"sku-{index}"
+        color = first_text_from_keys(sku, ("rms_v_choise_name", "product_color_name")) or first_text_from_keys(inventory, ("color_name",))
+        size = first_text_from_keys(sku, ("rms_h_choise_name", "product_size_name")) or first_text_from_keys(inventory, ("size",))
+        image_path = first_text_from_keys(sku, ("product_img_path",))
+        variants[variant_id] = {
+            "variantId": variant_id,
+            "merchantDefinedSkuId": variant_id,
+            "articleNumber": "",
+            "standardPrice": first_text_from_keys(sku, ("selling_price_with_tax", "selling_price_tax_included", "tax_included_selling_price"))
+            or first_text_from_keys(product, ("selling_price_no_format",))
+            or first_text_from_keys(sku, ("selling_price", "fixed_price")),
+            "displayPrice": first_text_from_keys(product, ("selling_price",)) or first_text_from_keys(sku, ("selling_price",)),
+            "fixedPrice": first_text_from_keys(sku, ("fixed_price",)),
+            "hidden": first_text_from_keys(sku, ("inventory_exist_flg",)) == "0",
+            "selectorValues": {"color": color, "size": size},
+            "specs": [
+                {"name": "素材", "value": first_text_from_keys(sku, ("material",))},
+                {"name": "発送予定", "value": first_text_from_keys(sku, ("inventory_status_message",))},
+            ],
+            "attributes": [
+                {"name": "颜色代码", "value": first_text_from_keys(sku, ("product_color_cd",))},
+            ],
+            "inventoryId": first_text_from_keys(sku, ("inventory_id",)),
+            "material": first_text_from_keys(sku, ("material",)),
+            "images": [rakuten_fashion_image_url(image_path)] if image_path else [],
+        }
+    return variants
+
+
+def rakuten_fashion_first_sku_value(product: dict[str, Any], key: str) -> str:
+    skus = product.get("product_sku")
+    if not isinstance(skus, list):
+        return ""
+    for sku in skus:
+        if isinstance(sku, dict):
+            value = first_text_from_keys(sku, (key,))
+            if value:
+                return value
+    return ""
+
+
+def variant_selectors_from_variants(variants: Any) -> list[dict[str, Any]]:
+    variant_values = variants.values() if isinstance(variants, dict) else variants if isinstance(variants, list) else []
+    selectors: dict[str, list[str]] = {}
+    for variant in variant_values:
+        if not isinstance(variant, dict):
+            continue
+        selector_values = variant.get("selectorValues")
+        if not isinstance(selector_values, dict):
+            continue
+        for key, value in selector_values.items():
+            text = normalize_text(value)
+            if not text:
+                continue
+            selectors.setdefault(str(key), [])
+            if text not in selectors[str(key)]:
+                selectors[str(key)].append(text)
+    return [{"key": key, "name": selector_display_name(key), "values": values} for key, values in selectors.items()]
+
+
+def selector_display_name(key: str) -> str:
+    return {"color": "颜色", "size": "尺码"}.get(key, key)
+
+
+def extract_image_urls_from_soup(soup: BeautifulSoup) -> list[str]:
+    urls: list[str] = []
+    for node in soup.select("img"):
+        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+            value = node.get(attr)
+            if value:
+                normalized = normalize_product_image_url(value)
+                if normalized:
+                    urls.append(normalized)
+    return unique_texts(urls)
+
+
+def unique_texts(values: list[Any]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = normalize_text(value)
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def normalize_detail_html(value: Any) -> str:
+    text = str(value or "").replace("\\/", "/")
+    text = unescape(text)
+    text = re.sub(r"<script[\s\S]*?</script>", "", text, flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.I)
+    return text.strip()
+
+
+def numeric_price(value: Any) -> float | None:
+    text = first_text_value(value)
+    if not text:
+        return None
+    normalized = re.sub(r"[^0-9.]", "", text)
+    if not normalized:
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
 
 
 def extract_price(text: str) -> float | None:

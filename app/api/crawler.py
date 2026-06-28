@@ -27,6 +27,10 @@ class CreateTaskPayload(BaseModel):
     mode: str = "manual"
 
 
+class TaskDeletePayload(BaseModel):
+    taskIds: list[str] = Field(default_factory=list)
+
+
 class StorePayload(BaseModel):
     aliasName: str = ""
     platform: str = "rakuten"
@@ -181,6 +185,14 @@ def restart_task(task_id: str, user: dict = Depends(require_authenticated_accoun
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.api_route("/tasks", methods=["DELETE"])
+def delete_tasks(payload: TaskDeletePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+    try:
+        return crawler_service.delete_tasks(user["username"], payload.taskIds)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/products")
 def list_products(
     status: str | None = Query(default=None),
@@ -291,6 +303,18 @@ def update_product_detail(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.put("/products/{product_id}/local-detail")
+def update_product_local_detail(
+    product_id: int,
+    payload: ProductDetailEditPayload,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return {"product": crawler_service.update_product_local_detail(user["username"], product_id, payload)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/stores")
 def list_stores(
     page: int | None = Query(default=None, ge=1),
@@ -361,6 +385,14 @@ def retry_sync_task(task_id: str, user: dict = Depends(require_authenticated_acc
     try:
         task = crawler_service.retry_sync_task(user["username"], task_id)
         return {"syncTask": task}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.api_route("/sync-tasks", methods=["DELETE"])
+def delete_sync_tasks(payload: TaskDeletePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+    try:
+        return crawler_service.delete_sync_tasks(user["username"], payload.taskIds)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -443,6 +475,14 @@ def retry_listing_task(task_id: str, user: dict = Depends(require_authenticated_
     try:
         task = crawler_service.retry_listing_task(user["username"], task_id)
         return {"listingTask": task}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.api_route("/listing-tasks", methods=["DELETE"])
+def delete_listing_tasks(payload: TaskDeletePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+    try:
+        return crawler_service.delete_listing_tasks(user["username"], payload.taskIds)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
