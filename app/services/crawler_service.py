@@ -6,6 +6,7 @@ import uuid
 import base64
 import hashlib
 import mimetypes
+import shutil
 import xml.etree.ElementTree as ET
 import time
 import threading
@@ -3689,6 +3690,17 @@ def remove_local_product_image_if_unused(image_url: str, current_images: list[st
         path.unlink(missing_ok=True)
 
 
+def clear_product_temp_image_files(product_id: int) -> None:
+    image_dir = (LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id))).resolve()
+    root = LOCAL_PRODUCT_IMAGE_DIR.resolve()
+    try:
+        image_dir.relative_to(root)
+    except ValueError:
+        return
+    if image_dir.exists() and image_dir.is_dir():
+        shutil.rmtree(image_dir, ignore_errors=True)
+
+
 def product_image_download_name(product_id: int, image_index: int, image_url: str) -> str:
     try:
         suffix = Path(urlsplit(image_url).path).suffix.lower()
@@ -3958,6 +3970,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
                 product.listed_at = datetime.now()
                 product.store_last_seen_at = datetime.now()
                 product.last_error = None
+                clear_product_temp_image_files(product.id)
                 success_count += 1
             except Exception as exc:
                 error_text = str(exc)
