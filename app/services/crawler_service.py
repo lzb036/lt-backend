@@ -180,6 +180,7 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "storeLastSeenAt": row.store_last_seen_at.isoformat(sep=" ") if row.store_last_seen_at else None,
         "title": row.title,
         "sourceUrl": row.source_url,
+        "rakutenItemUrl": product_rakuten_item_url(row, raw_payload),
         "itemNumber": row.item_number,
         "shopName": row.shop_name,
         "imageUrl": row.image_url,
@@ -195,6 +196,23 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
         "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
     }
+
+
+def product_rakuten_item_url(row: ProductModel, raw_payload: dict[str, Any]) -> str:
+    if row.review_status != "listed":
+        return row.source_url
+    listing_store = raw_payload.get("listingStore") if isinstance(raw_payload.get("listingStore"), dict) else {}
+    shop_code = (
+        first_text_from_keys(listing_store, ("storeCode", "shopCode"))
+        or normalize_shop_code(row.image_url)
+        or normalize_shop_code(first_text_from_keys(raw_payload, ("itemUrl", "itemPageUrl", "url")))
+    )
+    item_number = (
+        normalize_text(row.item_number)
+        or first_text_from_keys(raw_payload, ("itemNumber", "manageNumber"))
+        or normalize_text(row.rakuten_manage_number)
+    )
+    return build_public_item_page_url(shop_code, item_number) or row.source_url
 
 
 def product_raw_payload(row: ProductModel) -> dict[str, Any]:
@@ -268,6 +286,7 @@ def product_detail_to_public(row: ProductModel) -> dict[str, Any]:
         "genreId": first_text_from_keys(raw_payload, ("genreId", "genre_id", "genre")) or row.genre_id,
         "shopName": row.shop_name,
         "sourceUrl": row.source_url,
+        "rakutenItemUrl": product_rakuten_item_url(row, raw_payload),
         "listingStatus": row.rakuten_listing_status,
         "salesCount": product_sales_count(raw_payload),
         "created": first_text_from_keys(raw_payload, ("created",)),
@@ -466,8 +485,12 @@ def product_cabinet_file_targets(raw_payload: dict[str, Any], shop_code: str) ->
                 continue
             if is_ignored_cabinet_image_filename(path):
                 continue
-            seen.add(path)
-            targets.append({"filePath": path, "fileName": path.rsplit("/", 1)[-1]})
+            target = cabinet_target_from_path(path)
+            target_key = "|".join([target.get("folderPath", ""), target.get("filePath", ""), target.get("fileName", "")])
+            if target_key in seen:
+                continue
+            seen.add(target_key)
+            targets.append(target)
 
     def walk(value: Any) -> None:
         if isinstance(value, str):
@@ -484,6 +507,23 @@ def product_cabinet_file_targets(raw_payload: dict[str, Any], shop_code: str) ->
     for url in product_image_urls(raw_payload, shop_code=shop_code):
         remember(url)
     return targets
+
+
+def cabinet_target_from_path(path: str) -> dict[str, str]:
+    normalized_path = normalize_cabinet_path(path)
+    without_cabinet = normalized_path
+    if without_cabinet.lower().startswith("/cabinet/"):
+        without_cabinet = without_cabinet[len("/cabinet/") :]
+    else:
+        without_cabinet = without_cabinet.lstrip("/")
+    folder_path, _, file_path = without_cabinet.rpartition("/")
+    file_name = file_path or without_cabinet
+    return {
+        "folderPath": f"/{folder_path}" if folder_path else "",
+        "filePath": file_path or file_name,
+        "fileName": file_name,
+        "cabinetPath": normalized_path,
+    }
 
 
 def cabinet_paths_from_text(value: Any, shop_code: str) -> list[str]:
@@ -2672,6 +2712,97 @@ def create_listing_status_sync_task(owner_username: str, store_id: int, listing_
         }
 
 
+def create_product_listing_status_sync_task(owner_username: str, product_ids: list[int], listing_status: str) -> dict[str, Any]:
+    if listing_status not in {"listed", "unlisted"}:
+        raise RuntimeError("上架状态不合法。")
+    normalized_ids = normalize_product_ids(product_ids)
+    if not normalized_ids:
+        raise RuntimeError("请先选择商品。")
+    action_label = "批量上架" if listing_status == "listed" else "批量下架"
+    store_id = validate_sync_task_products(owner_username, normalized_ids)
+    task_id = create_sync_task_record(
+        owner_username,
+        store_id,
+        task_type="product_listing_status",
+        task_name_prefix=action_label,
+        message=f"等待执行{action_label}",
+        payload={"listingStatus": listing_status, "productIds": normalized_ids},
+    )
+    dispatch_sync_task(owner_username, task_id)
+    return created_sync_task_response(task_id, message=f"{action_label}任务已创建")
+
+
+def create_product_delete_sync_task(owner_username: str, product_ids: list[int]) -> dict[str, Any]:
+    normalized_ids = normalize_product_ids(product_ids)
+    if not normalized_ids:
+        raise RuntimeError("请先选择商品。")
+    store_id = validate_sync_task_products(owner_username, normalized_ids)
+    task_id = create_sync_task_record(
+        owner_username,
+        store_id,
+        task_type="product_delete",
+        task_name_prefix="批量删除",
+        message="等待执行批量删除",
+        payload={"productIds": normalized_ids},
+    )
+    dispatch_sync_task(owner_username, task_id)
+    return created_sync_task_response(task_id, message="批量删除任务已创建")
+
+
+def normalize_product_ids(product_ids: list[int]) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for value in product_ids or []:
+        product_id = int(value)
+        if product_id in seen:
+            continue
+        seen.add(product_id)
+        result.append(product_id)
+    return result
+
+
+def validate_sync_task_products(owner_username: str, product_ids: list[int]) -> int:
+    with session_scope() as session:
+        products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(product_ids),
+                ProductModel.review_status == "listed",
+            )
+        ).all()
+        found_ids = {product.id for product in products}
+        missing_ids = [product_id for product_id in product_ids if product_id not in found_ids]
+        if missing_ids:
+            raise RuntimeError(f"存在不可操作的店铺商品：{', '.join(str(value) for value in missing_ids[:10])}")
+        store_ids = {product.store_id for product in products if product.store_id}
+        if not products or len(store_ids) != 1:
+            raise RuntimeError("请选择同一个店铺下的店铺商品。")
+        store_id = int(next(iter(store_ids)))
+        store = session.get(StoreModel, store_id)
+        if store is None:
+            raise RuntimeError("商品关联店铺不存在。")
+        if not store.enabled:
+            raise RuntimeError("商品关联店铺已停用，不能创建同步任务。")
+        return store_id
+
+
+def created_sync_task_response(task_id: str, *, message: str) -> dict[str, Any]:
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        store = session.get(StoreModel, task.store_id) if task and task.store_id else None
+        return {
+            "syncTask": sync_task_to_public(task) if task else {"id": task_id},
+            "store": store_to_public(store) if store else None,
+            "summary": {
+                "total": 0,
+                "successCount": 0,
+                "failedCount": 0,
+                "message": message,
+                "errors": [],
+            },
+        }
+
+
 def create_sync_task_record(
     owner_username: str,
     store_id: int,
@@ -2735,6 +2866,32 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             status = "success" if failed_count == 0 else "partial"
             message = f"完成，{action_label} {success_count} 条，异常 {failed_count} 条"
             error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
+        elif task_type == "product_listing_status":
+            listing_status = normalize_text(payload.get("listingStatus"))
+            product_ids = normalize_product_ids(list(payload.get("productIds") or []))
+            result = perform_product_listing_status_sync(owner_username, store_id, product_ids, listing_status)
+            total_count = int(result.get("totalCount") or 0)
+            success_count = int(result.get("successCount") or 0)
+            failed_count = int(result.get("failedCount") or 0)
+            action_label = "上架" if listing_status == "listed" else "下架"
+            status = "success" if failed_count == 0 else "partial"
+            message = f"完成，{action_label} {success_count} 条，异常 {failed_count} 条"
+            error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
+        elif task_type == "product_delete":
+            product_ids = normalize_product_ids(list(payload.get("productIds") or []))
+            result = perform_product_delete_sync(owner_username, store_id, product_ids)
+            total_count = int(result.get("totalCount") or 0)
+            success_count = int(result.get("successCount") or 0)
+            failed_count = int(result.get("failedCount") or 0)
+            cabinet_deleted_count = int(result.get("cabinetDeletedCount") or 0)
+            status = "success" if failed_count == 0 else "partial"
+            message = f"完成，删除 {success_count} 条，异常 {failed_count} 条"
+            if cabinet_deleted_count:
+                message = f"{message}，同步删除图片 {cabinet_deleted_count} 张"
+            error_detail = summarize_task_errors(
+                [*list(result.get("errors") or []), *list(result.get("warnings") or [])],
+                limit=50,
+            )
         else:
             result = perform_store_sync(owner_username, store_id)
             total_count = int(result.get("totalCount") or 0)
@@ -2771,13 +2928,16 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
 
 
 def sync_task_running_message(task: SyncTaskModel) -> str:
-    if (task.task_type or "store_sync") == "listing_status":
+    task_type = task.task_type or "store_sync"
+    if task_type in {"listing_status", "product_listing_status"}:
         try:
             payload = json.loads(task.payload_json or "{}")
         except ValueError:
             payload = {}
         action_label = "上架" if normalize_text(payload.get("listingStatus")) == "listed" else "下架"
-        return f"正在执行全部{action_label}"
+        return f"正在执行{'全部' if task_type == 'listing_status' else '批量'}{action_label}"
+    if task_type == "product_delete":
+        return "正在执行批量删除"
     return "正在同步店铺商品"
 
 
@@ -2808,6 +2968,97 @@ def perform_store_listing_status_sync(owner_username: str, store_id: int, listin
             "successCount": summary["successCount"],
             "failedCount": summary["failedCount"],
             "errors": summary["errors"],
+        }
+
+
+def perform_product_listing_status_sync(
+    owner_username: str,
+    store_id: int,
+    product_ids: list[int],
+    listing_status: str,
+) -> dict[str, Any]:
+    if listing_status not in {"listed", "unlisted"}:
+        raise RuntimeError("上架状态不合法。")
+    if not product_ids:
+        raise RuntimeError("同步任务缺少商品。")
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        if store is None:
+            raise RuntimeError("店铺不存在。")
+        if not store.enabled:
+            raise RuntimeError("店铺已停用，不能更新上架状态。")
+        products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.store_id == store_id,
+                ProductModel.id.in_(product_ids),
+                ProductModel.review_status == "listed",
+            )
+        ).all()
+        found_ids = {product.id for product in products}
+        missing_ids = [product_id for product_id in product_ids if product_id not in found_ids]
+        result = apply_products_listing_status(session, products, listing_status) if products else {"successIds": [], "errors": []}
+        errors = list(result.get("errors") or [])
+        errors.extend(f"{product_id}: 商品不存在或不是店铺商品" for product_id in missing_ids)
+        session.flush()
+        success_count = len(result.get("successIds") or [])
+        failed_count = max(0, len(product_ids) - success_count)
+        return {
+            "store": store_to_public(store),
+            "totalCount": len(product_ids),
+            "successCount": success_count,
+            "failedCount": failed_count,
+            "errors": errors,
+        }
+
+
+def perform_product_delete_sync(owner_username: str, store_id: int, product_ids: list[int]) -> dict[str, Any]:
+    if not product_ids:
+        raise RuntimeError("同步任务缺少商品。")
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        if store is None:
+            raise RuntimeError("店铺不存在。")
+        if not store.enabled:
+            raise RuntimeError("店铺已停用，不能删除商品。")
+        rows = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.store_id == store_id,
+                ProductModel.id.in_(product_ids),
+                ProductModel.review_status == "listed",
+            )
+        ).all()
+        found_ids = {row.id for row in rows}
+        missing_ids = [product_id for product_id in product_ids if product_id not in found_ids]
+        success_count = 0
+        failed_count = len(missing_ids)
+        cabinet_deleted_count = 0
+        errors = [f"{product_id}: 商品不存在或不是店铺商品" for product_id in missing_ids]
+        warnings: list[str] = []
+        credential_cache: dict[int, tuple[StoreModel, str, str]] = {}
+        for row in rows:
+            try:
+                delete_store_product_from_rakuten(session, row, credential_cache)
+                cabinet_deleted_count += int(getattr(row, "_deleted_cabinet_count", 0) or 0)
+            except Exception as exc:
+                failed_count += 1
+                error_text = str(exc)
+                row.last_error = error_text
+                errors.append(f"{productCodeForError(row)}: {error_text}")
+                continue
+            warnings.extend(getattr(row, "_delete_warnings", []) or [])
+            session.delete(row)
+            success_count += 1
+        session.flush()
+        return {
+            "store": store_to_public(store),
+            "totalCount": len(product_ids),
+            "successCount": success_count,
+            "failedCount": failed_count,
+            "cabinetDeletedCount": cabinet_deleted_count,
+            "errors": errors,
+            "warnings": warnings,
         }
 
 
@@ -3028,6 +3279,22 @@ def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, An
         ).all()
         if not rows:
             raise RuntimeError("没有找到可删除的商品。")
+        if any(row.review_status == "listed" for row in rows):
+            if any(row.review_status != "listed" for row in rows):
+                raise RuntimeError("店铺商品删除任务不能和其他状态商品混选。")
+            if len({row.store_id for row in rows if row.store_id}) != 1:
+                raise RuntimeError("请选择同一个店铺下的店铺商品。")
+            return create_product_delete_sync_task(owner_username, normalized_ids)
+
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(normalized_ids),
+            )
+        ).all()
+        if not rows:
+            raise RuntimeError("没有找到可删除的商品。")
 
         success_count = 0
         failed_count = 0
@@ -3141,10 +3408,16 @@ def delete_product_cabinet_images(
 def resolve_cabinet_file_ids(service_secret: str, license_key: str, target: dict[str, str]) -> list[int]:
     file_path = normalize_text(target.get("filePath"))
     file_name = normalize_text(target.get("fileName"))
+    folder_path = normalize_text(target.get("folderPath"))
+    cabinet_path = normalize_text(target.get("cabinetPath"))
     if file_name:
         records = search_rakuten_cabinet_files(service_secret, license_key, file_name=file_name)
-        if file_path:
-            exact_ids = [int(record["fileId"]) for record in records if cabinet_record_matches_target(record, file_path)]
+        if file_path or folder_path or cabinet_path:
+            exact_ids = [
+                int(record["fileId"])
+                for record in records
+                if cabinet_record_matches_target(record, file_path, folder_path=folder_path, cabinet_path=cabinet_path)
+            ]
             if exact_ids:
                 return exact_ids
         if len(records) == 1:
@@ -3154,14 +3427,34 @@ def resolve_cabinet_file_ids(service_secret: str, license_key: str, target: dict
             records = search_rakuten_cabinet_files(service_secret, license_key, file_path=file_path)
         except RuntimeError:
             records = []
-        exact_ids = [int(record["fileId"]) for record in records if cabinet_record_matches_target(record, file_path)]
+        exact_ids = [
+            int(record["fileId"])
+            for record in records
+            if cabinet_record_matches_target(record, file_path, folder_path=folder_path, cabinet_path=cabinet_path)
+        ]
         if exact_ids:
             return exact_ids
     return []
 
 
-def cabinet_record_matches_target(record: dict[str, Any], file_path: str) -> bool:
-    expected = normalize_cabinet_path(file_path)
+def cabinet_record_matches_target(
+    record: dict[str, Any],
+    file_path: str,
+    *,
+    folder_path: str = "",
+    cabinet_path: str = "",
+) -> bool:
+    expected = normalize_cabinet_path(cabinet_path or file_path)
+    expected_file_path = normalize_text(file_path).strip("/").lower()
+    expected_folder_path = normalize_text(folder_path).strip("/").lower()
+    record_file_path = normalize_text(record.get("filePath")).strip("/").lower()
+    record_folder_path = normalize_text(record.get("folderPath")).strip("/").lower()
+    if expected_file_path and record_file_path != expected_file_path:
+        return False
+    if expected_folder_path and record_folder_path != expected_folder_path:
+        return False
+    if expected_file_path or expected_folder_path:
+        return True
     for value in (
         record.get("fileUrl"),
         cabinet_record_path(record),
@@ -4364,30 +4657,7 @@ def update_store_products_listing_status(
     normalized_ids = [int(value) for value in (product_ids or [])]
     if not normalized_ids:
         raise RuntimeError("请先选择商品。")
-
-    with session_scope() as session:
-        products = session.scalars(
-            select(ProductModel).where(
-                ProductModel.owner_username == owner_username,
-                ProductModel.id.in_(normalized_ids),
-                ProductModel.review_status == "listed",
-            )
-        ).all()
-        if not products:
-            raise RuntimeError("没有找到可操作的店铺商品。")
-
-        result = apply_products_listing_status(session, products, listing_status)
-        session.flush()
-        rows = session.scalars(
-            select(ProductModel).where(
-                ProductModel.owner_username == owner_username,
-                ProductModel.id.in_(normalized_ids),
-            )
-        ).all()
-        return {
-            "products": [product_to_public(row) for row in rows],
-            "summary": listing_status_result_summary(result, len(products)),
-        }
+    return create_product_listing_status_sync_task(owner_username, normalized_ids, listing_status)
 
 
 def update_store_all_products_listing_status(
