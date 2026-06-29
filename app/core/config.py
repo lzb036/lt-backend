@@ -66,9 +66,9 @@ class Settings(BaseModel):
     crawler_timeout_seconds: int = 20
     crawler_browser_fallback_enabled: bool = True
     crawler_browser_timeout_seconds: int = 35
-    rakuten_default_inventory_quantity: int = 999
-    rakuten_default_normal_delivery_time_id: int = 1
-    rakuten_default_back_order_delivery_time_id: int = 1
+    rakuten_default_inventory_quantity: int = 1000
+    rakuten_default_normal_delivery_time_id: int = 0
+    rakuten_default_back_order_delivery_time_id: int = 0
     crawler_user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
@@ -112,9 +112,9 @@ def build_settings() -> Settings:
         crawler_timeout_seconds=_env_int("LT_CRAWLER_TIMEOUT_SECONDS", 20),
         crawler_browser_fallback_enabled=_env_bool("LT_CRAWLER_BROWSER_FALLBACK_ENABLED", True),
         crawler_browser_timeout_seconds=_env_int("LT_CRAWLER_BROWSER_TIMEOUT_SECONDS", 35),
-        rakuten_default_inventory_quantity=max(0, _env_int("LT_RAKUTEN_DEFAULT_INVENTORY_QUANTITY", 999)),
-        rakuten_default_normal_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_NORMAL_DELIVERY_TIME_ID", 1)),
-        rakuten_default_back_order_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_BACK_ORDER_DELIVERY_TIME_ID", 1)),
+        rakuten_default_inventory_quantity=max(0, _env_int("LT_RAKUTEN_DEFAULT_INVENTORY_QUANTITY", 1000)),
+        rakuten_default_normal_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_NORMAL_DELIVERY_TIME_ID", 0)),
+        rakuten_default_back_order_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_BACK_ORDER_DELIVERY_TIME_ID", 0)),
         crawler_user_agent=_env_text("LT_CRAWLER_USER_AGENT") or Settings.model_fields["crawler_user_agent"].default,
     )
 
