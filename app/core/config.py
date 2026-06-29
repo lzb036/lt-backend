@@ -64,6 +64,8 @@ class Settings(BaseModel):
     initial_superadmin_username: str = "superadmin"
     initial_superadmin_password: str = "123456"
     crawler_timeout_seconds: int = 20
+    crawler_browser_fallback_enabled: bool = True
+    crawler_browser_timeout_seconds: int = 35
     crawler_user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
@@ -105,6 +107,8 @@ def build_settings() -> Settings:
         initial_superadmin_username=_env_text("LT_INITIAL_SUPERADMIN_USERNAME", "superadmin"),
         initial_superadmin_password=_env_text("LT_INITIAL_SUPERADMIN_PASSWORD", "123456"),
         crawler_timeout_seconds=_env_int("LT_CRAWLER_TIMEOUT_SECONDS", 20),
+        crawler_browser_fallback_enabled=_env_bool("LT_CRAWLER_BROWSER_FALLBACK_ENABLED", True),
+        crawler_browser_timeout_seconds=_env_int("LT_CRAWLER_BROWSER_TIMEOUT_SECONDS", 35),
         crawler_user_agent=_env_text("LT_CRAWLER_USER_AGENT") or Settings.model_fields["crawler_user_agent"].default,
     )
 

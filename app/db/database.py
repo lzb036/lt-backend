@@ -199,6 +199,26 @@ def ensure_schema_compatibility() -> None:
                 )
             )
 
+        sync_task_columns = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_sync_tasks'
+                    """
+                )
+            ).scalars()
+        )
+        if sync_task_columns:
+            if "task_type" not in sync_task_columns:
+                connection.execute(text("ALTER TABLE lt_sync_tasks ADD COLUMN task_type VARCHAR(32) NOT NULL DEFAULT 'store_sync'"))
+            if "payload_json" not in sync_task_columns:
+                connection.execute(text("ALTER TABLE lt_sync_tasks ADD COLUMN payload_json TEXT NULL"))
+                connection.execute(text("UPDATE lt_sync_tasks SET payload_json = '{}' WHERE payload_json IS NULL OR payload_json = ''"))
+                connection.execute(text("ALTER TABLE lt_sync_tasks MODIFY COLUMN payload_json TEXT NOT NULL"))
+
         sync_task_indexes = set(
             connection.execute(
                 text(

@@ -71,6 +71,11 @@ class ProductListingStatusPayload(BaseModel):
     listingStatus: str = Field(pattern="^(listed|unlisted)$")
 
 
+class StoreListingStatusPayload(BaseModel):
+    storeId: int
+    listingStatus: str = Field(pattern="^(listed|unlisted)$")
+
+
 class ProductPricePayload(BaseModel):
     price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
 
@@ -267,6 +272,21 @@ def update_products_listing_status(
         return crawler_service.update_store_products_listing_status(
             user["username"],
             payload.productIds,
+            payload.listingStatus,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/stores/listing-status")
+def update_store_listing_status(
+    payload: StoreListingStatusPayload,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return crawler_service.update_store_all_products_listing_status(
+            user["username"],
+            payload.storeId,
             payload.listingStatus,
         )
     except RuntimeError as exc:
