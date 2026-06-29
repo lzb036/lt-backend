@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import Cookie, Depends, HTTPException
@@ -76,3 +77,22 @@ def require_superadmin(user: dict[str, Any] = Depends(require_authenticated_acco
     if user.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="需要超级管理员权限")
     return user
+
+
+def has_permission(user: dict[str, Any], permission: str) -> bool:
+    if user.get("role") == "superadmin":
+        return True
+    return permission in set(user.get("permissionCodes") or [])
+
+
+def require_any_permission(*permissions: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    def dependency(user: dict[str, Any] = Depends(require_authenticated_account)) -> dict[str, Any]:
+        if not any(has_permission(user, permission) for permission in permissions):
+            raise HTTPException(status_code=403, detail="没有访问该功能的权限")
+        return user
+
+    return dependency
+
+
+def require_permission(permission: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    return require_any_permission(permission)

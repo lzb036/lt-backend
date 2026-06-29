@@ -28,6 +28,7 @@ class UserAccountModel(TimestampMixin, Base):
     display_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="operator", server_default="operator")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    permissions_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     password_salt_b64: Mapped[str] = mapped_column(String(255), nullable=False)
     password_hash_b64: Mapped[str] = mapped_column(String(255), nullable=False)
     password_iterations: Mapped[int] = mapped_column(Integer, nullable=False, default=240000, server_default="240000")
@@ -81,8 +82,9 @@ class RoleModel(TimestampMixin, Base):
 class StoreModel(TimestampMixin, Base):
     __tablename__ = "lt_stores"
     __table_args__ = (
-        UniqueConstraint("store_code", name="uq_lt_store_code"),
+        UniqueConstraint("owner_username", "store_code", name="uq_lt_store_owner_code"),
         Index("ix_lt_store_enabled", "enabled"),
+        Index("ix_lt_store_owner_enabled", "owner_username", "enabled"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)

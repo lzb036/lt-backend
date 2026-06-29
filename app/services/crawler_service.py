@@ -2492,9 +2492,25 @@ def product_list_order_by(status: str | None) -> tuple[Any, ...]:
     return (ProductModel.created_at.desc(), ProductModel.id.desc())
 
 
-def list_stores(*, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
+def ensure_store_owner(owner_username: str, store_id: int) -> StoreModel:
     with session_scope() as session:
-        query = select(StoreModel)
+        row = session.get(StoreModel, store_id)
+        if row is None:
+            raise RuntimeError("店铺不存在。")
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能操作其他用户的店铺。")
+        session.expunge(row)
+        return row
+
+
+def list_stores(
+    owner_username: str,
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    with session_scope() as session:
+        query = select(StoreModel).where(StoreModel.owner_username == owner_username)
         return paginate_query(
             session,
             query,
@@ -2509,6 +2525,8 @@ def list_stores(*, page: int | None = None, page_size: int | None = None) -> lis
 def save_store(owner_username: str, payload: Any, store_id: int | None = None) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(StoreModel, store_id) if store_id else None
+        if row is not None and row.owner_username != owner_username:
+            raise RuntimeError("不能操作其他用户的店铺。")
         if row is None:
             row = StoreModel(owner_username=owner_username)
             session.add(row)
@@ -2536,7 +2554,10 @@ def save_store(owner_username: str, payload: Any, store_id: int | None = None) -
         if incoming_license_key:
             row.rakuten_license_key_encrypted = encrypt_text(incoming_license_key)
         with session.no_autoflush:
-            duplicated_query = select(StoreModel).where(StoreModel.store_code == row.store_code)
+            duplicated_query = select(StoreModel).where(
+                StoreModel.owner_username == owner_username,
+                StoreModel.store_code == row.store_code,
+            )
             if row.id is not None:
                 duplicated_query = duplicated_query.where(StoreModel.id != row.id)
             duplicated_store = session.scalar(duplicated_query)
@@ -2546,11 +2567,13 @@ def save_store(owner_username: str, payload: Any, store_id: int | None = None) -
         return store_to_public(row)
 
 
-def delete_store(store_id: int) -> None:
+def delete_store(owner_username: str, store_id: int) -> None:
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
             return
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能删除其他用户的店铺。")
         session.delete(row)
 
 
@@ -2603,6 +2626,8 @@ def perform_store_sync(owner_username: str, store_id: int) -> dict[str, Any]:
         row = session.get(StoreModel, store_id)
         if row is None:
             raise RuntimeError("店铺不存在。")
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能同步其他用户的店铺。")
         if not row.enabled:
             raise RuntimeError("店铺已停用，不能更新商品。")
         synced_count = 0
@@ -2665,6 +2690,7 @@ def delete_sync_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any
 
 
 def create_sync_task(owner_username: str, store_id: int) -> dict[str, Any]:
+    ensure_store_owner(owner_username, store_id)
     task_id = create_sync_task_record(
         owner_username,
         store_id,
@@ -2686,6 +2712,7 @@ def create_sync_task(owner_username: str, store_id: int) -> dict[str, Any]:
 def create_listing_status_sync_task(owner_username: str, store_id: int, listing_status: str) -> dict[str, Any]:
     if listing_status not in {"listed", "unlisted"}:
         raise RuntimeError("上架状态不合法。")
+    ensure_store_owner(owner_username, store_id)
     action_label = "全部上架" if listing_status == "listed" else "全部下架"
     task_id = create_sync_task_record(
         owner_username,
@@ -2759,6 +2786,22 @@ def normalize_product_ids(product_ids: list[int]) -> list[int]:
         seen.add(product_id)
         result.append(product_id)
     return result
+
+
+def product_review_statuses(owner_username: str, product_ids: list[int]) -> set[str]:
+    normalized_ids = normalize_product_ids(product_ids)
+    if not normalized_ids:
+        raise RuntimeError("请先选择商品。")
+    with session_scope() as session:
+        statuses = session.scalars(
+            select(ProductModel.review_status).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(normalized_ids),
+            )
+        ).all()
+    if len(statuses) != len(normalized_ids):
+        raise RuntimeError("部分商品不存在，不能执行该操作。")
+    return {str(value or "") for value in statuses}
 
 
 def validate_sync_task_products(owner_username: str, product_ids: list[int]) -> int:
@@ -3080,9 +3123,13 @@ def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
         return sync_task_to_public(task) if task else {"id": task_id}
 
 
-def verify_all_stores() -> dict[str, Any]:
+def verify_all_stores(owner_username: str) -> dict[str, Any]:
     with session_scope() as session:
-        rows = session.scalars(select(StoreModel).order_by(StoreModel.created_at.desc())).all()
+        rows = session.scalars(
+            select(StoreModel)
+            .where(StoreModel.owner_username == owner_username)
+            .order_by(StoreModel.created_at.desc())
+        ).all()
         for row in rows:
             try:
                 verify_store_credentials(row)
@@ -4779,6 +4826,8 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
         store = session.get(StoreModel, store_id)
         if store is None:
             raise RuntimeError("上架店铺不存在。")
+        if store.owner_username != owner_username:
+            raise RuntimeError("不能使用其他用户的店铺上架。")
         if not store.enabled:
             raise RuntimeError("上架店铺已停用。")
         products = session.scalars(
@@ -4797,6 +4846,9 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
         if invalid_products:
             names = "、".join(productCodeForError(product) for product in invalid_products[:5])
             raise RuntimeError(f"只有已审核商品可以创建上架任务，请刷新列表后重试。异常商品：{names}")
+        for product in products:
+            product.review_status = "listing"
+            product.last_error = None
         task = ListingTaskModel(
             id=uuid.uuid4().hex,
             owner_username=owner_username,
@@ -4850,6 +4902,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.finished_at = datetime.now()
             for product in products:
                 product.last_error = task.message
+                restore_listing_product_to_approved(product)
             return
         if not store.enabled:
             task.status = "failed"
@@ -4860,6 +4913,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.finished_at = datetime.now()
             for product in products:
                 product.last_error = task.message
+                restore_listing_product_to_approved(product)
             return
         service_secret = decrypt_text(store.rakuten_service_secret_encrypted)
         license_key = decrypt_text(store.rakuten_license_key_encrypted)
@@ -4872,6 +4926,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.finished_at = datetime.now()
             for product in products:
                 product.last_error = task.message
+                restore_listing_product_to_approved(product)
             return
         cabinet_context: dict[str, Any] = {}
         try:
@@ -4881,8 +4936,9 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
         except Exception as exc:
             errors.append(f"R-Cabinet 使用量检测失败: {exc}")
         for product in products:
-            if product.review_status != "approved":
+            if product.review_status != "listing":
                 product.last_error = "商品未审核通过，不能上架。"
+                restore_listing_product_to_approved(product)
                 failed_count += 1
                 errors.append(f"{productCodeForError(product)}: {product.last_error}")
                 continue
@@ -4910,6 +4966,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
                 success_count += 1
             except Exception as exc:
                 error_text = str(exc)
+                restore_listing_product_to_approved(product)
                 product.last_error = error_text
                 failed_count += 1
                 errors.append(f"{productCodeForError(product)}: {error_text}")
@@ -4928,6 +4985,11 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
         task.finished_at = datetime.now()
 
 
+def restore_listing_product_to_approved(product: ProductModel) -> None:
+    if product.review_status == "listing":
+        product.review_status = "approved"
+
+
 def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
@@ -4935,6 +4997,20 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("上架任务不存在。")
         if task.owner_username != owner_username:
             raise RuntimeError("不能重试其他用户的上架任务。")
+        try:
+            product_ids = json.loads(task.product_ids_json or "[]")
+        except ValueError:
+            product_ids = []
+        products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(product_ids or [-1]),
+            )
+        ).all()
+        for product in products:
+            if product.review_status == "approved":
+                product.review_status = "listing"
+                product.last_error = None
         task.status = "running"
         task.message = "重新执行中"
         task.error_detail = None

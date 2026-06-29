@@ -43,6 +43,34 @@ def ensure_schema_compatibility() -> None:
     if not url.drivername.startswith("mysql"):
         return
     with engine.begin() as connection:
+        user_columns = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_user_accounts'
+                    """
+                )
+            ).scalars()
+        )
+        if user_columns and "permissions_json" not in user_columns:
+            connection.execute(text("ALTER TABLE lt_user_accounts ADD COLUMN permissions_json TEXT NULL"))
+            connection.execute(
+                text(
+                    """
+                    UPDATE lt_user_accounts
+                    SET permissions_json = CASE
+                        WHEN role = 'superadmin' THEN '["users.manage","crawler.manage","products.manage","stores.manage","settings.manage"]'
+                        ELSE '["crawler.manage","products.manage","stores.manage"]'
+                    END
+                    WHERE permissions_json IS NULL OR permissions_json = ''
+                    """
+                )
+            )
+            connection.execute(text("ALTER TABLE lt_user_accounts MODIFY COLUMN permissions_json TEXT NOT NULL"))
+
         store_columns = set(
             connection.execute(
                 text(
@@ -61,6 +89,46 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("ALTER TABLE lt_stores ADD COLUMN cabinet_remaining_folder_count INT NULL"))
         if "cabinet_usage_checked_at" not in store_columns:
             connection.execute(text("ALTER TABLE lt_stores ADD COLUMN cabinet_usage_checked_at DATETIME NULL"))
+
+        store_unique_constraints = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT CONSTRAINT_NAME
+                    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_stores'
+                      AND CONSTRAINT_TYPE = 'UNIQUE'
+                    """
+                )
+            ).scalars()
+        )
+        if "uq_lt_store_code" in store_unique_constraints:
+            connection.execute(text("ALTER TABLE lt_stores DROP INDEX uq_lt_store_code"))
+        if "uq_lt_store_owner_code" not in store_unique_constraints:
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE lt_stores
+                    ADD CONSTRAINT uq_lt_store_owner_code UNIQUE (owner_username, store_code)
+                    """
+                )
+            )
+
+        store_indexes = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT INDEX_NAME
+                    FROM INFORMATION_SCHEMA.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_stores'
+                    """
+                )
+            ).scalars()
+        )
+        if "ix_lt_store_owner_enabled" not in store_indexes:
+            connection.execute(text("CREATE INDEX ix_lt_store_owner_enabled ON lt_stores (owner_username, enabled)"))
 
         product_columns = set(
             connection.execute(

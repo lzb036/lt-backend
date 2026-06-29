@@ -6,10 +6,16 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from decimal import Decimal
 
-from app.core.auth import require_authenticated_account, require_superadmin
+from app.core.auth import has_permission, require_any_permission, require_permission, require_superadmin
 from app.services import crawler_service
+from app.services.user_service import require_existing_account
 
 router = APIRouter(prefix="/crawler", tags=["crawler"])
+
+require_crawler_permission = require_permission("crawler.manage")
+require_products_permission = require_permission("products.manage")
+require_stores_permission = require_permission("stores.manage")
+require_products_or_stores_permission = require_any_permission("products.manage", "stores.manage")
 
 
 class CrawlSourcePayload(BaseModel):
@@ -34,6 +40,7 @@ class TaskDeletePayload(BaseModel):
 
 
 class StorePayload(BaseModel):
+    ownerUsername: str | None = None
     aliasName: str = ""
     platform: str = "rakuten"
     enabled: bool = True
@@ -107,11 +114,24 @@ class RolePayload(BaseModel):
     notes: str = ""
 
 
+def resolve_target_username(user: dict, owner_username: str | None = None, *, require_child_owner: bool = False) -> str:
+    if owner_username and not has_permission(user, "stores.manage"):
+        raise HTTPException(status_code=403, detail="没有管理店铺所属用户的权限")
+    if user.get("role") == "superadmin" and owner_username:
+        target_user = require_existing_account(owner_username)
+        if require_child_owner and target_user.get("role") == "superadmin":
+            raise HTTPException(status_code=400, detail="请选择子公司用户作为店铺所属用户")
+        return owner_username
+    if user.get("role") == "superadmin" and require_child_owner:
+        raise HTTPException(status_code=400, detail="请选择店铺所属用户")
+    return user["username"]
+
+
 @router.get("/sources")
 def list_sources(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_crawler_permission),
 ) -> dict:
     result = crawler_service.list_sources(user["username"], page=page, page_size=pageSize)
     if isinstance(result, dict):
@@ -120,7 +140,7 @@ def list_sources(
 
 
 @router.post("/sources")
-def create_source(payload: CrawlSourcePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def create_source(payload: CrawlSourcePayload, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         source = crawler_service.save_source(user["username"], payload)
         return {"source": source}
@@ -129,7 +149,7 @@ def create_source(payload: CrawlSourcePayload, user: dict = Depends(require_auth
 
 
 @router.put("/sources/{source_id}")
-def update_source(source_id: int, payload: CrawlSourcePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def update_source(source_id: int, payload: CrawlSourcePayload, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         source = crawler_service.save_source(user["username"], payload, source_id)
         return {"source": source}
@@ -138,7 +158,7 @@ def update_source(source_id: int, payload: CrawlSourcePayload, user: dict = Depe
 
 
 @router.delete("/sources/{source_id}")
-def delete_source(source_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
+def delete_source(source_id: int, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         crawler_service.delete_source(user["username"], source_id)
         return {"deleted": True}
@@ -156,7 +176,7 @@ def list_tasks(
     mode: str | None = Query(default=None),
     createdAtFrom: str | None = Query(default=None),
     createdAtTo: str | None = Query(default=None),
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_crawler_permission),
 ) -> dict:
     result = crawler_service.list_tasks(
         user["username"],
@@ -175,7 +195,7 @@ def list_tasks(
 
 
 @router.post("/tasks")
-def create_task(payload: CreateTaskPayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def create_task(payload: CreateTaskPayload, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         task = crawler_service.create_task(user["username"], payload)
         return {"task": task}
@@ -184,7 +204,7 @@ def create_task(payload: CreateTaskPayload, user: dict = Depends(require_authent
 
 
 @router.post("/tasks/{task_id}/restart")
-def restart_task(task_id: str, user: dict = Depends(require_authenticated_account)) -> dict:
+def restart_task(task_id: str, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         task = crawler_service.run_existing_task(user["username"], task_id)
         return {"task": task}
@@ -193,7 +213,7 @@ def restart_task(task_id: str, user: dict = Depends(require_authenticated_accoun
 
 
 @router.api_route("/tasks", methods=["DELETE"])
-def delete_tasks(payload: TaskDeletePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def delete_tasks(payload: TaskDeletePayload, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         return crawler_service.delete_tasks(user["username"], payload.taskIds)
     except RuntimeError as exc:
@@ -214,8 +234,10 @@ def list_products(
     collectedAtTo: str | None = Query(default=None),
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_products_or_stores_permission),
 ) -> dict:
+    if status != "listed" and not has_permission(user, "products.manage"):
+        raise HTTPException(status_code=403, detail="没有管理商品的权限")
     result = crawler_service.list_products(
         user["username"],
         status=status,
@@ -242,7 +264,7 @@ def list_products(
 
 
 @router.put("/products/status")
-def update_product_status(payload: ProductStatusPayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def update_product_status(payload: ProductStatusPayload, user: dict = Depends(require_products_permission)) -> dict:
     try:
         products = crawler_service.update_product_status(
             user["username"],
@@ -256,9 +278,17 @@ def update_product_status(payload: ProductStatusPayload, user: dict = Depends(re
 
 
 @router.api_route("/products", methods=["DELETE"])
-def delete_products(payload: ProductDeletePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def delete_products(payload: ProductDeletePayload, user: dict = Depends(require_products_or_stores_permission)) -> dict:
     try:
+        review_statuses = crawler_service.product_review_statuses(user["username"], payload.productIds)
+        if review_statuses and review_statuses <= {"listed"}:
+            if not has_permission(user, "stores.manage"):
+                raise HTTPException(status_code=403, detail="没有管理店铺商品的权限")
+        elif not has_permission(user, "products.manage"):
+            raise HTTPException(status_code=403, detail="没有管理商品的权限")
         return crawler_service.delete_products(user["username"], payload.productIds)
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -266,7 +296,7 @@ def delete_products(payload: ProductDeletePayload, user: dict = Depends(require_
 @router.put("/products/listing-status")
 def update_products_listing_status(
     payload: ProductListingStatusPayload,
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
     try:
         return crawler_service.update_store_products_listing_status(
@@ -281,7 +311,7 @@ def update_products_listing_status(
 @router.put("/stores/listing-status")
 def update_store_listing_status(
     payload: StoreListingStatusPayload,
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
     try:
         return crawler_service.update_store_all_products_listing_status(
@@ -294,9 +324,17 @@ def update_store_listing_status(
 
 
 @router.get("/products/{product_id}")
-def get_product_detail(product_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
+def get_product_detail(product_id: int, user: dict = Depends(require_products_or_stores_permission)) -> dict:
     try:
-        return {"product": crawler_service.get_product_detail(user["username"], product_id)}
+        product = crawler_service.get_product_detail(user["username"], product_id)
+        if product.get("reviewStatus") == "listed":
+            if not has_permission(user, "stores.manage") and not has_permission(user, "products.manage"):
+                raise HTTPException(status_code=403, detail="没有查看店铺商品的权限")
+        elif not has_permission(user, "products.manage"):
+            raise HTTPException(status_code=403, detail="没有查看商品的权限")
+        return {"product": product}
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -305,7 +343,7 @@ def get_product_detail(product_id: int, user: dict = Depends(require_authenticat
 def update_product_price(
     product_id: int,
     payload: ProductPricePayload,
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
     try:
         return {"product": crawler_service.update_store_product_price(user["username"], product_id, payload.price)}
@@ -317,7 +355,7 @@ def update_product_price(
 def update_product_detail(
     product_id: int,
     payload: ProductDetailEditPayload,
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
     try:
         return {"product": crawler_service.update_store_product_detail(user["username"], product_id, payload)}
@@ -329,7 +367,7 @@ def update_product_detail(
 def update_product_local_detail(
     product_id: int,
     payload: ProductDetailEditPayload,
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_products_permission),
 ) -> dict:
     try:
         return {"product": crawler_service.update_product_local_detail(user["username"], product_id, payload)}
@@ -341,9 +379,12 @@ def update_product_local_detail(
 def download_product_image(
     product_id: int,
     image_index: int,
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_products_or_stores_permission),
 ):
     try:
+        review_statuses = crawler_service.product_review_statuses(user["username"], [product_id])
+        if review_statuses != {"listed"} and not has_permission(user, "products.manage"):
+            raise HTTPException(status_code=403, detail="没有下载该商品图片的权限")
         info = crawler_service.product_image_download_info(user["username"], product_id, image_index)
         headers = {"Content-Disposition": f'attachment; filename="{info["filename"]}"'}
         if info["type"] == "local":
@@ -368,6 +409,8 @@ def download_product_image(
                 yield chunk
 
         return StreamingResponse(stream_content(), media_type=info["mediaType"], headers=headers)
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except requests.RequestException as exc:
@@ -379,7 +422,7 @@ def replace_product_image(
     product_id: int,
     image_index: int,
     file: UploadFile = File(...),
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_products_permission),
 ) -> dict:
     try:
         return {"product": crawler_service.replace_product_image(user["username"], product_id, image_index, file)}
@@ -391,7 +434,7 @@ def replace_product_image(
 def delete_product_image(
     product_id: int,
     image_index: int,
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_products_permission),
 ) -> dict:
     try:
         return {"product": crawler_service.delete_product_image(user["username"], product_id, image_index)}
@@ -403,50 +446,68 @@ def delete_product_image(
 def list_stores(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
-    user: dict = Depends(require_authenticated_account),
+    ownerUsername: str | None = Query(default=None),
+    user: dict = Depends(require_products_or_stores_permission),
 ) -> dict:
-    result = crawler_service.list_stores(page=page, page_size=pageSize)
+    target_username = resolve_target_username(user, ownerUsername)
+    result = crawler_service.list_stores(target_username, page=page, page_size=pageSize)
     if isinstance(result, dict):
         return result
     return {"stores": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
 
 
 @router.post("/stores")
-def create_store(payload: StorePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def create_store(payload: StorePayload, user: dict = Depends(require_stores_permission)) -> dict:
     try:
-        store = crawler_service.save_store(user["username"], payload)
+        target_username = resolve_target_username(user, payload.ownerUsername, require_child_owner=True)
+        store = crawler_service.save_store(target_username, payload)
         return {"store": store}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.put("/stores/{store_id}")
-def update_store(store_id: int, payload: StorePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def update_store(store_id: int, payload: StorePayload, user: dict = Depends(require_stores_permission)) -> dict:
     try:
-        store = crawler_service.save_store(user["username"], payload, store_id)
+        target_username = resolve_target_username(user, payload.ownerUsername, require_child_owner=True)
+        store = crawler_service.save_store(target_username, payload, store_id)
         return {"store": store}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.delete("/stores/{store_id}")
-def delete_store(store_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
+def delete_store(
+    store_id: int,
+    ownerUsername: str | None = Query(default=None),
+    user: dict = Depends(require_stores_permission),
+) -> dict:
     try:
-        crawler_service.delete_store(store_id)
+        target_username = resolve_target_username(user, ownerUsername)
+        crawler_service.delete_store(target_username, store_id)
         return {"deleted": True}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/stores/verify")
-def verify_stores(user: dict = Depends(require_authenticated_account)) -> dict:
-    return crawler_service.verify_all_stores()
+def verify_stores(
+    ownerUsername: str | None = Query(default=None),
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    target_username = resolve_target_username(user, ownerUsername)
+    return crawler_service.verify_all_stores(target_username)
 
 
 @router.post("/stores/{store_id}/sync")
-def sync_store(store_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
+def sync_store(
+    store_id: int,
+    ownerUsername: str | None = Query(default=None),
+    user: dict = Depends(require_stores_permission),
+) -> dict:
     try:
-        result = crawler_service.sync_store(user["username"], store_id)
+        target_username = resolve_target_username(user, ownerUsername)
+        result = crawler_service.sync_store(target_username, store_id)
         return result
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -456,7 +517,7 @@ def sync_store(store_id: int, user: dict = Depends(require_authenticated_account
 def list_sync_tasks(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_products_or_stores_permission),
 ) -> dict:
     result = crawler_service.list_sync_tasks(user["username"], page=page, page_size=pageSize)
     if isinstance(result, dict):
@@ -465,7 +526,7 @@ def list_sync_tasks(
 
 
 @router.post("/sync-tasks/{task_id}/retry")
-def retry_sync_task(task_id: str, user: dict = Depends(require_authenticated_account)) -> dict:
+def retry_sync_task(task_id: str, user: dict = Depends(require_products_or_stores_permission)) -> dict:
     try:
         task = crawler_service.retry_sync_task(user["username"], task_id)
         return {"syncTask": task}
@@ -474,7 +535,7 @@ def retry_sync_task(task_id: str, user: dict = Depends(require_authenticated_acc
 
 
 @router.api_route("/sync-tasks", methods=["DELETE"])
-def delete_sync_tasks(payload: TaskDeletePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def delete_sync_tasks(payload: TaskDeletePayload, user: dict = Depends(require_products_or_stores_permission)) -> dict:
     try:
         return crawler_service.delete_sync_tasks(user["username"], payload.taskIds)
     except RuntimeError as exc:
@@ -485,7 +546,7 @@ def delete_sync_tasks(payload: TaskDeletePayload, user: dict = Depends(require_a
 def list_schedules(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_crawler_permission),
 ) -> dict:
     result = crawler_service.list_scheduled_crawls(user["username"], page=page, page_size=pageSize)
     if isinstance(result, dict):
@@ -494,7 +555,7 @@ def list_schedules(
 
 
 @router.post("/schedules")
-def create_schedule(payload: ScheduledCrawlPayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def create_schedule(payload: ScheduledCrawlPayload, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         schedule = crawler_service.save_scheduled_crawl(user["username"], payload)
         return {"schedule": schedule}
@@ -506,7 +567,7 @@ def create_schedule(payload: ScheduledCrawlPayload, user: dict = Depends(require
 def update_schedule(
     schedule_id: int,
     payload: ScheduledCrawlPayload,
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_crawler_permission),
 ) -> dict:
     try:
         schedule = crawler_service.save_scheduled_crawl(user["username"], payload, schedule_id)
@@ -516,7 +577,7 @@ def update_schedule(
 
 
 @router.delete("/schedules/{schedule_id}")
-def delete_schedule(schedule_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
+def delete_schedule(schedule_id: int, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         crawler_service.delete_scheduled_crawl(user["username"], schedule_id)
         return {"deleted": True}
@@ -525,7 +586,7 @@ def delete_schedule(schedule_id: int, user: dict = Depends(require_authenticated
 
 
 @router.post("/schedules/{schedule_id}/run")
-def run_schedule(schedule_id: int, user: dict = Depends(require_authenticated_account)) -> dict:
+def run_schedule(schedule_id: int, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         schedule = crawler_service.run_scheduled_crawl(user["username"], schedule_id)
         return {"schedule": schedule}
@@ -537,7 +598,7 @@ def run_schedule(schedule_id: int, user: dict = Depends(require_authenticated_ac
 def list_listing_tasks(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
-    user: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_products_permission),
 ) -> dict:
     result = crawler_service.list_listing_tasks(user["username"], page=page, page_size=pageSize)
     if isinstance(result, dict):
@@ -546,7 +607,7 @@ def list_listing_tasks(
 
 
 @router.post("/listing-tasks")
-def create_listing_task(payload: ListingTaskPayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def create_listing_task(payload: ListingTaskPayload, user: dict = Depends(require_products_permission)) -> dict:
     try:
         task = crawler_service.create_listing_task(user["username"], payload)
         return {"listingTask": task}
@@ -555,7 +616,7 @@ def create_listing_task(payload: ListingTaskPayload, user: dict = Depends(requir
 
 
 @router.post("/listing-tasks/{task_id}/retry")
-def retry_listing_task(task_id: str, user: dict = Depends(require_authenticated_account)) -> dict:
+def retry_listing_task(task_id: str, user: dict = Depends(require_products_permission)) -> dict:
     try:
         task = crawler_service.retry_listing_task(user["username"], task_id)
         return {"listingTask": task}
@@ -564,7 +625,7 @@ def retry_listing_task(task_id: str, user: dict = Depends(require_authenticated_
 
 
 @router.api_route("/listing-tasks", methods=["DELETE"])
-def delete_listing_tasks(payload: TaskDeletePayload, user: dict = Depends(require_authenticated_account)) -> dict:
+def delete_listing_tasks(payload: TaskDeletePayload, user: dict = Depends(require_products_permission)) -> dict:
     try:
         return crawler_service.delete_listing_tasks(user["username"], payload.taskIds)
     except RuntimeError as exc:
