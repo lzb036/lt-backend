@@ -49,8 +49,10 @@ RAKUTEN_CABINET_FILE_DELETE_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/
 RAKUTEN_CABINET_FILE_INSERT_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/file/insert"
 RAKUTEN_CABINET_FOLDERS_GET_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/folders/get"
 RAKUTEN_CABINET_FOLDER_INSERT_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/folder/insert"
+RAKUTEN_INVENTORY_BULK_UPSERT_URL = "https://api.rms.rakuten.co.jp/es/2.1/inventories/bulk-upsert"
 RAKUTEN_ITEM_SEARCH_HITS = 100
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
+RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT = 400
 LOCAL_PRODUCT_IMAGE_URL_PREFIX = "/api/static/product-images"
 LOCAL_PRODUCT_IMAGE_DIR = settings.backend_dir / "data" / "product-images"
 ALLOWED_PRODUCT_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
@@ -1849,6 +1851,37 @@ def delete_rakuten_item(service_secret: str, license_key: str, manage_number: st
         if detail:
             message = f"{message}：{detail[:500]}"
         raise RuntimeError(message) from exc
+
+
+def bulk_upsert_rakuten_inventories(
+    service_secret: str,
+    license_key: str,
+    inventories: list[dict[str, Any]],
+) -> None:
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+    if not inventories:
+        return
+    for offset in range(0, len(inventories), RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT):
+        chunk = inventories[offset : offset + RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT]
+        response = requests.post(
+            RAKUTEN_INVENTORY_BULK_UPSERT_URL,
+            timeout=settings.crawler_timeout_seconds,
+            headers={
+                "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+                "Accept": "application/json",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={"inventories": chunk},
+        )
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            detail = normalize_text(response.text)
+            message = "乐天库存/发货信息登记失败"
+            if detail:
+                message = f"{message}：{detail[:800]}"
+            raise RuntimeError(message) from exc
 
 
 def delete_rakuten_cabinet_file(service_secret: str, license_key: str, file_id: int) -> None:
@@ -3958,7 +3991,16 @@ def create_store_product_on_rakuten(
     payload = build_rakuten_item_upsert_payload(product, raw_payload, uploaded_product_images, manage_number=manage_number)
     try:
         put_rakuten_item(service_secret, license_key, manage_number, payload)
+        inventory_payloads = build_rakuten_inventory_upsert_payloads(
+            manage_number,
+            payload.get("variants") if isinstance(payload.get("variants"), dict) else {},
+        )
+        bulk_upsert_rakuten_inventories(service_secret, license_key, inventory_payloads)
     except Exception as exc:
+        try:
+            delete_rakuten_item(service_secret, license_key, manage_number)
+        except Exception:
+            pass
         rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_images_for_rollback)
         if rollback_message:
             raise RuntimeError(f"{exc}；已回滚本次上传图片：{rollback_message}") from exc
@@ -4536,6 +4578,49 @@ def build_rakuten_listing_variants(raw_payload: dict[str, Any], product: Product
             next_variant["attributes"] = attributes
         result[normalized_variant_id[:32]] = {key: value for key, value in next_variant.items() if value not in (None, "", {}, [])}
     return result
+
+
+def build_rakuten_inventory_upsert_payloads(
+    manage_number: str,
+    variants: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized_manage_number = normalize_text(manage_number)
+    if not normalized_manage_number or not variants:
+        return []
+    quantity = max(0, int(settings.rakuten_default_inventory_quantity))
+    normal_delivery_time_id = int(settings.rakuten_default_normal_delivery_time_id)
+    back_order_delivery_time_id = int(settings.rakuten_default_back_order_delivery_time_id)
+    inventories: list[dict[str, Any]] = []
+    for variant_id, variant in variants.items():
+        normalized_variant_id = normalize_text(variant_id)
+        if not normalized_variant_id:
+            continue
+        inventory: dict[str, Any] = {
+            "manageNumber": normalized_manage_number,
+            "variantId": normalized_variant_id,
+            "quantity": quantity,
+        }
+        operation_lead_time: dict[str, int] = {}
+        if normal_delivery_time_id > 0:
+            operation_lead_time["normalDeliveryTimeId"] = normal_delivery_time_id
+        if back_order_delivery_time_id > 0:
+            operation_lead_time["backOrderDeliveryTimeId"] = back_order_delivery_time_id
+        if operation_lead_time:
+            inventory["operationLeadTime"] = operation_lead_time
+        ship_from_ids = variant.get("shipFromIds") if isinstance(variant, dict) else None
+        if isinstance(ship_from_ids, list):
+            normalized_ship_from_ids: list[int] = []
+            for value in ship_from_ids:
+                try:
+                    ship_from_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if ship_from_id > 0 and ship_from_id not in normalized_ship_from_ids:
+                    normalized_ship_from_ids.append(ship_from_id)
+            if normalized_ship_from_ids:
+                inventory["shipFromIds"] = normalized_ship_from_ids
+        inventories.append(inventory)
+    return inventories
 
 
 def normalize_rakuten_variant_attributes(value: Any) -> list[dict[str, Any]]:
