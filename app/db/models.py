@@ -140,6 +140,8 @@ class CrawlTaskModel(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_lt_crawl_task_owner_status", "owner_username", "status"),
         Index("ix_lt_crawl_task_owner_created", "owner_username", "created_at"),
+        Index("ix_lt_crawl_task_owner_started", "owner_username", "started_at"),
+        Index("ix_lt_crawl_task_owner_finished", "owner_username", "finished_at"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -168,6 +170,8 @@ class ProductModel(TimestampMixin, Base):
         UniqueConstraint("owner_username", "source_url_hash", name="uq_lt_product_owner_source_url_hash"),
         UniqueConstraint("store_id", "rakuten_manage_number", name="uq_lt_product_store_manage_number"),
         Index("ix_lt_product_owner_status", "owner_username", "review_status"),
+        Index("ix_lt_product_owner_created", "owner_username", "created_at"),
+        Index("ix_lt_product_owner_updated", "owner_username", "updated_at"),
         Index("ix_lt_product_owner_title", "owner_username", "title"),
         Index("ix_lt_product_store_status", "store_id", "store_product_status"),
         Index("ix_lt_product_store_listing_listed", "store_id", "review_status", "rakuten_listing_status", "listed_at"),
@@ -205,6 +209,9 @@ class ListingTaskModel(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_lt_listing_task_owner_status", "owner_username", "status"),
         Index("ix_lt_listing_task_owner_created", "owner_username", "created_at"),
+        Index("ix_lt_listing_task_owner_started", "owner_username", "started_at"),
+        Index("ix_lt_listing_task_owner_finished", "owner_username", "finished_at"),
+        Index("ix_lt_listing_task_owner_updated", "owner_username", "updated_at"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
@@ -231,6 +238,9 @@ class SyncTaskModel(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_lt_sync_task_owner_status", "owner_username", "status"),
         Index("ix_lt_sync_task_owner_created", "owner_username", "created_at"),
+        Index("ix_lt_sync_task_owner_started", "owner_username", "started_at"),
+        Index("ix_lt_sync_task_owner_finished", "owner_username", "finished_at"),
+        Index("ix_lt_sync_task_owner_updated", "owner_username", "updated_at"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)

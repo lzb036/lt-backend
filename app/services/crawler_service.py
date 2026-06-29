@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 
 from app.core.config import settings
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
@@ -2330,6 +2330,182 @@ def delete_source(owner_username: str, source_id: int) -> None:
         if row.owner_username != owner_username:
             raise RuntimeError("不能删除其他用户的采集源。")
         session.delete(row)
+
+
+def today_range() -> tuple[datetime, datetime]:
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
+
+
+def _count_grouped_status(
+    session: Any,
+    model: Any,
+    owner_username: str,
+    statuses: list[str],
+    start_at: datetime,
+    end_at: datetime,
+    *timestamp_columns: Any,
+) -> dict[str, int]:
+    if not timestamp_columns:
+        timestamp_columns = (model.created_at,)
+    time_conditions = [
+        and_(column >= start_at, column < end_at)
+        for column in timestamp_columns
+    ]
+    rows = session.execute(
+        select(model.status, func.count())
+        .where(
+            model.owner_username == owner_username,
+            or_(*time_conditions),
+        )
+        .group_by(model.status)
+    ).all()
+    counts = {status: 0 for status in statuses}
+    for status, count in rows:
+        if status in counts:
+            counts[str(status)] = int(count or 0)
+    return counts
+
+
+def _count_grouped_product_status(
+    session: Any,
+    owner_username: str,
+    statuses: list[str],
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, int]:
+    rows = session.execute(
+        select(ProductModel.review_status, func.count())
+        .where(
+            ProductModel.owner_username == owner_username,
+            or_(
+                and_(ProductModel.created_at >= start_at, ProductModel.created_at < end_at),
+                and_(ProductModel.updated_at >= start_at, ProductModel.updated_at < end_at),
+            ),
+        )
+        .group_by(ProductModel.review_status)
+    ).all()
+    counts = {status: 0 for status in statuses}
+    for status, count in rows:
+        if status in counts:
+            counts[str(status)] = int(count or 0)
+    return counts
+
+
+def dashboard_summary(
+    owner_username: str,
+    *,
+    include_stores: bool = True,
+    include_crawler: bool = True,
+    include_products: bool = True,
+    include_sync_tasks: bool = True,
+) -> dict[str, Any]:
+    start_at, end_at = today_range()
+    task_statuses = ["queued", "running", "success", "failed"]
+    empty_task_counts = {status: 0 for status in task_statuses}
+    empty_product_counts = {"pending": 0, "approved": 0, "error": 0}
+    with session_scope() as session:
+        total_stores = enabled_stores = error_stores = 0
+        if include_stores:
+            total_stores = int(session.scalar(
+                select(func.count()).select_from(StoreModel).where(StoreModel.owner_username == owner_username)
+            ) or 0)
+            enabled_stores = int(session.scalar(
+                select(func.count()).select_from(StoreModel).where(
+                    StoreModel.owner_username == owner_username,
+                    StoreModel.enabled.is_(True),
+                )
+            ) or 0)
+            error_stores = int(session.scalar(
+                select(func.count()).select_from(StoreModel).where(
+                    StoreModel.owner_username == owner_username,
+                    StoreModel.last_error.is_not(None),
+                    StoreModel.last_error != "",
+                )
+            ) or 0)
+        crawl_tasks = empty_task_counts.copy()
+        if include_crawler:
+            crawl_tasks = _count_grouped_status(
+                session,
+                CrawlTaskModel,
+                owner_username,
+                task_statuses,
+                start_at,
+                end_at,
+                CrawlTaskModel.created_at,
+                CrawlTaskModel.started_at,
+                CrawlTaskModel.finished_at,
+            )
+        products = empty_product_counts.copy()
+        listing_tasks = empty_task_counts.copy()
+        if include_products:
+            products = _count_grouped_product_status(
+                session,
+                owner_username,
+                ["pending", "approved", "error"],
+                start_at,
+                end_at,
+            )
+            listing_tasks = _count_grouped_status(
+                session,
+                ListingTaskModel,
+                owner_username,
+                task_statuses,
+                start_at,
+                end_at,
+                ListingTaskModel.created_at,
+                ListingTaskModel.started_at,
+                ListingTaskModel.finished_at,
+                ListingTaskModel.updated_at,
+            )
+        sync_tasks = empty_task_counts.copy()
+        if include_sync_tasks:
+            sync_tasks = _count_grouped_status(
+                session,
+                SyncTaskModel,
+                owner_username,
+                task_statuses,
+                start_at,
+                end_at,
+                SyncTaskModel.created_at,
+                SyncTaskModel.started_at,
+                SyncTaskModel.finished_at,
+                SyncTaskModel.updated_at,
+            )
+    return {
+        "dateRange": {
+            "from": start_at.isoformat(sep=" "),
+            "to": end_at.isoformat(sep=" "),
+        },
+        "stores": {
+            "total": total_stores,
+            "enabled": enabled_stores,
+            "error": error_stores,
+        },
+        "products": {
+            "pending": products["pending"],
+            "approved": products["approved"],
+            "error": products["error"],
+        },
+        "crawlTasks": {
+            "queued": crawl_tasks["queued"],
+            "running": crawl_tasks["running"],
+            "success": crawl_tasks["success"],
+            "failed": crawl_tasks["failed"],
+        },
+        "listingTasks": {
+            "queued": listing_tasks["queued"],
+            "running": listing_tasks["running"],
+            "success": listing_tasks["success"],
+            "failed": listing_tasks["failed"],
+        },
+        "syncTasks": {
+            "queued": sync_tasks["queued"],
+            "running": sync_tasks["running"],
+            "success": sync_tasks["success"],
+            "failed": sync_tasks["failed"],
+        },
+    }
 
 
 def list_tasks(

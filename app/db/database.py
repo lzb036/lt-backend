@@ -231,6 +231,10 @@ def ensure_schema_compatibility() -> None:
         )
         if "ix_lt_product_owner_store" not in product_indexes:
             connection.execute(text("CREATE INDEX ix_lt_product_owner_store ON lt_products (owner_username, store_id)"))
+        if "ix_lt_product_owner_created" not in product_indexes:
+            connection.execute(text("CREATE INDEX ix_lt_product_owner_created ON lt_products (owner_username, created_at)"))
+        if "ix_lt_product_owner_updated" not in product_indexes:
+            connection.execute(text("CREATE INDEX ix_lt_product_owner_updated ON lt_products (owner_username, updated_at)"))
         if "ix_lt_product_store_status" not in product_indexes:
             connection.execute(text("CREATE INDEX ix_lt_product_store_status ON lt_products (store_id, store_product_status)"))
         if "ix_lt_product_store_listing_listed" not in product_indexes:
@@ -299,11 +303,87 @@ def ensure_schema_compatibility() -> None:
                 )
             ).scalars()
         )
-        if sync_task_indexes:
+        if sync_task_columns:
             if "ix_lt_sync_task_owner_status" not in sync_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_status ON lt_sync_tasks (owner_username, status)"))
             if "ix_lt_sync_task_owner_created" not in sync_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_created ON lt_sync_tasks (owner_username, created_at)"))
+            if "ix_lt_sync_task_owner_started" not in sync_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_started ON lt_sync_tasks (owner_username, started_at)"))
+            if "ix_lt_sync_task_owner_finished" not in sync_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_finished ON lt_sync_tasks (owner_username, finished_at)"))
+            if "ix_lt_sync_task_owner_updated" not in sync_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_updated ON lt_sync_tasks (owner_username, updated_at)"))
+
+        listing_task_indexes = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT INDEX_NAME
+                    FROM INFORMATION_SCHEMA.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_listing_tasks'
+                    """
+                )
+            ).scalars()
+        )
+        listing_task_columns = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_listing_tasks'
+                    """
+                )
+            ).scalars()
+        )
+        if listing_task_columns:
+            if "ix_lt_listing_task_owner_status" not in listing_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_listing_task_owner_status ON lt_listing_tasks (owner_username, status)"))
+            if "ix_lt_listing_task_owner_created" not in listing_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_listing_task_owner_created ON lt_listing_tasks (owner_username, created_at)"))
+            if "ix_lt_listing_task_owner_started" not in listing_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_listing_task_owner_started ON lt_listing_tasks (owner_username, started_at)"))
+            if "ix_lt_listing_task_owner_finished" not in listing_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_listing_task_owner_finished ON lt_listing_tasks (owner_username, finished_at)"))
+            if "ix_lt_listing_task_owner_updated" not in listing_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_listing_task_owner_updated ON lt_listing_tasks (owner_username, updated_at)"))
+
+        crawl_task_indexes = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT INDEX_NAME
+                    FROM INFORMATION_SCHEMA.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_crawl_tasks'
+                    """
+                )
+            ).scalars()
+        )
+        crawl_task_columns = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_crawl_tasks'
+                    """
+                )
+            ).scalars()
+        )
+        if crawl_task_columns:
+            if "ix_lt_crawl_task_owner_status" not in crawl_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_crawl_task_owner_status ON lt_crawl_tasks (owner_username, status)"))
+            if "ix_lt_crawl_task_owner_created" not in crawl_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_crawl_task_owner_created ON lt_crawl_tasks (owner_username, created_at)"))
+            if "ix_lt_crawl_task_owner_started" not in crawl_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_crawl_task_owner_started ON lt_crawl_tasks (owner_username, started_at)"))
+            if "ix_lt_crawl_task_owner_finished" not in crawl_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_crawl_task_owner_finished ON lt_crawl_tasks (owner_username, finished_at)"))
 
         schedule_columns = set(
             connection.execute(

@@ -127,6 +127,19 @@ def resolve_target_username(user: dict, owner_username: str | None = None, *, re
     return user["username"]
 
 
+@router.get("/dashboard/summary")
+def get_dashboard_summary(user: dict = Depends(require_any_permission("crawler.manage", "products.manage", "stores.manage"))) -> dict:
+    return {
+        "summary": crawler_service.dashboard_summary(
+            user["username"],
+            include_stores=has_permission(user, "stores.manage"),
+            include_crawler=has_permission(user, "crawler.manage"),
+            include_products=has_permission(user, "products.manage"),
+            include_sync_tasks=has_permission(user, "products.manage") or has_permission(user, "stores.manage"),
+        )
+    }
+
+
 @router.get("/sources")
 def list_sources(
     page: int | None = Query(default=None, ge=1),
