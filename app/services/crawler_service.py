@@ -81,6 +81,11 @@ def dispatch_sync_task(owner_username: str, task_id: str) -> None:
     worker.start()
 
 
+def dispatch_listing_task(owner_username: str, task_id: str) -> None:
+    worker = threading.Thread(target=run_listing_task, args=(owner_username, task_id), daemon=True)
+    worker.start()
+
+
 def log_event(owner_username: str, task_id: str | None, level: str, message: str) -> None:
     with session_scope() as session:
         session.add(CrawlLogModel(owner_username=owner_username, task_id=task_id, level=level, message=message))
@@ -5016,7 +5021,7 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
         task.error_detail = None
         task.started_at = datetime.now()
         task.finished_at = None
-    run_listing_task(owner_username, task_id)
+    dispatch_listing_task(owner_username, task_id)
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
         return listing_task_to_public(task) if task else {"id": task_id}

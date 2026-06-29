@@ -457,9 +457,9 @@ def list_stores(
 
 
 @router.post("/stores")
-def create_store(payload: StorePayload, user: dict = Depends(require_stores_permission)) -> dict:
+def create_store(payload: StorePayload, user: dict = Depends(require_superadmin)) -> dict:
     try:
-        target_username = resolve_target_username(user, payload.ownerUsername, require_child_owner=True)
+        target_username = resolve_target_username(user, payload.ownerUsername, require_child_owner=bool(payload.ownerUsername))
         store = crawler_service.save_store(target_username, payload)
         return {"store": store}
     except RuntimeError as exc:
@@ -467,9 +467,9 @@ def create_store(payload: StorePayload, user: dict = Depends(require_stores_perm
 
 
 @router.put("/stores/{store_id}")
-def update_store(store_id: int, payload: StorePayload, user: dict = Depends(require_stores_permission)) -> dict:
+def update_store(store_id: int, payload: StorePayload, user: dict = Depends(require_superadmin)) -> dict:
     try:
-        target_username = resolve_target_username(user, payload.ownerUsername, require_child_owner=True)
+        target_username = resolve_target_username(user, payload.ownerUsername, require_child_owner=bool(payload.ownerUsername))
         store = crawler_service.save_store(target_username, payload, store_id)
         return {"store": store}
     except RuntimeError as exc:
@@ -480,10 +480,10 @@ def update_store(store_id: int, payload: StorePayload, user: dict = Depends(requ
 def delete_store(
     store_id: int,
     ownerUsername: str | None = Query(default=None),
-    user: dict = Depends(require_stores_permission),
+    user: dict = Depends(require_superadmin),
 ) -> dict:
     try:
-        target_username = resolve_target_username(user, ownerUsername)
+        target_username = resolve_target_username(user, ownerUsername, require_child_owner=bool(ownerUsername))
         crawler_service.delete_store(target_username, store_id)
         return {"deleted": True}
     except RuntimeError as exc:
