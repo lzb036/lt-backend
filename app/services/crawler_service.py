@@ -259,19 +259,26 @@ def product_detail_to_public(row: ProductModel) -> dict[str, Any]:
 
 def product_descriptions(raw_payload: dict[str, Any]) -> list[dict[str, str]]:
     descriptions: list[dict[str, str]] = []
-    seen_values: set[str] = set()
+    seen_values: set[tuple[str, str]] = set()
 
-    def append(label: str, value: Any) -> None:
-        text = first_text_value(value)
-        if not text or text in seen_values:
+    def append(label: str, value: Any, *, keep_empty: bool = False) -> None:
+        normalized_label = normalize_text(label) or "商品说明"
+        if not has_description_source(value):
             return
-        seen_values.add(text)
-        descriptions.append({"label": label, "value": text})
+        text = normalize_detail_html(value)
+        text_key = description_content_key(text)
+        seen_key = (normalized_label, text_key)
+        if not text_key and not keep_empty:
+            return
+        if seen_key in seen_values:
+            return
+        seen_values.add(seen_key)
+        descriptions.append({"label": normalized_label, "value": text})
 
     product_description = raw_payload.get("productDescription")
     if isinstance(product_description, dict):
-        append("PC商品说明", product_description.get("pc"))
-        append("移动端商品说明", product_description.get("sp"))
+        append("PC用 商品説明文", product_description.get("pc"), keep_empty=True)
+        append("スマートフォン用 商品説明文", product_description.get("sp"), keep_empty=True)
         append("智能手机商品说明", product_description.get("smartphone"))
         append("商品说明", product_description.get("value"))
     else:
@@ -288,14 +295,13 @@ def product_descriptions(raw_payload: dict[str, Any]) -> list[dict[str, str]]:
     fields = (
         ("商品说明", "description"),
         ("PC用商品说明", "pcDescription"),
-        ("移动端商品说明", "spDescription"),
+        ("スマートフォン用 商品説明文", "spDescription"),
         ("智能手机商品说明", "smartphoneDescription"),
     )
     for label, key in fields:
         append(label, raw_payload.get(key))
-    if not descriptions:
-        append("销售说明", raw_payload.get("salesDescription"))
-    return descriptions
+    append("PC用 販売説明文", raw_payload.get("salesDescription"), keep_empty=True)
+    return clean_market_product_descriptions(descriptions, keep_empty_labels=RAKUTEN_DESCRIPTION_FIELD_LABELS)
 
 
 def product_shop_code(row: ProductModel, raw_payload: dict[str, Any]) -> str:
@@ -312,6 +318,16 @@ def product_shop_code(row: ProductModel, raw_payload: dict[str, Any]) -> str:
 
 def product_image_urls(raw_payload: dict[str, Any], *, shop_code: str = "") -> list[str]:
     urls: list[str] = []
+    skipped_description_keys = {
+        "description",
+        "descriptions",
+        "productdescription",
+        "pcdescription",
+        "spdescription",
+        "smartphonedescription",
+        "salesdescription",
+        "descriptionimages",
+    }
 
     def remember(value: Any) -> None:
         url = normalize_product_image_url(value, shop_code=shop_code)
@@ -328,7 +344,9 @@ def product_image_urls(raw_payload: dict[str, Any], *, shop_code: str = "") -> l
         if isinstance(value, dict):
             for key in ("url", "imageUrl", "location", "value"):
                 collect(value.get(key))
-            for child in value.values():
+            for key, child in value.items():
+                if str(key).lower() in skipped_description_keys:
+                    continue
                 collect(child)
         elif isinstance(value, list):
             for child in value:
@@ -3056,7 +3074,7 @@ def create_store_product_on_rakuten(
 ) -> dict[str, Any]:
     raw_payload = product_raw_payload(product)
     manage_number = generate_listing_manage_number(product, raw_payload)
-    uploaded_images = upload_product_images_to_rakuten(
+    uploaded_product_images = upload_product_images_to_rakuten(
         service_secret,
         license_key,
         store,
@@ -3064,11 +3082,23 @@ def create_store_product_on_rakuten(
         manage_number,
         cabinet_context=cabinet_context,
     )
-    payload = build_rakuten_item_upsert_payload(product, raw_payload, uploaded_images)
+    description_result = upload_product_description_images_to_rakuten(
+        service_secret,
+        license_key,
+        store,
+        product,
+        manage_number,
+        raw_payload,
+        cabinet_context=cabinet_context,
+    )
+    raw_payload = description_result["rawPayload"]
+    uploaded_description_images = description_result["uploadedImages"]
+    uploaded_images_for_rollback = [*uploaded_product_images, *uploaded_description_images]
+    payload = build_rakuten_item_upsert_payload(product, raw_payload, uploaded_product_images)
     try:
         put_rakuten_item(service_secret, license_key, manage_number, payload)
     except Exception as exc:
-        rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_images)
+        rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_images_for_rollback)
         if rollback_message:
             raise RuntimeError(f"{exc}；已回滚本次上传图片：{rollback_message}") from exc
         raise
@@ -3077,10 +3107,11 @@ def create_store_product_on_rakuten(
     updated_payload.update(payload)
     updated_payload["manageNumber"] = manage_number
     updated_payload["itemNumber"] = payload.get("itemNumber") or manage_number
-    updated_payload["images"] = uploaded_images
+    updated_payload["images"] = uploaded_product_images
+    updated_payload["descriptionImages"] = uploaded_description_images
     updated_payload["ltEditedImages"] = [
         build_rakuten_cabinet_image_url(store.store_code, image["location"])
-        for image in uploaded_images
+        for image in uploaded_product_images
         if image.get("location")
     ]
     updated_payload["listingStore"] = {
@@ -3096,7 +3127,7 @@ def create_store_product_on_rakuten(
         "itemNumber": payload.get("itemNumber") or manage_number,
         "payload": updated_payload,
         "price": price_from_rakuten_item(updated_payload),
-        "imageUrl": build_rakuten_cabinet_image_url(store.store_code, uploaded_images[0]["location"]) if uploaded_images else product.image_url,
+        "imageUrl": build_rakuten_cabinet_image_url(store.store_code, uploaded_product_images[0]["location"]) if uploaded_product_images else product.image_url,
     }
 
 
@@ -3178,6 +3209,192 @@ def upload_product_images_to_rakuten(
         raise
     reserve_listing_cabinet_folder_slots(cabinet_context, cabinet_folder, len(uploaded_images))
     return uploaded_images
+
+
+def upload_product_description_images_to_rakuten(
+    service_secret: str,
+    license_key: str,
+    store: StoreModel,
+    product: ProductModel,
+    manage_number: str,
+    raw_payload: dict[str, Any],
+    cabinet_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    description_items = product_descriptions(raw_payload)
+    image_urls = unique_texts(
+        [
+            url
+            for description in description_items
+            for url in description_image_urls(description.get("value"))
+            if should_transfer_description_image(url, store.store_code)
+        ]
+    )
+    if not image_urls:
+        return {"rawPayload": raw_payload, "uploadedImages": []}
+
+    uploaded_images: list[dict[str, str]] = []
+    replacement_map: dict[str, str] = {}
+    cabinet_folder = ensure_listing_cabinet_folder_for_upload(
+        service_secret,
+        license_key,
+        store,
+        len(image_urls),
+        cabinet_context=cabinet_context,
+    )
+    folder_id = int(cabinet_folder.get("folderId") or 0)
+    folder_path = normalize_text(cabinet_folder.get("directoryName") or cabinet_folder.get("folderPath") or cabinet_folder.get("folderName"))
+    if not folder_id or not folder_path:
+        raise RuntimeError("R-Cabinet 上架说明图文件夹不可用。")
+    try:
+        for index, image_url in enumerate(image_urls, start=1):
+            image_data = load_product_image_bytes(image_url)
+            suffix = image_data["suffix"]
+            file_path = normalize_cabinet_file_path(f"{manage_number}-desc-{index}{suffix}")
+            file_name = normalize_cabinet_file_name(f"{product.title[:20]}-说明-{index}")
+            result = insert_rakuten_cabinet_file(
+                service_secret,
+                license_key,
+                file_name=file_name,
+                file_path=file_path,
+                content=image_data["content"],
+                content_type=image_data["contentType"],
+                folder_id=folder_id,
+                overwrite=True,
+            )
+            location = cabinet_image_location(folder_path, result.get("filePath") or file_path)
+            file_url = result.get("fileUrl") or build_rakuten_cabinet_image_url(store.store_code, location)
+            uploaded_images.append(
+                {
+                    "type": "CABINET_DESCRIPTION",
+                    "location": location,
+                    "alt": product.title[:255],
+                    "fileId": str(result.get("fileId") or ""),
+                    "folderId": str(folder_id),
+                    "folderPath": folder_path,
+                    "sourceUrl": image_url,
+                    "fileUrl": file_url,
+                }
+            )
+            replacement_map[image_url] = file_url
+    except Exception as exc:
+        rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_images)
+        if rollback_message:
+            raise RuntimeError(f"{exc}；已回滚本次已上传说明图：{rollback_message}") from exc
+        raise
+
+    updated_payload = replace_product_description_image_urls(raw_payload, replacement_map)
+    reserve_listing_cabinet_folder_slots(cabinet_context, cabinet_folder, len(uploaded_images))
+    return {"rawPayload": updated_payload, "uploadedImages": uploaded_images}
+
+
+def description_image_urls(html: Any) -> list[str]:
+    soup = BeautifulSoup(str(html or ""), "lxml")
+    urls: list[str] = []
+    for image in soup.select("img, source"):
+        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+            url = normalize_description_image_url(image.get(attr))
+            if url:
+                urls.append(url)
+        srcset = image.get("srcset")
+        if srcset:
+            for candidate_url, _descriptor in parse_srcset_candidates(srcset):
+                url = normalize_description_image_url(candidate_url)
+                if url:
+                    urls.append(url)
+    return unique_texts(urls)
+
+
+def normalize_description_image_url(value: Any) -> str:
+    text = normalize_text(value)
+    if not text or text.lower().startswith(("data:", "blob:", "javascript:")):
+        return ""
+    if text.startswith("//"):
+        text = f"https:{text}"
+    if not text.startswith(("http://", "https://")):
+        return ""
+    return text
+
+
+def should_transfer_description_image(url: str, target_shop_code: str) -> bool:
+    text = normalize_description_image_url(url)
+    if not text:
+        return False
+    parsed = urlsplit(text)
+    host = parsed.netloc.lower()
+    path = unquote(parsed.path or "").lower()
+    normalized_shop_code = normalize_shop_code(target_shop_code).lower()
+    if normalized_shop_code and host == "image.rakuten.co.jp":
+        parts = [part for part in path.split("/") if part]
+        if parts[:2] and parts[0] == normalized_shop_code and parts[1] == "cabinet":
+            return False
+    if normalized_shop_code and host in {"shop.r10s.jp", "tshop.r10s.jp"}:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 2 and parts[0] == normalized_shop_code and parts[1] == "cabinet":
+            return False
+    return True
+
+
+def replace_product_description_image_urls(raw_payload: dict[str, Any], replacement_map: dict[str, str]) -> dict[str, Any]:
+    if not replacement_map:
+        return raw_payload
+    updated_payload = json.loads(json.dumps(raw_payload, ensure_ascii=False))
+    product_description = updated_payload.get("productDescription")
+    if isinstance(product_description, dict):
+        for key in ("pc", "sp", "smartphone", "value"):
+            if key in product_description:
+                product_description[key] = replace_description_html_image_urls(product_description.get(key), replacement_map)
+    elif "productDescription" in updated_payload:
+        updated_payload["productDescription"] = replace_description_html_image_urls(product_description, replacement_map)
+
+    for key in ("description", "pcDescription", "spDescription", "smartphoneDescription", "salesDescription"):
+        if key in updated_payload:
+            updated_payload[key] = replace_description_html_image_urls(updated_payload.get(key), replacement_map)
+
+    raw_descriptions = updated_payload.get("descriptions")
+    if isinstance(raw_descriptions, list):
+        for item in raw_descriptions:
+            if isinstance(item, dict) and "value" in item:
+                item["value"] = replace_description_html_image_urls(item.get("value"), replacement_map)
+    return updated_payload
+
+
+def replace_description_html_image_urls(html: Any, replacement_map: dict[str, str]) -> str:
+    if not html or not replacement_map:
+        return str(html or "")
+    soup = BeautifulSoup(str(html), "lxml")
+    for image in soup.select("img, source"):
+        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+            value = normalize_description_image_url(image.get(attr))
+            if value and value in replacement_map:
+                image[attr] = replacement_map[value]
+        srcset = image.get("srcset")
+        if srcset:
+            image["srcset"] = replace_srcset_image_urls(srcset, replacement_map)
+    body = soup.body
+    return body.decode_contents().strip() if body is not None else str(soup).strip()
+
+
+def parse_srcset_candidates(value: str) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    for raw_candidate in str(value or "").split(","):
+        candidate = raw_candidate.strip()
+        if not candidate:
+            continue
+        parts = candidate.split()
+        url = parts[0] if parts else ""
+        descriptor = " ".join(parts[1:]) if len(parts) > 1 else ""
+        if url:
+            candidates.append((url, descriptor))
+    return candidates
+
+
+def replace_srcset_image_urls(value: str, replacement_map: dict[str, str]) -> str:
+    candidates = []
+    for url, descriptor in parse_srcset_candidates(value):
+        normalized_url = normalize_description_image_url(url)
+        next_url = replacement_map.get(normalized_url, url)
+        candidates.append(f"{next_url} {descriptor}".strip())
+    return ", ".join(candidates)
 
 
 def ensure_listing_cabinet_folder_for_upload(
@@ -3496,21 +3713,22 @@ def build_rakuten_variant_selectors(raw_payload: dict[str, Any], variants: dict[
 
 def build_rakuten_product_description(raw_payload: dict[str, Any]) -> dict[str, str]:
     descriptions = product_descriptions(raw_payload)
-    first_description = descriptions[0]["value"] if descriptions else ""
-    html = truncate_text(first_description, 10240)
-    if not html:
-        return {}
-    return {"pc": html, "sp": html}
+    pc_description = first_description_by_label(descriptions, ("PC用 商品説明文", "PC用商品说明文", "PC商品说明", "PC用商品説明文"))
+    sp_description = first_description_by_label(descriptions, ("スマートフォン用 商品説明文", "智能手机用商品说明文", "スマートフォン用商品说明文", "移动端商品说明", "スマートフォン用商品説明文"))
+    fallback_description = best_product_description(descriptions)
+    pc_html = truncate_text(pc_description or fallback_description, 10240)
+    sp_html = truncate_text(sp_description or fallback_description, 10240)
+    result: dict[str, str] = {}
+    if pc_html:
+        result["pc"] = pc_html
+    if sp_html:
+        result["sp"] = sp_html
+    return result
 
 
 def build_rakuten_sales_description(raw_payload: dict[str, Any]) -> str:
-    sales_description = first_text_from_keys(raw_payload, ("salesDescription",))
-    if sales_description:
-        return truncate_text(sales_description, 10240)
     descriptions = product_descriptions(raw_payload)
-    if len(descriptions) > 1:
-        return truncate_text(descriptions[1]["value"], 10240)
-    return ""
+    return truncate_text(first_description_by_label(descriptions, ("PC用 販売説明文", "PC用销售说明文", "销售说明", "PC用販売説明文")), 10240)
 
 
 def truncate_text(value: Any, max_length: int) -> str:
@@ -4732,13 +4950,13 @@ def market_product_descriptions(
         descriptions.append({"label": "商品说明", "value": description})
     if embedded_item:
         embedded_descriptions = (
-            ("商品说明", embedded_item.get("newProductDescription")),
-            ("PC商品说明", (embedded_item.get("pcFields") or {}).get("productDescription") if isinstance(embedded_item.get("pcFields"), dict) else None),
-            ("销售说明", embedded_item.get("salesDescription")),
+            ("スマートフォン用 商品説明文", embedded_item.get("newProductDescription")),
+            ("PC用 商品説明文", (embedded_item.get("pcFields") or {}).get("productDescription") if isinstance(embedded_item.get("pcFields"), dict) else None),
+            ("PC用 販売説明文", embedded_item.get("salesDescription")),
         )
         for label, value in embedded_descriptions:
             html_value = normalize_detail_html(value)
-            if html_value and all(item["value"] != html_value for item in descriptions):
+            if html_value and all(description_content_key(item["value"]) != description_content_key(html_value) for item in descriptions):
                 descriptions.append({"label": label, "value": html_value})
     for selector, label in (
         ("#itemCaption", "商品说明"),
@@ -4747,10 +4965,200 @@ def market_product_descriptions(
     ):
         node = soup.select_one(selector)
         if node:
-            html_value = normalize_detail_html(str(node))
-            if html_value and all(item["value"] != html_value for item in descriptions):
-                descriptions.append({"label": label, "value": html_value})
-    return descriptions
+            text_value = strip_low_quality_description_lines(str(node))
+            if text_value and all(description_content_key(item["value"]) != description_content_key(text_value) for item in descriptions):
+                descriptions.append({"label": label, "value": text_value})
+    return clean_market_product_descriptions(descriptions, keep_empty_labels=RAKUTEN_DESCRIPTION_FIELD_LABELS)
+
+
+RAKUTEN_DESCRIPTION_FIELD_LABELS = (
+    "PC用 商品説明文",
+    "スマートフォン用 商品説明文",
+    "PC用 販売説明文",
+    "PC用商品说明文",
+    "智能手机用商品说明文",
+    "PC用销售说明文",
+)
+
+
+LOW_QUALITY_DESCRIPTION_KEYWORDS = (
+    "キャンセルポリシー",
+    "メーカー希望小売価格",
+    "メーカーカタログ",
+    "メーカーサイトに基づいて掲載",
+    "メーカーサイトTOP",
+    "メーカーサイト会社概要",
+    "特定商取引法表示",
+    "会社概要",
+    "有効期間",
+    "年間ランキング",
+    "ランキング",
+    "受賞",
+    "買い物かご",
+    "商品レビュー",
+    "ショップレビュー",
+)
+PRODUCT_DESCRIPTION_KEYWORDS = (
+    "商品ポイント",
+    "デザイン",
+    "シルエット",
+    "コーディネート",
+    "サイズ",
+    "カラー",
+    "素材",
+    "原産国",
+    "生産国",
+    "商品名",
+    "商品コード",
+    "洗濯",
+    "着用",
+    "アイテム",
+    "セットアップ",
+    "パンツ",
+    "トップス",
+    "ウエスト",
+    "伸縮",
+    "仕様",
+    "重量",
+    "長さ",
+)
+
+
+def clean_market_product_descriptions(
+    descriptions: list[dict[str, str]],
+    *,
+    keep_empty_labels: tuple[str, ...] = (),
+) -> list[dict[str, str]]:
+    if not descriptions:
+        return []
+    normalized: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    keep_empty_label_set = {normalize_text(label) for label in keep_empty_labels}
+    for item in descriptions:
+        label = normalize_text(item.get("label")) or "商品说明"
+        is_official_rakuten_field = label in keep_empty_label_set
+        value = normalize_detail_html(item.get("value"))
+        if not is_official_rakuten_field:
+            value = strip_low_quality_description_lines(value)
+        value_key = description_content_key(value)
+        seen_key = (label, value_key)
+        if (not value or not value_key) and not is_official_rakuten_field:
+            continue
+        if seen_key in seen:
+            continue
+        seen.add(seen_key)
+        if not is_official_rakuten_field and is_low_quality_product_description(value):
+            continue
+        normalized.append({"label": label, "value": value})
+    if not normalized:
+        return []
+    return normalized
+
+
+def first_description_by_label(descriptions: list[dict[str, str]], labels: tuple[str, ...]) -> str:
+    normalized_labels = {normalize_text(label) for label in labels}
+    for description in descriptions:
+        if normalize_text(description.get("label")) in normalized_labels:
+            return normalize_detail_html(description.get("value"))
+    return ""
+
+
+def best_product_description(descriptions: list[dict[str, str]]) -> str:
+    if not descriptions:
+        return ""
+    return max(descriptions, key=product_description_quality_score).get("value") or ""
+
+
+def strip_low_quality_description_lines(value: str) -> str:
+    text = detail_html_plain_text(normalize_detail_html(value))
+    if not text:
+        return ""
+    lines: list[str] = []
+    for raw_line in re.split(r"[\r\n]+", text):
+        line = normalize_text(raw_line)
+        if not line:
+            continue
+        if is_low_quality_description_line(line):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def is_low_quality_description_line(line: str) -> bool:
+    if not line or line in {"?", "？", "-", "ー"}:
+        return True
+    keyword_hits = sum(1 for keyword in LOW_QUALITY_DESCRIPTION_KEYWORDS if keyword in line)
+    product_hits = sum(1 for keyword in PRODUCT_DESCRIPTION_KEYWORDS if keyword in line)
+    if keyword_hits and product_hits:
+        return False
+    if keyword_hits >= 1 and len(line) <= 120:
+        return True
+    if keyword_hits >= 2 and len(line) <= 240:
+        return True
+    return False
+
+
+def is_low_quality_product_description(value: str) -> bool:
+    plain_text = detail_html_plain_text(value)
+    if not plain_text:
+        return True
+    if plain_text in {"?", "？", "-", "ー"}:
+        return True
+    keyword_hits = sum(1 for keyword in LOW_QUALITY_DESCRIPTION_KEYWORDS if keyword in plain_text)
+    product_hits = sum(1 for keyword in PRODUCT_DESCRIPTION_KEYWORDS if keyword in plain_text)
+    if len(plain_text) < 40 and product_hits == 0:
+        return True
+    if keyword_hits >= 2 and product_hits == 0:
+        return True
+    if len(plain_text) < 120 and keyword_hits >= 1 and product_hits == 0:
+        return True
+    return False
+
+
+def is_near_duplicate_description(left: str, right: str) -> bool:
+    left_text = normalize_text(left)
+    right_text = normalize_text(right)
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+    shorter, longer = sorted((left_text, right_text), key=len)
+    return len(shorter) >= 80 and shorter in longer and (len(longer) - len(shorter) <= 80)
+
+
+def product_description_quality_score(item: dict[str, str]) -> int:
+    label = normalize_text(item.get("label"))
+    value = normalize_detail_html(item.get("value"))
+    plain_text = detail_html_plain_text(value)
+    score = min(len(plain_text), 2000)
+    score += sum(250 for keyword in PRODUCT_DESCRIPTION_KEYWORDS if keyword in plain_text)
+    score -= sum(350 for keyword in LOW_QUALITY_DESCRIPTION_KEYWORDS if keyword in plain_text)
+    if "销售" in label or "sales" in label.lower():
+        score += 300
+    if "PC" in label or "商品说明" in label:
+        score += 80
+    return score
+
+
+def detail_html_plain_text(value: Any) -> str:
+    return normalize_text(BeautifulSoup(str(value or ""), "lxml").get_text(" ", strip=True))
+
+
+def description_content_key(value: Any) -> str:
+    html = str(value or "")
+    plain_text = detail_html_plain_text(html)
+    if plain_text:
+        return plain_text
+    soup = BeautifulSoup(html, "lxml")
+    image_sources: list[str] = []
+    for image in soup.select("img, source"):
+        src = image.get("src") or image.get("data-src") or image.get("data-original") or image.get("srcset")
+        src_text = normalize_text(src)
+        if src_text:
+            image_sources.append(src_text)
+    if image_sources:
+        return "|".join(image_sources)
+    return normalize_text(html)
 
 
 def market_item_image_urls(item: dict[str, Any], *, shop_code: str, item_number: str) -> list[str]:
@@ -5094,7 +5502,33 @@ def normalize_detail_html(value: Any) -> str:
     text = unescape(text)
     text = re.sub(r"<script[\s\S]*?</script>", "", text, flags=re.I)
     text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.I)
-    return text.strip()
+    return sanitize_description_html(text).strip()
+
+
+def sanitize_description_html(value: str) -> str:
+    soup = BeautifulSoup(value or "", "lxml")
+    for element in soup.select("script, style, iframe, object, embed, link, meta, svg, canvas, video, audio"):
+        element.decompose()
+    for element in soup.select("*"):
+        for attribute in list(element.attrs):
+            name = attribute.lower()
+            value_text = " ".join(element.get_attribute_list(attribute)).strip()
+            if name.startswith("on") or value_text.lower().startswith("javascript:"):
+                del element.attrs[attribute]
+    body = soup.body
+    if body is not None:
+        return body.decode_contents().strip()
+    return str(soup).strip()
+
+
+def has_description_source(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
 
 
 def numeric_price(value: Any) -> float | None:
