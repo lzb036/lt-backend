@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from html import unescape
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
 import requests
@@ -808,6 +808,32 @@ def sync_task_to_public(row: SyncTaskModel) -> dict[str, Any]:
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
         "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
     }
+
+
+def update_task_progress(
+    model: Any,
+    task_id: str,
+    *,
+    total_count: int | None = None,
+    success_count: int | None = None,
+    failed_count: int | None = None,
+    message: str | None = None,
+    status: str | None = None,
+) -> None:
+    with session_scope() as session:
+        task = session.get(model, task_id)
+        if task is None:
+            return
+        if total_count is not None:
+            task.total_count = max(0, int(total_count))
+        if success_count is not None:
+            task.success_count = max(0, int(success_count))
+        if failed_count is not None:
+            task.failed_count = max(0, int(failed_count))
+        if message is not None:
+            task.message = message
+        if status is not None:
+            task.status = status
 
 
 def role_to_public(row: RoleModel) -> dict[str, Any]:
@@ -2871,7 +2897,7 @@ def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:
     }
 
 
-def perform_store_sync(owner_username: str, store_id: int) -> dict[str, Any]:
+def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | None = None) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
@@ -2886,8 +2912,17 @@ def perform_store_sync(owner_username: str, store_id: int) -> dict[str, Any]:
         license_key = decrypt_text(row.rakuten_license_key_encrypted)
         verify_store_credentials(row)
         items = fetch_rakuten_store_items(service_secret, license_key)
+        if task_id:
+            update_task_progress(
+                SyncTaskModel,
+                task_id,
+                total_count=len(items),
+                success_count=0,
+                failed_count=0,
+                message=f"同步中，已处理 0 / {len(items)} 条",
+            )
         seen_manage_numbers: set[str] = set()
-        for item in items:
+        for index, item in enumerate(items, start=1):
             manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
             if manage_number:
                 seen_manage_numbers.add(manage_number)
@@ -2895,6 +2930,15 @@ def perform_store_sync(owner_username: str, store_id: int) -> dict[str, Any]:
                 synced_count += 1
             else:
                 failed_count += 1
+            if task_id:
+                update_task_progress(
+                    SyncTaskModel,
+                    task_id,
+                    total_count=len(items),
+                    success_count=synced_count,
+                    failed_count=failed_count,
+                    message=f"同步中，已处理 {index} / {len(items)} 条",
+                )
         mark_missing_store_products_removed(session, row, seen_manage_numbers)
         session.flush()
         return {
@@ -3151,7 +3195,11 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             raise RuntimeError("同步任务没有关联店铺。")
         if task_type == "listing_status":
             listing_status = normalize_text(payload.get("listingStatus"))
-            result = perform_store_listing_status_sync(owner_username, store_id, listing_status)
+            result = perform_store_listing_status_sync(owner_username, store_id, listing_status, task_id=task_id)
+            payload["result"] = {
+                "successIds": list(result.get("successIds") or []),
+                "failedIds": list(result.get("failedIds") or []),
+            }
             total_count = int(result.get("totalCount") or 0)
             success_count = int(result.get("successCount") or 0)
             failed_count = int(result.get("failedCount") or 0)
@@ -3162,7 +3210,11 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
         elif task_type == "product_listing_status":
             listing_status = normalize_text(payload.get("listingStatus"))
             product_ids = normalize_product_ids(list(payload.get("productIds") or []))
-            result = perform_product_listing_status_sync(owner_username, store_id, product_ids, listing_status)
+            result = perform_product_listing_status_sync(owner_username, store_id, product_ids, listing_status, task_id=task_id)
+            payload["result"] = {
+                "successIds": list(result.get("successIds") or []),
+                "failedIds": list(result.get("failedIds") or []),
+            }
             total_count = int(result.get("totalCount") or 0)
             success_count = int(result.get("successCount") or 0)
             failed_count = int(result.get("failedCount") or 0)
@@ -3172,7 +3224,7 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
         elif task_type == "product_delete":
             product_ids = normalize_product_ids(list(payload.get("productIds") or []))
-            result = perform_product_delete_sync(owner_username, store_id, product_ids)
+            result = perform_product_delete_sync(owner_username, store_id, product_ids, task_id=task_id)
             payload["result"] = {
                 "successIds": list(result.get("successIds") or []),
                 "failedIds": list(result.get("failedIds") or []),
@@ -3190,7 +3242,7 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
                 limit=50,
             )
         else:
-            result = perform_store_sync(owner_username, store_id)
+            result = perform_store_sync(owner_username, store_id, task_id=task_id)
             total_count = int(result.get("totalCount") or 0)
             success_count = int(result.get("syncedCount") or 0)
             failed_count = int(result.get("failedCount") or 0)
@@ -3239,7 +3291,13 @@ def sync_task_running_message(task: SyncTaskModel) -> str:
     return "正在同步店铺商品"
 
 
-def perform_store_listing_status_sync(owner_username: str, store_id: int, listing_status: str) -> dict[str, Any]:
+def perform_store_listing_status_sync(
+    owner_username: str,
+    store_id: int,
+    listing_status: str,
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
     if listing_status not in {"listed", "unlisted"}:
         raise RuntimeError("上架状态不合法。")
     with session_scope() as session:
@@ -3257,7 +3315,12 @@ def perform_store_listing_status_sync(owner_username: str, store_id: int, listin
         ).all()
         if not products:
             raise RuntimeError("当前店铺没有可操作的店铺商品。")
-        result = apply_products_listing_status(session, products, listing_status)
+        result = apply_products_listing_status(
+            session,
+            products,
+            listing_status,
+            progress_callback=sync_task_progress_callback(task_id, len(products), "上下架同步") if task_id else None,
+        )
         session.flush()
         summary = listing_status_result_summary(result, len(products))
         return {
@@ -3265,6 +3328,8 @@ def perform_store_listing_status_sync(owner_username: str, store_id: int, listin
             "totalCount": summary["total"],
             "successCount": summary["successCount"],
             "failedCount": summary["failedCount"],
+            "successIds": summary["successIds"],
+            "failedIds": summary["failedIds"],
             "errors": summary["errors"],
         }
 
@@ -3274,6 +3339,8 @@ def perform_product_listing_status_sync(
     store_id: int,
     product_ids: list[int],
     listing_status: str,
+    *,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     if listing_status not in {"listed", "unlisted"}:
         raise RuntimeError("上架状态不合法。")
@@ -3295,22 +3362,51 @@ def perform_product_listing_status_sync(
         ).all()
         found_ids = {product.id for product in products}
         missing_ids = [product_id for product_id in product_ids if product_id not in found_ids]
-        result = apply_products_listing_status(session, products, listing_status) if products else {"successIds": [], "errors": []}
+        if task_id:
+            update_task_progress(
+                SyncTaskModel,
+                task_id,
+                total_count=len(product_ids),
+                success_count=0,
+                failed_count=len(missing_ids),
+                message=f"上下架同步中，已处理 0 / {len(product_ids)} 条",
+            )
+        result = (
+            apply_products_listing_status(
+                session,
+                products,
+                listing_status,
+                progress_callback=sync_task_progress_callback(task_id, len(product_ids), "上下架同步", initial_failed=len(missing_ids)) if task_id else None,
+            )
+            if products
+            else {"successIds": [], "errors": []}
+        )
         errors = list(result.get("errors") or [])
         errors.extend(f"{product_id}: 商品不存在或不是店铺商品" for product_id in missing_ids)
         session.flush()
-        success_count = len(result.get("successIds") or [])
+        success_ids = list(result.get("successIds") or [])
+        failed_ids = [*list(result.get("failedIds") or []), *missing_ids]
+        failed_ids = list(dict.fromkeys(failed_ids))
+        success_count = len(success_ids)
         failed_count = max(0, len(product_ids) - success_count)
         return {
             "store": store_to_public(store),
             "totalCount": len(product_ids),
             "successCount": success_count,
             "failedCount": failed_count,
+            "successIds": success_ids,
+            "failedIds": failed_ids,
             "errors": errors,
         }
 
 
-def perform_product_delete_sync(owner_username: str, store_id: int, product_ids: list[int]) -> dict[str, Any]:
+def perform_product_delete_sync(
+    owner_username: str,
+    store_id: int,
+    product_ids: list[int],
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
     if not product_ids:
         raise RuntimeError("同步任务缺少商品。")
     with session_scope() as session:
@@ -3337,7 +3433,16 @@ def perform_product_delete_sync(owner_username: str, store_id: int, product_ids:
         errors = [f"{product_id}: 商品不存在或不是店铺商品" for product_id in missing_ids]
         warnings: list[str] = []
         credential_cache: dict[int, tuple[StoreModel, str, str]] = {}
-        for row in rows:
+        if task_id:
+            update_task_progress(
+                SyncTaskModel,
+                task_id,
+                total_count=len(product_ids),
+                success_count=0,
+                failed_count=failed_count,
+                message=f"删除中，已处理 0 / {len(product_ids)} 条",
+            )
+        for index, row in enumerate(rows, start=1):
             try:
                 delete_store_product_from_rakuten(session, row, credential_cache)
                 cabinet_deleted_count += int(getattr(row, "_deleted_cabinet_count", 0) or 0)
@@ -3347,11 +3452,29 @@ def perform_product_delete_sync(owner_username: str, store_id: int, product_ids:
                 error_text = str(exc)
                 row.last_error = error_text
                 errors.append(f"{productCodeForError(row)}: {error_text}")
+                if task_id:
+                    update_task_progress(
+                        SyncTaskModel,
+                        task_id,
+                        total_count=len(product_ids),
+                        success_count=success_count,
+                        failed_count=failed_count,
+                        message=f"删除中，已处理 {index + len(missing_ids)} / {len(product_ids)} 条",
+                    )
                 continue
             warnings.extend(getattr(row, "_delete_warnings", []) or [])
             success_ids.append(row.id)
             session.delete(row)
             success_count += 1
+            if task_id:
+                update_task_progress(
+                    SyncTaskModel,
+                    task_id,
+                    total_count=len(product_ids),
+                    success_count=success_count,
+                    failed_count=failed_count,
+                    message=f"删除中，已处理 {index + len(missing_ids)} / {len(product_ids)} 条",
+                )
         session.flush()
         return {
             "store": store_to_public(store),
@@ -5107,19 +5230,35 @@ def update_store_all_products_listing_status(
     return create_listing_status_sync_task(owner_username, store_id, listing_status)
 
 
-def apply_products_listing_status(session: Any, products: list[ProductModel], listing_status: str) -> dict[str, Any]:
+def apply_products_listing_status(
+    session: Any,
+    products: list[ProductModel],
+    listing_status: str,
+    *,
+    progress_callback: Callable[[int, int, int], None] | None = None,
+) -> dict[str, Any]:
     success_ids: list[int] = []
+    failed_ids: list[int] = []
     errors: list[str] = []
     credential_cache: dict[int, tuple[str, str]] = {}
-    for product in products:
+    failed_count = 0
+    for index, product in enumerate(products, start=1):
         manage_number = normalize_text(product.rakuten_manage_number or product.item_number)
         if not product.store_id:
             errors.append(f"{product.title} 未关联店铺")
             product.last_error = "未关联店铺，不能更新乐天上架状态。"
+            failed_ids.append(product.id)
+            failed_count += 1
+            if progress_callback:
+                progress_callback(index, len(success_ids), failed_count)
             continue
         if not manage_number:
             errors.append(f"{product.title} 缺少商品管理编号")
             product.last_error = "缺少商品管理编号，不能更新乐天上架状态。"
+            failed_ids.append(product.id)
+            failed_count += 1
+            if progress_callback:
+                progress_callback(index, len(success_ids), failed_count)
             continue
 
         credentials = credential_cache.get(product.store_id)
@@ -5128,10 +5267,18 @@ def apply_products_listing_status(session: Any, products: list[ProductModel], li
             if store is None:
                 errors.append(f"{product.title} 关联店铺不存在")
                 product.last_error = "关联店铺不存在，不能更新乐天上架状态。"
+                failed_ids.append(product.id)
+                failed_count += 1
+                if progress_callback:
+                    progress_callback(index, len(success_ids), failed_count)
                 continue
             if not store.enabled:
                 errors.append(f"{store.alias_name or store.store_name} 已停用")
                 product.last_error = "关联店铺已停用，不能更新乐天上架状态。"
+                failed_ids.append(product.id)
+                failed_count += 1
+                if progress_callback:
+                    progress_callback(index, len(success_ids), failed_count)
                 continue
             credentials = (
                 decrypt_text(store.rakuten_service_secret_encrypted),
@@ -5150,6 +5297,10 @@ def apply_products_listing_status(session: Any, products: list[ProductModel], li
             error_text = str(exc)
             product.last_error = error_text
             errors.append(f"{manage_number}: {error_text}")
+            failed_ids.append(product.id)
+            failed_count += 1
+            if progress_callback:
+                progress_callback(index, len(success_ids), failed_count)
             continue
 
         product.rakuten_listing_status = listing_status
@@ -5157,16 +5308,45 @@ def apply_products_listing_status(session: Any, products: list[ProductModel], li
         product.store_product_status = "active"
         product.store_last_seen_at = datetime.now()
         success_ids.append(product.id)
-    return {"successIds": success_ids, "errors": errors}
+        if progress_callback:
+            progress_callback(index, len(success_ids), failed_count)
+    return {"successIds": success_ids, "failedIds": failed_ids, "errors": errors}
+
+
+def sync_task_progress_callback(
+    task_id: str | None,
+    total_count: int,
+    action_label: str,
+    *,
+    initial_failed: int = 0,
+) -> Callable[[int, int, int], None] | None:
+    if not task_id:
+        return None
+
+    def update(processed_count: int, success_count: int, failed_count: int) -> None:
+        update_task_progress(
+            SyncTaskModel,
+            task_id,
+            total_count=total_count,
+            success_count=success_count,
+            failed_count=initial_failed + failed_count,
+            message=f"{action_label}中，已处理 {min(total_count, processed_count + initial_failed)} / {total_count} 条",
+        )
+
+    return update
 
 
 def listing_status_result_summary(result: dict[str, Any], total_count: int) -> dict[str, Any]:
-    success_count = len(result.get("successIds") or [])
+    success_ids = list(result.get("successIds") or [])
+    failed_ids = list(result.get("failedIds") or [])
+    success_count = len(success_ids)
     failed_count = max(0, int(total_count) - success_count)
     return {
         "total": int(total_count),
         "successCount": success_count,
         "failedCount": failed_count,
+        "successIds": success_ids,
+        "failedIds": failed_ids,
         "message": f"完成，成功 {success_count} 个，失败 {failed_count} 个",
         "errors": list(result.get("errors") or [])[:20],
     }
@@ -5332,13 +5512,30 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             apply_store_cabinet_usage(store, cabinet_usage)
         except Exception as exc:
             errors.append(f"R-Cabinet 使用量检测失败: {exc}")
-        for product in products:
+        update_task_progress(
+            ListingTaskModel,
+            task_id,
+            total_count=len(products),
+            success_count=0,
+            failed_count=0,
+            message=f"上架中，已处理 0 / {len(products)} 条",
+        )
+        for index, product in enumerate(products, start=1):
             if product.review_status != "listing":
                 product.last_error = "商品未审核通过，不能上架。"
                 restore_listing_product_to_approved(product)
                 failed_count += 1
                 failed_ids.append(product.id)
                 errors.append(f"{productCodeForError(product)}: {product.last_error}")
+                update_task_progress(
+                    ListingTaskModel,
+                    task_id,
+                    total_count=len(products),
+                    success_count=success_count,
+                    failed_count=failed_count,
+                    message=f"上架中，已处理 {index} / {len(products)} 条",
+                )
+                session.flush()
                 continue
             try:
                 listing_result = create_store_product_on_rakuten(
@@ -5370,6 +5567,15 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
                 failed_count += 1
                 failed_ids.append(product.id)
                 errors.append(f"{productCodeForError(product)}: {error_text}")
+            update_task_progress(
+                ListingTaskModel,
+                task_id,
+                total_count=len(products),
+                success_count=success_count,
+                failed_count=failed_count,
+                message=f"上架中，已处理 {index} / {len(products)} 条",
+            )
+            session.flush()
         sync_store_cabinet_usage_fields(store, service_secret, license_key)
         task.total_count = len(products)
         task.success_count = success_count
@@ -5526,6 +5732,7 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
             target=target,
             mode=str(getattr(payload, "mode", "") or "manual"),
             status="queued",
+            total_count=initial_crawl_task_total_count(source_type, target),
             message="等待执行",
         )
         session.add(task)
@@ -5544,7 +5751,7 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
         if task.owner_username != owner_username:
             raise RuntimeError("不能重启其他用户的采集任务。")
         task.status = "queued"
-        task.total_count = 0
+        task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
         task.success_count = 0
         task.failed_count = 0
         task.message = "等待重新执行"
@@ -5594,37 +5801,55 @@ def run_task(task_id: str) -> None:
         task.status = "running"
         task.started_at = datetime.now()
         task.message = "采集中"
+        if task.total_count <= 0:
+            task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
         owner_username = task.owner_username
         source_type = task.source_type
         target = task.target
 
     try:
         items = collect_items(source_type, target)
+        update_task_progress(
+            CrawlTaskModel,
+            task_id,
+            total_count=len(items),
+            success_count=0,
+            failed_count=0,
+            message=f"采集中，已处理 0 / {len(items)} 条",
+        )
         with session_scope() as session:
             task = session.get(CrawlTaskModel, task_id)
             if task is None:
                 return
-            task.total_count = len(items)
             success_count = 0
             failed_count = 0
             saved_count = 0
             errors: list[str] = []
             if not items:
                 errors.append("未采集到商品，请检查采集内容、榜单时间或乐天页面结构。")
-            for item in items:
+            for index, item in enumerate(items, start=1):
                 item_error = collected_item_error(item)
                 saved = upsert_product(session, owner_username, task_id, item)
                 if saved:
                     saved_count += 1
                 if saved and item_error is None:
                     success_count += 1
-                    continue
-                failed_count += 1
-                if item_error:
-                    errors.append(item_error)
-                elif not saved:
-                    name = str(item.get("title") or item.get("source_url") or "商品").strip()
-                    errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
+                else:
+                    failed_count += 1
+                    if item_error:
+                        errors.append(item_error)
+                    elif not saved:
+                        name = str(item.get("title") or item.get("source_url") or "商品").strip()
+                        errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
+                update_task_progress(
+                    CrawlTaskModel,
+                    task_id,
+                    total_count=len(items),
+                    success_count=success_count,
+                    failed_count=failed_count,
+                    message=f"采集中，已处理 {index} / {len(items)} 条",
+                )
+                session.flush()
             task.success_count = success_count
             task.failed_count = failed_count
             if not items:
@@ -5646,6 +5871,11 @@ def run_task(task_id: str) -> None:
             task.message = "采集失败"
             task.error_detail = str(exc)
         log_event(owner_username, task_id, "error", str(exc))
+
+
+def initial_crawl_task_total_count(source_type: str, target: str) -> int:
+    # Before crawling, this is the number of crawl targets, not the final product count.
+    return 1 if normalize_text(source_type) and normalize_text(target) else 0
 
 
 def collect_items(source_type: str, target: str) -> list[dict[str, Any]]:
