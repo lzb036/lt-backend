@@ -2989,7 +2989,20 @@ def delete_store(owner_username: str, store_id: int) -> None:
             return
         if row.owner_username != owner_username:
             raise RuntimeError("不能删除其他用户的店铺。")
+        product_ids = session.scalars(
+            select(ProductModel.id).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.store_id == store_id,
+            )
+        ).all()
+        if product_ids:
+            session.query(ProductModel).filter(
+                ProductModel.owner_username == owner_username,
+                ProductModel.store_id == store_id,
+            ).delete(synchronize_session=False)
         session.delete(row)
+    for product_id in product_ids:
+        clear_product_temp_image_files(int(product_id))
 
 
 def verify_store_credentials(row: StoreModel) -> None:
