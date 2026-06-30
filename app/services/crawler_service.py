@@ -18,7 +18,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from sqlalchemy import and_, func, or_, select
 
 from app.core.config import settings
@@ -52,6 +52,8 @@ RAKUTEN_CABINET_FOLDER_INSERT_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabine
 RAKUTEN_INVENTORY_BULK_UPSERT_URL = "https://api.rms.rakuten.co.jp/es/2.1/inventories/bulk-upsert"
 RAKUTEN_ITEM_SEARCH_HITS = 100
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
+RAKUTEN_WRITE_MAX_RETRIES = 3
+RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT = 400
 LOCAL_PRODUCT_IMAGE_URL_PREFIX = "/api/static/product-images"
 LOCAL_PRODUCT_IMAGE_DIR = settings.backend_dir / "data" / "product-images"
@@ -61,6 +63,49 @@ MAX_PRODUCT_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024
 RAKUTEN_LISTING_IMAGE_LIMIT = 20
 RAKUTEN_SP_DESCRIPTION_IMAGE_LIMIT = 20
+RAKUTEN_SP_DESCRIPTION_ALLOWED_TAGS = {
+    "a",
+    "b",
+    "br",
+    "center",
+    "font",
+    "img",
+    "p",
+    "table",
+    "td",
+    "th",
+    "tr",
+}
+RAKUTEN_SP_DESCRIPTION_ALLOWED_ATTRIBUTES = {
+    "*": {"align"},
+    "a": {"href"},
+    "font": {"color", "face", "size"},
+    "img": {"alt", "border", "height", "src", "width"},
+    "table": {"bgcolor", "border", "cellpadding", "cellspacing", "height", "width"},
+    "td": {"align", "bgcolor", "colspan", "height", "rowspan", "valign", "width"},
+    "th": {"align", "bgcolor", "colspan", "height", "rowspan", "valign", "width"},
+    "tr": {"align", "bgcolor", "valign"},
+}
+RAKUTEN_SP_DESCRIPTION_DROP_TAGS = {
+    "audio",
+    "button",
+    "canvas",
+    "embed",
+    "form",
+    "iframe",
+    "input",
+    "link",
+    "map",
+    "meta",
+    "object",
+    "script",
+    "select",
+    "source",
+    "style",
+    "svg",
+    "textarea",
+    "video",
+}
 RAKUTEN_CABINET_FOLDER_PAGE_SIZE = 100
 RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT = 500
 RAKUTEN_CABINET_FOLDER_CREATE_ATTEMPTS = 10
@@ -316,7 +361,7 @@ def product_descriptions(raw_payload: dict[str, Any]) -> list[dict[str, str]]:
         normalized_label = normalize_text(label) or "商品说明"
         if not has_description_source(value):
             return
-        text = normalize_detail_html(value)
+        text = normalize_listing_detail_html(value)
         text_key = description_content_key(text)
         seen_key = (normalized_label, text_key)
         if not text_key and not keep_empty:
@@ -325,6 +370,11 @@ def product_descriptions(raw_payload: dict[str, Any]) -> list[dict[str, str]]:
             return
         seen_values.add(seen_key)
         descriptions.append({"label": normalized_label, "value": text})
+
+    source_fields = source_rakuten_description_fields(raw_payload)
+    append("PC用 商品説明文", source_fields.get("PC用 商品説明文"), keep_empty=True)
+    append("スマートフォン用 商品説明文", source_fields.get("スマートフォン用 商品説明文"), keep_empty=True)
+    append("PC用 販売説明文", source_fields.get("PC用 販売説明文"), keep_empty=True)
 
     product_description = raw_payload.get("productDescription")
     if isinstance(product_description, dict):
@@ -355,6 +405,48 @@ def product_descriptions(raw_payload: dict[str, Any]) -> list[dict[str, str]]:
     return normalize_rakuten_description_fields(
         clean_market_product_descriptions(descriptions, keep_empty_labels=RAKUTEN_DESCRIPTION_FIELD_LABELS)
     )
+
+
+def source_rakuten_description_fields(raw_payload: dict[str, Any]) -> dict[str, str]:
+    fields = {label: "" for label in RAKUTEN_STANDARD_DESCRIPTION_LABELS}
+    embedded_item = raw_payload.get("embeddedItem") if isinstance(raw_payload.get("embeddedItem"), dict) else {}
+    pc_fields = embedded_item.get("pcFields") if isinstance(embedded_item.get("pcFields"), dict) else {}
+    source_values = {
+        "PC用 商品説明文": pc_fields.get("productDescription"),
+        "スマートフォン用 商品説明文": embedded_item.get("newProductDescription"),
+        "PC用 販売説明文": embedded_item.get("salesDescription"),
+    }
+    for label, value in source_values.items():
+        if has_description_source(value):
+            fields[label] = str(value or "")
+
+    product_description = raw_payload.get("productDescription")
+    if isinstance(product_description, dict):
+        fallback_values = {
+            "PC用 商品説明文": product_description.get("pc"),
+            "スマートフォン用 商品説明文": product_description.get("sp") or product_description.get("smartphone"),
+            "PC用 販売説明文": raw_payload.get("salesDescription"),
+        }
+        for label, value in fallback_values.items():
+            if not fields[label] and has_description_source(value):
+                fields[label] = str(value or "")
+
+    raw_descriptions = raw_payload.get("descriptions")
+    if isinstance(raw_descriptions, list):
+        for item in raw_descriptions:
+            if not isinstance(item, dict):
+                continue
+            target_label = standard_rakuten_description_label(first_text_from_keys(item, ("label", "name")))
+            if target_label and not fields[target_label] and has_description_source(item.get("value")):
+                fields[target_label] = str(item.get("value") or "")
+
+    if not fields["PC用 販売説明文"] and has_description_source(raw_payload.get("salesDescription")):
+        fields["PC用 販売説明文"] = str(raw_payload.get("salesDescription") or "")
+    return fields
+
+
+def product_descriptions_for_display(raw_payload: dict[str, Any], images: list[str] | None = None, *, shop_code: str = "") -> list[dict[str, str]]:
+    return product_descriptions(raw_payload)
 
 
 def product_shop_code(row: ProductModel, raw_payload: dict[str, Any]) -> str:
@@ -1926,9 +2018,10 @@ def bulk_upsert_rakuten_inventories(
         return
     for offset in range(0, len(inventories), RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT):
         chunk = inventories[offset : offset + RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT]
-        response = requests.post(
+        response = request_rakuten_write(
+            "POST",
             RAKUTEN_INVENTORY_BULK_UPSERT_URL,
-            timeout=settings.crawler_timeout_seconds,
+            operation="乐天库存/发货信息登记",
             headers={
                 "Authorization": build_rakuten_authorization_header(service_secret, license_key),
                 "Accept": "application/json",
@@ -4098,6 +4191,36 @@ def listing_image_sources_for_repair(raw_payload: dict[str, Any], shop_code: str
     return product_image_urls(fallback_payload, shop_code=shop_code)[:RAKUTEN_LISTING_IMAGE_LIMIT]
 
 
+def request_rakuten_write(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    operation: str,
+    **kwargs: Any,
+) -> requests.Response:
+    timeout = max(int(settings.rakuten_write_timeout_seconds), int(settings.crawler_timeout_seconds))
+    last_error: Exception | None = None
+    for attempt in range(RAKUTEN_WRITE_MAX_RETRIES):
+        try:
+            response = requests.request(method, url, timeout=timeout, headers=headers, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            if attempt < RAKUTEN_WRITE_MAX_RETRIES - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"{operation}超时或连接失败，已重试 {RAKUTEN_WRITE_MAX_RETRIES} 次：{exc}") from exc
+
+        if response.status_code in RAKUTEN_WRITE_RETRY_STATUS_CODES and attempt < RAKUTEN_WRITE_MAX_RETRIES - 1:
+            response.close()
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        return response
+    if last_error is not None:
+        raise RuntimeError(f"{operation}失败：{last_error}") from last_error
+    raise RuntimeError(f"{operation}失败。")
+
+
 def put_rakuten_item(
     service_secret: str,
     license_key: str,
@@ -4109,9 +4232,10 @@ def put_rakuten_item(
     normalized_manage_number = normalize_text(manage_number)
     if not normalized_manage_number:
         raise RuntimeError("商品管理编号为空，不能创建乐天商品。")
-    response = requests.put(
+    response = request_rakuten_write(
+        "PUT",
         RAKUTEN_ITEM_PATCH_URL.format(manageNumber=quote(normalized_manage_number, safe="")),
-        timeout=settings.crawler_timeout_seconds,
+        operation=f"乐天商品 {normalized_manage_number} 创建",
         headers={
             "Authorization": build_rakuten_authorization_header(service_secret, license_key),
             "Accept": "application/json",
@@ -4426,12 +4550,26 @@ def replace_product_description_image_urls(raw_payload: dict[str, Any], replacem
         if key in updated_payload:
             updated_payload[key] = replace_description_html_image_urls(updated_payload.get(key), replacement_map)
 
+    replace_embedded_item_description_image_urls(updated_payload, replacement_map)
+
     raw_descriptions = updated_payload.get("descriptions")
     if isinstance(raw_descriptions, list):
         for item in raw_descriptions:
             if isinstance(item, dict) and "value" in item:
                 item["value"] = replace_description_html_image_urls(item.get("value"), replacement_map)
     return updated_payload
+
+
+def replace_embedded_item_description_image_urls(raw_payload: dict[str, Any], replacement_map: dict[str, str]) -> None:
+    embedded_item = raw_payload.get("embeddedItem")
+    if not isinstance(embedded_item, dict):
+        return
+    pc_fields = embedded_item.get("pcFields")
+    if isinstance(pc_fields, dict) and "productDescription" in pc_fields:
+        pc_fields["productDescription"] = replace_description_html_image_urls(pc_fields.get("productDescription"), replacement_map)
+    for key in ("newProductDescription", "salesDescription"):
+        if key in embedded_item:
+            embedded_item[key] = replace_description_html_image_urls(embedded_item.get(key), replacement_map)
 
 
 def replace_description_html_image_urls(html: Any, replacement_map: dict[str, str]) -> str:
@@ -4468,12 +4606,26 @@ def remove_product_description_image_urls(raw_payload: dict[str, Any], image_url
         if key in updated_payload:
             updated_payload[key] = remove_description_html_image_urls(updated_payload.get(key), normalized_urls)
 
+    remove_embedded_item_description_image_urls(updated_payload, normalized_urls)
+
     raw_descriptions = updated_payload.get("descriptions")
     if isinstance(raw_descriptions, list):
         for item in raw_descriptions:
             if isinstance(item, dict) and "value" in item:
                 item["value"] = remove_description_html_image_urls(item.get("value"), normalized_urls)
     return updated_payload
+
+
+def remove_embedded_item_description_image_urls(raw_payload: dict[str, Any], image_urls: set[str]) -> None:
+    embedded_item = raw_payload.get("embeddedItem")
+    if not isinstance(embedded_item, dict):
+        return
+    pc_fields = embedded_item.get("pcFields")
+    if isinstance(pc_fields, dict) and "productDescription" in pc_fields:
+        pc_fields["productDescription"] = remove_description_html_image_urls(pc_fields.get("productDescription"), image_urls)
+    for key in ("newProductDescription", "salesDescription"):
+        if key in embedded_item:
+            embedded_item[key] = remove_description_html_image_urls(embedded_item.get(key), image_urls)
 
 
 def remove_description_html_image_urls(html: Any, image_urls: set[str]) -> str:
@@ -4819,6 +4971,7 @@ def build_rakuten_inventory_upsert_payloads(
         inventory: dict[str, Any] = {
             "manageNumber": normalized_manage_number,
             "variantId": normalized_variant_id,
+            "mode": "ABSOLUTE",
             "quantity": quantity,
         }
         operation_lead_time: dict[str, int] = {}
@@ -4976,10 +5129,27 @@ def sanitize_rakuten_listing_description_html(value: Any, *, max_length: int) ->
         return ""
     text = re.sub(r"<\s*thcolspan(\s|>)", r'<th colspan="2"\1', text, flags=re.I)
     text = re.sub(r"</\s*thcolspan\s*>", "</th>", text, flags=re.I)
-    text = sanitize_description_html(text)
+    text = sanitize_rakuten_pc_description_html(text)
     text = re.sub(r"<\s*thcolspan(\s|>)", r'<th colspan="2"\1', text, flags=re.I)
     text = re.sub(r"</\s*thcolspan\s*>", "</th>", text, flags=re.I)
     return truncate_text(text, max_length)
+
+
+def sanitize_rakuten_pc_description_html(value: Any) -> str:
+    soup = BeautifulSoup(str(value or ""), "lxml")
+    for comment in soup.find_all(string=lambda item: isinstance(item, Comment)):
+        comment.extract()
+    for element in soup.select("script, object, embed, link, meta, svg, canvas, video, audio, form, input, select, textarea, button"):
+        element.decompose()
+    for element in soup.select("*"):
+        for attribute in list(element.attrs):
+            name = normalize_text(attribute).lower()
+            attr_values = element.get_attribute_list(attribute)
+            value_text = " ".join(str(value) for value in attr_values).strip()
+            if is_unsafe_html_attribute_value(name, value_text):
+                del element.attrs[attribute]
+    body = soup.body
+    return body.decode_contents().strip() if body is not None else str(soup).strip()
 
 
 def sanitize_rakuten_sp_description_html(value: Any, *, max_length: int) -> str:
@@ -4987,13 +5157,7 @@ def sanitize_rakuten_sp_description_html(value: Any, *, max_length: int) -> str:
     if not text:
         return ""
     soup = BeautifulSoup(text, "lxml")
-    for element in soup.select("script, style, iframe, object, embed, link, meta, svg, canvas, video, audio"):
-        element.decompose()
-    for element in soup.select("div, section, article, header, footer, main, nav, aside"):
-        element.unwrap()
-    for element in soup.select("span"):
-        if not element.attrs:
-            element.unwrap()
+    sanitize_rakuten_sp_description_soup(soup)
     image_count = 0
     for image in soup.select("img"):
         image_count += 1
@@ -5001,8 +5165,42 @@ def sanitize_rakuten_sp_description_html(value: Any, *, max_length: int) -> str:
             image.decompose()
     body = soup.body
     cleaned = body.decode_contents().strip() if body is not None else str(soup).strip()
-    cleaned = re.sub(r"<\s*/?\s*div(?:\s[^>]*)?>", "", cleaned, flags=re.I)
     return truncate_text(cleaned, max_length)
+
+
+def sanitize_rakuten_sp_description_soup(soup: BeautifulSoup) -> None:
+    for comment in soup.find_all(string=lambda value: isinstance(value, Comment)):
+        comment.extract()
+    for element in list(soup.find_all(True)):
+        tag_name = normalize_text(element.name).lower()
+        if tag_name in RAKUTEN_SP_DESCRIPTION_DROP_TAGS:
+            element.decompose()
+            continue
+        if tag_name in {"html", "body"}:
+            continue
+        if tag_name not in RAKUTEN_SP_DESCRIPTION_ALLOWED_TAGS:
+            element.unwrap()
+            continue
+        allowed_attributes = set(RAKUTEN_SP_DESCRIPTION_ALLOWED_ATTRIBUTES.get("*", set()))
+        allowed_attributes.update(RAKUTEN_SP_DESCRIPTION_ALLOWED_ATTRIBUTES.get(tag_name, set()))
+        for attribute in list(element.attrs):
+            attr_name = normalize_text(attribute).lower()
+            attr_values = element.get_attribute_list(attribute)
+            attr_value = " ".join(str(value) for value in attr_values).strip()
+            if attr_name not in allowed_attributes or is_unsafe_html_attribute_value(attr_name, attr_value):
+                del element.attrs[attribute]
+
+
+def is_unsafe_html_attribute_value(name: str, value: str) -> bool:
+    normalized_name = normalize_text(name).lower()
+    normalized_value = normalize_text(value).lower()
+    if normalized_name.startswith("on"):
+        return True
+    if normalized_value.startswith(("javascript:", "data:", "vbscript:")):
+        return True
+    if normalized_name in {"src", "href"} and normalized_value and not normalized_value.startswith(("http://", "https://", "/", "#", "mailto:", "tel:")):
+        return True
+    return False
 
 
 def truncate_text(value: Any, max_length: int) -> str:
@@ -6551,7 +6749,7 @@ def clean_market_product_descriptions(
     for item in descriptions:
         label = normalize_text(item.get("label")) or "商品说明"
         is_official_rakuten_field = label in keep_empty_label_set
-        value = normalize_detail_html(item.get("value"))
+        value = normalize_listing_detail_html(item.get("value")) if is_official_rakuten_field else normalize_detail_html(item.get("value"))
         if not is_official_rakuten_field:
             value = strip_low_quality_description_lines(value)
         value_key = description_content_key(value)
@@ -6565,14 +6763,15 @@ def clean_market_product_descriptions(
             seen_empty_official.add(label)
             normalized.append({"label": label, "value": value})
             continue
-        previous_index = seen_by_content.get(value_key)
+        content_key = f"{label}\0{value_key}" if is_official_rakuten_field else value_key
+        previous_index = seen_by_content.get(content_key)
         current = {"label": label, "value": value}
         if previous_index is not None:
             previous = normalized[previous_index]
             if description_label_priority(label, keep_empty_label_set) > description_label_priority(previous["label"], keep_empty_label_set):
                 normalized[previous_index] = current
             continue
-        seen_by_content[value_key] = len(normalized)
+        seen_by_content[content_key] = len(normalized)
         normalized.append(current)
     if not normalized:
         return []
@@ -6584,8 +6783,8 @@ def normalize_rakuten_description_fields(descriptions: list[dict[str, str]]) -> 
     extras: list[dict[str, str]] = []
     for item in descriptions:
         label = normalize_text(item.get("label")) or "商品说明"
-        value = normalize_detail_html(item.get("value"))
         target_label = standard_rakuten_description_label(label)
+        value = normalize_listing_detail_html(item.get("value")) if target_label else normalize_detail_html(item.get("value"))
         if target_label:
             if value and not fields[target_label]:
                 fields[target_label] = value
@@ -6636,7 +6835,7 @@ def first_description_by_label(descriptions: list[dict[str, str]], labels: tuple
     normalized_labels = {normalize_text(label) for label in labels}
     for description in descriptions:
         if normalize_text(description.get("label")) in normalized_labels:
-            return normalize_detail_html(description.get("value"))
+            return normalize_listing_detail_html(description.get("value"))
     return ""
 
 
@@ -7088,6 +7287,14 @@ def normalize_detail_html(value: Any) -> str:
     text = re.sub(r"<script[\s\S]*?</script>", "", text, flags=re.I)
     text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.I)
     return sanitize_description_html(text).strip()
+
+
+def normalize_listing_detail_html(value: Any) -> str:
+    text = str(value or "").replace("\\/", "/")
+    text = unescape(text)
+    if not text.strip():
+        return ""
+    return sanitize_rakuten_pc_description_html(text).strip()
 
 
 def sanitize_description_html(value: str) -> str:

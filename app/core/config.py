@@ -64,6 +64,7 @@ class Settings(BaseModel):
     initial_superadmin_username: str = "superadmin"
     initial_superadmin_password: str = "123456"
     crawler_timeout_seconds: int = 20
+    rakuten_write_timeout_seconds: int = 60
     crawler_browser_fallback_enabled: bool = True
     crawler_browser_timeout_seconds: int = 35
     rakuten_default_inventory_quantity: int = 1000
@@ -110,6 +111,7 @@ def build_settings() -> Settings:
         initial_superadmin_username=_env_text("LT_INITIAL_SUPERADMIN_USERNAME", "superadmin"),
         initial_superadmin_password=_env_text("LT_INITIAL_SUPERADMIN_PASSWORD", "123456"),
         crawler_timeout_seconds=_env_int("LT_CRAWLER_TIMEOUT_SECONDS", 20),
+        rakuten_write_timeout_seconds=_env_int("LT_RAKUTEN_WRITE_TIMEOUT_SECONDS", 60),
         crawler_browser_fallback_enabled=_env_bool("LT_CRAWLER_BROWSER_FALLBACK_ENABLED", True),
         crawler_browser_timeout_seconds=_env_int("LT_CRAWLER_BROWSER_TIMEOUT_SECONDS", 35),
         rakuten_default_inventory_quantity=max(0, _env_int("LT_RAKUTEN_DEFAULT_INVENTORY_QUANTITY", 1000)),
