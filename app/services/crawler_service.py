@@ -928,6 +928,52 @@ def update_task_progress(
             task.status = status
 
 
+def ensure_user_task_capacity(
+    session: Any,
+    model: Any,
+    owner_username: str,
+    *,
+    limit: int,
+    label: str,
+    exclude_task_id: str | None = None,
+) -> None:
+    query = select(func.count()).where(
+        model.owner_username == owner_username,
+        model.status.in_(("queued", "running")),
+    )
+    if exclude_task_id:
+        query = query.where(model.id != exclude_task_id)
+    count = int(session.scalar(query) or 0)
+    if count >= limit:
+        raise RuntimeError(f"当前用户已有 {count} 个{label}任务正在执行，请等待任务完成后再创建。")
+
+
+def ensure_store_task_capacity(
+    session: Any,
+    store_id: int | None,
+    *,
+    exclude_sync_task_id: str | None = None,
+    exclude_listing_task_id: str | None = None,
+) -> None:
+    if not store_id:
+        return
+    sync_query = select(func.count()).where(
+        SyncTaskModel.store_id == store_id,
+        SyncTaskModel.status.in_(("queued", "running")),
+    )
+    if exclude_sync_task_id:
+        sync_query = sync_query.where(SyncTaskModel.id != exclude_sync_task_id)
+    listing_query = select(func.count()).where(
+        ListingTaskModel.store_id == store_id,
+        ListingTaskModel.status.in_(("queued", "running")),
+    )
+    if exclude_listing_task_id:
+        listing_query = listing_query.where(ListingTaskModel.id != exclude_listing_task_id)
+    count = int(session.scalar(sync_query) or 0) + int(session.scalar(listing_query) or 0)
+    if count > 0:
+        raise RuntimeError("该店铺已有同步、上架、上下架或删除任务正在执行，请等待完成后再操作。")
+
+
 def role_to_public(row: RoleModel) -> dict[str, Any]:
     try:
         permissions = json.loads(row.permissions_json or "[]")
@@ -3243,6 +3289,14 @@ def create_sync_task_record(
     payload: dict[str, Any] | None = None,
 ) -> str:
     with session_scope() as session:
+        ensure_user_task_capacity(
+            session,
+            SyncTaskModel,
+            owner_username,
+            limit=settings.max_running_sync_tasks_per_user,
+            label="同步",
+        )
+        ensure_store_task_capacity(session, store_id)
         store = session.get(StoreModel, store_id)
         if store is None:
             raise RuntimeError("店铺不存在。")
@@ -3589,6 +3643,15 @@ def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("同步任务不存在。")
         if task.owner_username != owner_username:
             raise RuntimeError("不能重试其他用户的同步任务。")
+        ensure_user_task_capacity(
+            session,
+            SyncTaskModel,
+            owner_username,
+            limit=settings.max_running_sync_tasks_per_user,
+            label="同步",
+            exclude_task_id=task_id,
+        )
+        ensure_store_task_capacity(session, task.store_id, exclude_sync_task_id=task_id)
         task.status = "running"
         task.message = "重新同步中"
         task.error_detail = None
@@ -5593,6 +5656,14 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
     if not store_id:
         raise RuntimeError("请选择上架店铺。")
     with session_scope() as session:
+        ensure_user_task_capacity(
+            session,
+            ListingTaskModel,
+            owner_username,
+            limit=settings.max_running_listing_tasks_per_user,
+            label="上架",
+        )
+        ensure_store_task_capacity(session, int(store_id))
         store = session.get(StoreModel, store_id)
         if store is None:
             raise RuntimeError("上架店铺不存在。")
@@ -5636,7 +5707,7 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
         session.flush()
         task_id = task.id
 
-    run_listing_task(owner_username, task_id)
+    dispatch_listing_task(owner_username, task_id)
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
         return listing_task_to_public(task) if task else {"id": task_id}
@@ -5802,6 +5873,15 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("上架任务不存在。")
         if task.owner_username != owner_username:
             raise RuntimeError("不能重试其他用户的上架任务。")
+        ensure_user_task_capacity(
+            session,
+            ListingTaskModel,
+            owner_username,
+            limit=settings.max_running_listing_tasks_per_user,
+            label="上架",
+            exclude_task_id=task_id,
+        )
+        ensure_store_task_capacity(session, task.store_id, exclude_listing_task_id=task_id)
         try:
             product_ids = json.loads(task.product_ids_json or "[]")
         except ValueError:
@@ -5912,6 +5992,13 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
     source_type = str(getattr(payload, "sourceType", "") or "").strip()
     target = str(getattr(payload, "target", "") or "").strip()
     with session_scope() as session:
+        ensure_user_task_capacity(
+            session,
+            CrawlTaskModel,
+            owner_username,
+            limit=settings.max_running_crawl_tasks_per_user,
+            label="采集",
+        )
         source = session.get(CrawlSourceModel, source_id) if source_id else None
         if source is not None:
             if source.owner_username != owner_username:
@@ -5948,6 +6035,14 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("采集任务不存在。")
         if task.owner_username != owner_username:
             raise RuntimeError("不能重启其他用户的采集任务。")
+        ensure_user_task_capacity(
+            session,
+            CrawlTaskModel,
+            owner_username,
+            limit=settings.max_running_crawl_tasks_per_user,
+            label="采集",
+            exclude_task_id=task_id,
+        )
         task.status = "queued"
         task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
         task.success_count = 0

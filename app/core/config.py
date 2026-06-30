@@ -56,6 +56,9 @@ class Settings(BaseModel):
     database_url: str
     database_echo: bool = False
     database_auto_create: bool = True
+    database_pool_size: int = 10
+    database_max_overflow: int = 20
+    database_pool_timeout: int = 30
     session_cookie_name: str = "lt_session"
     session_cookie_secure: bool = False
     session_duration_seconds: int = 60 * 60 * 24 * 7
@@ -65,6 +68,9 @@ class Settings(BaseModel):
     initial_superadmin_password: str = "123456"
     crawler_timeout_seconds: int = 20
     rakuten_write_timeout_seconds: int = 60
+    max_running_crawl_tasks_per_user: int = 2
+    max_running_sync_tasks_per_user: int = 2
+    max_running_listing_tasks_per_user: int = 1
     crawler_browser_fallback_enabled: bool = True
     crawler_browser_timeout_seconds: int = 35
     rakuten_default_inventory_quantity: int = 1000
@@ -103,6 +109,9 @@ def build_settings() -> Settings:
         database_url=database_url,
         database_echo=_env_bool("LT_DATABASE_ECHO", False),
         database_auto_create=_env_bool("LT_DATABASE_AUTO_CREATE", True),
+        database_pool_size=max(1, _env_int("LT_DATABASE_POOL_SIZE", 10)),
+        database_max_overflow=max(0, _env_int("LT_DATABASE_MAX_OVERFLOW", 20)),
+        database_pool_timeout=max(1, _env_int("LT_DATABASE_POOL_TIMEOUT", 30)),
         session_cookie_name=_env_text("LT_SESSION_COOKIE_NAME", "lt_session"),
         session_cookie_secure=_env_bool("LT_SESSION_COOKIE_SECURE", False),
         session_duration_seconds=_env_int("LT_SESSION_DURATION_SECONDS", 60 * 60 * 24 * 7),
@@ -112,6 +121,9 @@ def build_settings() -> Settings:
         initial_superadmin_password=_env_text("LT_INITIAL_SUPERADMIN_PASSWORD", "123456"),
         crawler_timeout_seconds=_env_int("LT_CRAWLER_TIMEOUT_SECONDS", 20),
         rakuten_write_timeout_seconds=_env_int("LT_RAKUTEN_WRITE_TIMEOUT_SECONDS", 60),
+        max_running_crawl_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_CRAWL_TASKS_PER_USER", 2)),
+        max_running_sync_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_SYNC_TASKS_PER_USER", 2)),
+        max_running_listing_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_USER", 1)),
         crawler_browser_fallback_enabled=_env_bool("LT_CRAWLER_BROWSER_FALLBACK_ENABLED", True),
         crawler_browser_timeout_seconds=_env_int("LT_CRAWLER_BROWSER_TIMEOUT_SECONDS", 35),
         rakuten_default_inventory_quantity=max(0, _env_int("LT_RAKUTEN_DEFAULT_INVENTORY_QUANTITY", 1000)),
