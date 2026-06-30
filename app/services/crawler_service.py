@@ -60,6 +60,7 @@ ALLOWED_PRODUCT_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif"}
 MAX_PRODUCT_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024
 RAKUTEN_LISTING_IMAGE_LIMIT = 20
+RAKUTEN_SP_DESCRIPTION_IMAGE_LIMIT = 20
 RAKUTEN_CABINET_FOLDER_PAGE_SIZE = 100
 RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT = 500
 RAKUTEN_CABINET_FOLDER_CREATE_ATTEMPTS = 10
@@ -351,7 +352,9 @@ def product_descriptions(raw_payload: dict[str, Any]) -> list[dict[str, str]]:
     for label, key in fields:
         append(label, raw_payload.get(key))
     append("PC用 販売説明文", raw_payload.get("salesDescription"), keep_empty=True)
-    return clean_market_product_descriptions(descriptions, keep_empty_labels=RAKUTEN_DESCRIPTION_FIELD_LABELS)
+    return normalize_rakuten_description_fields(
+        clean_market_product_descriptions(descriptions, keep_empty_labels=RAKUTEN_DESCRIPTION_FIELD_LABELS)
+    )
 
 
 def product_shop_code(row: ProductModel, raw_payload: dict[str, Any]) -> str:
@@ -430,6 +433,21 @@ def set_product_image_urls(raw_payload: dict[str, Any], images: list[str]) -> di
         updated_media["images"] = [{"type": "CABINET" if is_cabinet_image_url(image) else "ABSOLUTE", "location": image} for image in normalized_images]
         updated_payload["media"] = updated_media
     updated_payload["updated"] = datetime.now().isoformat(timespec="seconds")
+    return updated_payload
+
+
+def set_product_image_urls_with_description_updates(
+    raw_payload: dict[str, Any],
+    images: list[str],
+    *,
+    replace_map: dict[str, str] | None = None,
+    remove_urls: list[str] | None = None,
+) -> dict[str, Any]:
+    updated_payload = set_product_image_urls(raw_payload, images)
+    if replace_map:
+        updated_payload = replace_product_description_image_urls(updated_payload, replace_map)
+    if remove_urls:
+        updated_payload = remove_product_description_image_urls(updated_payload, remove_urls)
     return updated_payload
 
 
@@ -731,9 +749,17 @@ def scheduled_crawl_to_public(row: ScheduledCrawlModel) -> dict[str, Any]:
 
 def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
     try:
-        product_ids = json.loads(row.product_ids_json or "[]")
+        product_ids_payload = json.loads(row.product_ids_json or "[]")
     except ValueError:
-        product_ids = []
+        product_ids_payload = []
+    if isinstance(product_ids_payload, dict):
+        product_ids = product_ids_payload.get("productIds") if isinstance(product_ids_payload.get("productIds"), list) else []
+        success_ids = product_ids_payload.get("successIds") if isinstance(product_ids_payload.get("successIds"), list) else []
+        failed_ids = product_ids_payload.get("failedIds") if isinstance(product_ids_payload.get("failedIds"), list) else []
+    else:
+        product_ids = product_ids_payload if isinstance(product_ids_payload, list) else []
+        success_ids = []
+        failed_ids = []
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -743,7 +769,9 @@ def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
         "totalCount": row.total_count,
         "successCount": row.success_count,
         "failedCount": row.failed_count,
-        "productIds": product_ids if isinstance(product_ids, list) else [],
+        "productIds": product_ids,
+        "successIds": success_ids,
+        "failedIds": failed_ids,
         "message": row.message,
         "errorDetail": row.error_detail,
         "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
@@ -754,6 +782,11 @@ def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
 
 
 def sync_task_to_public(row: SyncTaskModel) -> dict[str, Any]:
+    try:
+        payload = json.loads(row.payload_json or "{}")
+    except ValueError:
+        payload = {}
+    task_result = payload.get("result") if isinstance(payload, dict) and isinstance(payload.get("result"), dict) else {}
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -765,6 +798,9 @@ def sync_task_to_public(row: SyncTaskModel) -> dict[str, Any]:
         "totalCount": row.total_count,
         "successCount": row.success_count,
         "failedCount": row.failed_count,
+        "payload": payload if isinstance(payload, dict) else {},
+        "successIds": task_result.get("successIds") if isinstance(task_result.get("successIds"), list) else [],
+        "failedIds": task_result.get("failedIds") if isinstance(task_result.get("failedIds"), list) else [],
         "message": row.message,
         "errorDetail": row.error_detail,
         "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
@@ -3137,6 +3173,10 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
         elif task_type == "product_delete":
             product_ids = normalize_product_ids(list(payload.get("productIds") or []))
             result = perform_product_delete_sync(owner_username, store_id, product_ids)
+            payload["result"] = {
+                "successIds": list(result.get("successIds") or []),
+                "failedIds": list(result.get("failedIds") or []),
+            }
             total_count = int(result.get("totalCount") or 0)
             success_count = int(result.get("successCount") or 0)
             failed_count = int(result.get("failedCount") or 0)
@@ -3181,6 +3221,7 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
         task.status = status
         task.message = message
         task.error_detail = error_detail
+        task.payload_json = json.dumps(payload, ensure_ascii=False)
         task.finished_at = datetime.now()
 
 
@@ -3288,6 +3329,8 @@ def perform_product_delete_sync(owner_username: str, store_id: int, product_ids:
         ).all()
         found_ids = {row.id for row in rows}
         missing_ids = [product_id for product_id in product_ids if product_id not in found_ids]
+        success_ids: list[int] = []
+        failed_ids: list[int] = list(missing_ids)
         success_count = 0
         failed_count = len(missing_ids)
         cabinet_deleted_count = 0
@@ -3300,11 +3343,13 @@ def perform_product_delete_sync(owner_username: str, store_id: int, product_ids:
                 cabinet_deleted_count += int(getattr(row, "_deleted_cabinet_count", 0) or 0)
             except Exception as exc:
                 failed_count += 1
+                failed_ids.append(row.id)
                 error_text = str(exc)
                 row.last_error = error_text
                 errors.append(f"{productCodeForError(row)}: {error_text}")
                 continue
             warnings.extend(getattr(row, "_delete_warnings", []) or [])
+            success_ids.append(row.id)
             session.delete(row)
             success_count += 1
         session.flush()
@@ -3313,6 +3358,8 @@ def perform_product_delete_sync(owner_username: str, store_id: int, product_ids:
             "totalCount": len(product_ids),
             "successCount": success_count,
             "failedCount": failed_count,
+            "successIds": success_ids,
+            "failedIds": failed_ids,
             "cabinetDeletedCount": cabinet_deleted_count,
             "errors": errors,
             "warnings": warnings,
@@ -4212,6 +4259,8 @@ def normalize_description_image_url(value: Any) -> str:
     text = normalize_text(value)
     if not text or text.lower().startswith(("data:", "blob:", "javascript:")):
         return ""
+    if text.startswith(LOCAL_PRODUCT_IMAGE_URL_PREFIX):
+        return text.split("?", 1)[0].split("#", 1)[0]
     if text.startswith("//"):
         text = f"https:{text}"
     if not text.startswith(("http://", "https://")):
@@ -4274,6 +4323,55 @@ def replace_description_html_image_urls(html: Any, replacement_map: dict[str, st
         srcset = image.get("srcset")
         if srcset:
             image["srcset"] = replace_srcset_image_urls(srcset, replacement_map)
+    body = soup.body
+    return body.decode_contents().strip() if body is not None else str(soup).strip()
+
+
+def remove_product_description_image_urls(raw_payload: dict[str, Any], image_urls: list[str]) -> dict[str, Any]:
+    normalized_urls = {normalize_description_image_url(url) for url in image_urls}
+    normalized_urls.discard("")
+    if not normalized_urls:
+        return raw_payload
+    updated_payload = json.loads(json.dumps(raw_payload, ensure_ascii=False))
+    product_description = updated_payload.get("productDescription")
+    if isinstance(product_description, dict):
+        for key in ("pc", "sp", "smartphone", "value"):
+            if key in product_description:
+                product_description[key] = remove_description_html_image_urls(product_description.get(key), normalized_urls)
+    elif "productDescription" in updated_payload:
+        updated_payload["productDescription"] = remove_description_html_image_urls(product_description, normalized_urls)
+
+    for key in ("description", "pcDescription", "spDescription", "smartphoneDescription", "salesDescription"):
+        if key in updated_payload:
+            updated_payload[key] = remove_description_html_image_urls(updated_payload.get(key), normalized_urls)
+
+    raw_descriptions = updated_payload.get("descriptions")
+    if isinstance(raw_descriptions, list):
+        for item in raw_descriptions:
+            if isinstance(item, dict) and "value" in item:
+                item["value"] = remove_description_html_image_urls(item.get("value"), normalized_urls)
+    return updated_payload
+
+
+def remove_description_html_image_urls(html: Any, image_urls: set[str]) -> str:
+    if not html or not image_urls:
+        return str(html or "")
+    soup = BeautifulSoup(str(html), "lxml")
+    for image in soup.select("img, source"):
+        should_remove = False
+        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+            value = normalize_description_image_url(image.get(attr))
+            if value and value in image_urls:
+                should_remove = True
+                break
+        srcset = image.get("srcset")
+        if srcset:
+            srcset_urls = {normalize_description_image_url(url) for url, _descriptor in parse_srcset_candidates(srcset)}
+            srcset_urls.discard("")
+            if srcset_urls and srcset_urls.issubset(image_urls):
+                should_remove = True
+        if should_remove:
+            image.decompose()
     body = soup.body
     return body.decode_contents().strip() if body is not None else str(soup).strip()
 
@@ -4729,11 +4827,10 @@ def build_rakuten_variant_selectors(raw_payload: dict[str, Any], variants: dict[
 
 def build_rakuten_product_description(raw_payload: dict[str, Any]) -> dict[str, str]:
     descriptions = product_descriptions(raw_payload)
-    pc_description = first_description_by_label(descriptions, ("PC用 商品説明文", "PC用商品说明文", "PC商品说明", "PC用商品説明文"))
-    sp_description = first_description_by_label(descriptions, ("スマートフォン用 商品説明文", "智能手机用商品说明文", "スマートフォン用商品说明文", "移动端商品说明", "スマートフォン用商品説明文"))
-    fallback_description = best_product_description(descriptions)
-    pc_html = sanitize_rakuten_listing_description_html(pc_description or fallback_description, max_length=10240)
-    sp_html = sanitize_rakuten_listing_description_html(sp_description or fallback_description, max_length=10240)
+    pc_description = first_description_by_label(descriptions, ("PC用 商品説明文",))
+    sp_description = first_description_by_label(descriptions, ("スマートフォン用 商品説明文",))
+    pc_html = sanitize_rakuten_listing_description_html(pc_description, max_length=10240)
+    sp_html = sanitize_rakuten_sp_description_html(sp_description, max_length=10240)
     result: dict[str, str] = {}
     if pc_html:
         result["pc"] = pc_html
@@ -4745,7 +4842,7 @@ def build_rakuten_product_description(raw_payload: dict[str, Any]) -> dict[str, 
 def build_rakuten_sales_description(raw_payload: dict[str, Any]) -> str:
     descriptions = product_descriptions(raw_payload)
     return sanitize_rakuten_listing_description_html(
-        first_description_by_label(descriptions, ("PC用 販売説明文", "PC用销售说明文", "销售说明", "PC用販売説明文")),
+        first_description_by_label(descriptions, ("PC用 販売説明文",)),
         max_length=10240,
     )
 
@@ -4760,6 +4857,29 @@ def sanitize_rakuten_listing_description_html(value: Any, *, max_length: int) ->
     text = re.sub(r"<\s*thcolspan(\s|>)", r'<th colspan="2"\1', text, flags=re.I)
     text = re.sub(r"</\s*thcolspan\s*>", "</th>", text, flags=re.I)
     return truncate_text(text, max_length)
+
+
+def sanitize_rakuten_sp_description_html(value: Any, *, max_length: int) -> str:
+    text = sanitize_rakuten_listing_description_html(value, max_length=max_length)
+    if not text:
+        return ""
+    soup = BeautifulSoup(text, "lxml")
+    for element in soup.select("script, style, iframe, object, embed, link, meta, svg, canvas, video, audio"):
+        element.decompose()
+    for element in soup.select("div, section, article, header, footer, main, nav, aside"):
+        element.unwrap()
+    for element in soup.select("span"):
+        if not element.attrs:
+            element.unwrap()
+    image_count = 0
+    for image in soup.select("img"):
+        image_count += 1
+        if image_count > RAKUTEN_SP_DESCRIPTION_IMAGE_LIMIT:
+            image.decompose()
+    body = soup.body
+    cleaned = body.decode_contents().strip() if body is not None else str(soup).strip()
+    cleaned = re.sub(r"<\s*/?\s*div(?:\s[^>]*)?>", "", cleaned, flags=re.I)
+    return truncate_text(cleaned, max_length)
 
 
 def truncate_text(value: Any, max_length: int) -> str:
@@ -4834,7 +4954,10 @@ def replace_product_image(owner_username: str, product_id: int, image_index: int
         saved_url = save_uploaded_product_image(product_id, image_index, upload_file)
         old_url = images[image_index]
         images[image_index] = saved_url
-        product.raw_payload_json = json.dumps(set_product_image_urls(raw_payload, images), ensure_ascii=False)
+        product.raw_payload_json = json.dumps(
+            set_product_image_urls_with_description_updates(raw_payload, images, replace_map={old_url: saved_url}),
+            ensure_ascii=False,
+        )
         product.image_url = images[0] if images else ""
         product.last_error = None
         remove_local_product_image_if_unused(old_url, images)
@@ -4853,7 +4976,10 @@ def delete_product_image(owner_username: str, product_id: int, image_index: int)
         images = product_images_for_edit(product)
         removed_url = image_url_at_index(images, image_index)
         next_images = [image for index, image in enumerate(images) if index != image_index]
-        product.raw_payload_json = json.dumps(set_product_image_urls(raw_payload, next_images), ensure_ascii=False)
+        product.raw_payload_json = json.dumps(
+            set_product_image_urls_with_description_updates(raw_payload, next_images, remove_urls=[removed_url]),
+            ensure_ascii=False,
+        )
         product.image_url = next_images[0] if next_images else ""
         product.last_error = None
         remove_local_product_image_if_unused(removed_url, next_images)
@@ -5158,6 +5284,8 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
         ).all()
         success_count = 0
         failed_count = 0
+        success_ids: list[int] = []
+        failed_ids: list[int] = []
         errors: list[str] = []
         if store is None:
             task.status = "failed"
@@ -5166,6 +5294,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.message = "上架店铺不存在"
             task.error_detail = task.message
             task.finished_at = datetime.now()
+            task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
             for product in products:
                 product.last_error = task.message
                 restore_listing_product_to_approved(product)
@@ -5177,6 +5306,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.message = "上架店铺已停用"
             task.error_detail = task.message
             task.finished_at = datetime.now()
+            task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
             for product in products:
                 product.last_error = task.message
                 restore_listing_product_to_approved(product)
@@ -5190,6 +5320,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.message = "上架店铺缺少乐天 Secret 或乐天 Key"
             task.error_detail = task.message
             task.finished_at = datetime.now()
+            task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
             for product in products:
                 product.last_error = task.message
                 restore_listing_product_to_approved(product)
@@ -5206,6 +5337,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
                 product.last_error = "商品未审核通过，不能上架。"
                 restore_listing_product_to_approved(product)
                 failed_count += 1
+                failed_ids.append(product.id)
                 errors.append(f"{productCodeForError(product)}: {product.last_error}")
                 continue
             try:
@@ -5230,11 +5362,13 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
                 product.last_error = None
                 clear_product_temp_image_files(product.id)
                 success_count += 1
+                success_ids.append(product.id)
             except Exception as exc:
                 error_text = str(exc)
                 restore_listing_product_to_approved(product)
                 product.last_error = error_text
                 failed_count += 1
+                failed_ids.append(product.id)
                 errors.append(f"{productCodeForError(product)}: {error_text}")
         sync_store_cabinet_usage_fields(store, service_secret, license_key)
         task.total_count = len(products)
@@ -5248,6 +5382,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.status = "failed"
         task.message = f"完成，上架 {success_count} 条，异常 {failed_count} 条"
         task.error_detail = "\n".join(errors[:50]) if errors else None
+        task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": success_ids, "failedIds": failed_ids}, ensure_ascii=False)
         task.finished_at = datetime.now()
 
 
@@ -6122,6 +6257,13 @@ RAKUTEN_DESCRIPTION_FIELD_LABELS = (
 )
 
 
+RAKUTEN_STANDARD_DESCRIPTION_LABELS = (
+    "PC用 商品説明文",
+    "スマートフォン用 商品説明文",
+    "PC用 販売説明文",
+)
+
+
 LOW_QUALITY_DESCRIPTION_KEYWORDS = (
     "キャンセルポリシー",
     "メーカー希望小売価格",
@@ -6205,6 +6347,50 @@ def clean_market_product_descriptions(
     if not normalized:
         return []
     return normalized
+
+
+def normalize_rakuten_description_fields(descriptions: list[dict[str, str]]) -> list[dict[str, str]]:
+    fields: dict[str, str] = {label: "" for label in RAKUTEN_STANDARD_DESCRIPTION_LABELS}
+    extras: list[dict[str, str]] = []
+    for item in descriptions:
+        label = normalize_text(item.get("label")) or "商品说明"
+        value = normalize_detail_html(item.get("value"))
+        target_label = standard_rakuten_description_label(label)
+        if target_label:
+            if value and not fields[target_label]:
+                fields[target_label] = value
+            continue
+        if value:
+            extras.append({"label": label, "value": value})
+
+    for item in extras:
+        label = item["label"]
+        value = item["value"]
+        target_label = fallback_rakuten_description_label(label, value)
+        if value and not fields[target_label]:
+            fields[target_label] = value
+
+    return [{"label": label, "value": fields[label]} for label in RAKUTEN_STANDARD_DESCRIPTION_LABELS]
+
+
+def standard_rakuten_description_label(label: str) -> str:
+    normalized = normalize_text(label).replace(" ", "")
+    if normalized in {"PC用商品説明文", "PC用商品说明文", "PC商品说明", "PC用商品説明"}:
+        return "PC用 商品説明文"
+    if normalized in {"スマートフォン用商品説明文", "スマートフォン用商品说明文", "智能手机商品说明", "智能手机用商品说明文", "移动端商品说明"}:
+        return "スマートフォン用 商品説明文"
+    if normalized in {"PC用販売説明文", "PC用销售说明文", "销售说明", "販売説明文"}:
+        return "PC用 販売説明文"
+    return ""
+
+
+def fallback_rakuten_description_label(label: str, value: str) -> str:
+    normalized = normalize_text(label)
+    if "販売" in normalized or "销售" in normalized or "sale" in normalized.lower():
+        return "PC用 販売説明文"
+    if "スマートフォン" in normalized or "智能手机" in normalized or "移动" in normalized:
+        return "スマートフォン用 商品説明文"
+    return "PC用 商品説明文"
 
 
 def description_label_priority(label: str, official_labels: set[str]) -> int:
