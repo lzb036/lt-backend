@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit,
 import requests
 from bs4 import BeautifulSoup, Comment
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
@@ -979,20 +980,37 @@ def update_task_progress(
     message: str | None = None,
     status: str | None = None,
 ) -> None:
-    with session_scope() as session:
-        task = session.get(model, task_id)
-        if task is None:
+    last_error: OperationalError | None = None
+    for attempt in range(3):
+        try:
+            with session_scope() as session:
+                task = session.get(model, task_id)
+                if task is None:
+                    return
+                if total_count is not None:
+                    task.total_count = max(0, int(total_count))
+                if success_count is not None:
+                    task.success_count = max(0, int(success_count))
+                if failed_count is not None:
+                    task.failed_count = max(0, int(failed_count))
+                if message is not None:
+                    task.message = message
+                if status is not None:
+                    task.status = status
             return
-        if total_count is not None:
-            task.total_count = max(0, int(total_count))
-        if success_count is not None:
-            task.success_count = max(0, int(success_count))
-        if failed_count is not None:
-            task.failed_count = max(0, int(failed_count))
-        if message is not None:
-            task.message = message
-        if status is not None:
-            task.status = status
+        except OperationalError as exc:
+            last_error = exc
+            if not is_mysql_lock_wait_timeout(exc) or attempt >= 2:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+
+
+def is_mysql_lock_wait_timeout(exc: OperationalError) -> bool:
+    original = getattr(exc, "orig", None)
+    code = getattr(original, "args", [None])[0] if original is not None else None
+    return code == 1205 or "Lock wait timeout exceeded" in str(exc)
 
 
 def ensure_user_task_capacity(
@@ -6613,39 +6631,38 @@ def run_task(task_id: str) -> None:
             failed_count=0,
             message=f"采集中，已处理 0 / {len(items)} 条",
         )
+        success_count = 0
+        failed_count = 0
+        saved_count = 0
+        errors: list[str] = []
+        if not items:
+            errors.append("未采集到商品，请检查采集内容、榜单时间或乐天页面结构。")
+        for index, item in enumerate(items, start=1):
+            item_error = collected_item_error(item)
+            saved = save_collected_item(owner_username, task_id, item)
+            if saved:
+                saved_count += 1
+            if saved and item_error is None:
+                success_count += 1
+            else:
+                failed_count += 1
+                if item_error:
+                    errors.append(item_error)
+                elif not saved:
+                    name = str(item.get("title") or item.get("source_url") or "商品").strip()
+                    errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
+            update_task_progress(
+                CrawlTaskModel,
+                task_id,
+                total_count=len(items),
+                success_count=success_count,
+                failed_count=failed_count,
+                message=f"采集中，已处理 {index} / {len(items)} 条",
+            )
         with session_scope() as session:
             task = session.get(CrawlTaskModel, task_id)
             if task is None:
                 return
-            success_count = 0
-            failed_count = 0
-            saved_count = 0
-            errors: list[str] = []
-            if not items:
-                errors.append("未采集到商品，请检查采集内容、榜单时间或乐天页面结构。")
-            for index, item in enumerate(items, start=1):
-                item_error = collected_item_error(item)
-                saved = upsert_product(session, owner_username, task_id, item)
-                if saved:
-                    saved_count += 1
-                if saved and item_error is None:
-                    success_count += 1
-                else:
-                    failed_count += 1
-                    if item_error:
-                        errors.append(item_error)
-                    elif not saved:
-                        name = str(item.get("title") or item.get("source_url") or "商品").strip()
-                        errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
-                update_task_progress(
-                    CrawlTaskModel,
-                    task_id,
-                    total_count=len(items),
-                    success_count=success_count,
-                    failed_count=failed_count,
-                    message=f"采集中，已处理 {index} / {len(items)} 条",
-                )
-                session.flush()
             task.success_count = success_count
             task.failed_count = failed_count
             task.status = resolve_crawl_task_status("failed" if not items else "success", len(items), success_count, failed_count)
@@ -6664,6 +6681,11 @@ def run_task(task_id: str) -> None:
             task.message = "采集失败"
             task.error_detail = str(exc)
         log_event(owner_username, task_id, "error", str(exc))
+
+
+def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any]) -> bool:
+    with session_scope() as session:
+        return upsert_product(session, owner_username, task_id, item)
 
 
 def initial_crawl_task_total_count(source_type: str, target: str) -> int:
