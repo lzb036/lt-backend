@@ -73,12 +73,13 @@ class Settings(BaseModel):
     max_running_listing_tasks_per_user: int = 1
     crawler_browser_fallback_enabled: bool = True
     crawler_browser_timeout_seconds: int = 35
+    crawler_max_ranking_pages: int = 200
     rakuten_default_inventory_quantity: int = 1000
     rakuten_default_normal_delivery_time_id: int = 0
     rakuten_default_back_order_delivery_time_id: int = 0
     crawler_user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
     )
 
 
@@ -126,6 +127,7 @@ def build_settings() -> Settings:
         max_running_listing_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_USER", 1)),
         crawler_browser_fallback_enabled=_env_bool("LT_CRAWLER_BROWSER_FALLBACK_ENABLED", True),
         crawler_browser_timeout_seconds=_env_int("LT_CRAWLER_BROWSER_TIMEOUT_SECONDS", 35),
+        crawler_max_ranking_pages=max(1, _env_int("LT_CRAWLER_MAX_RANKING_PAGES", 200)),
         rakuten_default_inventory_quantity=max(0, _env_int("LT_RAKUTEN_DEFAULT_INVENTORY_QUANTITY", 1000)),
         rakuten_default_normal_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_NORMAL_DELIVERY_TIME_ID", 0)),
         rakuten_default_back_order_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_BACK_ORDER_DELIVERY_TIME_ID", 0)),

@@ -32,6 +32,8 @@ class CreateTaskPayload(BaseModel):
     sourceId: int | None = None
     sourceType: str | None = None
     target: str | None = None
+    rankingPeriod: str | None = Field(default=None, pattern="^(realtime|daily|weekly|monthly)$")
+    crawlLimit: int | str | None = None
     mode: str = "manual"
 
 
@@ -57,6 +59,7 @@ class ScheduledCrawlPayload(BaseModel):
     sourceType: str = Field(default="keyword", pattern="^(keyword|shop|ranking|product_url)$")
     target: str = ""
     rankingPeriod: str = Field(default="daily", pattern="^(realtime|daily|weekly|monthly)$")
+    crawlLimit: int | str | None = None
     enabled: bool = True
     intervalMinutes: int = Field(default=60, ge=5, le=1440)
     scheduleTime: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
@@ -93,10 +96,22 @@ class ProductVariantEditPayload(BaseModel):
     hidden: bool = False
 
 
+class ProductImageReplacementPayload(BaseModel):
+    from_: str = Field(alias="from")
+    to: str
+
+
+class ProductImageChangesPayload(BaseModel):
+    images: list[str] = Field(default_factory=list)
+    replacements: list[ProductImageReplacementPayload] = Field(default_factory=list)
+    removeUrls: list[str] = Field(default_factory=list)
+
+
 class ProductDetailEditPayload(BaseModel):
     title: str = Field(min_length=1, max_length=500)
     tagline: str = ""
     variants: list[ProductVariantEditPayload] = Field(default_factory=list)
+    imageChanges: ProductImageChangesPayload | None = None
 
 
 class ListingTaskPayload(BaseModel):
@@ -428,6 +443,18 @@ def download_product_image(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except requests.RequestException as exc:
         raise HTTPException(status_code=400, detail="图片下载失败，请稍后重试。") from exc
+
+
+@router.post("/products/{product_id}/images/draft")
+def upload_product_image_draft(
+    product_id: int,
+    file: UploadFile = File(...),
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return {"url": crawler_service.save_product_image_draft(user["username"], product_id, file)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/products/{product_id}/images/{image_index}/replace")

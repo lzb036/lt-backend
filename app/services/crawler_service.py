@@ -15,7 +15,7 @@ from decimal import Decimal
 from html import unescape
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup, Comment
@@ -57,6 +57,8 @@ RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT = 400
 LOCAL_PRODUCT_IMAGE_URL_PREFIX = "/api/static/product-images"
 LOCAL_PRODUCT_IMAGE_DIR = settings.backend_dir / "data" / "product-images"
+LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX = "/api/static/product-image-drafts"
+LOCAL_PRODUCT_IMAGE_DRAFT_DIR = settings.backend_dir / "data" / "product-image-drafts"
 ALLOWED_PRODUCT_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
 ALLOWED_PRODUCT_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif"}
 MAX_PRODUCT_IMAGE_BYTES = 2 * 1024 * 1024
@@ -203,7 +205,7 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
         "sourceType": row.source_type,
         "target": row.target,
         "mode": row.mode,
-        "status": row.status,
+        "status": resolve_crawl_task_status(row.status, row.total_count, row.success_count, row.failed_count),
         "totalCount": row.total_count,
         "successCount": row.success_count,
         "failedCount": row.failed_count,
@@ -213,6 +215,23 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
         "finishedAt": row.finished_at.isoformat(sep=" ") if row.finished_at else None,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
     }
+
+
+def resolve_crawl_task_status(status: str, total_count: int, success_count: int, failed_count: int) -> str:
+    if status in {"queued", "running"}:
+        return status
+    total = max(0, int(total_count or 0))
+    success = max(0, int(success_count or 0))
+    failed = max(0, int(failed_count or 0))
+    if total > 0 and failed >= total and success == 0:
+        return "failed"
+    if success > 0 and failed > 0:
+        return "partial"
+    if failed > 0 and success == 0:
+        return "failed"
+    if success > 0 and failed == 0:
+        return "success"
+    return status
 
 
 def product_to_public(row: ProductModel) -> dict[str, Any]:
@@ -509,8 +528,7 @@ def product_editable_image_urls(raw_payload: dict[str, Any], *, shop_code: str =
             url = normalize_product_image_url(image, shop_code=shop_code)
             if url and url not in urls:
                 urls.append(url)
-        if urls:
-            return urls
+        return urls
     return product_image_urls(raw_payload, shop_code=shop_code)
 
 
@@ -545,7 +563,7 @@ def set_product_image_urls_with_description_updates(
 
 def normalize_product_image_url(value: Any, *, shop_code: str = "") -> str:
     text = unescape(str(value or "")).replace("\\/", "/").strip().strip("'\"")
-    if text.startswith(LOCAL_PRODUCT_IMAGE_URL_PREFIX):
+    if text.startswith((LOCAL_PRODUCT_IMAGE_URL_PREFIX, LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX)):
         return text.split("?", 1)[0].split("#", 1)[0]
     if not text.startswith(("http://", "https://")):
         if not shop_code:
@@ -780,6 +798,18 @@ def ranking_period_label(value: Any) -> str:
         "weekly": "周榜",
         "monthly": "月榜",
     }.get(period, "日榜")
+
+
+def crawl_limit_label(value: Any, *, default: str = "全部") -> str:
+    normalized = normalize_text(value)
+    if not normalized:
+        return default
+    if normalized.lower() in {"all", "none"} or normalized in {"全部", "全量"}:
+        return "全部"
+    match = re.search(r"([0-9]{1,5})", normalized)
+    if not match:
+        return default
+    return f"前 {max(1, int(match.group(1)))}"
 
 
 def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
@@ -1090,6 +1120,8 @@ def parse_rakuten_product_target(target: str) -> tuple[str, str] | None:
             return None
         shop_code, item_number = parts
     if not shop_code or not item_number:
+        return None
+    if item_number.lower() == "c":
         return None
     if any(part.startswith(("http:", "https:")) for part in (shop_code, item_number)):
         return None
@@ -2761,7 +2793,7 @@ def list_tasks(
         if target:
             query = query.where(CrawlTaskModel.target.like(f"%{target}%"))
         if status:
-            query = query.where(CrawlTaskModel.status == status)
+            query = query.where(crawl_task_status_filter(status))
         if source_type:
             query = query.where(CrawlTaskModel.source_type == source_type)
         if mode:
@@ -2779,6 +2811,31 @@ def list_tasks(
             response_key="tasks",
             serializer=task_to_public,
         )
+
+
+def crawl_task_status_filter(status: str) -> Any:
+    normalized = normalize_text(status)
+    if normalized in {"queued", "running"}:
+        return CrawlTaskModel.status == normalized
+    if normalized == "failed":
+        return and_(
+            CrawlTaskModel.status.notin_(("queued", "running")),
+            CrawlTaskModel.failed_count > 0,
+            CrawlTaskModel.success_count == 0,
+        )
+    if normalized == "partial":
+        return and_(
+            CrawlTaskModel.status.notin_(("queued", "running")),
+            CrawlTaskModel.success_count > 0,
+            CrawlTaskModel.failed_count > 0,
+        )
+    if normalized == "success":
+        return and_(
+            CrawlTaskModel.status.notin_(("queued", "running")),
+            CrawlTaskModel.success_count > 0,
+            CrawlTaskModel.failed_count == 0,
+        )
+    return CrawlTaskModel.status == normalized
 
 
 def normalize_task_ids(task_ids: list[str]) -> list[str]:
@@ -3729,15 +3786,20 @@ def save_scheduled_crawl(owner_username: str, payload: Any, schedule_id: int | N
             raise RuntimeError("不能修改其他用户的定时任务。")
 
         raw_target = str(getattr(payload, "target", "") or "").strip()
-        normalized_target = normalize_rakuten_shop_target(raw_target)
+        parsed_target, existing_limit, _ = parse_ranking_target(strip_shop_ranking_prefix(raw_target))
+        normalized_target = normalize_rakuten_shop_target(parsed_target)
         if not normalized_target:
             raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR)
         schedule_time = normalize_schedule_time(getattr(payload, "scheduleTime", "09:00"))
         period_label = ranking_period_label(getattr(payload, "rankingPeriod", "daily"))
+        limit_label = crawl_limit_label(
+            getattr(payload, "crawlLimit", None),
+            default="全部" if existing_limit is None else f"前 {existing_limit}",
+        )
 
         row.source_id = None
         row.source_type = "shop"
-        row.target = f"店铺:{normalized_target} {period_label} 全部"
+        row.target = f"店铺:{normalized_target} {period_label} {limit_label}"
         row.name = str(getattr(payload, "name", "") or "").strip() or f"{normalized_target} 每日定时采集"
         row.crawl_content = normalized_target
         row.crawl_condition = "店铺采集"
@@ -3920,6 +3982,7 @@ def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, An
                     continue
                 warnings.extend(getattr(row, "_delete_warnings", []) or [])
             deleted_ids.append(row.id)
+            clear_product_temp_image_files(row.id)
             session.delete(row)
             success_count += 1
         session.flush()
@@ -5291,6 +5354,8 @@ def update_product_local_detail(owner_username: str, product_id: int, payload: A
             raise RuntimeError("商品不存在。")
         if product.review_status == "listed":
             raise RuntimeError("店铺商品请使用同步修改。")
+        if product.review_status != "pending" and getattr(payload, "imageChanges", None):
+            raise RuntimeError("只有待审核商品可以修改图片。")
 
         updated_payload = patch_local_item_detail(
             product_raw_payload(product),
@@ -5298,12 +5363,61 @@ def update_product_local_detail(owner_username: str, product_id: int, payload: A
             tagline=getattr(payload, "tagline", ""),
             variants=list(getattr(payload, "variants", []) or []),
         )
+        image_changes = getattr(payload, "imageChanges", None)
+        if product.review_status == "pending":
+            updated_payload = apply_product_image_changes(product, updated_payload, image_changes)
         product.title = first_text_from_keys(updated_payload, ("itemName", "title", "name")) or product.title
         product.price = price_from_rakuten_item(updated_payload)
+        if image_changes:
+            images = product_editable_image_urls(updated_payload, shop_code=product_shop_code(product, updated_payload))
+            product.image_url = images[0] if images else ""
         product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
         product.last_error = None
         session.flush()
         return product_detail_to_public(product)
+
+
+def apply_product_image_changes(product: ProductModel, raw_payload: dict[str, Any], image_changes: Any) -> dict[str, Any]:
+    if not image_changes:
+        return raw_payload
+    images = unique_texts([
+        normalize_product_image_url(image, shop_code=product_shop_code(product, raw_payload))
+        for image in list(getattr(image_changes, "images", []) or [])
+    ])
+    old_images = product_images_for_edit(product)
+    replacements: dict[str, str] = {}
+    for item in list(getattr(image_changes, "replacements", []) or []):
+        old_url = normalize_product_image_url(getattr(item, "from_", ""), shop_code=product_shop_code(product, raw_payload))
+        new_url = normalize_product_image_url(getattr(item, "to", ""), shop_code=product_shop_code(product, raw_payload))
+        if old_url and new_url:
+            replacements[old_url] = new_url
+    remove_urls = unique_texts([
+        normalize_product_image_url(image, shop_code=product_shop_code(product, raw_payload))
+        for image in list(getattr(image_changes, "removeUrls", []) or [])
+    ])
+    finalized_urls: dict[str, str] = {}
+
+    def finalize_once(image_url: str) -> str:
+        if image_url not in finalized_urls:
+            finalized_urls[image_url] = finalize_product_image_url(product.id, image_url)
+        return finalized_urls[image_url]
+
+    normalized_images = [finalize_once(image) for image in images]
+    finalized_replacements = {
+        old_url: finalize_once(new_url)
+        for old_url, new_url in replacements.items()
+    }
+    updated_payload = set_product_image_urls_with_description_updates(
+        raw_payload,
+        normalized_images,
+        replace_map=finalized_replacements,
+        remove_urls=remove_urls,
+    )
+    current_images = set(normalized_images)
+    for old_url in old_images:
+        if old_url not in current_images:
+            remove_local_product_image_if_unused(old_url, normalized_images)
+    return updated_payload
 
 
 def product_images_for_edit(product: ProductModel) -> list[str]:
@@ -5343,8 +5457,8 @@ def replace_product_image(owner_username: str, product_id: int, image_index: int
         product = session.get(ProductModel, product_id)
         if product is None or product.owner_username != owner_username:
             raise RuntimeError("商品不存在。")
-        if product.review_status == "listed":
-            raise RuntimeError("店铺商品图片暂不支持本地替换，请在待审核或已审核阶段处理。")
+        if product.review_status != "pending":
+            raise RuntimeError("只有待审核商品可以修改图片。")
         raw_payload = product_raw_payload(product)
         images = product_images_for_edit(product)
         image_url_at_index(images, image_index)
@@ -5367,8 +5481,8 @@ def delete_product_image(owner_username: str, product_id: int, image_index: int)
         product = session.get(ProductModel, product_id)
         if product is None or product.owner_username != owner_username:
             raise RuntimeError("商品不存在。")
-        if product.review_status == "listed":
-            raise RuntimeError("店铺商品图片暂不支持本地删除，请在待审核或已审核阶段处理。")
+        if product.review_status != "pending":
+            raise RuntimeError("只有待审核商品可以修改图片。")
         raw_payload = product_raw_payload(product)
         images = product_images_for_edit(product)
         removed_url = image_url_at_index(images, image_index)
@@ -5390,7 +5504,31 @@ def image_url_at_index(images: list[str], image_index: int) -> str:
     return images[image_index]
 
 
+def save_product_image_draft(owner_username: str, product_id: int, upload_file: Any) -> str:
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            raise RuntimeError("商品不存在。")
+        if product.review_status != "pending":
+            raise RuntimeError("只有待审核商品可以修改图片。")
+    return save_uploaded_product_image_file(
+        upload_file,
+        LOCAL_PRODUCT_IMAGE_DRAFT_DIR / str(product_id),
+        lambda filename: local_product_image_draft_url(product_id, filename),
+        name_prefix="draft",
+    )
+
+
 def save_uploaded_product_image(product_id: int, image_index: int, upload_file: Any) -> str:
+    return save_uploaded_product_image_file(
+        upload_file,
+        LOCAL_PRODUCT_IMAGE_DIR / str(product_id),
+        lambda filename: local_product_image_url(product_id, filename),
+        name_prefix=str(image_index + 1),
+    )
+
+
+def save_uploaded_product_image_file(upload_file: Any, image_dir: Path, url_builder: Callable[[str], str], *, name_prefix: str) -> str:
     filename = normalize_text(getattr(upload_file, "filename", ""))
     suffix = Path(filename).suffix.lower()
     if suffix == ".jpeg":
@@ -5400,9 +5538,8 @@ def save_uploaded_product_image(product_id: int, image_index: int, upload_file: 
         raise RuntimeError("图片格式只支持 jpg、jpeg、png、gif。")
     if content_type and content_type not in ALLOWED_PRODUCT_IMAGE_MIME_TYPES:
         raise RuntimeError("图片文件类型不正确。")
-    image_dir = LOCAL_PRODUCT_IMAGE_DIR / str(product_id)
     image_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = f"{image_index + 1}-{uuid.uuid4().hex[:12]}{suffix}"
+    safe_name = f"{name_prefix}-{uuid.uuid4().hex[:12]}{suffix}"
     target_path = image_dir / safe_name
     size = 0
     try:
@@ -5425,18 +5562,44 @@ def save_uploaded_product_image(product_id: int, image_index: int, upload_file: 
     if size <= 0:
         target_path.unlink(missing_ok=True)
         raise RuntimeError("上传的图片为空。")
-    return local_product_image_url(product_id, safe_name)
+    return url_builder(safe_name)
 
 
 def local_product_image_url(product_id: int, filename: str) -> str:
     return f"{LOCAL_PRODUCT_IMAGE_URL_PREFIX}/{int(product_id)}/{quote(filename, safe='')}"
 
 
+def local_product_image_draft_url(product_id: int, filename: str) -> str:
+    return f"{LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX}/{int(product_id)}/{quote(filename, safe='')}"
+
+
+def finalize_product_image_url(product_id: int, image_url: str) -> str:
+    draft_path = local_product_image_path_from_url(image_url)
+    if not draft_path or not is_product_image_draft_url(image_url):
+        return image_url
+    target_dir = LOCAL_PRODUCT_IMAGE_DIR / str(product_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_name = f"saved-{uuid.uuid4().hex[:12]}{draft_path.suffix.lower()}"
+    target_path = target_dir / target_name
+    shutil.move(str(draft_path), str(target_path))
+    return local_product_image_url(product_id, target_name)
+
+
+def is_product_image_draft_url(image_url: str) -> bool:
+    return normalize_text(image_url).startswith(LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX)
+
+
 def local_product_image_path_from_url(image_url: str) -> Path | None:
     text = normalize_text(image_url)
-    if not text.startswith(LOCAL_PRODUCT_IMAGE_URL_PREFIX):
+    if text.startswith(LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX):
+        root_dir = LOCAL_PRODUCT_IMAGE_DRAFT_DIR
+        prefix = LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX
+    elif text.startswith(LOCAL_PRODUCT_IMAGE_URL_PREFIX):
+        root_dir = LOCAL_PRODUCT_IMAGE_DIR
+        prefix = LOCAL_PRODUCT_IMAGE_URL_PREFIX
+    else:
         return None
-    relative = text.removeprefix(LOCAL_PRODUCT_IMAGE_URL_PREFIX).lstrip("/")
+    relative = text.removeprefix(prefix).lstrip("/")
     parts = [unquote(part) for part in relative.split("/") if part]
     if len(parts) != 2:
         return None
@@ -5445,8 +5608,8 @@ def local_product_image_path_from_url(image_url: str) -> Path | None:
         return None
     if "/" in filename or "\\" in filename:
         return None
-    candidate = (LOCAL_PRODUCT_IMAGE_DIR / product_id / filename).resolve()
-    root = LOCAL_PRODUCT_IMAGE_DIR.resolve()
+    candidate = (root_dir / product_id / filename).resolve()
+    root = root_dir.resolve()
     try:
         candidate.relative_to(root)
     except ValueError:
@@ -5463,14 +5626,15 @@ def remove_local_product_image_if_unused(image_url: str, current_images: list[st
 
 
 def clear_product_temp_image_files(product_id: int) -> None:
-    image_dir = (LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id))).resolve()
-    root = LOCAL_PRODUCT_IMAGE_DIR.resolve()
-    try:
-        image_dir.relative_to(root)
-    except ValueError:
-        return
-    if image_dir.exists() and image_dir.is_dir():
-        shutil.rmtree(image_dir, ignore_errors=True)
+    for root_dir in (LOCAL_PRODUCT_IMAGE_DIR, LOCAL_PRODUCT_IMAGE_DRAFT_DIR):
+        image_dir = (root_dir / str(int(product_id))).resolve()
+        root = root_dir.resolve()
+        try:
+            image_dir.relative_to(root)
+        except ValueError:
+            continue
+        if image_dir.exists() and image_dir.is_dir():
+            shutil.rmtree(image_dir, ignore_errors=True)
 
 
 def product_image_download_name(product_id: int, image_index: int, image_url: str) -> str:
@@ -6022,6 +6186,17 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
             raise RuntimeError("采集类型和目标不能为空。")
         if source_type == "product_url":
             target = normalize_rakuten_product_target(target)
+        elif source_type == "shop":
+            parsed_target, existing_limit, existing_period = parse_ranking_target(strip_shop_ranking_prefix(target))
+            raw_target = normalize_rakuten_shop_target(parsed_target)
+            if not raw_target:
+                raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR)
+            period_label = ranking_period_label(getattr(payload, "rankingPeriod", None) or existing_period)
+            limit_label = crawl_limit_label(
+                getattr(payload, "crawlLimit", None),
+                default="全部" if existing_limit is None else f"前 {existing_limit}",
+            )
+            target = f"店铺:{raw_target} {period_label} {limit_label}"
         task = CrawlTaskModel(
             id=uuid.uuid4().hex,
             owner_username=owner_username,
@@ -6158,10 +6333,7 @@ def run_task(task_id: str) -> None:
                 session.flush()
             task.success_count = success_count
             task.failed_count = failed_count
-            if not items:
-                task.status = "failed"
-            else:
-                task.status = "success" if failed_count == 0 else "partial"
+            task.status = resolve_crawl_task_status("failed" if not items else "success", len(items), success_count, failed_count)
             task.finished_at = datetime.now()
             task.message = f"完成，采集 {len(items)} 条，完整 {success_count} 条，异常 {failed_count} 条，入库 {saved_count} 条"
             task.error_detail = summarize_task_errors(errors)
@@ -6180,31 +6352,135 @@ def run_task(task_id: str) -> None:
 
 
 def initial_crawl_task_total_count(source_type: str, target: str) -> int:
-    # Before crawling, this is the number of crawl targets, not the final product count.
-    return 1 if normalize_text(source_type) and normalize_text(target) else 0
+    normalized_source_type = normalize_text(source_type)
+    normalized_target = normalize_text(target)
+    if not normalized_source_type or not normalized_target:
+        return 0
+    if normalized_source_type == "product_url":
+        return 1
+    if normalized_source_type in {"shop", "ranking"}:
+        _, limit, _ = parse_ranking_target(
+            strip_shop_ranking_prefix(normalized_target) if normalized_source_type == "shop" else normalized_target
+        )
+        return int(limit or 0)
+    return 0
 
 
 def collect_items(source_type: str, target: str) -> list[dict[str, Any]]:
     if source_type == "product_url":
         return [collect_product_detail(normalize_rakuten_product_target(target))]
     limit: int | None = 30
+    shop_code_filter = ""
     if source_type == "shop":
         target, limit, period = parse_ranking_target(strip_shop_ranking_prefix(target))
+        normalized_shop_target = normalize_rakuten_shop_target(target)
+        if looks_like_rakuten_shop_code(normalized_shop_target):
+            shop_code_filter = normalize_shop_code(normalized_shop_target)
         target = resolve_rakuten_shop_search_keyword(target)
     elif source_type == "ranking":
         target, limit, period = parse_ranking_target(target)
     else:
         period = "daily"
-    url = build_source_url(source_type, target)
-    if source_type in {"ranking", "shop"}:
+    if source_type == "ranking":
         url = build_ranking_source_url(target, period)
-    html = fetch_html(url)
-    items = parse_search_items(html, url)
+    elif source_type == "shop" and period == "realtime":
+        url = build_ranking_source_url(target, period)
+    else:
+        url = build_source_url(source_type, target)
+        if source_type == "shop":
+            url = build_ranking_source_url(target, period)
+    items = collect_listing_items(url, limit)
     if source_type in {"ranking", "shop"} and period == "realtime":
         keyword = normalize_text(target).lower()
         items = [item for item in items if keyword in normalize_text(item.get("title")).lower()]
+    if source_type == "shop" and shop_code_filter:
+        items = [item for item in items if product_url_shop_code(item.get("source_url")) == shop_code_filter]
     limited_items = items if limit is None else items[:limit]
     return enrich_collected_items_with_detail(limited_items)
+
+
+def collect_listing_items(url: str, requested_limit: int | None) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    ranking_total: int | None = None
+    page_number = 1
+    while page_number <= settings.crawler_max_ranking_pages:
+        page_url = ranking_page_url(url, page_number)
+        html = fetch_listing_html(page_url)
+        assert_listing_page_available(html, page_url)
+        if ranking_total is None:
+            ranking_total = parse_ranking_total_count(html)
+        page_items = parse_search_items(html, page_url)
+        new_count = 0
+        for item in page_items:
+            source_url = normalize_text(item.get("source_url"))
+            if not source_url or source_url in seen:
+                continue
+            seen.add(source_url)
+            items.append(item)
+            new_count += 1
+            if requested_limit is not None and len(items) >= requested_limit:
+                return items
+            if ranking_total is not None and len(items) >= ranking_total:
+                return items
+        if not should_fetch_next_ranking_page(
+            page_items=page_items,
+            new_count=new_count,
+            collected_count=len(items),
+            requested_limit=requested_limit,
+            ranking_total=ranking_total,
+        ):
+            break
+        page_number += 1
+    return items
+
+
+def should_fetch_next_ranking_page(
+    *,
+    page_items: list[dict[str, Any]],
+    new_count: int,
+    collected_count: int,
+    requested_limit: int | None,
+    ranking_total: int | None,
+) -> bool:
+    if not page_items or new_count <= 0:
+        return False
+    if requested_limit is not None and collected_count >= requested_limit:
+        return False
+    if ranking_total is not None:
+        return collected_count < ranking_total
+    return requested_limit is None or collected_count < requested_limit
+
+
+def parse_ranking_total_count(html: str) -> int | None:
+    text = normalize_text(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
+    patterns = (
+        r"(?:共|全)\s*([0-9,，]+)\s*(?:个|件)",
+        r"\(\s*(?:共|全)\s*([0-9,，]+)\s*(?:个|件)\s*\)",
+        r"([0-9,，]+)\s*(?:個|件)\s*(?:中|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        number = int(match.group(1).replace(",", "").replace("，", ""))
+        if number > 0:
+            return number
+    return None
+
+
+def ranking_page_url(url: str, page_number: int) -> str:
+    if page_number <= 1:
+        return url
+    parsed = urlsplit(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query["p"] = [str(page_number)]
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query, doseq=True), parsed.fragment))
+
+
+def product_url_shop_code(source_url: Any) -> str:
+    parsed = parse_rakuten_product_target(normalize_text(source_url))
+    return normalize_shop_code(parsed[0]) if parsed else ""
 
 
 def enrich_collected_items_with_detail(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -6247,7 +6523,7 @@ def parse_ranking_target(target: str) -> tuple[str, int | None, str]:
     if all_match:
         limit = None
         normalized = normalized[: all_match.start()].strip()
-    match = re.search(r"(?:^|\s)前\s*([0-9]{1,3})\s*$", normalized)
+    match = re.search(r"(?:^|\s)前\s*([0-9]{1,5})\s*$", normalized)
     if match:
         limit = int(match.group(1))
         normalized = normalized[: match.start()].strip()
@@ -6264,7 +6540,7 @@ def parse_ranking_target(target: str) -> tuple[str, int | None, str]:
             period = "monthly"
         else:
             period = "daily"
-    return normalized, None if limit is None else min(100, max(1, limit)), period
+    return normalized, None if limit is None else max(1, limit), period
 
 
 def build_ranking_source_url(keyword: str, period: str) -> str:
@@ -6302,6 +6578,52 @@ def fetch_html(url: str) -> str:
     response.raise_for_status()
     response.encoding = response.encoding or response.apparent_encoding
     return response.text
+
+
+def fetch_listing_html(url: str) -> str:
+    try:
+        html = fetch_html(url)
+    except requests.RequestException as exc:
+        if not settings.crawler_browser_fallback_enabled:
+            raise
+        try:
+            return fetch_html_with_browser(url)
+        except Exception as browser_exc:
+            raise RuntimeError(f"乐天列表页采集失败：{exc}；浏览器兜底采集失败：{browser_exc}") from browser_exc
+    if should_retry_listing_with_browser(html):
+        try:
+            return fetch_html_with_browser(url)
+        except Exception as browser_exc:
+            if is_rakuten_access_limited_page(html):
+                raise RuntimeError(f"乐天列表页返回访问集中/拦截页，浏览器兜底采集失败：{browser_exc}") from browser_exc
+            return html
+    return html
+
+
+def should_retry_listing_with_browser(html: str) -> bool:
+    if not settings.crawler_browser_fallback_enabled:
+        return False
+    if is_blocked_or_empty_rakuten_html(html):
+        return True
+    if "item.rakuten.co.jp" not in (html or "") and "brandavenue.rakuten.co.jp/item/" not in (html or ""):
+        return True
+    if len(html or "") < 2000:
+        text = normalize_text(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
+        return "Reference #" in text or "楽天" not in text
+    return False
+
+
+def assert_listing_page_available(html: str, url: str) -> None:
+    text = normalize_text(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
+    if is_rakuten_access_limited_page(html):
+        raise RuntimeError(f"乐天排行页当前返回访问集中/拦截页，无法采集：{url}")
+    if not text:
+        raise RuntimeError(f"乐天列表页为空，无法采集：{url}")
+
+
+def is_rakuten_access_limited_page(html: str) -> bool:
+    text = normalize_text(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
+    return "アクセスが集中しております" in text or re.search(r"Reference\s+#", text) is not None
 
 
 def parse_search_items(html: str, page_url: str) -> list[dict[str, Any]]:
@@ -6428,7 +6750,7 @@ def fetch_html_with_browser(url: str) -> str:
             finally:
                 browser.close()
     except PlaywrightTimeoutError as exc:
-        raise RuntimeError("浏览器加载乐天商品详情页超时。") from exc
+        raise RuntimeError("浏览器加载乐天页面超时。") from exc
     except Exception as exc:
         message = normalize_text(str(exc))
         if "Executable doesn't exist" in message or "playwright install" in message:
@@ -6631,7 +6953,7 @@ def is_blocked_or_empty_rakuten_html(html: str) -> bool:
 def extract_rakuten_market_item_info(soup: BeautifulSoup) -> dict[str, Any]:
     for script in soup.find_all("script"):
         text = script.string or script.get_text() or ""
-        if '"itemInfoSku"' not in text or '"variantSelectors"' not in text:
+        if '"itemInfoSku"' not in text:
             continue
         stripped = text.strip()
         if not stripped.startswith("{"):
