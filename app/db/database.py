@@ -144,6 +144,10 @@ def ensure_schema_compatibility() -> None:
         )
         if "store_id" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN store_id INT NULL"))
+        if "parent_product_id" not in product_columns:
+            connection.execute(text("ALTER TABLE lt_products ADD COLUMN parent_product_id INT NULL"))
+        if "listing_task_id" not in product_columns:
+            connection.execute(text("ALTER TABLE lt_products ADD COLUMN listing_task_id VARCHAR(64) NULL"))
         if "rakuten_manage_number" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN rakuten_manage_number VARCHAR(255) NULL"))
         if "store_product_status" not in product_columns:
@@ -246,6 +250,10 @@ def ensure_schema_compatibility() -> None:
                     """
                 )
             )
+        if "ix_lt_product_parent_status" not in product_indexes:
+            connection.execute(text("CREATE INDEX ix_lt_product_parent_status ON lt_products (parent_product_id, review_status)"))
+        if "ix_lt_product_listing_task" not in product_indexes:
+            connection.execute(text("CREATE INDEX ix_lt_product_listing_task ON lt_products (listing_task_id)"))
 
         product_unique_constraints = set(
             connection.execute(

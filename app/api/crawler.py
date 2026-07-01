@@ -68,7 +68,7 @@ class ScheduledCrawlPayload(BaseModel):
 
 class ProductStatusPayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
-    status: str = Field(pattern="^(pending|approved|error|listed|rejected)$")
+    status: str = Field(pattern="^(pending|approved|error|listed|listed_master|rejected)$")
     message: str = ""
 
 

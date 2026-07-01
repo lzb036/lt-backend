@@ -6,6 +6,7 @@ import uuid
 import base64
 import hashlib
 import mimetypes
+import random
 import shutil
 import xml.etree.ElementTree as ET
 import time
@@ -117,7 +118,11 @@ IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif"
 RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集支持普通乐天商品链接、Rakuten Fashion 商品链接、带参数链接、店铺编码/商品编号。"
 RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺url代码、店铺url或sid。"
 RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
+CRAWLER_HTTP_RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
 SCHEDULE_RUN_LOCK = threading.Lock()
+CRAWLER_REQUEST_LOCK = threading.Lock()
+CRAWLER_SESSION_LOCAL = threading.local()
+CRAWLER_LAST_REQUEST_AT = 0.0
 SCHEDULE_RUNNER_STARTED = False
 
 
@@ -245,10 +250,13 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "id": row.id,
         "ownerUsername": row.owner_username,
         "taskId": row.task_id,
+        "parentProductId": row.parent_product_id,
+        "listingTaskId": row.listing_task_id,
         "storeId": row.store_id,
         "rakutenManageNumber": row.rakuten_manage_number,
         "storeProductStatus": row.store_product_status,
         "rakutenListingStatus": row.rakuten_listing_status,
+        "listedStores": product_listed_stores(raw_payload),
         "storeLastSeenAt": row.store_last_seen_at.isoformat(sep=" ") if row.store_last_seen_at else None,
         "title": row.title,
         "sourceUrl": row.source_url,
@@ -268,6 +276,35 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
         "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
     }
+
+
+def product_listed_stores(raw_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    listed_stores = raw_payload.get("listedStores") if isinstance(raw_payload.get("listedStores"), list) else []
+    result: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in listed_stores:
+        if not isinstance(item, dict):
+            continue
+        try:
+            store_id = int(item.get("storeId") or 0)
+        except (TypeError, ValueError):
+            store_id = 0
+        if not store_id or store_id in seen:
+            continue
+        seen.add(store_id)
+        result.append(
+            {
+                "storeId": store_id,
+                "storeCode": normalize_text(item.get("storeCode")),
+                "storeName": normalize_text(item.get("storeName")),
+                "aliasName": normalize_text(item.get("aliasName")),
+                "manageNumber": normalize_text(item.get("manageNumber")),
+                "itemNumber": normalize_text(item.get("itemNumber")),
+                "productId": int(item.get("productId") or 0) if str(item.get("productId") or "").isdigit() else None,
+                "listedAt": normalize_text(item.get("listedAt")),
+            }
+        )
+    return result
 
 
 def product_rakuten_item_url(row: ProductModel, raw_payload: dict[str, Any]) -> str:
@@ -1029,6 +1066,7 @@ def _product_status_filter(status: str | None) -> str | None:
         "pending": "pending",
         "approved": "approved",
         "error": "error",
+        "listed_master": "listed_master",
         "listed": "listed",
         "rejected": "rejected",
     }
@@ -3052,6 +3090,14 @@ def delete_store(owner_username: str, store_id: int) -> None:
                 ProductModel.store_id == store_id,
             )
         ).all()
+        parent_products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.review_status == "listed_master",
+            )
+        ).all()
+        for product in parent_products:
+            remove_product_listed_store_mark(product, store_id)
         if product_ids:
             session.query(ProductModel).filter(
                 ProductModel.owner_username == owner_username,
@@ -3135,6 +3181,9 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
             manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
             if manage_number:
                 seen_manage_numbers.add(manage_number)
+            item_number = first_text_from_keys(item, ("itemNumber",))
+            if item_number:
+                seen_manage_numbers.add(item_number)
             if upsert_store_product(session, owner_username, row, item):
                 synced_count += 1
             else:
@@ -3149,6 +3198,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
                     message=f"同步中，已处理 {index} / {len(items)} 条",
                 )
         mark_missing_store_products_removed(session, row, seen_manage_numbers)
+        reconcile_listed_master_store_marks_after_store_sync(session, owner_username, row, seen_manage_numbers)
         session.flush()
         return {
             "store": store_to_public(row),
@@ -3680,6 +3730,7 @@ def perform_product_delete_sync(
                     )
                 continue
             warnings.extend(getattr(row, "_delete_warnings", []) or [])
+            remove_listed_store_mark_for_store_product(session, row)
             success_ids.append(row.id)
             session.delete(row)
             success_count += 1
@@ -3905,7 +3956,7 @@ def start_schedule_runner(interval_seconds: int = 60) -> None:
 
 
 def update_product_status(owner_username: str, product_ids: list[int], status: str, *, message: str = "") -> list[dict[str, Any]]:
-    if status not in {"pending", "approved", "error", "listed", "rejected"}:
+    if status not in {"pending", "approved", "error", "listed", "listed_master", "rejected"}:
         raise RuntimeError("商品状态不合法。")
     with session_scope() as session:
         rows = session.scalars(
@@ -3981,6 +4032,13 @@ def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, An
                     failed_products.append(product_to_public(row))
                     continue
                 warnings.extend(getattr(row, "_delete_warnings", []) or [])
+                remove_listed_store_mark_for_store_product(session, row)
+            if row.review_status == "listed_master":
+                child_rows = session.scalars(
+                    select(ProductModel).where(ProductModel.parent_product_id == row.id)
+                ).all()
+                for child in child_rows:
+                    child.parent_product_id = None
             deleted_ids.append(row.id)
             clear_product_temp_image_files(row.id)
             session.delete(row)
@@ -4400,6 +4458,7 @@ def create_store_product_on_rakuten(
     cabinet_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_payload = product_raw_payload(product)
+    product._listing_store_id = store.id
     manage_number = generate_listing_manage_number(product, raw_payload)
     uploaded_product_images = upload_product_images_to_rakuten(
         service_secret,
@@ -4467,8 +4526,240 @@ def create_store_product_on_rakuten(
     }
 
 
+def upsert_listed_store_product_from_listing_result(
+    session: Any,
+    owner_username: str,
+    source_product: ProductModel,
+    store: StoreModel,
+    listing_result: dict[str, Any],
+) -> ProductModel:
+    manage_number = normalize_text(listing_result.get("manageNumber"))
+    if not manage_number:
+        raise RuntimeError("上架结果缺少商品管理编号。")
+    row = session.scalar(
+        select(ProductModel).where(
+            ProductModel.store_id == store.id,
+            ProductModel.rakuten_manage_number == manage_number,
+        )
+    )
+    payload = listing_result.get("payload") if isinstance(listing_result.get("payload"), dict) else {}
+    source_url = build_public_item_page_url(store.store_code, listing_result.get("itemNumber") or manage_number)
+    source_hash_url = f"{source_url}#store={store.id}&manage={quote(manage_number, safe='')}"
+    if row is None:
+        row = ProductModel(owner_username=owner_username, source_url=source_url, source_url_hash=make_source_url_hash(source_hash_url))
+        session.add(row)
+    row.owner_username = owner_username
+    row.parent_product_id = source_product.id
+    row.listing_task_id = None
+    row.task_id = source_product.task_id
+    row.store_id = store.id
+    row.rakuten_manage_number = manage_number
+    row.item_number = normalize_text(listing_result.get("itemNumber")) or manage_number
+    row.title = source_product.title
+    row.source_url = source_url
+    row.source_url_hash = make_source_url_hash(source_hash_url)
+    row.shop_name = store.store_name or source_product.shop_name
+    row.image_url = normalize_text(listing_result.get("imageUrl")) or source_product.image_url
+    row.price = Decimal(str(listing_result["price"])) if listing_result.get("price") is not None else source_product.price
+    row.currency = source_product.currency or "JPY"
+    row.genre_id = source_product.genre_id
+    row.review_status = "listed"
+    row.store_product_status = "active"
+    row.rakuten_listing_status = "listed"
+    row.raw_payload_json = json.dumps(payload, ensure_ascii=False)
+    row.listed_at = datetime.now()
+    row.store_last_seen_at = datetime.now()
+    row.last_error = None
+    return row
+
+
+def record_product_listed_store(
+    product: ProductModel,
+    listed_product: ProductModel,
+    store: StoreModel,
+    listing_result: dict[str, Any],
+) -> None:
+    upsert_product_listed_store_record(product, {
+        "storeId": store.id,
+        "storeCode": store.store_code,
+        "storeName": store.store_name,
+        "aliasName": store.alias_name,
+        "manageNumber": normalize_text(listing_result.get("manageNumber")) or listed_product.rakuten_manage_number,
+        "itemNumber": normalize_text(listing_result.get("itemNumber")) or listed_product.item_number,
+        "productId": listed_product.id,
+        "listedAt": datetime.now().isoformat(sep=" ", timespec="seconds"),
+    })
+
+
+def ensure_product_listed_store_mark_from_store_product(session: Any, store_product: ProductModel, store: StoreModel) -> None:
+    if not store_product.parent_product_id:
+        return
+    parent = session.get(ProductModel, store_product.parent_product_id)
+    if parent is None or parent.owner_username != store_product.owner_username:
+        return
+    upsert_product_listed_store_record(parent, {
+        "storeId": store.id,
+        "storeCode": store.store_code,
+        "storeName": store.store_name,
+        "aliasName": store.alias_name,
+        "manageNumber": normalize_text(store_product.rakuten_manage_number),
+        "itemNumber": normalize_text(store_product.item_number),
+        "productId": store_product.id,
+        "listedAt": (store_product.listed_at or datetime.now()).isoformat(sep=" ", timespec="seconds"),
+    })
+
+
+def upsert_product_listed_store_record(product: ProductModel, record: dict[str, Any]) -> None:
+    raw_payload = product_raw_payload(product)
+    listed_stores = raw_payload.get("listedStores") if isinstance(raw_payload.get("listedStores"), list) else []
+    try:
+        next_store_id = int(record.get("storeId") or 0)
+    except (TypeError, ValueError):
+        next_store_id = 0
+    if not next_store_id:
+        return
+    next_stores: list[dict[str, Any]] = []
+    replaced = False
+    for item in listed_stores:
+        if not isinstance(item, dict):
+            continue
+        try:
+            store_id = int(item.get("storeId") or 0)
+        except (TypeError, ValueError):
+            store_id = 0
+        if store_id == next_store_id:
+            next_stores.append(record)
+            replaced = True
+        else:
+            next_stores.append(item)
+    if not replaced:
+        next_stores.append(record)
+    raw_payload["listedStores"] = next_stores
+    product.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+    product.review_status = "listed_master"
+    product.listing_task_id = None
+    product.last_error = None
+    product.listed_at = product.listed_at or datetime.now()
+
+
+def remove_product_listed_store_mark(product: ProductModel, store_id: int) -> bool:
+    raw_payload = product_raw_payload(product)
+    listed_stores = raw_payload.get("listedStores") if isinstance(raw_payload.get("listedStores"), list) else []
+    next_stores: list[dict[str, Any]] = []
+    removed = False
+    for item in listed_stores:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_store_id = int(item.get("storeId") or 0)
+        except (TypeError, ValueError):
+            item_store_id = 0
+        if item_store_id == int(store_id):
+            removed = True
+            continue
+        next_stores.append(item)
+    if not removed:
+        return False
+    raw_payload["listedStores"] = next_stores
+    product.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+    if next_stores:
+        product.review_status = "listed_master"
+    elif product.review_status == "listed_master":
+        product.review_status = "approved"
+    product.listing_task_id = None
+    return True
+
+
+def remove_listed_store_mark_for_store_product(session: Any, store_product: ProductModel) -> None:
+    if not store_product.store_id:
+        return
+    parent = session.get(ProductModel, store_product.parent_product_id) if store_product.parent_product_id else None
+    if parent is not None and parent.owner_username == store_product.owner_username:
+        remove_product_listed_store_mark(parent, int(store_product.store_id))
+
+
+def reconcile_listed_master_store_marks_after_store_sync(
+    session: Any,
+    owner_username: str,
+    store: StoreModel,
+    seen_identifiers: set[str],
+) -> None:
+    normalized_seen = {normalize_text(value) for value in seen_identifiers if normalize_text(value)}
+    products = session.scalars(
+        select(ProductModel).where(
+            ProductModel.owner_username == owner_username,
+            ProductModel.review_status == "listed_master",
+        )
+    ).all()
+    for product in products:
+        store_records = [
+            record for record in product_listed_stores(product_raw_payload(product))
+            if int(record.get("storeId") or 0) == int(store.id)
+        ]
+        if not store_records:
+            continue
+        for record in store_records:
+            if listed_store_record_is_seen_after_sync(session, product, record, normalized_seen):
+                continue
+            remove_product_listed_store_mark(product, int(store.id))
+            break
+
+
+def listed_store_record_is_seen_after_sync(
+    session: Any,
+    product: ProductModel,
+    record: dict[str, Any],
+    seen_identifiers: set[str],
+) -> bool:
+    if not seen_identifiers:
+        return False
+    record_identifiers = {
+        normalize_text(record.get("manageNumber")),
+        normalize_text(record.get("itemNumber")),
+    }
+    if any(identifier and identifier in seen_identifiers for identifier in record_identifiers):
+        return True
+    store_product = linked_store_product_from_listed_store_record(session, product, record)
+    if store_product is None:
+        return False
+    product_identifiers = {
+        normalize_text(store_product.rakuten_manage_number),
+        normalize_text(store_product.item_number),
+    }
+    return any(identifier and identifier in seen_identifiers for identifier in product_identifiers)
+
+
+def linked_store_product_from_listed_store_record(
+    session: Any,
+    product: ProductModel,
+    record: dict[str, Any],
+) -> ProductModel | None:
+    product_id = record.get("productId")
+    try:
+        normalized_product_id = int(product_id or 0)
+    except (TypeError, ValueError):
+        normalized_product_id = 0
+    if normalized_product_id:
+        row = session.get(ProductModel, normalized_product_id)
+        if (
+            row is not None
+            and row.owner_username == product.owner_username
+            and row.parent_product_id == product.id
+            and int(row.store_id or 0) == int(record.get("storeId") or 0)
+        ):
+            return row
+    return session.scalar(
+        select(ProductModel).where(
+            ProductModel.owner_username == product.owner_username,
+            ProductModel.parent_product_id == product.id,
+            ProductModel.store_id == int(record.get("storeId") or 0),
+            ProductModel.review_status == "listed",
+        )
+    )
+
+
 def generate_listing_manage_number(product: ProductModel, raw_payload: dict[str, Any]) -> str:
-    existing = normalize_text(product.rakuten_manage_number)
+    existing = normalize_text(product.rakuten_manage_number) if product.review_status == "listed" else ""
     if existing:
         return existing[:32]
     base = (
@@ -4479,7 +4770,8 @@ def generate_listing_manage_number(product: ProductModel, raw_payload: dict[str,
     normalized = re.sub(r"[^A-Za-z0-9_-]+", "-", base).strip("-_").lower()
     if not normalized:
         normalized = f"lt{product.id}"
-    suffix = f"-{product.id}"
+    store_id = int(getattr(product, "_listing_store_id", 0) or 0)
+    suffix = f"-{store_id}-{product.id}" if store_id else f"-{product.id}"
     max_base_len = max(1, 32 - len(suffix))
     if normalized.endswith(suffix):
         return normalized[:32]
@@ -5860,15 +6152,23 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
         missing_ids = [product_id for product_id in product_ids if product_id not in found_ids]
         if missing_ids:
             raise RuntimeError("部分商品不存在，不能创建上架任务。")
-        invalid_products = [product for product in products if product.review_status != "approved"]
+        invalid_products = [product for product in products if product.review_status not in {"approved", "listed_master"} or product.listing_task_id]
         if invalid_products:
             names = "、".join(productCodeForError(product) for product in invalid_products[:5])
-            raise RuntimeError(f"只有已审核商品可以创建上架任务，请刷新列表后重试。异常商品：{names}")
+            raise RuntimeError(f"只有已审核或已上架管理商品可以创建上架任务，且商品不能正在上架中。异常商品：{names}")
+        duplicated_products = [
+            product for product in products
+            if any(int(item.get("storeId") or 0) == int(store.id) for item in product_listed_stores(product_raw_payload(product)))
+        ]
+        if duplicated_products:
+            names = "、".join(productCodeForError(product) for product in duplicated_products[:5])
+            raise RuntimeError(f"以下商品已上架过该店铺，请选择其他店铺：{names}")
+        task_id = uuid.uuid4().hex
         for product in products:
-            product.review_status = "listing"
+            product.listing_task_id = task_id
             product.last_error = None
         task = ListingTaskModel(
-            id=uuid.uuid4().hex,
+            id=task_id,
             owner_username=owner_username,
             store_id=store.id,
             task_name=task_name or f"上架任务 {datetime.now():%Y-%m-%d %H:%M}",
@@ -5882,7 +6182,6 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
         )
         session.add(task)
         session.flush()
-        task_id = task.id
 
     dispatch_listing_task(owner_username, task_id)
     with session_scope() as session:
@@ -5891,6 +6190,13 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
 
 
 def run_listing_task(owner_username: str, task_id: str) -> None:
+    try:
+        _run_listing_task(owner_username, task_id)
+    except Exception as exc:
+        fail_listing_task_unexpectedly(owner_username, task_id, exc)
+
+
+def _run_listing_task(owner_username: str, task_id: str) -> None:
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
         if task is None:
@@ -5923,7 +6229,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
             for product in products:
                 product.last_error = task.message
-                restore_listing_product_to_approved(product)
+                clear_listing_product_lock(product, task_id)
             return
         if not store.enabled:
             task.status = "failed"
@@ -5935,7 +6241,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
             for product in products:
                 product.last_error = task.message
-                restore_listing_product_to_approved(product)
+                clear_listing_product_lock(product, task_id)
             return
         service_secret = decrypt_text(store.rakuten_service_secret_encrypted)
         license_key = decrypt_text(store.rakuten_license_key_encrypted)
@@ -5949,7 +6255,7 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
             for product in products:
                 product.last_error = task.message
-                restore_listing_product_to_approved(product)
+                clear_listing_product_lock(product, task_id)
             return
         cabinet_context: dict[str, Any] = {}
         try:
@@ -5958,29 +6264,22 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
             apply_store_cabinet_usage(store, cabinet_usage)
         except Exception as exc:
             errors.append(f"R-Cabinet 使用量检测失败: {exc}")
-        update_task_progress(
-            ListingTaskModel,
-            task_id,
-            total_count=len(products),
-            success_count=0,
-            failed_count=0,
-            message=f"上架中，已处理 0 / {len(products)} 条",
-        )
+        task.total_count = len(products)
+        task.success_count = 0
+        task.failed_count = 0
+        task.message = f"上架中，已处理 0 / {len(products)} 条"
+        session.flush()
         for index, product in enumerate(products, start=1):
-            if product.review_status != "listing":
-                product.last_error = "商品未审核通过，不能上架。"
-                restore_listing_product_to_approved(product)
+            if product.review_status not in {"approved", "listed_master"} or product.listing_task_id != task_id:
+                product.last_error = "商品状态已变化或不属于当前上架任务，不能上架。"
+                clear_listing_product_lock(product, task_id)
                 failed_count += 1
                 failed_ids.append(product.id)
                 errors.append(f"{productCodeForError(product)}: {product.last_error}")
-                update_task_progress(
-                    ListingTaskModel,
-                    task_id,
-                    total_count=len(products),
-                    success_count=success_count,
-                    failed_count=failed_count,
-                    message=f"上架中，已处理 {index} / {len(products)} 条",
-                )
+                task.total_count = len(products)
+                task.success_count = success_count
+                task.failed_count = failed_count
+                task.message = f"上架中，已处理 {index} / {len(products)} 条"
                 session.flush()
                 continue
             try:
@@ -5991,36 +6290,22 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
                     product,
                     cabinet_context=cabinet_context,
                 )
-                product.review_status = "listed"
-                product.store_id = store.id
-                product.rakuten_manage_number = listing_result["manageNumber"]
-                product.item_number = listing_result["itemNumber"]
-                product.rakuten_listing_status = "listed"
-                product.store_product_status = "active"
-                product.image_url = listing_result["imageUrl"]
-                product.price = Decimal(str(listing_result["price"])) if listing_result.get("price") is not None else product.price
-                product.raw_payload_json = json.dumps(listing_result["payload"], ensure_ascii=False)
-                product.listed_at = datetime.now()
-                product.store_last_seen_at = datetime.now()
-                product.last_error = None
-                clear_product_temp_image_files(product.id)
+                listed_product = upsert_listed_store_product_from_listing_result(session, owner_username, product, store, listing_result)
+                session.flush()
+                record_product_listed_store(product, listed_product, store, listing_result)
                 success_count += 1
                 success_ids.append(product.id)
             except Exception as exc:
                 error_text = str(exc)
-                restore_listing_product_to_approved(product)
+                clear_listing_product_lock(product, task_id)
                 product.last_error = error_text
                 failed_count += 1
                 failed_ids.append(product.id)
                 errors.append(f"{productCodeForError(product)}: {error_text}")
-            update_task_progress(
-                ListingTaskModel,
-                task_id,
-                total_count=len(products),
-                success_count=success_count,
-                failed_count=failed_count,
-                message=f"上架中，已处理 {index} / {len(products)} 条",
-            )
+            task.total_count = len(products)
+            task.success_count = success_count
+            task.failed_count = failed_count
+            task.message = f"上架中，已处理 {index} / {len(products)} 条"
             session.flush()
         sync_store_cabinet_usage_fields(store, service_secret, license_key)
         task.total_count = len(products)
@@ -6038,9 +6323,39 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
         task.finished_at = datetime.now()
 
 
-def restore_listing_product_to_approved(product: ProductModel) -> None:
-    if product.review_status == "listing":
-        product.review_status = "approved"
+def clear_listing_product_lock(product: ProductModel, task_id: str | None = None) -> None:
+    if task_id is None or product.listing_task_id == task_id:
+        product.listing_task_id = None
+
+
+def fail_listing_task_unexpectedly(owner_username: str, task_id: str, exc: Exception) -> None:
+    message = str(exc) or "上架任务执行失败。"
+    with session_scope() as session:
+        task = session.get(ListingTaskModel, task_id)
+        if task is not None and task.owner_username == owner_username:
+            try:
+                product_ids = json.loads(task.product_ids_json or "[]")
+            except ValueError:
+                product_ids = []
+            if isinstance(product_ids, dict):
+                product_ids = product_ids.get("productIds") if isinstance(product_ids.get("productIds"), list) else []
+            products = session.scalars(
+                select(ProductModel).where(
+                    ProductModel.owner_username == owner_username,
+                    ProductModel.id.in_(product_ids or [-1]),
+                )
+            ).all()
+            for product in products:
+                clear_listing_product_lock(product, task_id)
+                product.last_error = message
+            task.status = "failed"
+            task.failed_count = len(products)
+            task.total_count = len(products)
+            task.message = "上架失败"
+            task.error_detail = message
+            task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
+            task.finished_at = datetime.now()
+    log_event(owner_username, task_id, "error", message)
 
 
 def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
@@ -6070,8 +6385,8 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             )
         ).all()
         for product in products:
-            if product.review_status == "approved":
-                product.review_status = "listing"
+            if product.review_status in {"approved", "listed_master"} and not product.listing_task_id:
+                product.listing_task_id = task_id
                 product.last_error = None
         task.status = "running"
         task.message = "重新执行中"
@@ -6289,7 +6604,7 @@ def run_task(task_id: str) -> None:
         target = task.target
 
     try:
-        items = collect_items(source_type, target)
+        items = collect_items(source_type, target, task_id=task_id)
         update_task_progress(
             CrawlTaskModel,
             task_id,
@@ -6366,7 +6681,7 @@ def initial_crawl_task_total_count(source_type: str, target: str) -> int:
     return 0
 
 
-def collect_items(source_type: str, target: str) -> list[dict[str, Any]]:
+def collect_items(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
     if source_type == "product_url":
         return [collect_product_detail(normalize_rakuten_product_target(target))]
     limit: int | None = 30
@@ -6389,13 +6704,21 @@ def collect_items(source_type: str, target: str) -> list[dict[str, Any]]:
         url = build_source_url(source_type, target)
         if source_type == "shop":
             url = build_ranking_source_url(target, period)
-    items = collect_listing_items(url, limit)
+    listing_limit = None if shop_code_filter else limit
+    items = collect_listing_items(url, listing_limit)
     if source_type in {"ranking", "shop"} and period == "realtime":
         keyword = normalize_text(target).lower()
         items = [item for item in items if keyword in normalize_text(item.get("title")).lower()]
     if source_type == "shop" and shop_code_filter:
         items = [item for item in items if product_url_shop_code(item.get("source_url")) == shop_code_filter]
     limited_items = items if limit is None else items[:limit]
+    if task_id:
+        update_task_progress(
+            CrawlTaskModel,
+            task_id,
+            total_count=len(limited_items),
+            message=f"已发现 {len(limited_items)} 个商品，开始采集详情",
+        )
     return enrich_collected_items_with_detail(limited_items)
 
 
@@ -6569,15 +6892,121 @@ def build_source_url(source_type: str, target: str) -> str:
     return f"{RAKUTEN_SEARCH_BASE}{quote(target)}/"
 
 
+def crawler_browser_headers(url: str = "") -> dict[str, str]:
+    parsed = urlsplit(url) if url else None
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed and parsed.scheme and parsed.netloc else "https://www.rakuten.co.jp"
+    return {
+        "User-Agent": settings.crawler_user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "ja-JP,ja;q=0.9,zh-CN;q=0.8,zh;q=0.7,en-US;q=0.6,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+        "DNT": "1",
+        "Referer": origin + "/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
+def crawler_request_proxies() -> dict[str, str] | None:
+    proxy_url = normalize_text(settings.crawler_proxy_url)
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def crawler_delay_seconds() -> float:
+    min_ms = max(0, int(settings.crawler_min_delay_ms or 0))
+    max_ms = max(min_ms, int(settings.crawler_max_delay_ms or min_ms))
+    if max_ms <= 0:
+        return 0.0
+    return random.uniform(min_ms / 1000, max_ms / 1000)
+
+
+def throttle_crawler_request() -> None:
+    global CRAWLER_LAST_REQUEST_AT
+    delay = crawler_delay_seconds()
+    if delay <= 0:
+        return
+    with CRAWLER_REQUEST_LOCK:
+        elapsed = time.monotonic() - CRAWLER_LAST_REQUEST_AT
+        wait_seconds = max(0.0, delay - elapsed)
+        if wait_seconds:
+            time.sleep(wait_seconds)
+        CRAWLER_LAST_REQUEST_AT = time.monotonic()
+
+
+def crawler_backoff_seconds(attempt: int) -> float:
+    return min(12.0, (1.5 ** max(0, attempt - 1)) + random.uniform(0.2, 1.2))
+
+
+def get_crawler_session() -> requests.Session:
+    session = getattr(CRAWLER_SESSION_LOCAL, "session", None)
+    if isinstance(session, requests.Session):
+        return session
+    session = requests.Session()
+    session.headers.update(crawler_browser_headers())
+    CRAWLER_SESSION_LOCAL.session = session
+    CRAWLER_SESSION_LOCAL.warmed = False
+    return session
+
+
+def warmup_crawler_session(session: requests.Session) -> None:
+    if getattr(CRAWLER_SESSION_LOCAL, "warmed", False):
+        return
+    CRAWLER_SESSION_LOCAL.warmed = True
+    warmup_url = normalize_text(settings.crawler_warmup_url)
+    if not warmup_url:
+        return
+    try:
+        throttle_crawler_request()
+        session.get(
+            warmup_url,
+            timeout=settings.crawler_timeout_seconds,
+            headers=crawler_browser_headers(warmup_url),
+            proxies=crawler_request_proxies(),
+        )
+    except requests.RequestException:
+        return
+
+
 def fetch_html(url: str) -> str:
-    response = requests.get(
-        url,
-        timeout=settings.crawler_timeout_seconds,
-        headers={"User-Agent": settings.crawler_user_agent},
-    )
-    response.raise_for_status()
-    response.encoding = response.encoding or response.apparent_encoding
-    return response.text
+    session = get_crawler_session()
+    warmup_crawler_session(session)
+    max_attempts = max(1, int(settings.crawler_max_retries or 0) + 1)
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            throttle_crawler_request()
+            response = session.get(
+                url,
+                timeout=settings.crawler_timeout_seconds,
+                headers=crawler_browser_headers(url),
+                proxies=crawler_request_proxies(),
+            )
+            if response.status_code in CRAWLER_HTTP_RETRY_STATUS_CODES and attempt < max_attempts:
+                time.sleep(crawler_backoff_seconds(attempt))
+                continue
+            response.raise_for_status()
+            response.encoding = response.encoding or response.apparent_encoding
+            html = response.text
+            if is_rakuten_access_limited_page(html) and attempt < max_attempts:
+                time.sleep(crawler_backoff_seconds(attempt))
+                continue
+            return html
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                raise
+            time.sleep(crawler_backoff_seconds(attempt))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("乐天页面采集失败。")
 
 
 def fetch_listing_html(url: str) -> str:
@@ -6630,6 +7059,12 @@ def parse_search_items(html: str, page_url: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "lxml")
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
+    for item in parse_search_items_from_json_ld(soup, page_url):
+        source_url = normalize_text(item.get("source_url"))
+        if not source_url or source_url in seen:
+            continue
+        seen.add(source_url)
+        items.append(item)
     for link in soup.select("a[href*='item.rakuten.co.jp'], a[href*='brandavenue.rakuten.co.jp/item/']"):
         href = normalize_product_href(str(link.get("href") or ""), page_url)
         title = " ".join(link.get_text(" ", strip=True).split())
@@ -6657,6 +7092,59 @@ def parse_search_items(html: str, page_url: str) -> list[dict[str, Any]]:
             }
         )
     return items
+
+
+def parse_search_items_from_json_ld(soup: BeautifulSoup, page_url: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for entry in extract_json_ld_objects(soup):
+        entry_type = entry.get("@type")
+        if entry_type == "ItemList" or (isinstance(entry_type, list) and "ItemList" in entry_type):
+            for product in json_ld_item_list_products(entry):
+                item = search_item_from_json_ld_product(product, page_url)
+                if item:
+                    items.append(item)
+            continue
+        if entry_type == "Product" or (isinstance(entry_type, list) and "Product" in entry_type):
+            item = search_item_from_json_ld_product(entry, page_url)
+            if item:
+                items.append(item)
+    return items
+
+
+def json_ld_item_list_products(item_list: dict[str, Any]) -> list[dict[str, Any]]:
+    values = item_list.get("itemListElement")
+    if not isinstance(values, list):
+        return []
+    products: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        product = value.get("item") if isinstance(value.get("item"), dict) else value
+        if isinstance(product, dict):
+            products.append(product)
+    return products
+
+
+def search_item_from_json_ld_product(product: dict[str, Any], page_url: str) -> dict[str, Any] | None:
+    href = normalize_product_href(
+        first_text_from_keys(product, ("url", "@id", "itemUrl", "itemPageUrl")),
+        page_url,
+    )
+    if not href:
+        return None
+    title = first_text_from_keys(product, ("name", "itemName", "title")) or href
+    offers = product.get("offers") if isinstance(product.get("offers"), dict) else {}
+    image_url = normalize_product_image_url(first_url_from_keys(product, ("image", "imageUrl", "thumbnailUrl")))
+    return {
+        "title": title[:500],
+        "source_url": href,
+        "image_url": image_url,
+        "price": price_from_rakuten_item(offers) if isinstance(offers, dict) else price_from_rakuten_item(product),
+        "shop_name": "",
+        "item_number": extract_item_number(href),
+        "genre_id": "",
+        "raw": {"pageUrl": page_url, "listSource": "json_ld"},
+    }
 
 
 def normalize_product_href(href: str, page_url: str) -> str:
@@ -6970,8 +7458,58 @@ def extract_rakuten_market_item_info(soup: BeautifulSoup) -> dict[str, Any]:
                     break
                 value = value.get(key)
             if isinstance(value, dict):
-                return value
+                return merge_rakuten_market_embedded_payload(value, payload)
     return {}
+
+
+def merge_rakuten_market_embedded_payload(item_info: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    result = dict(item_info)
+    result["embeddedPayload"] = payload
+    for key in (
+        "title",
+        "itemName",
+        "name",
+        "tagline",
+        "catchcopy",
+        "catchCopy",
+        "catchCopyTrans",
+        "subTitle",
+        "subtitle",
+        "newProductDescription",
+        "salesDescription",
+        "rCategoryId",
+        "genreId",
+        "manageNumber",
+    ):
+        if not has_description_source(result.get(key)):
+            value = first_value_by_key(payload, key)
+            if has_description_source(value):
+                result[key] = value
+    pc_fields = result.get("pcFields") if isinstance(result.get("pcFields"), dict) else {}
+    pc_description = pc_fields.get("productDescription") if isinstance(pc_fields, dict) else None
+    if not has_description_source(pc_description):
+        value = first_value_by_key(payload, "productDescription")
+        if has_description_source(value):
+            next_pc_fields = dict(pc_fields)
+            next_pc_fields["productDescription"] = value
+            result["pcFields"] = next_pc_fields
+    return result
+
+
+def first_value_by_key(source: Any, target_key: str) -> Any:
+    if isinstance(source, dict):
+        if target_key in source and has_description_source(source.get(target_key)):
+            return source.get(target_key)
+        for child in source.values():
+            value = first_value_by_key(child, target_key)
+            if has_description_source(value):
+                return value
+    elif isinstance(source, list):
+        for child in source:
+            value = first_value_by_key(child, target_key)
+            if has_description_source(value):
+                return value
+    return None
 
 
 def extract_json_ld_objects(soup: BeautifulSoup) -> list[dict[str, Any]]:
@@ -7806,23 +8344,33 @@ def upsert_store_product(session: Any, owner_username: str, store: StoreModel, i
         "genre_id": first_text_from_keys(item, ("genreId", "genre_id", "genre")),
         "raw": item,
     }
-    return upsert_product(session, owner_username, None, normalized, review_status="listed", store_id=store.id)
+    saved = upsert_product(session, owner_username, None, normalized, review_status="listed", store_id=store.id)
+    if saved and manage_number:
+        row = session.scalar(
+            select(ProductModel).where(
+                ProductModel.store_id == store.id,
+                ProductModel.rakuten_manage_number == manage_number,
+                ProductModel.review_status == "listed",
+            )
+        )
+        if row is not None:
+            ensure_product_listed_store_mark_from_store_product(session, row, store)
+    return saved
 
 
 def mark_missing_store_products_removed(session: Any, store: StoreModel, seen_manage_numbers: set[str]) -> None:
-    if not seen_manage_numbers:
-        return
-    rows = session.scalars(
-        select(ProductModel).where(
-            ProductModel.store_id == store.id,
-            ProductModel.review_status == "listed",
-            ProductModel.rakuten_manage_number.is_not(None),
-            ProductModel.rakuten_manage_number.not_in(seen_manage_numbers),
-        )
-    ).all()
+    query = select(ProductModel).where(
+        ProductModel.store_id == store.id,
+        ProductModel.review_status == "listed",
+        ProductModel.rakuten_manage_number.is_not(None),
+    )
+    if seen_manage_numbers:
+        query = query.where(ProductModel.rakuten_manage_number.not_in(seen_manage_numbers))
+    rows = session.scalars(query).all()
     for row in rows:
         row.store_product_status = "removed"
         row.last_error = "本次更新未从乐天店铺后台返回，可能已在乐天下架或删除。"
+        remove_listed_store_mark_for_store_product(session, row)
 
 
 def upsert_product(

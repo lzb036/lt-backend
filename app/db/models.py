@@ -175,6 +175,8 @@ class ProductModel(TimestampMixin, Base):
         Index("ix_lt_product_owner_title", "owner_username", "title"),
         Index("ix_lt_product_store_status", "store_id", "store_product_status"),
         Index("ix_lt_product_store_listing_listed", "store_id", "review_status", "rakuten_listing_status", "listed_at"),
+        Index("ix_lt_product_parent_status", "parent_product_id", "review_status"),
+        Index("ix_lt_product_listing_task", "listing_task_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -184,6 +186,8 @@ class ProductModel(TimestampMixin, Base):
         nullable=False,
     )
     task_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("lt_crawl_tasks.id", ondelete="SET NULL"))
+    parent_product_id: Mapped[int | None] = mapped_column(ForeignKey("lt_products.id", ondelete="SET NULL"))
+    listing_task_id: Mapped[str | None] = mapped_column(String(64))
     store_id: Mapped[int | None] = mapped_column(ForeignKey("lt_stores.id", ondelete="SET NULL"))
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
