@@ -3,13 +3,14 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 
 from app.api.auth import router as auth_router
 from app.api.crawler import router as crawler_router
 from app.api.profile import router as profile_router
 from app.api.users import router as users_router
 from app.core.config import settings
-from app.db.database import init_database
+from app.db.database import SessionLocal, init_database
 from app.services.crawler_service import LOCAL_PRODUCT_IMAGE_DIR, LOCAL_PRODUCT_IMAGE_DRAFT_DIR, start_schedule_runner
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
@@ -42,3 +43,47 @@ def startup() -> None:
 @app.get("/")
 def root() -> dict[str, str]:
     return {"name": settings.app_name, "version": settings.app_version}
+
+
+@app.get("/api/health")
+def health() -> dict[str, object]:
+    checks = {
+        "database": check_database(),
+        "productImagesWritable": check_directory_writable(LOCAL_PRODUCT_IMAGE_DIR),
+        "productImageDraftsWritable": check_directory_writable(LOCAL_PRODUCT_IMAGE_DRAFT_DIR),
+    }
+    return {
+        "status": "ok" if all(checks.values()) else "degraded",
+        "name": settings.app_name,
+        "version": settings.app_version,
+        "checks": checks,
+        "settings": {
+            "productImageDraftRetentionDays": settings.product_image_draft_retention_days,
+            "taskQueueMode": settings.task_queue_mode,
+            "taskQueueName": settings.task_queue_name,
+            "crawlerBatchSize": settings.crawler_batch_size,
+            "crawlerBatchPauseSeconds": settings.crawler_batch_pause_seconds,
+        },
+    }
+
+
+def check_database() -> bool:
+    session = SessionLocal()
+    try:
+        session.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+    finally:
+        session.close()
+
+
+def check_directory_writable(directory) -> bool:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / ".healthcheck"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False

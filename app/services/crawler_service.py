@@ -25,6 +25,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
+from app.core.task_queue import enqueue_task
 from app.db.database import session_scope
 from app.db.models import (
     CrawlLogModel,
@@ -125,21 +126,96 @@ CRAWLER_REQUEST_LOCK = threading.Lock()
 CRAWLER_SESSION_LOCAL = threading.local()
 CRAWLER_LAST_REQUEST_AT = 0.0
 SCHEDULE_RUNNER_STARTED = False
+DRAFT_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 
 
 def dispatch_crawl_task(task_id: str) -> None:
+    if should_use_redis_task_queue():
+        try:
+            enqueue_task(run_task, task_id, description=f"采集任务 {task_id}")
+        except Exception as exc:
+            mark_background_task_dispatch_failed(CrawlTaskModel, task_id, exc)
+            raise
+        return
     worker = threading.Thread(target=run_task, args=(task_id,), daemon=True)
     worker.start()
 
 
 def dispatch_sync_task(owner_username: str, task_id: str) -> None:
+    if should_use_redis_task_queue():
+        try:
+            enqueue_task(
+                run_sync_task,
+                owner_username,
+                task_id,
+                description=f"同步任务 {task_id}",
+            )
+        except Exception as exc:
+            mark_background_task_dispatch_failed(SyncTaskModel, task_id, exc)
+            raise
+        return
     worker = threading.Thread(target=run_sync_task, args=(owner_username, task_id), daemon=True)
     worker.start()
 
 
 def dispatch_listing_task(owner_username: str, task_id: str) -> None:
+    if should_use_redis_task_queue():
+        try:
+            enqueue_task(
+                run_listing_task,
+                owner_username,
+                task_id,
+                description=f"上架任务 {task_id}",
+            )
+        except Exception as exc:
+            mark_background_task_dispatch_failed(ListingTaskModel, task_id, exc)
+            raise
+        return
     worker = threading.Thread(target=run_listing_task, args=(owner_username, task_id), daemon=True)
     worker.start()
+
+
+def dispatch_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
+    if should_use_redis_task_queue():
+        try:
+            enqueue_task(
+                run_scheduled_crawl_job,
+                owner_username,
+                schedule_id,
+                job_id=f"schedule-{schedule_id}-{uuid.uuid4().hex[:8]}",
+                description=f"定时采集 {schedule_id}",
+            )
+        except Exception as exc:
+            mark_scheduled_crawl_dispatch_failed(schedule_id, exc)
+            raise
+        return
+    worker = threading.Thread(target=run_scheduled_crawl_job, args=(owner_username, schedule_id), daemon=True)
+    worker.start()
+
+
+def should_use_redis_task_queue() -> bool:
+    return settings.task_queue_mode == "redis"
+
+
+def mark_background_task_dispatch_failed(model: Any, task_id: str, exc: Exception) -> None:
+    with session_scope() as session:
+        task = session.get(model, task_id)
+        if task is None:
+            return
+        task.status = "failed"
+        task.failed_count = max(1, int(getattr(task, "failed_count", 0) or 0))
+        task.message = "任务投递失败"
+        task.error_detail = f"Redis 队列投递失败：{exc}"
+        task.finished_at = datetime.now()
+
+
+def mark_scheduled_crawl_dispatch_failed(schedule_id: int, exc: Exception) -> None:
+    with session_scope() as session:
+        row = session.get(ScheduledCrawlModel, schedule_id)
+        if row is None:
+            return
+        row.status = "failed"
+        row.notes = f"Redis 队列投递失败：{exc}"
 
 
 def log_event(owner_username: str, task_id: str | None, level: str, message: str) -> None:
@@ -3895,6 +3971,15 @@ def delete_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
 
 
 def run_scheduled_crawl(owner_username: str, schedule_id: int) -> dict[str, Any]:
+    run_scheduled_crawl_job(owner_username, schedule_id)
+    with session_scope() as session:
+        row = session.get(ScheduledCrawlModel, schedule_id)
+        if row is None:
+            raise RuntimeError("定时任务不存在。")
+        return scheduled_crawl_to_public(row)
+
+
+def run_scheduled_crawl_job(owner_username: str, schedule_id: int) -> None:
     with session_scope() as session:
         row = session.get(ScheduledCrawlModel, schedule_id)
         if row is None:
@@ -3917,7 +4002,6 @@ def run_scheduled_crawl(owner_username: str, schedule_id: int) -> dict[str, Any]
         row.status = "idle" if row.enabled else "disabled"
         row.next_run_at = next_daily_run_at(row.schedule_time) if row.enabled else None
         session.flush()
-        return scheduled_crawl_to_public(row)
 
 
 def run_due_scheduled_crawls_once() -> int:
@@ -3943,7 +4027,7 @@ def run_due_scheduled_crawls_once() -> int:
 
         for owner_username, schedule_id in due_items:
             try:
-                run_scheduled_crawl(owner_username, schedule_id)
+                dispatch_scheduled_crawl(owner_username, schedule_id)
             except Exception as exc:
                 with session_scope() as session:
                     row = session.get(ScheduledCrawlModel, schedule_id)
@@ -3956,6 +4040,19 @@ def run_due_scheduled_crawls_once() -> int:
         SCHEDULE_RUN_LOCK.release()
 
 
+def run_periodic_maintenance_once() -> None:
+    cleanup_expired_product_image_drafts_if_due()
+
+
+def cleanup_expired_product_image_drafts_if_due() -> int:
+    global DRAFT_IMAGE_CLEANUP_LAST_RUN_AT
+    now = time.time()
+    if DRAFT_IMAGE_CLEANUP_LAST_RUN_AT and now - DRAFT_IMAGE_CLEANUP_LAST_RUN_AT < 24 * 60 * 60:
+        return 0
+    DRAFT_IMAGE_CLEANUP_LAST_RUN_AT = now
+    return cleanup_expired_product_image_drafts()
+
+
 def start_schedule_runner(interval_seconds: int = 60) -> None:
     global SCHEDULE_RUNNER_STARTED
     if SCHEDULE_RUNNER_STARTED:
@@ -3966,6 +4063,7 @@ def start_schedule_runner(interval_seconds: int = 60) -> None:
         while True:
             try:
                 run_due_scheduled_crawls_once()
+                run_periodic_maintenance_once()
             except Exception:
                 pass
             time.sleep(max(10, interval_seconds))
@@ -5947,6 +6045,30 @@ def clear_product_temp_image_files(product_id: int) -> None:
             shutil.rmtree(image_dir, ignore_errors=True)
 
 
+def cleanup_expired_product_image_drafts() -> int:
+    root = LOCAL_PRODUCT_IMAGE_DRAFT_DIR
+    if not root.exists():
+        return 0
+    cutoff = time.time() - settings.product_image_draft_retention_days * 24 * 60 * 60
+    deleted_count = 0
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            path.unlink(missing_ok=True)
+            deleted_count += 1
+        except OSError:
+            continue
+    for directory in sorted((item for item in root.rglob("*") if item.is_dir()), key=lambda item: len(item.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            continue
+    return deleted_count
+
+
 def product_image_download_name(product_id: int, image_index: int, image_url: str) -> str:
     try:
         suffix = Path(urlsplit(image_url).path).suffix.lower()
@@ -6637,28 +6759,35 @@ def run_task(task_id: str) -> None:
         errors: list[str] = []
         if not items:
             errors.append("未采集到商品，请检查采集内容、榜单时间或乐天页面结构。")
-        for index, item in enumerate(items, start=1):
-            item_error = collected_item_error(item)
-            saved = save_collected_item(owner_username, task_id, item)
-            if saved:
-                saved_count += 1
-            if saved and item_error is None:
-                success_count += 1
-            else:
-                failed_count += 1
-                if item_error:
-                    errors.append(item_error)
-                elif not saved:
-                    name = str(item.get("title") or item.get("source_url") or "商品").strip()
-                    errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
-            update_task_progress(
-                CrawlTaskModel,
-                task_id,
-                total_count=len(items),
-                success_count=success_count,
-                failed_count=failed_count,
-                message=f"采集中，已处理 {index} / {len(items)} 条",
-            )
+        batch_size = max(1, int(settings.crawler_batch_size))
+        processed_count = 0
+        batches = list(chunk_items(items, batch_size))
+        for batch_index, batch_items in enumerate(batches, start=1):
+            for item in batch_items:
+                processed_count += 1
+                item_error = collected_item_error(item)
+                saved = save_collected_item(owner_username, task_id, item)
+                if saved:
+                    saved_count += 1
+                if saved and item_error is None:
+                    success_count += 1
+                else:
+                    failed_count += 1
+                    if item_error:
+                        errors.append(item_error)
+                    elif not saved:
+                        name = str(item.get("title") or item.get("source_url") or "商品").strip()
+                        errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
+                update_task_progress(
+                    CrawlTaskModel,
+                    task_id,
+                    total_count=len(items),
+                    success_count=success_count,
+                    failed_count=failed_count,
+                    message=f"采集中，批次 {batch_index} / {len(batches)}，已处理 {processed_count} / {len(items)} 条",
+                )
+            if batch_index < len(batches) and settings.crawler_batch_pause_seconds > 0:
+                time.sleep(settings.crawler_batch_pause_seconds)
         with session_scope() as session:
             task = session.get(CrawlTaskModel, task_id)
             if task is None:
@@ -6686,6 +6815,11 @@ def run_task(task_id: str) -> None:
 def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any]) -> bool:
     with session_scope() as session:
         return upsert_product(session, owner_username, task_id, item)
+
+
+def chunk_items(items: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
+    normalized_size = max(1, int(batch_size or 1))
+    return [items[index:index + normalized_size] for index in range(0, len(items), normalized_size)]
 
 
 def initial_crawl_task_total_count(source_type: str, target: str) -> int:

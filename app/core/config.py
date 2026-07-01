@@ -62,6 +62,8 @@ class Settings(BaseModel):
     session_cookie_name: str = "lt_session"
     session_cookie_secure: bool = False
     session_duration_seconds: int = 60 * 60 * 24 * 7
+    login_max_failed_attempts: int = 5
+    login_lockout_seconds: int = 15 * 60
     session_secret: str
     credential_encryption_secret: str
     initial_superadmin_username: str = "superadmin"
@@ -77,8 +79,17 @@ class Settings(BaseModel):
     crawler_min_delay_ms: int = 600
     crawler_max_delay_ms: int = 1600
     crawler_max_retries: int = 3
+    crawler_batch_size: int = 10
+    crawler_batch_pause_seconds: float = 3.0
     crawler_warmup_url: str = "https://www.rakuten.co.jp/"
     crawler_proxy_url: str = ""
+    product_image_draft_retention_days: int = 7
+    task_queue_mode: str = "thread"
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    task_queue_name: str = "lt-tasks"
+    task_queue_job_timeout_seconds: int = 60 * 60
+    task_queue_result_ttl_seconds: int = 24 * 60 * 60
+    task_queue_failure_ttl_seconds: int = 7 * 24 * 60 * 60
     rakuten_default_inventory_quantity: int = 1000
     rakuten_default_normal_delivery_time_id: int = 0
     rakuten_default_back_order_delivery_time_id: int = 0
@@ -121,6 +132,8 @@ def build_settings() -> Settings:
         session_cookie_name=_env_text("LT_SESSION_COOKIE_NAME", "lt_session"),
         session_cookie_secure=_env_bool("LT_SESSION_COOKIE_SECURE", False),
         session_duration_seconds=_env_int("LT_SESSION_DURATION_SECONDS", 60 * 60 * 24 * 7),
+        login_max_failed_attempts=max(1, _env_int("LT_LOGIN_MAX_FAILED_ATTEMPTS", 5)),
+        login_lockout_seconds=max(60, _env_int("LT_LOGIN_LOCKOUT_SECONDS", 15 * 60)),
         session_secret=_load_secret("LT_SESSION_SECRET", "session_secret.txt"),
         credential_encryption_secret=_load_secret("LT_CREDENTIAL_SECRET", "credential_secret.txt"),
         initial_superadmin_username=_env_text("LT_INITIAL_SUPERADMIN_USERNAME", "superadmin"),
@@ -136,8 +149,17 @@ def build_settings() -> Settings:
         crawler_min_delay_ms=max(0, _env_int("LT_CRAWLER_MIN_DELAY_MS", 600)),
         crawler_max_delay_ms=max(0, _env_int("LT_CRAWLER_MAX_DELAY_MS", 1600)),
         crawler_max_retries=max(0, _env_int("LT_CRAWLER_MAX_RETRIES", 3)),
+        crawler_batch_size=max(1, _env_int("LT_CRAWLER_BATCH_SIZE", 10)),
+        crawler_batch_pause_seconds=max(0, float(_env_text("LT_CRAWLER_BATCH_PAUSE_SECONDS", "3") or "0")),
         crawler_warmup_url=_env_text("LT_CRAWLER_WARMUP_URL", "https://www.rakuten.co.jp/"),
         crawler_proxy_url=_env_text("LT_CRAWLER_PROXY_URL", ""),
+        product_image_draft_retention_days=max(1, _env_int("LT_PRODUCT_IMAGE_DRAFT_RETENTION_DAYS", 7)),
+        task_queue_mode=_env_text("LT_TASK_QUEUE_MODE", "thread").lower() or "thread",
+        redis_url=_env_text("LT_REDIS_URL", "redis://127.0.0.1:6379/0"),
+        task_queue_name=_env_text("LT_TASK_QUEUE_NAME", "lt-tasks"),
+        task_queue_job_timeout_seconds=max(60, _env_int("LT_TASK_QUEUE_JOB_TIMEOUT_SECONDS", 60 * 60)),
+        task_queue_result_ttl_seconds=max(0, _env_int("LT_TASK_QUEUE_RESULT_TTL_SECONDS", 24 * 60 * 60)),
+        task_queue_failure_ttl_seconds=max(60, _env_int("LT_TASK_QUEUE_FAILURE_TTL_SECONDS", 7 * 24 * 60 * 60)),
         rakuten_default_inventory_quantity=max(0, _env_int("LT_RAKUTEN_DEFAULT_INVENTORY_QUANTITY", 1000)),
         rakuten_default_normal_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_NORMAL_DELIVERY_TIME_ID", 0)),
         rakuten_default_back_order_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_BACK_ORDER_DELIVERY_TIME_ID", 0)),

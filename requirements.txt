@@ -9,3 +9,5 @@ beautifulsoup4==4.13.4
 lxml==6.0.0
 python-multipart==0.0.20
 playwright==1.60.0
+redis==5.2.1
+rq==2.1.0
