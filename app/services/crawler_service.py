@@ -8,6 +8,7 @@ import hashlib
 import mimetypes
 import random
 import shutil
+import unicodedata
 import xml.etree.ElementTree as ET
 import time
 import threading
@@ -120,6 +121,28 @@ RAKUTEN_CABINET_FOLDER_CREATE_ATTEMPTS = 10
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
+RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES = {"-", "ー", "－", "―", "なし", "無し", "無", "不明", "n/a", "N/A", "na", "NA"}
+RAKUTEN_ATTRIBUTE_DEFAULT_UNITS = {
+    "本体横幅": "cm",
+    "本体縦幅": "cm",
+    "本体高さ": "cm",
+    "本体奥行": "cm",
+}
+RAKUTEN_ATTRIBUTE_UNIT_ALIASES = {
+    "mm": "mm",
+    "ミリ": "mm",
+    "ミリメートル": "mm",
+    "cm": "cm",
+    "㎝": "cm",
+    "センチ": "cm",
+    "センチメートル": "cm",
+    "m": "m",
+    "メートル": "m",
+    "g": "g",
+    "グラム": "g",
+    "kg": "kg",
+    "キログラム": "kg",
+}
 RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集支持普通乐天商品链接、Rakuten Fashion 商品链接、带参数链接、店铺编码/商品编号。"
 RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺url代码、店铺url或sid。"
 RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
@@ -5974,13 +5997,76 @@ def normalize_rakuten_variant_attributes(value: Any) -> list[dict[str, Any]]:
         attribute_value = first_text_from_keys(item, ("value", "attributeValue", "text"))
         if not name or not attribute_value or name in seen_names:
             continue
+        normalized_value = normalize_rakuten_attribute_value(attribute_value)
+        if not normalized_value:
+            continue
+        unit = normalize_rakuten_attribute_unit(first_text_from_keys(item, ("unit",)))
+        values, unit = normalize_rakuten_attribute_values_and_unit(name, normalized_value, unit)
+        if not values:
+            continue
         seen_names.add(name)
-        attribute: dict[str, Any] = {"name": name, "values": [attribute_value]}
-        unit = first_text_from_keys(item, ("unit",))
+        attribute: dict[str, Any] = {"name": name, "values": values}
         if unit:
             attribute["unit"] = unit
         attributes.append(attribute)
     return attributes
+
+
+def normalize_rakuten_attribute_value(value: Any) -> str:
+    text = normalize_text(value)
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    return "" if normalized in RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES else normalized
+
+
+def normalize_rakuten_attribute_values_and_unit(name: str, value: str, unit: str) -> tuple[list[str], str]:
+    normalized_name = normalize_text(name)
+    normalized_value = normalize_rakuten_attribute_value(value)
+    normalized_unit = normalize_rakuten_attribute_unit(unit)
+    if not normalized_value:
+        return [], ""
+    parsed_number, parsed_unit = parse_rakuten_attribute_number_and_unit(normalized_value)
+    if parsed_unit and not normalized_unit:
+        normalized_unit = parsed_unit
+    if not normalized_unit:
+        normalized_unit = RAKUTEN_ATTRIBUTE_DEFAULT_UNITS.get(normalized_name, "")
+    if normalized_unit:
+        number = parsed_number or normalize_rakuten_attribute_number(normalized_value)
+        if not number:
+            return [], ""
+        return [number], normalized_unit
+    return [normalized_value], ""
+
+
+def parse_rakuten_attribute_number_and_unit(value: Any) -> tuple[str, str]:
+    normalized = unicodedata.normalize("NFKC", normalize_text(value))
+    if not normalized:
+        return "", ""
+    unit_pattern = "|".join(sorted((re.escape(unit) for unit in RAKUTEN_ATTRIBUTE_UNIT_ALIASES), key=len, reverse=True))
+    match = re.search(rf"([0-9]+(?:[.,][0-9]+)?)\s*({unit_pattern})\b", normalized, flags=re.I)
+    if not match:
+        return "", ""
+    return normalize_rakuten_attribute_number(match.group(1)), normalize_rakuten_attribute_unit(match.group(2))
+
+
+def normalize_rakuten_attribute_unit(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", normalize_text(value)).lower()
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\s+", "", normalized)
+    return RAKUTEN_ATTRIBUTE_UNIT_ALIASES.get(normalized, normalized)
+
+
+def normalize_rakuten_attribute_number(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", normalize_text(value)).replace(",", ".")
+    match = re.search(r"[0-9]+(?:\.[0-9]+)?", normalized)
+    if not match:
+        return ""
+    number = match.group(0)
+    if "." in number:
+        number = number.rstrip("0").rstrip(".")
+    return number
 
 
 def normalize_rakuten_price(value: Any) -> str:
