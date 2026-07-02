@@ -122,6 +122,7 @@ DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
 RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES = {"-", "ー", "－", "―", "なし", "無し", "無", "不明", "n/a", "N/A", "na", "NA"}
+RAKUTEN_ATTRIBUTE_ALLOW_PLACEHOLDER_NAMES = {"ブランド名", "シリーズ名", "メーカー型番"}
 RAKUTEN_ATTRIBUTE_DEFAULT_UNITS = {
     "本体横幅": "cm",
     "本体縦幅": "cm",
@@ -5997,7 +5998,8 @@ def normalize_rakuten_variant_attributes(value: Any) -> list[dict[str, Any]]:
         attribute_value = first_text_from_keys(item, ("value", "attributeValue", "text"))
         if not name or not attribute_value or name in seen_names:
             continue
-        normalized_value = normalize_rakuten_attribute_value(attribute_value)
+        allow_placeholder = normalize_text(name) in RAKUTEN_ATTRIBUTE_ALLOW_PLACEHOLDER_NAMES
+        normalized_value = normalize_rakuten_attribute_value(attribute_value, allow_placeholder=allow_placeholder)
         if not normalized_value:
             continue
         unit = normalize_rakuten_attribute_unit(first_text_from_keys(item, ("unit",)))
@@ -6012,17 +6014,22 @@ def normalize_rakuten_variant_attributes(value: Any) -> list[dict[str, Any]]:
     return attributes
 
 
-def normalize_rakuten_attribute_value(value: Any) -> str:
+def normalize_rakuten_attribute_value(value: Any, *, allow_placeholder: bool = False) -> str:
     text = normalize_text(value)
     if not text:
         return ""
     normalized = unicodedata.normalize("NFKC", text)
-    return "" if normalized in RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES else normalized
+    if normalized in RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES and not allow_placeholder:
+        return ""
+    return normalized
 
 
 def normalize_rakuten_attribute_values_and_unit(name: str, value: str, unit: str) -> tuple[list[str], str]:
     normalized_name = normalize_text(name)
-    normalized_value = normalize_rakuten_attribute_value(value)
+    normalized_value = normalize_rakuten_attribute_value(
+        value,
+        allow_placeholder=normalized_name in RAKUTEN_ATTRIBUTE_ALLOW_PLACEHOLDER_NAMES,
+    )
     normalized_unit = normalize_rakuten_attribute_unit(unit)
     if not normalized_value:
         return [], ""
