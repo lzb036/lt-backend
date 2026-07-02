@@ -88,7 +88,7 @@ RAKUTEN_SP_DESCRIPTION_ALLOWED_TAGS = {
 RAKUTEN_SP_DESCRIPTION_ALLOWED_ATTRIBUTES = {
     "*": {"align"},
     "a": {"href"},
-    "font": {"color", "face", "size"},
+    "font": {"color", "size"},
     "img": {"alt", "border", "height", "src", "width"},
     "table": {"bgcolor", "border", "cellpadding", "cellspacing", "height", "width"},
     "td": {"align", "bgcolor", "colspan", "height", "rowspan", "valign", "width"},
@@ -118,6 +118,9 @@ RAKUTEN_SP_DESCRIPTION_DROP_TAGS = {
 RAKUTEN_CABINET_FOLDER_PAGE_SIZE = 100
 RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT = 500
 RAKUTEN_CABINET_FOLDER_CREATE_ATTEMPTS = 10
+RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS = 0.45
+RAKUTEN_CABINET_REQUEST_MAX_RETRIES = 6
+RAKUTEN_CABINET_QPS_BACKOFF_SECONDS = (1.5, 3.0, 5.0, 8.0, 13.0)
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
@@ -128,6 +131,13 @@ RAKUTEN_ATTRIBUTE_DEFAULT_UNITS = {
     "本体縦幅": "cm",
     "本体高さ": "cm",
     "本体奥行": "cm",
+    "ボール径": "mm",
+    "芯径": "mm",
+    "線幅": "mm",
+    "印鑑の直径": "mm",
+    "印面サイズ": "mm",
+    "印面直径": "mm",
+    "直径": "mm",
 }
 RAKUTEN_ATTRIBUTE_UNIT_ALIASES = {
     "mm": "mm",
@@ -144,14 +154,72 @@ RAKUTEN_ATTRIBUTE_UNIT_ALIASES = {
     "kg": "kg",
     "キログラム": "kg",
 }
+RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE = "代表カラー"
+RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK = "その他"
+SINGLE_PRODUCT_VARIANT_ID = "default"
+RAKUTEN_COLOR_SELECTOR_KEYWORDS = ("カラー", "色", "color", "colour")
+RAKUTEN_COLOR_VALUE_MAP = {
+    "ブラック": "ブラック",
+    "黒": "ブラック",
+    "くろ": "ブラック",
+    "クロ": "ブラック",
+    "black": "ブラック",
+    "ホワイト": "ホワイト",
+    "白": "ホワイト",
+    "しろ": "ホワイト",
+    "white": "ホワイト",
+    "グレー": "グレー",
+    "灰": "グレー",
+    "gray": "グレー",
+    "grey": "グレー",
+    "シルバー": "シルバー",
+    "銀": "シルバー",
+    "silver": "シルバー",
+    "レッド": "レッド",
+    "赤": "レッド",
+    "red": "レッド",
+    "ピンク": "ピンク",
+    "桃": "ピンク",
+    "pink": "ピンク",
+    "オレンジ": "オレンジ",
+    "orange": "オレンジ",
+    "イエロー": "イエロー",
+    "黄": "イエロー",
+    "yellow": "イエロー",
+    "グリーン": "グリーン",
+    "緑": "グリーン",
+    "green": "グリーン",
+    "ブルー": "ブルー",
+    "青": "ブルー",
+    "blue": "ブルー",
+    "ネイビー": "ネイビー",
+    "紺": "ネイビー",
+    "navy": "ネイビー",
+    "パープル": "パープル",
+    "紫": "パープル",
+    "purple": "パープル",
+    "ブラウン": "ブラウン",
+    "茶": "ブラウン",
+    "brown": "ブラウン",
+    "ベージュ": "ベージュ",
+    "beige": "ベージュ",
+    "クリア": "クリア",
+    "透明": "クリア",
+    "clear": "クリア",
+    "マルチ": "マルチカラー",
+    "ミックス": "マルチカラー",
+    "multi": "マルチカラー",
+}
 RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集支持普通乐天商品链接、Rakuten Fashion 商品链接、带参数链接、店铺编码/商品编号。"
 RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺url代码、店铺url或sid。"
 RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
 CRAWLER_HTTP_RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
 SCHEDULE_RUN_LOCK = threading.Lock()
 CRAWLER_REQUEST_LOCK = threading.Lock()
+RAKUTEN_CABINET_REQUEST_LOCK = threading.Lock()
 CRAWLER_SESSION_LOCAL = threading.local()
 CRAWLER_LAST_REQUEST_AT = 0.0
+RAKUTEN_CABINET_LAST_REQUEST_AT = 0.0
 SCHEDULE_RUNNER_STARTED = False
 DRAFT_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
@@ -738,7 +806,7 @@ def localize_collected_product_images(owner_username: str, product_id: int) -> s
         if product.review_status not in {"pending", "approved", "error", "listed_master"}:
             return ""
         raw_payload = product_raw_payload(product)
-        updated_payload = set_product_image_urls(raw_payload, image_result["urls"])
+        updated_payload = set_product_image_urls(raw_payload, image_result["urls"]) if image_result["urls"] else dict(raw_payload)
         if replacement_map:
             updated_payload = replace_product_description_image_urls(updated_payload, replacement_map)
             updated_payload = replace_payload_image_url_texts(updated_payload, replacement_map)
@@ -760,8 +828,19 @@ def localize_collected_product_images(owner_username: str, product_id: int) -> s
             updated_payload.pop("ltLocalImageErrors", None)
             if product.last_error and product.last_error.startswith("图片本地化"):
                 product.last_error = None
+        original_images = [
+            image
+            for image in source_images
+            if normalize_product_image_url(image, shop_code=shop_code)
+            and not is_local_product_image_url(image)
+            and not is_product_image_draft_url(image)
+            and not is_gif_image_url(image)
+        ]
+        if original_images:
+            updated_payload["ltOriginalImages"] = unique_texts(original_images)
         product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
-        product.image_url = image_result["urls"][0] if image_result["urls"] else ""
+        if image_result["urls"]:
+            product.image_url = image_result["urls"][0]
         remove_unused_local_product_images(product.id, collect_local_product_image_urls(updated_payload))
         session.flush()
         return product.last_error or ""
@@ -1128,7 +1207,7 @@ def product_variants(raw_payload: dict[str, Any]) -> list[dict[str, Any]]:
     elif isinstance(variants, list):
         variant_items = ((first_text_from_keys(item, ("variantId", "skuId", "merchantDefinedSkuId")) if isinstance(item, dict) else "", item) for item in variants)
     else:
-        return []
+        variant_items = []
 
     result: list[dict[str, Any]] = []
     for variant_id, variant in variant_items:
@@ -1148,7 +1227,25 @@ def product_variants(raw_payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "material": first_text_from_keys(variant, ("material",)),
             }
         )
-    return result
+    if result:
+        return result
+    price = price_from_rakuten_item_without_variants(raw_payload)
+    if price is None:
+        return []
+    return [
+        {
+            "variantId": SINGLE_PRODUCT_VARIANT_ID,
+            "merchantDefinedSkuId": "",
+            "articleNumber": "",
+            "standardPrice": str(int(price)) if price == int(price) else str(price),
+            "hidden": False,
+            "selectorValues": {},
+            "specs": [],
+            "attributes": [],
+            "material": "",
+            "singleProduct": True,
+        }
+    ]
 
 
 def selector_values_to_public(values: Any) -> list[Any]:
@@ -1686,6 +1783,83 @@ def build_rakuten_authorization_header(service_secret: str, license_key: str) ->
     return f"ESA {authorization}"
 
 
+def throttle_rakuten_cabinet_request() -> None:
+    global RAKUTEN_CABINET_LAST_REQUEST_AT
+    min_interval = max(0.0, RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS)
+    if min_interval <= 0:
+        return
+    with RAKUTEN_CABINET_REQUEST_LOCK:
+        now = time.monotonic()
+        elapsed = now - RAKUTEN_CABINET_LAST_REQUEST_AT
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        RAKUTEN_CABINET_LAST_REQUEST_AT = time.monotonic()
+
+
+def rakuten_cabinet_request(method: str, url: str, **kwargs: Any) -> requests.Response:
+    attempts = max(1, RAKUTEN_CABINET_REQUEST_MAX_RETRIES)
+    last_exc: requests.RequestException | None = None
+    for attempt in range(1, attempts + 1):
+        throttle_rakuten_cabinet_request()
+        try:
+            response = requests.request(method, url, **kwargs)
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                raise
+            time.sleep(rakuten_cabinet_backoff_seconds(attempt))
+            continue
+        if is_rakuten_cabinet_qps_limited_response(response):
+            if attempt >= attempts:
+                raise RuntimeError(f"R-Cabinet 请求触发 QPSLimit，已重试 {attempts} 次：{normalize_text(response.text)[:500]}")
+            response.close()
+            time.sleep(rakuten_cabinet_backoff_seconds(attempt))
+            continue
+        return response
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("R-Cabinet 请求失败。")
+
+
+def rakuten_cabinet_backoff_seconds(attempt: int) -> float:
+    index = max(0, min(len(RAKUTEN_CABINET_QPS_BACKOFF_SECONDS) - 1, attempt - 1))
+    base = float(RAKUTEN_CABINET_QPS_BACKOFF_SECONDS[index])
+    return base + random.uniform(0, 0.5)
+
+
+def is_rakuten_cabinet_qps_limited_response(response: requests.Response) -> bool:
+    text = normalize_text(getattr(response, "text", ""))
+    return response.status_code == 429 or "QPSLimit" in text
+
+
+def cabinet_xml_error_message(xml_text: str) -> str:
+    text = normalize_text(xml_text)
+    if not text:
+        return ""
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return ""
+    system_status = ""
+    messages: list[str] = []
+    result_codes: list[str] = []
+    for element in root.iter():
+        local_name = element.tag.split("}", 1)[-1].lower()
+        value = normalize_text(element.text)
+        if not value:
+            continue
+        if local_name == "systemstatus":
+            system_status = value.upper()
+        elif local_name == "message":
+            messages.append(value)
+        elif local_name in {"resultcode", "code"}:
+            result_codes.append(value)
+    if system_status and system_status != "OK":
+        parts = [*messages, *[f"resultCode={code}" for code in result_codes]]
+        return "，".join(unique_texts(parts)) or text[:500]
+    return ""
+
+
 def fetch_rakuten_shop_meta(service_secret: str, license_key: str) -> dict[str, str]:
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 和乐天 Key 不能为空。")
@@ -1711,7 +1885,8 @@ def fetch_rakuten_cabinet_usage(service_secret: str, license_key: str) -> dict[s
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 和乐天 Key 不能为空。")
     try:
-        response = requests.get(
+        response = rakuten_cabinet_request(
+            "GET",
             RAKUTEN_CABINET_USAGE_URL,
             timeout=settings.crawler_timeout_seconds,
             headers={
@@ -1760,7 +1935,8 @@ def fetch_rakuten_cabinet_folders(service_secret: str, license_key: str) -> list
     seen_ids: set[int] = set()
     offset = 1
     while True:
-        response = requests.get(
+        response = rakuten_cabinet_request(
+            "GET",
             RAKUTEN_CABINET_FOLDERS_GET_URL,
             timeout=settings.crawler_timeout_seconds,
             headers={
@@ -1873,7 +2049,8 @@ def create_rakuten_cabinet_folder(
         "</folderInsertRequest>"
         "</request>"
     )
-    response = requests.post(
+    response = rakuten_cabinet_request(
+        "POST",
         RAKUTEN_CABINET_FOLDER_INSERT_URL,
         timeout=settings.crawler_timeout_seconds,
         headers={
@@ -2439,15 +2616,20 @@ def patch_local_item_detail(raw_payload: dict[str, Any], *, title: str, tagline:
 
     raw_variants = updated_payload.get("variants")
     variant_updates: dict[str, Any] = {}
+    single_product_price: Decimal | None = None
     for variant in variants:
         variant_id = normalize_text(getattr(variant, "variantId", ""))
         standard_price = getattr(variant, "standardPrice", None)
         if not variant_id:
             continue
+        price_label = "价格" if variant_id == SINGLE_PRODUCT_VARIANT_ID and not raw_variants else f"SKU {variant_id} 价格"
         if standard_price is None or standard_price <= 0:
-            raise RuntimeError(f"SKU {variant_id} 价格必须大于 0。")
+            raise RuntimeError(f"{price_label}必须大于 0。")
         if standard_price != standard_price.to_integral_value():
-            raise RuntimeError(f"SKU {variant_id} 价格必须为日元整数。")
+            raise RuntimeError(f"{price_label}必须为日元整数。")
+        if variant_id == SINGLE_PRODUCT_VARIANT_ID and not raw_variants:
+            single_product_price = standard_price.to_integral_value()
+            continue
         variant_updates[variant_id] = {
             "standardPrice": str(int(standard_price)),
             "price": str(int(standard_price)),
@@ -2480,6 +2662,11 @@ def patch_local_item_detail(raw_payload: dict[str, Any], *, title: str, tagline:
             variant_id: {"variantId": variant_id, **variant_patch}
             for variant_id, variant_patch in variant_updates.items()
         }
+    if single_product_price is not None:
+        price_text = str(int(single_product_price))
+        updated_payload["price"] = price_text
+        updated_payload["standardPrice"] = price_text
+        updated_payload["itemPrice"] = price_text
 
     updated_payload["updated"] = datetime.now().isoformat(timespec="seconds")
     return updated_payload
@@ -2553,7 +2740,8 @@ def delete_rakuten_cabinet_file(service_secret: str, license_key: str, file_id: 
         "</fileDeleteRequest>"
         "</request>"
     )
-    response = requests.post(
+    response = rakuten_cabinet_request(
+        "POST",
         RAKUTEN_CABINET_FILE_DELETE_URL,
         timeout=settings.crawler_timeout_seconds,
         headers={
@@ -2571,6 +2759,9 @@ def delete_rakuten_cabinet_file(service_secret: str, license_key: str, file_id: 
         if detail:
             message = f"{message}：{detail[:500]}"
         raise RuntimeError(message) from exc
+    error_message = cabinet_xml_error_message(response.text)
+    if error_message:
+        raise RuntimeError(f"R-Cabinet 图片 {file_id} 删除失败：{error_message[:500]}")
 
 
 def insert_rakuten_cabinet_file(
@@ -2603,7 +2794,8 @@ def insert_rakuten_cabinet_file(
         "</fileInsertRequest>"
         "</request>"
     )
-    response = requests.post(
+    response = rakuten_cabinet_request(
+        "POST",
         RAKUTEN_CABINET_FILE_INSERT_URL,
         timeout=settings.crawler_timeout_seconds,
         headers={
@@ -2621,6 +2813,9 @@ def insert_rakuten_cabinet_file(
         if detail:
             message = f"{message}：{detail[:500]}"
         raise RuntimeError(message) from exc
+    error_message = cabinet_xml_error_message(response.text)
+    if error_message:
+        raise RuntimeError(f"R-Cabinet 图片 {normalized_file_path} 上传失败：{error_message[:500]}")
     result = parse_cabinet_insert_xml(response.text)
     result["fileName"] = normalized_file_name
     result["filePath"] = normalized_file_path
@@ -2641,6 +2836,10 @@ def parse_cabinet_insert_xml(xml_text: str) -> dict[str, Any]:
                 result["fileId"] = int(float(text))
             except ValueError:
                 pass
+        elif local_name == "message" and text:
+            result["message"] = text
+        elif local_name == "systemstatus" and text:
+            result["systemStatus"] = text
         elif local_name in {"fileurl", "fileurlssl", "url"} and text:
             result["fileUrl"] = text
         elif local_name in {"resultcode", "code"} and text:
@@ -2701,7 +2900,8 @@ def search_rakuten_cabinet_file_ids(
         params["filePath"] = file_path
     if file_name:
         params["fileName"] = file_name
-    response = requests.get(
+    response = rakuten_cabinet_request(
+        "GET",
         RAKUTEN_CABINET_FILE_SEARCH_URL,
         timeout=settings.crawler_timeout_seconds,
         headers={
@@ -2737,7 +2937,8 @@ def search_rakuten_cabinet_files(
         params["filePath"] = file_path
     if file_name:
         params["fileName"] = file_name
-    response = requests.get(
+    response = rakuten_cabinet_request(
+        "GET",
         RAKUTEN_CABINET_FILE_SEARCH_URL,
         timeout=settings.crawler_timeout_seconds,
         headers={
@@ -2910,8 +3111,40 @@ def build_rakuten_cabinet_image_url(shop_code: str, location: str) -> str:
     return f"https://image.rakuten.co.jp/{quote(normalized_shop_code, safe='')}/cabinet/{quote(normalized_location, safe='/')}"
 
 
+RAKUTEN_PRICE_KEYS = (
+    "itemPrice",
+    "price",
+    "standardPrice",
+    "displayPrice",
+    "taxIncludedPrice",
+    "tax_included_price",
+    "taxIncludedPriceMin",
+    "taxIncludedPriceMax",
+    "sellingPrice",
+    "selling_price",
+    "selling_price_no_format",
+    "sellingPriceWithTax",
+    "selling_price_with_tax",
+    "selling_price_tax_included",
+    "tax_included_selling_price",
+)
+
+
 def price_from_rakuten_item(item: dict[str, Any]) -> float | None:
-    value = first_text_from_keys(item, ("itemPrice", "price", "standardPrice", "displayPrice")) or first_variant_price(item)
+    value = first_text_from_keys(item, RAKUTEN_PRICE_KEYS) or first_variant_price(item)
+    if not value:
+        return None
+    normalized = re.sub(r"[^0-9.]", "", value)
+    if not normalized:
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def price_from_rakuten_item_without_variants(item: dict[str, Any]) -> float | None:
+    value = first_text_from_keys(item, RAKUTEN_PRICE_KEYS)
     if not value:
         return None
     normalized = re.sub(r"[^0-9.]", "", value)
@@ -2946,7 +3179,7 @@ def variant_prices(item: dict[str, Any]) -> list[float]:
     for variant in variant_items:
         if not isinstance(variant, dict):
             continue
-        value = first_text_from_keys(variant, ("standardPrice", "price", "displayPrice"))
+        value = first_text_from_keys(variant, RAKUTEN_PRICE_KEYS)
         normalized = re.sub(r"[^0-9.]", "", value)
         if not normalized:
             continue
@@ -4152,6 +4385,8 @@ def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("同步任务不存在。")
         if task.owner_username != owner_username:
             raise RuntimeError("不能重试其他用户的同步任务。")
+        if task.status in {"queued", "running"}:
+            raise RuntimeError("同步任务正在执行中，不能重试。")
         ensure_user_task_capacity(
             session,
             SyncTaskModel,
@@ -4870,6 +5105,105 @@ def put_rakuten_item(
         raise RuntimeError(message) from exc
 
 
+def put_rakuten_item_with_attribute_retry(
+    service_secret: str,
+    license_key: str,
+    manage_number: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        put_rakuten_item(service_secret, license_key, manage_number, payload)
+        return payload
+    except RuntimeError as exc:
+        patched_payload = patch_payload_for_missing_mandatory_attributes(payload, str(exc))
+        if patched_payload == payload:
+            raise
+        put_rakuten_item(service_secret, license_key, manage_number, patched_payload)
+        return patched_payload
+
+
+def patch_payload_for_missing_mandatory_attributes(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
+    missing_attributes = extract_missing_mandatory_attribute_names(error_text)
+    supported_missing_attributes = [
+        attribute for attribute in missing_attributes
+        if attribute in {RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE}
+    ]
+    if not supported_missing_attributes:
+        return payload
+    variants = payload.get("variants")
+    if not isinstance(variants, dict):
+        return payload
+    patched = json.loads(json.dumps(payload, ensure_ascii=False))
+    patched_variants = patched.get("variants")
+    if not isinstance(patched_variants, dict):
+        return payload
+    changed = False
+    for variant in patched_variants.values():
+        if not isinstance(variant, dict):
+            continue
+        attributes = variant.get("attributes")
+        if not isinstance(attributes, list):
+            attributes = []
+            variant["attributes"] = attributes
+        existing_names = {normalize_text(attribute.get("name")) for attribute in attributes if isinstance(attribute, dict)}
+        if RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE in supported_missing_attributes and RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE not in existing_names:
+            color = infer_rakuten_representative_color(variant, payload) or RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK
+            attributes.append({"name": RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE, "values": [color]})
+            changed = True
+    return patched if changed else payload
+
+
+def extract_missing_mandatory_attribute_names(error_text: str) -> list[str]:
+    text = normalize_text(error_text)
+    if not text:
+        return []
+    names: list[str] = []
+    for match in re.finditer(r"attributeNames:\s*([^\"。；;]+)", text):
+        raw_names = match.group(1)
+        for name in re.split(r"[,、，]\s*", raw_names):
+            normalized = normalize_text(name).strip("[]'\" ")
+            if normalized and normalized not in names:
+                names.append(normalized)
+    for match in re.finditer(r'"attributeNames"\s*:\s*\[([^\]]+)\]', text):
+        raw_names = match.group(1)
+        for name in re.findall(r'"([^"]+)"', raw_names):
+            normalized = normalize_text(name)
+            if normalized and normalized not in names:
+                names.append(normalized)
+    try:
+        json_start = text.find("{")
+        if json_start >= 0:
+            payload = json.loads(text[json_start:])
+            names.extend(extract_missing_mandatory_attribute_names_from_json(payload))
+    except Exception:
+        pass
+    return unique_texts(names)
+
+
+def extract_missing_mandatory_attribute_names_from_json(value: Any) -> list[str]:
+    names: list[str] = []
+    if isinstance(value, dict):
+        metadata = value.get("metadata")
+        if isinstance(metadata, dict):
+            details = metadata.get("details")
+            if isinstance(details, list):
+                for detail in details:
+                    if not isinstance(detail, dict):
+                        continue
+                    if normalize_text(detail.get("code")) != "invalidAllMandatoryAttributes":
+                        continue
+                    properties = detail.get("properties") if isinstance(detail.get("properties"), dict) else {}
+                    attribute_names = properties.get("attributeNames")
+                    if isinstance(attribute_names, list):
+                        names.extend(normalize_text(name) for name in attribute_names if normalize_text(name))
+        for child in value.values():
+            names.extend(extract_missing_mandatory_attribute_names_from_json(child))
+    elif isinstance(value, list):
+        for item in value:
+            names.extend(extract_missing_mandatory_attribute_names_from_json(item))
+    return names
+
+
 def create_store_product_on_rakuten(
     service_secret: str,
     license_key: str,
@@ -4905,7 +5239,7 @@ def create_store_product_on_rakuten(
         uploaded_description_images = description_result["uploadedImages"]
         payload = build_rakuten_item_upsert_payload(product, raw_payload, uploaded_product_images, manage_number=manage_number)
         item_write_started = True
-        put_rakuten_item(service_secret, license_key, manage_number, payload)
+        payload = put_rakuten_item_with_attribute_retry(service_secret, license_key, manage_number, payload)
         inventory_payloads = build_rakuten_inventory_upsert_payloads(
             manage_number,
             payload.get("variants") if isinstance(payload.get("variants"), dict) else {},
@@ -5212,7 +5546,10 @@ def upload_product_images_to_rakuten(
     cabinet_context: dict[str, Any] | None = None,
     source_images: list[str] | None = None,
 ) -> list[dict[str, str]]:
-    images = (source_images or product_images_for_edit(product))[:RAKUTEN_LISTING_IMAGE_LIMIT]
+    images = [
+        image for image in recover_missing_local_product_images(product, source_images or product_images_for_edit(product))
+        if not is_gif_image_url(image)
+    ][:RAKUTEN_LISTING_IMAGE_LIMIT]
     if not images:
         raise RuntimeError("商品缺少图片，不能上架到乐天。")
     uploaded_images: list[dict[str, str]] = []
@@ -5229,13 +5566,20 @@ def upload_product_images_to_rakuten(
         raise RuntimeError("R-Cabinet 上架文件夹不可用。")
     try:
         for index, image_url in enumerate(images, start=1):
-            image_data = prepare_rakuten_cabinet_image(
-                load_product_image_bytes(
-                    image_url,
-                    max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
-                    size_error_message="图片下载大小不能超过 20MB。",
+            try:
+                image_data = prepare_rakuten_cabinet_image(
+                    load_product_image_bytes(
+                        image_url,
+                        max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+                        size_error_message="图片下载大小不能超过 20MB。",
+                    )
                 )
-            )
+            except ProductImageUnavailableError:
+                continue
+            except RuntimeError as exc:
+                if should_skip_listing_image_error(exc):
+                    continue
+                raise
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="p")
             file_name = normalize_cabinet_file_name(f"{product.title[:24]}-{index}")
@@ -5267,6 +5611,8 @@ def upload_product_images_to_rakuten(
         if rollback_message:
             raise RuntimeError(f"{exc}；已回滚本次已上传图片：{rollback_message}") from exc
         raise
+    if not uploaded_images:
+        raise RuntimeError("商品本地图片文件不存在或已失效，未能上传任何图片。")
     reserve_listing_cabinet_folder_slots(cabinet_context, cabinet_folder, len(uploaded_images))
     return uploaded_images
 
@@ -5281,15 +5627,22 @@ def upload_product_description_images_to_rakuten(
     cabinet_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     description_items = product_descriptions(raw_payload)
+    all_description_image_urls = unique_texts([
+        url
+        for description in description_items
+        for url in description_image_urls(description.get("value"))
+    ])
+    removed_image_urls: list[str] = [url for url in all_description_image_urls if is_gif_image_url(url)]
     image_urls = unique_texts(
         [
             url
-            for description in description_items
-            for url in description_image_urls(description.get("value"))
-            if should_transfer_description_image(url, store.store_code)
+            for url in all_description_image_urls
+            if should_transfer_description_image(url, store.store_code) and not is_gif_image_url(url)
         ]
     )
     if not image_urls:
+        if removed_image_urls:
+            raw_payload = remove_product_description_image_urls(raw_payload, removed_image_urls)
         return {"rawPayload": raw_payload, "uploadedImages": []}
 
     uploaded_images: list[dict[str, str]] = []
@@ -5307,13 +5660,22 @@ def upload_product_description_images_to_rakuten(
         raise RuntimeError("R-Cabinet 上架说明图文件夹不可用。")
     try:
         for index, image_url in enumerate(image_urls, start=1):
-            image_data = prepare_rakuten_cabinet_image(
-                load_product_image_bytes(
-                    image_url,
-                    max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
-                    size_error_message="图片下载大小不能超过 20MB。",
+            try:
+                image_data = prepare_rakuten_cabinet_image(
+                    load_product_image_bytes(
+                        image_url,
+                        max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+                        size_error_message="图片下载大小不能超过 20MB。",
+                    )
                 )
-            )
+            except ProductImageUnavailableError:
+                removed_image_urls.append(image_url)
+                continue
+            except RuntimeError as exc:
+                if should_skip_listing_image_error(exc):
+                    removed_image_urls.append(image_url)
+                    continue
+                raise
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="d")
             file_name = normalize_cabinet_file_name(f"{product.title[:20]}-说明-{index}")
@@ -5348,6 +5710,10 @@ def upload_product_description_images_to_rakuten(
             raise RuntimeError(f"{exc}；已回滚本次已上传说明图：{rollback_message}") from exc
         raise
 
+    if removed_image_urls:
+        raw_payload = remove_product_description_image_urls(raw_payload, removed_image_urls)
+    if not uploaded_images:
+        return {"rawPayload": raw_payload, "uploadedImages": []}
     updated_payload = replace_product_description_image_urls(raw_payload, replacement_map)
     reserve_listing_cabinet_folder_slots(cabinet_context, cabinet_folder, len(uploaded_images))
     return {"rawPayload": updated_payload, "uploadedImages": uploaded_images}
@@ -5652,6 +6018,87 @@ def cabinet_file_ids_from_uploaded_image(
     return []
 
 
+def should_skip_listing_image_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        is_missing_local_product_image_error(exc)
+        or "图片文件无法识别" in message
+        or "图片文件无法读取" in message
+        or "R-Cabinet 图片格式只支持" in message
+        or "Unsupported format Error" in message
+        or "GIF 图片" in message
+    )
+
+
+def recover_missing_local_product_images(product: ProductModel, images: list[str]) -> list[str]:
+    normalized_images = unique_texts([image for image in images if normalize_product_image_url(image)])
+    if not any(is_missing_local_product_image_url(image) for image in normalized_images):
+        return normalized_images
+    raw_payload = product_raw_payload(product)
+    shop_code = product_shop_code(product, raw_payload)
+    original_images = [
+        image
+        for image in product_original_image_urls(raw_payload, shop_code=shop_code)
+        if not is_gif_image_url(image)
+    ]
+    if not original_images:
+        fallback_payload = dict(raw_payload)
+        fallback_payload.pop("ltEditedImages", None)
+        fallback_payload.pop("images", None)
+        original_images = [
+            image
+            for image in product_image_urls(fallback_payload, shop_code=shop_code)
+            if not is_local_product_image_url(image)
+            and not is_product_image_draft_url(image)
+            and not is_gif_image_url(image)
+        ]
+    if original_images:
+        try:
+            image_result = localize_product_image_urls(product.id, original_images, prefix="r")
+        except Exception:
+            image_result = {"urls": []}
+        recovered_urls = image_result.get("urls") if isinstance(image_result, dict) else []
+        if recovered_urls:
+            existing_urls = [image for image in normalized_images if not is_missing_local_product_image_url(image)]
+            next_urls = unique_texts([*existing_urls, *recovered_urls])
+            persist_recovered_product_images(product, raw_payload, next_urls)
+            return next_urls
+    return [image for image in normalized_images if not is_missing_local_product_image_url(image)]
+
+
+def persist_recovered_product_images(product: ProductModel, raw_payload: dict[str, Any], image_urls: list[str]) -> None:
+    if not image_urls:
+        return
+    try:
+        updated_payload = set_product_image_urls(raw_payload, image_urls)
+        product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
+        product.image_url = image_urls[0]
+        if product.last_error and "本地图片文件不存在" in product.last_error:
+            product.last_error = None
+    except Exception:
+        return
+
+
+def product_original_image_urls(raw_payload: dict[str, Any], *, shop_code: str = "") -> list[str]:
+    original_images = raw_payload.get("ltOriginalImages")
+    if isinstance(original_images, list):
+        return unique_texts([
+            normalize_product_image_url(image, shop_code=shop_code)
+            for image in original_images
+            if normalize_product_image_url(image, shop_code=shop_code)
+        ])
+    return []
+
+
+def is_missing_local_product_image_url(image_url: str) -> bool:
+    local_path = local_product_image_path_from_url(image_url)
+    return bool(local_path and not local_path.exists())
+
+
+def is_missing_local_product_image_error(exc: Exception) -> bool:
+    return "本地图片文件不存在" in str(exc)
+
+
 def load_product_image_bytes(
     image_url: str,
     *,
@@ -5728,8 +6175,7 @@ def prepare_rakuten_cabinet_image(image_data: dict[str, Any]) -> dict[str, Any]:
     if suffix == ".jpeg":
         suffix = ".jpg"
     if suffix == ".gif":
-        validate_rakuten_cabinet_gif(content)
-        return {"content": content, "suffix": ".gif", "contentType": "image/gif"}
+        raise RuntimeError("GIF 图片不参与上架，请替换为 jpg/png。")
     if suffix not in {".jpg", ".png"}:
         raise RuntimeError("R-Cabinet 图片格式只支持 jpg、png、gif。")
     try:
@@ -5745,16 +6191,6 @@ def prepare_rakuten_cabinet_image(image_data: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("图片文件无法识别。") from exc
     except OSError as exc:
         raise RuntimeError("图片文件无法读取。") from exc
-
-    width, height = image.size
-    if (
-        suffix == ".jpg"
-        and content_type == "image/jpeg"
-        and len(content) <= RAKUTEN_CABINET_MAX_IMAGE_BYTES
-        and width <= RAKUTEN_CABINET_MAX_IMAGE_DIMENSION
-        and height <= RAKUTEN_CABINET_MAX_IMAGE_DIMENSION
-    ):
-        return {"content": content, "suffix": ".jpg", "contentType": "image/jpeg"}
 
     image = resize_image_to_max_dimension(image, RAKUTEN_CABINET_MAX_IMAGE_DIMENSION)
     if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
@@ -5896,6 +6332,9 @@ def normalize_rakuten_item_image_location(value: Any) -> str:
 def build_rakuten_listing_variants(raw_payload: dict[str, Any], product: ProductModel) -> dict[str, dict[str, Any]]:
     raw_variants = raw_payload.get("variants")
     variant_items: list[tuple[str, dict[str, Any]]] = []
+    fallback_price = price_from_rakuten_item_without_variants(raw_payload)
+    if fallback_price is None and product.price is not None:
+        fallback_price = float(product.price)
     if isinstance(raw_variants, dict):
         variant_items = [(normalize_text(key), value) for key, value in raw_variants.items() if isinstance(value, dict)]
     elif isinstance(raw_variants, list):
@@ -5904,19 +6343,27 @@ def build_rakuten_listing_variants(raw_payload: dict[str, Any], product: Product
                 variant_id = first_text_from_keys(value, ("variantId", "skuId", "merchantDefinedSkuId")) or f"sku-{index}"
                 variant_items.append((variant_id, value))
     if not variant_items:
-        price = price_from_rakuten_item(raw_payload)
-        if price is None and product.price is not None:
-            price = float(product.price)
+        price = fallback_price
         if price is None:
             return {}
         variant_items = [("default", {"standardPrice": str(int(price)), "selectorValues": {}})]
+    if fallback_price is None:
+        variant_price_values = [
+            price
+            for _, variant in variant_items
+            if isinstance(variant, dict)
+            for price in [price_from_rakuten_item_without_variants(variant)]
+            if price is not None
+        ]
+        if variant_price_values:
+            fallback_price = min(variant_price_values)
 
     result: dict[str, dict[str, Any]] = {}
     for index, (variant_id, variant) in enumerate(variant_items, start=1):
         normalized_variant_id = re.sub(r"[^A-Za-z0-9_-]+", "-", normalize_text(variant_id)).strip("-_") or f"sku-{index}"
-        price_text = first_text_from_keys(variant, ("standardPrice", "price", "displayPrice"))
-        if not price_text and product.price is not None:
-            price_text = str(product.price)
+        price_text = first_text_from_keys(variant, RAKUTEN_PRICE_KEYS)
+        if not price_text and fallback_price is not None:
+            price_text = str(int(fallback_price)) if fallback_price == int(fallback_price) else str(fallback_price)
         normalized_price = normalize_rakuten_price(price_text)
         if not normalized_price:
             continue
@@ -5936,6 +6383,7 @@ def build_rakuten_listing_variants(raw_payload: dict[str, Any], product: Product
                 if normalize_text(key) and normalize_text(value)
             }
         attributes = normalize_rakuten_variant_attributes(variant.get("attributes"))
+        attributes = ensure_rakuten_variant_required_attributes(attributes, variant, raw_payload)
         if attributes:
             next_variant["attributes"] = attributes
         result[normalized_variant_id[:32]] = {key: value for key, value in next_variant.items() if value not in (None, "", {}, [])}
@@ -5995,7 +6443,7 @@ def normalize_rakuten_variant_attributes(value: Any) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         name = first_text_from_keys(item, ("name", "attributeName", "label"))
-        attribute_value = first_text_from_keys(item, ("value", "attributeValue", "text"))
+        attribute_value = first_text_from_keys(item, ("value", "attributeValue", "text", "values"))
         if not name or not attribute_value or name in seen_names:
             continue
         allow_placeholder = normalize_text(name) in RAKUTEN_ATTRIBUTE_ALLOW_PLACEHOLDER_NAMES
@@ -6012,6 +6460,68 @@ def normalize_rakuten_variant_attributes(value: Any) -> list[dict[str, Any]]:
             attribute["unit"] = unit
         attributes.append(attribute)
     return attributes
+
+
+def ensure_rakuten_variant_required_attributes(
+    attributes: list[dict[str, Any]],
+    variant: dict[str, Any],
+    raw_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return list(attributes)
+
+
+def infer_rakuten_representative_color(variant: dict[str, Any], raw_payload: dict[str, Any]) -> str:
+    candidates: list[Any] = []
+    for source in (variant, raw_payload):
+        fields: list[Any] = []
+        if isinstance(source, dict):
+            fields.extend([
+                source.get("attributes"),
+                source.get("specs"),
+            ])
+        for attrs in fields:
+            if not isinstance(attrs, list):
+                continue
+            for item in attrs:
+                if not isinstance(item, dict):
+                    continue
+                name = first_text_from_keys(item, ("name", "attributeName", "label", "title"))
+                value = first_text_from_keys(item, ("value", "attributeValue", "text", "values"))
+                normalized_name = normalize_text(name).lower()
+                if normalize_text(name) == RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE:
+                    candidates.append(value)
+                elif any(keyword.lower() in normalized_name for keyword in RAKUTEN_COLOR_SELECTOR_KEYWORDS):
+                    candidates.append(value)
+    selector_values = variant.get("selectorValues") if isinstance(variant.get("selectorValues"), dict) else {}
+    for key, value in selector_values.items():
+        normalized_key = normalize_text(key).lower()
+        if any(keyword.lower() in normalized_key for keyword in RAKUTEN_COLOR_SELECTOR_KEYWORDS):
+            candidates.append(value)
+    candidates.extend(selector_values.values())
+    candidates.extend(
+        [
+            first_text_from_keys(variant, ("variantId", "skuId", "merchantDefinedSkuId")),
+            first_text_from_keys(raw_payload, ("title", "itemName", "name")),
+        ]
+    )
+    for candidate in candidates:
+        color = normalize_rakuten_representative_color(candidate)
+        if color:
+            return color
+    return ""
+
+
+def normalize_rakuten_representative_color(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", normalize_text(value))
+    if not text:
+        return ""
+    if text in RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES:
+        return ""
+    lowered = text.lower()
+    for token, color in sorted(RAKUTEN_COLOR_VALUE_MAP.items(), key=lambda item: len(item[0]), reverse=True):
+        if token.lower() in lowered:
+            return color
+    return text[:30] if len(text) <= 30 and re.search(r"[色カラーblackwhitebluegreenredpinkyelloworangepurplebrowngraygrey]", lowered, flags=re.I) else ""
 
 
 def normalize_rakuten_attribute_value(value: Any, *, allow_placeholder: bool = False) -> str:
@@ -7015,6 +7525,8 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("上架任务不存在。")
         if task.owner_username != owner_username:
             raise RuntimeError("不能重试其他用户的上架任务。")
+        if task.status in {"queued", "running"}:
+            raise RuntimeError("上架任务正在执行中，不能重试。")
         ensure_user_task_capacity(
             session,
             ListingTaskModel,
@@ -7188,6 +7700,8 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("采集任务不存在。")
         if task.owner_username != owner_username:
             raise RuntimeError("不能重启其他用户的采集任务。")
+        if task.status in {"queued", "running"}:
+            raise RuntimeError("采集任务正在执行中，不能重新采集。")
         ensure_user_task_capacity(
             session,
             CrawlTaskModel,
