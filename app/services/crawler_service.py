@@ -157,6 +157,7 @@ RAKUTEN_ATTRIBUTE_UNIT_ALIASES = {
 RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE = "代表カラー"
 RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK = "その他"
 SINGLE_PRODUCT_VARIANT_ID = "default"
+LISTING_MANAGE_NUMBER_PREFIX = "fashiongoods"
 RAKUTEN_COLOR_SELECTOR_KEYWORDS = ("カラー", "色", "color", "colour")
 RAKUTEN_COLOR_VALUE_MAP = {
     "ブラック": "ブラック",
@@ -5521,20 +5522,15 @@ def generate_listing_manage_number(product: ProductModel, raw_payload: dict[str,
     existing = normalize_text(product.rakuten_manage_number) if product.review_status == "listed" else ""
     if existing:
         return existing[:32]
-    base = (
-        first_text_from_keys(raw_payload, ("itemNumber", "manageNumber"))
-        or normalize_text(product.item_number)
-        or f"lt{product.id}"
-    )
-    normalized = re.sub(r"[^A-Za-z0-9_-]+", "-", base).strip("-_").lower()
-    if not normalized:
-        normalized = f"lt{product.id}"
     store_id = int(getattr(product, "_listing_store_id", 0) or 0)
-    suffix = f"-{store_id}-{product.id}" if store_id else f"-{product.id}"
-    max_base_len = max(1, 32 - len(suffix))
-    if normalized.endswith(suffix):
-        return normalized[:32]
-    return f"{normalized[:max_base_len]}{suffix}"[:32]
+    return build_listing_manage_number(product.id, store_id=store_id)
+
+
+def build_listing_manage_number(product_id: int, *, store_id: int = 0, listed_at: datetime | None = None) -> str:
+    date_text = (listed_at or datetime.now()).strftime("%Y%m%d")
+    store_text = str(max(0, int(store_id or 0)))[-3:] or "0"
+    product_text = str(max(0, int(product_id or 0)))[-5:].zfill(5)
+    return f"{LISTING_MANAGE_NUMBER_PREFIX}{store_text}{date_text}{product_text}"[:32]
 
 
 def upload_product_images_to_rakuten(
