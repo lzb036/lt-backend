@@ -14,6 +14,7 @@ import threading
 from datetime import datetime, timedelta
 from decimal import Decimal
 from html import unescape
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
@@ -66,6 +67,8 @@ ALLOWED_PRODUCT_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
 ALLOWED_PRODUCT_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif"}
 MAX_PRODUCT_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024
+RAKUTEN_CABINET_MAX_IMAGE_BYTES = MAX_PRODUCT_IMAGE_BYTES
+RAKUTEN_CABINET_MAX_IMAGE_DIMENSION = 3840
 RAKUTEN_LISTING_IMAGE_LIMIT = 20
 RAKUTEN_SP_DESCRIPTION_IMAGE_LIMIT = 20
 RAKUTEN_SP_DESCRIPTION_ALLOWED_TAGS = {
@@ -780,7 +783,11 @@ def localize_product_description_images(
 
 
 def save_remote_product_image(product_id: int, image_url: str, name_prefix: str) -> str:
-    image_data = load_product_image_bytes(image_url)
+    image_data = load_product_image_bytes(
+        image_url,
+        max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+        size_error_message="图片下载大小不能超过 20MB。",
+    )
     image_dir = LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id))
     image_dir.mkdir(parents=True, exist_ok=True)
     safe_name = f"{name_prefix}-{uuid.uuid4().hex[:12]}{image_data['suffix']}"
@@ -4795,28 +4802,31 @@ def create_store_product_on_rakuten(
     raw_payload = product_raw_payload(product)
     product._listing_store_id = store.id
     manage_number = generate_listing_manage_number(product, raw_payload)
-    uploaded_product_images = upload_product_images_to_rakuten(
-        service_secret,
-        license_key,
-        store,
-        product,
-        manage_number,
-        cabinet_context=cabinet_context,
-    )
-    description_result = upload_product_description_images_to_rakuten(
-        service_secret,
-        license_key,
-        store,
-        product,
-        manage_number,
-        raw_payload,
-        cabinet_context=cabinet_context,
-    )
-    raw_payload = description_result["rawPayload"]
-    uploaded_description_images = description_result["uploadedImages"]
-    uploaded_images_for_rollback = [*uploaded_product_images, *uploaded_description_images]
-    payload = build_rakuten_item_upsert_payload(product, raw_payload, uploaded_product_images, manage_number=manage_number)
+    uploaded_product_images: list[dict[str, str]] = []
+    uploaded_description_images: list[dict[str, str]] = []
+    item_write_started = False
     try:
+        uploaded_product_images = upload_product_images_to_rakuten(
+            service_secret,
+            license_key,
+            store,
+            product,
+            manage_number,
+            cabinet_context=cabinet_context,
+        )
+        description_result = upload_product_description_images_to_rakuten(
+            service_secret,
+            license_key,
+            store,
+            product,
+            manage_number,
+            raw_payload,
+            cabinet_context=cabinet_context,
+        )
+        raw_payload = description_result["rawPayload"]
+        uploaded_description_images = description_result["uploadedImages"]
+        payload = build_rakuten_item_upsert_payload(product, raw_payload, uploaded_product_images, manage_number=manage_number)
+        item_write_started = True
         put_rakuten_item(service_secret, license_key, manage_number, payload)
         inventory_payloads = build_rakuten_inventory_upsert_payloads(
             manage_number,
@@ -4824,10 +4834,12 @@ def create_store_product_on_rakuten(
         )
         bulk_upsert_rakuten_inventories(service_secret, license_key, inventory_payloads)
     except Exception as exc:
-        try:
-            delete_rakuten_item(service_secret, license_key, manage_number)
-        except Exception:
-            pass
+        if item_write_started:
+            try:
+                delete_rakuten_item(service_secret, license_key, manage_number)
+            except Exception:
+                pass
+        uploaded_images_for_rollback = [*uploaded_product_images, *uploaded_description_images]
         rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_images_for_rollback)
         if rollback_message:
             raise RuntimeError(f"{exc}；已回滚本次上传图片：{rollback_message}") from exc
@@ -5139,7 +5151,13 @@ def upload_product_images_to_rakuten(
         raise RuntimeError("R-Cabinet 上架文件夹不可用。")
     try:
         for index, image_url in enumerate(images, start=1):
-            image_data = load_product_image_bytes(image_url)
+            image_data = prepare_rakuten_cabinet_image(
+                load_product_image_bytes(
+                    image_url,
+                    max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+                    size_error_message="图片下载大小不能超过 20MB。",
+                )
+            )
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="p")
             file_name = normalize_cabinet_file_name(f"{product.title[:24]}-{index}")
@@ -5211,7 +5229,13 @@ def upload_product_description_images_to_rakuten(
         raise RuntimeError("R-Cabinet 上架说明图文件夹不可用。")
     try:
         for index, image_url in enumerate(image_urls, start=1):
-            image_data = load_product_image_bytes(image_url)
+            image_data = prepare_rakuten_cabinet_image(
+                load_product_image_bytes(
+                    image_url,
+                    max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+                    size_error_message="图片下载大小不能超过 20MB。",
+                )
+            )
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="d")
             file_name = normalize_cabinet_file_name(f"{product.title[:20]}-说明-{index}")
@@ -5550,7 +5574,13 @@ def cabinet_file_ids_from_uploaded_image(
     return []
 
 
-def load_product_image_bytes(image_url: str) -> dict[str, Any]:
+def load_product_image_bytes(
+    image_url: str,
+    *,
+    max_bytes: int = MAX_PRODUCT_IMAGE_BYTES,
+    size_error_message: str = "图片大小不能超过 2MB。",
+) -> dict[str, Any]:
+    normalized_max_bytes = max(1, int(max_bytes or MAX_PRODUCT_IMAGE_BYTES))
     local_path = local_product_image_path_from_url(image_url)
     if local_path:
         if not local_path.exists():
@@ -5563,6 +5593,7 @@ def load_product_image_bytes(image_url: str) -> dict[str, Any]:
             image_url,
             timeout=settings.crawler_timeout_seconds,
             headers={"User-Agent": settings.crawler_user_agent},
+            proxies=crawler_request_proxies(),
             stream=True,
         )
         try:
@@ -5573,8 +5604,8 @@ def load_product_image_bytes(image_url: str) -> dict[str, Any]:
                 if not chunk:
                     continue
                 size += len(chunk)
-                if size > MAX_PRODUCT_IMAGE_BYTES:
-                    raise RuntimeError("图片大小不能超过 2MB。")
+                if size > normalized_max_bytes:
+                    raise RuntimeError(size_error_message)
                 chunks.append(chunk)
             content = b"".join(chunks)
             suffix = Path(urlsplit(image_url).path).suffix.lower()
@@ -5599,9 +5630,104 @@ def load_product_image_bytes(image_url: str) -> dict[str, Any]:
         raise RuntimeError("图片文件类型不正确。")
     if not content:
         raise RuntimeError("图片内容为空。")
-    if len(content) > MAX_PRODUCT_IMAGE_BYTES:
-        raise RuntimeError("图片大小不能超过 2MB。")
+    if len(content) > normalized_max_bytes:
+        raise RuntimeError(size_error_message)
     return {"content": content, "suffix": suffix, "contentType": content_type}
+
+
+def prepare_rakuten_cabinet_image(image_data: dict[str, Any]) -> dict[str, Any]:
+    content = image_data.get("content") or b""
+    suffix = normalize_text(image_data.get("suffix")).lower()
+    content_type = normalize_text(image_data.get("contentType")).lower()
+    if not content:
+        raise RuntimeError("图片内容为空。")
+    if suffix == ".jpeg":
+        suffix = ".jpg"
+    if suffix == ".gif":
+        validate_rakuten_cabinet_gif(content)
+        return {"content": content, "suffix": ".gif", "contentType": "image/gif"}
+    if suffix not in {".jpg", ".png"}:
+        raise RuntimeError("R-Cabinet 图片格式只支持 jpg、png、gif。")
+    try:
+        from PIL import Image, ImageOps, UnidentifiedImageError
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 Pillow，不能自动处理 R-Cabinet 图片尺寸，请先执行 pip install -r requirements.txt。") from exc
+
+    try:
+        with Image.open(BytesIO(content)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.load()
+    except UnidentifiedImageError as exc:
+        raise RuntimeError("图片文件无法识别。") from exc
+    except OSError as exc:
+        raise RuntimeError("图片文件无法读取。") from exc
+
+    width, height = image.size
+    if (
+        suffix == ".jpg"
+        and content_type == "image/jpeg"
+        and len(content) <= RAKUTEN_CABINET_MAX_IMAGE_BYTES
+        and width <= RAKUTEN_CABINET_MAX_IMAGE_DIMENSION
+        and height <= RAKUTEN_CABINET_MAX_IMAGE_DIMENSION
+    ):
+        return {"content": content, "suffix": ".jpg", "contentType": "image/jpeg"}
+
+    image = resize_image_to_max_dimension(image, RAKUTEN_CABINET_MAX_IMAGE_DIMENSION)
+    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        transparent_image = image.convert("RGBA")
+        background.paste(transparent_image, mask=transparent_image.getchannel("A"))
+        image = background
+    elif image.mode not in {"RGB", "L"}:
+        image = image.convert("RGB")
+    elif image.mode == "L":
+        image = image.convert("RGB")
+
+    quality_values = (88, 82, 76, 70, 64, 58)
+    current = image
+    for scale_attempt in range(5):
+        if scale_attempt:
+            next_width = max(1, int(current.width * 0.9))
+            next_height = max(1, int(current.height * 0.9))
+            current = current.resize((next_width, next_height), Image.Resampling.LANCZOS)
+        for quality in quality_values:
+            output = BytesIO()
+            current.save(output, format="JPEG", quality=quality, optimize=True, progressive=True)
+            normalized_content = output.getvalue()
+            if len(normalized_content) <= RAKUTEN_CABINET_MAX_IMAGE_BYTES:
+                return {"content": normalized_content, "suffix": ".jpg", "contentType": "image/jpeg"}
+    raise RuntimeError("图片压缩后仍超过 R-Cabinet 2MB 限制，请替换为更小的图片。")
+
+
+def validate_rakuten_cabinet_gif(content: bytes) -> None:
+    if len(content) > RAKUTEN_CABINET_MAX_IMAGE_BYTES:
+        raise RuntimeError("GIF 图片超过 R-Cabinet 2MB 限制，请替换为 jpg/png。")
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 Pillow，不能自动检查 R-Cabinet 图片尺寸，请先执行 pip install -r requirements.txt。") from exc
+    try:
+        with Image.open(BytesIO(content)) as image:
+            width, height = image.size
+    except UnidentifiedImageError as exc:
+        raise RuntimeError("GIF 图片文件无法识别。") from exc
+    except OSError as exc:
+        raise RuntimeError("GIF 图片文件无法读取。") from exc
+    if width > RAKUTEN_CABINET_MAX_IMAGE_DIMENSION or height > RAKUTEN_CABINET_MAX_IMAGE_DIMENSION:
+        raise RuntimeError("GIF 图片尺寸超过 R-Cabinet 限制，请替换为 jpg/png。")
+
+
+def resize_image_to_max_dimension(image: Any, max_dimension: int) -> Any:
+    width, height = image.size
+    if width <= max_dimension and height <= max_dimension:
+        return image.copy()
+    scale = min(max_dimension / width, max_dimension / height)
+    next_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 Pillow，不能自动处理 R-Cabinet 图片尺寸，请先执行 pip install -r requirements.txt。") from exc
+    return image.resize(next_size, Image.Resampling.LANCZOS)
 
 
 def product_image_suffix_from_content_type(content_type: str) -> str:
