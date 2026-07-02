@@ -132,6 +132,12 @@ SCHEDULE_RUNNER_STARTED = False
 DRAFT_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 
 
+class ProductImageUnavailableError(RuntimeError):
+    def __init__(self, status_code: int) -> None:
+        self.status_code = int(status_code)
+        super().__init__(f"图片不存在或已失效（HTTP {self.status_code}）。")
+
+
 def dispatch_crawl_task(task_id: str) -> None:
     if should_use_redis_task_queue():
         try:
@@ -711,8 +717,16 @@ def localize_collected_product_images(owner_username: str, product_id: int) -> s
         if replacement_map:
             updated_payload = replace_product_description_image_urls(updated_payload, replacement_map)
             updated_payload = replace_payload_image_url_texts(updated_payload, replacement_map)
+        removed_description_urls = description_result.get("removedUrls") or []
+        if removed_description_urls:
+            updated_payload = remove_product_description_image_urls(updated_payload, removed_description_urls)
         updated_payload["ltLocalImagesReady"] = True
         updated_payload["ltLocalImageUpdatedAt"] = datetime.now().isoformat(timespec="seconds")
+        description_warnings = description_result.get("warnings") or []
+        if description_warnings:
+            updated_payload["ltLocalImageWarnings"] = description_warnings[:20]
+        else:
+            updated_payload.pop("ltLocalImageWarnings", None)
         if image_result["errors"] or description_result["errors"]:
             image_errors = [*image_result["errors"], *description_result["errors"]]
             updated_payload["ltLocalImageErrors"] = image_errors[:20]
@@ -768,6 +782,8 @@ def localize_product_description_images(
     )
     replacement_map: dict[str, str] = {}
     errors: list[str] = []
+    warnings: list[str] = []
+    removed_urls: list[str] = []
     known_replacements = existing_replacements or {}
     for index, image_url in enumerate(description_urls, start=1):
         if is_local_product_image_url(image_url):
@@ -777,9 +793,12 @@ def localize_product_description_images(
             continue
         try:
             replacement_map[image_url] = save_remote_product_image(product_id, image_url, f"d{index:02d}")
+        except ProductImageUnavailableError as exc:
+            removed_urls.append(image_url)
+            warnings.append(f"{image_url}: {exc}，已从详情说明移除。")
         except Exception as exc:
-            errors.append(f"{image_url}: {exc}")
-    return {"replacementMap": replacement_map, "errors": errors}
+            warnings.append(f"{image_url}: {exc}")
+    return {"replacementMap": replacement_map, "errors": errors, "warnings": warnings, "removedUrls": unique_texts(removed_urls)}
 
 
 def save_remote_product_image(product_id: int, image_url: str, name_prefix: str) -> str:
@@ -5604,7 +5623,13 @@ def load_product_image_bytes(
             stream=True,
         )
         try:
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                status_code = int(response.status_code or 0)
+                if status_code in {404, 410}:
+                    raise ProductImageUnavailableError(status_code) from exc
+                raise RuntimeError(f"读取商品图片失败（HTTP {status_code}）。") from exc
             chunks: list[bytes] = []
             size = 0
             for chunk in response.iter_content(chunk_size=1024 * 256):
