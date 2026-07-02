@@ -126,11 +126,29 @@ MAX_PAGE_SIZE = 500
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
 RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES = {"-", "ー", "－", "―", "なし", "無し", "無", "不明", "n/a", "N/A", "na", "NA"}
 RAKUTEN_ATTRIBUTE_ALLOW_PLACEHOLDER_NAMES = {"ブランド名", "シリーズ名", "メーカー型番"}
+RAKUTEN_ATTRIBUTE_TEXT_ONLY_NAMES = {"ブランド名", "シリーズ名", "メーカー型番"}
 RAKUTEN_ATTRIBUTE_DEFAULT_UNITS = {
     "本体横幅": "cm",
     "本体縦幅": "cm",
     "本体高さ": "cm",
     "本体奥行": "cm",
+    "着丈": "cm",
+    "身丈": "cm",
+    "総丈": "cm",
+    "袖丈": "cm",
+    "裄丈": "cm",
+    "肩幅": "cm",
+    "身幅": "cm",
+    "胸囲": "cm",
+    "バスト": "cm",
+    "ウエスト": "cm",
+    "ヒップ": "cm",
+    "股上": "cm",
+    "股下": "cm",
+    "わたり幅": "cm",
+    "渡り幅": "cm",
+    "裾幅": "cm",
+    "もも周り": "cm",
     "ボール径": "mm",
     "芯径": "mm",
     "線幅": "mm",
@@ -394,6 +412,7 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
         "totalCount": row.total_count,
         "successCount": row.success_count,
         "failedCount": row.failed_count,
+        "warningCount": getattr(row, "warning_count", 0) or 0,
         "message": row.message,
         "errorDetail": row.error_detail,
         "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
@@ -1444,6 +1463,7 @@ def update_task_progress(
     total_count: int | None = None,
     success_count: int | None = None,
     failed_count: int | None = None,
+    warning_count: int | None = None,
     message: str | None = None,
     status: str | None = None,
 ) -> None:
@@ -1460,6 +1480,8 @@ def update_task_progress(
                     task.success_count = max(0, int(success_count))
                 if failed_count is not None:
                     task.failed_count = max(0, int(failed_count))
+                if warning_count is not None and hasattr(task, "warning_count"):
+                    task.warning_count = max(0, int(warning_count))
                 if message is not None:
                     task.message = message
                 if status is not None:
@@ -5116,11 +5138,17 @@ def put_rakuten_item_with_attribute_retry(
         put_rakuten_item(service_secret, license_key, manage_number, payload)
         return payload
     except RuntimeError as exc:
-        patched_payload = patch_payload_for_missing_mandatory_attributes(payload, str(exc))
+        patched_payload = patch_payload_for_attribute_errors(payload, str(exc))
         if patched_payload == payload:
             raise
         put_rakuten_item(service_secret, license_key, manage_number, patched_payload)
         return patched_payload
+
+
+def patch_payload_for_attribute_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
+    patched_payload = patch_payload_for_missing_mandatory_attributes(payload, error_text)
+    patched_payload = patch_payload_for_attribute_unit_errors(patched_payload, error_text)
+    return patched_payload
 
 
 def patch_payload_for_missing_mandatory_attributes(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
@@ -5152,6 +5180,88 @@ def patch_payload_for_missing_mandatory_attributes(payload: dict[str, Any], erro
             attributes.append({"name": RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE, "values": [color]})
             changed = True
     return patched if changed else payload
+
+
+def patch_payload_for_attribute_unit_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
+    rules = extract_attribute_unit_error_rules(error_text)
+    if not rules:
+        return payload
+    variants = payload.get("variants")
+    if not isinstance(variants, dict):
+        return payload
+    patched = json.loads(json.dumps(payload, ensure_ascii=False))
+    patched_variants = patched.get("variants")
+    if not isinstance(patched_variants, dict):
+        return payload
+    changed = False
+    for variant in patched_variants.values():
+        if not isinstance(variant, dict):
+            continue
+        attributes = variant.get("attributes")
+        if not isinstance(attributes, list):
+            continue
+        for attribute in attributes:
+            if not isinstance(attribute, dict):
+                continue
+            name = normalize_text(attribute.get("name"))
+            action = rules.get(name)
+            if not action:
+                continue
+            values = attribute.get("values")
+            first_value = first_text_value(values)
+            if action == "remove_unit":
+                if "unit" in attribute:
+                    attribute.pop("unit", None)
+                    changed = True
+                continue
+            if action == "require_unit":
+                next_values, next_unit = normalize_rakuten_attribute_values_and_unit(name, first_value, normalize_text(attribute.get("unit")))
+                if next_values and next_unit:
+                    if attribute.get("values") != next_values:
+                        attribute["values"] = next_values
+                        changed = True
+                    if attribute.get("unit") != next_unit:
+                        attribute["unit"] = next_unit
+                        changed = True
+    return patched if changed else payload
+
+
+def extract_attribute_unit_error_rules(error_text: str) -> dict[str, str]:
+    rules: dict[str, str] = {}
+
+    def collect_from_detail(detail: Any) -> None:
+        if not isinstance(detail, dict):
+            return
+        code = normalize_text(detail.get("code"))
+        properties = detail.get("properties") if isinstance(detail.get("properties"), dict) else {}
+        attribute_name = normalize_text(properties.get("attributeName"))
+        if not attribute_name:
+            return
+        if code == "invalidNoInputUnit":
+            rules[attribute_name] = "remove_unit"
+        elif code == "invalidNoUnitAndValues":
+            rules[attribute_name] = "require_unit"
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            collect_from_detail(value)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    text = normalize_text(error_text)
+    try:
+        json_start = text.find("{")
+        if json_start >= 0:
+            walk(json.loads(text[json_start:]))
+    except Exception:
+        pass
+    for match in re.finditer(r'"code"\s*:\s*"(invalidNoInputUnit|invalidNoUnitAndValues)".*?"attributeName"\s*:\s*"([^"]+)"', text):
+        code, attribute_name = match.groups()
+        rules[normalize_text(attribute_name)] = "remove_unit" if code == "invalidNoInputUnit" else "require_unit"
+    return rules
 
 
 def extract_missing_mandatory_attribute_names(error_text: str) -> list[str]:
@@ -6539,6 +6649,8 @@ def normalize_rakuten_attribute_values_and_unit(name: str, value: str, unit: str
     normalized_unit = normalize_rakuten_attribute_unit(unit)
     if not normalized_value:
         return [], ""
+    if normalized_name in RAKUTEN_ATTRIBUTE_TEXT_ONLY_NAMES:
+        return [normalized_value], ""
     parsed_number, parsed_unit = parse_rakuten_attribute_number_and_unit(normalized_value)
     if parsed_unit and not normalized_unit:
         normalized_unit = parsed_unit
@@ -7710,6 +7822,7 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
         task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
         task.success_count = 0
         task.failed_count = 0
+        task.warning_count = 0
         task.message = "等待重新执行"
         task.error_detail = None
         task.started_at = None
@@ -7771,10 +7884,12 @@ def run_task(task_id: str) -> None:
             total_count=len(items),
             success_count=0,
             failed_count=0,
+            warning_count=0,
             message=f"采集中，已处理 0 / {len(items)} 条",
         )
         success_count = 0
         failed_count = 0
+        warning_count = 0
         saved_count = 0
         errors: list[str] = []
         if not items:
@@ -7791,8 +7906,11 @@ def run_task(task_id: str) -> None:
                 save_error = normalize_text(save_result.get("error"))
                 if saved:
                     saved_count += 1
-                if saved and item_error is None and not save_error:
                     success_count += 1
+                    item_warnings = [message for message in (item_error, save_error) if message]
+                    if item_warnings:
+                        warning_count += 1
+                        errors.extend(item_warnings)
                 else:
                     failed_count += 1
                     if item_error:
@@ -7808,6 +7926,7 @@ def run_task(task_id: str) -> None:
                     total_count=len(items),
                     success_count=success_count,
                     failed_count=failed_count,
+                    warning_count=warning_count,
                     message=f"采集中，批次 {batch_index} / {len(batches)}，已处理 {processed_count} / {len(items)} 条",
                 )
             if batch_index < len(batches) and settings.crawler_batch_pause_seconds > 0:
@@ -7818,11 +7937,12 @@ def run_task(task_id: str) -> None:
                 return
             task.success_count = success_count
             task.failed_count = failed_count
+            task.warning_count = warning_count
             task.status = resolve_crawl_task_status("failed" if not items else "success", len(items), success_count, failed_count)
             task.finished_at = datetime.now()
-            task.message = f"完成，采集 {len(items)} 条，完整 {success_count} 条，异常 {failed_count} 条，入库 {saved_count} 条"
+            task.message = f"完成，采集 {len(items)} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条"
             task.error_detail = summarize_task_errors(errors)
-        log_event(owner_username, task_id, "info", f"任务完成，完整 {success_count} 条，异常 {failed_count} 条，入库 {saved_count} 条商品")
+        log_event(owner_username, task_id, "info", f"任务完成，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条商品")
     except Exception as exc:
         with session_scope() as session:
             task = session.get(CrawlTaskModel, task_id)
@@ -7830,6 +7950,7 @@ def run_task(task_id: str) -> None:
                 return
             task.status = "failed"
             task.failed_count = 1
+            task.warning_count = 0
             task.finished_at = datetime.now()
             task.message = "采集失败"
             task.error_detail = str(exc)
