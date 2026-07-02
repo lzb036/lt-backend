@@ -905,11 +905,18 @@ def normalize_product_image_url(value: Any, *, shop_code: str = "") -> str:
     if text.startswith((LOCAL_PRODUCT_IMAGE_URL_PREFIX, LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX)):
         return text.split("?", 1)[0].split("#", 1)[0]
     if not text.startswith(("http://", "https://")):
-        if not shop_code:
-            return ""
         if not re.search(r"\.(apng|avif|bmp|gif|jpe?g|png|webp)(?:$|[?#])", text, flags=re.I):
             return ""
         normalized_location = text.lstrip("/")
+        thumbnail_match = re.match(r"@0_mall/([^/]+)/cabinet/(.+)", normalized_location, flags=re.I)
+        if thumbnail_match:
+            matched_shop_code = normalize_shop_code(thumbnail_match.group(1))
+            if shop_code and matched_shop_code and matched_shop_code != normalize_shop_code(shop_code):
+                return ""
+            shop_code = shop_code or matched_shop_code
+            normalized_location = thumbnail_match.group(2)
+        if not shop_code:
+            return ""
         if normalized_location.startswith("cabinet/"):
             normalized_location = normalized_location.removeprefix("cabinet/")
         text = build_rakuten_cabinet_image_url(shop_code, normalized_location)
@@ -7141,6 +7148,7 @@ def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any])
     with session_scope() as session:
         saved = upsert_product(session, owner_username, task_id, item)
         if saved:
+            session.flush()
             source_url = str(item.get("source_url") or "").strip()
             if source_url:
                 product = session.scalar(
