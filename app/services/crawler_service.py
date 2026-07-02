@@ -130,6 +130,7 @@ CRAWLER_SESSION_LOCAL = threading.local()
 CRAWLER_LAST_REQUEST_AT = 0.0
 SCHEDULE_RUNNER_STARTED = False
 DRAFT_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
+ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 
 
 class ProductImageUnavailableError(RuntimeError):
@@ -4294,6 +4295,7 @@ def run_due_scheduled_crawls_once() -> int:
 
 def run_periodic_maintenance_once() -> None:
     cleanup_expired_product_image_drafts_if_due()
+    cleanup_orphan_product_image_dirs_if_due()
 
 
 def cleanup_expired_product_image_drafts_if_due() -> int:
@@ -4303,6 +4305,15 @@ def cleanup_expired_product_image_drafts_if_due() -> int:
         return 0
     DRAFT_IMAGE_CLEANUP_LAST_RUN_AT = now
     return cleanup_expired_product_image_drafts()
+
+
+def cleanup_orphan_product_image_dirs_if_due() -> int:
+    global ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT
+    now = time.time()
+    if ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT and now - ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT < 24 * 60 * 60:
+        return 0
+    ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT = now
+    return cleanup_orphan_product_image_dirs()
 
 
 def start_schedule_runner(interval_seconds: int = 60) -> None:
@@ -6395,6 +6406,43 @@ def clear_product_temp_image_files(product_id: int) -> None:
             continue
         if image_dir.exists() and image_dir.is_dir():
             shutil.rmtree(image_dir, ignore_errors=True)
+
+
+def cleanup_orphan_product_image_dirs() -> int:
+    product_ids = collect_product_image_dir_ids()
+    if not product_ids:
+        return 0
+    existing_ids: set[int] = set()
+    with session_scope() as session:
+        for offset in range(0, len(product_ids), 500):
+            batch = product_ids[offset:offset + 500]
+            existing_ids.update(
+                int(value)
+                for value in session.scalars(select(ProductModel.id).where(ProductModel.id.in_(batch))).all()
+            )
+    orphan_ids = [product_id for product_id in product_ids if product_id not in existing_ids]
+    for product_id in orphan_ids:
+        clear_product_temp_image_files(product_id)
+    return len(orphan_ids)
+
+
+def collect_product_image_dir_ids() -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    for root_dir in (LOCAL_PRODUCT_IMAGE_DIR, LOCAL_PRODUCT_IMAGE_DRAFT_DIR):
+        if not root_dir.exists() or not root_dir.is_dir():
+            continue
+        for path in root_dir.iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                product_id = int(path.name)
+            except ValueError:
+                continue
+            if product_id not in seen:
+                seen.add(product_id)
+                ids.append(product_id)
+    return ids
 
 
 def cleanup_expired_product_image_drafts() -> int:
