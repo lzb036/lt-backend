@@ -675,6 +675,224 @@ def set_product_image_urls_with_description_updates(
     return updated_payload
 
 
+def localize_collected_product_images(owner_username: str, product_id: int) -> str:
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            return ""
+        if product.review_status not in {"pending", "approved", "error", "listed_master"}:
+            return ""
+        raw_payload = product_raw_payload(product)
+        shop_code = product_shop_code(product, raw_payload)
+        product_title = product.title
+        source_images = product_editable_image_urls(raw_payload, shop_code=shop_code)
+        if product.image_url and product.image_url not in source_images:
+            source_images.insert(0, product.image_url)
+
+    image_result = localize_product_image_urls(product_id, source_images, prefix="p")
+    description_result = localize_product_description_images(
+        product_id,
+        raw_payload,
+        existing_replacements=image_result["replacementMap"],
+    )
+    replacement_map = {**image_result["replacementMap"], **description_result["replacementMap"]}
+
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            return ""
+        if product.review_status not in {"pending", "approved", "error", "listed_master"}:
+            return ""
+        raw_payload = product_raw_payload(product)
+        updated_payload = set_product_image_urls(raw_payload, image_result["urls"])
+        if replacement_map:
+            updated_payload = replace_product_description_image_urls(updated_payload, replacement_map)
+            updated_payload = replace_payload_image_url_texts(updated_payload, replacement_map)
+        updated_payload["ltLocalImagesReady"] = True
+        updated_payload["ltLocalImageUpdatedAt"] = datetime.now().isoformat(timespec="seconds")
+        if image_result["errors"] or description_result["errors"]:
+            image_errors = [*image_result["errors"], *description_result["errors"]]
+            updated_payload["ltLocalImageErrors"] = image_errors[:20]
+            product.last_error = summarize_local_image_errors(product_title or product.title, product.source_url, product.id, image_errors)
+        else:
+            updated_payload.pop("ltLocalImageErrors", None)
+            if product.last_error and product.last_error.startswith("图片本地化"):
+                product.last_error = None
+        product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
+        product.image_url = image_result["urls"][0] if image_result["urls"] else ""
+        remove_unused_local_product_images(product.id, collect_local_product_image_urls(updated_payload))
+        session.flush()
+        return product.last_error or ""
+
+
+def localize_product_image_urls(product_id: int, image_urls: list[str], *, prefix: str) -> dict[str, Any]:
+    local_urls: list[str] = []
+    replacement_map: dict[str, str] = {}
+    errors: list[str] = []
+    source_urls = unique_texts(image_urls)
+    if not source_urls:
+        errors.append("未采集到商品主图。")
+    for index, image_url in enumerate(source_urls, start=1):
+        if is_product_image_draft_url(image_url):
+            continue
+        if is_local_product_image_url(image_url):
+            if image_url not in local_urls:
+                local_urls.append(image_url)
+            continue
+        try:
+            local_url = save_remote_product_image(product_id, image_url, f"{prefix}{index:02d}")
+        except Exception as exc:
+            errors.append(f"{image_url}: {exc}")
+            continue
+        replacement_map[image_url] = local_url
+        local_urls.append(local_url)
+    return {"urls": unique_texts(local_urls), "replacementMap": replacement_map, "errors": errors}
+
+
+def localize_product_description_images(
+    product_id: int,
+    raw_payload: dict[str, Any],
+    *,
+    existing_replacements: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    description_urls = unique_texts(
+        [
+            url
+            for description in product_descriptions(raw_payload)
+            for url in description_image_urls(description.get("value"))
+            if not is_product_image_draft_url(url)
+        ]
+    )
+    replacement_map: dict[str, str] = {}
+    errors: list[str] = []
+    known_replacements = existing_replacements or {}
+    for index, image_url in enumerate(description_urls, start=1):
+        if is_local_product_image_url(image_url):
+            continue
+        if image_url in known_replacements:
+            replacement_map[image_url] = known_replacements[image_url]
+            continue
+        try:
+            replacement_map[image_url] = save_remote_product_image(product_id, image_url, f"d{index:02d}")
+        except Exception as exc:
+            errors.append(f"{image_url}: {exc}")
+    return {"replacementMap": replacement_map, "errors": errors}
+
+
+def save_remote_product_image(product_id: int, image_url: str, name_prefix: str) -> str:
+    image_data = load_product_image_bytes(image_url)
+    image_dir = LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id))
+    image_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = f"{name_prefix}-{uuid.uuid4().hex[:12]}{image_data['suffix']}"
+    target_path = image_dir / safe_name
+    target_path.write_bytes(image_data["content"])
+    return local_product_image_url(product_id, safe_name)
+
+
+def is_local_product_image_url(image_url: str) -> bool:
+    return normalize_text(image_url).startswith(LOCAL_PRODUCT_IMAGE_URL_PREFIX)
+
+
+def summarize_local_image_errors(product_title: str, source_url: str, product_id: int, errors: list[str]) -> str:
+    if not errors:
+        return ""
+    display_name = normalize_text(product_title or source_url or product_id)
+    first_error = errors[0]
+    suffix = f"，另有 {len(errors) - 1} 张失败" if len(errors) > 1 else ""
+    return f"图片本地化失败：{display_name}: {first_error[:300]}{suffix}"
+
+
+def mark_product_local_image_error(owner_username: str, product_id: int, message: str) -> None:
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            return
+        product.last_error = message[:1000]
+
+
+def replace_payload_image_url_texts(value: Any, replacement_map: dict[str, str]) -> Any:
+    if not replacement_map:
+        return value
+    if isinstance(value, str):
+        next_value = replace_payload_image_urls_in_text(value, replacement_map)
+        for old_url, new_url in replacement_map.items():
+            if old_url and new_url:
+                next_value = next_value.replace(old_url, new_url)
+        return next_value
+    if isinstance(value, list):
+        return [replace_payload_image_url_texts(item, replacement_map) for item in value]
+    if isinstance(value, dict):
+        return {key: replace_payload_image_url_texts(child, replacement_map) for key, child in value.items()}
+    return value
+
+
+def replace_payload_image_urls_in_text(value: str, replacement_map: dict[str, str]) -> str:
+    def replace_match(match: re.Match[str]) -> str:
+        matched = match.group(0)
+        image_url = matched.rstrip(".,;")
+        trailing = matched[len(image_url):]
+        replacement = (
+            replacement_map.get(image_url)
+            or replacement_map.get(normalize_product_image_url(image_url))
+            or replacement_map.get(normalize_description_image_url(image_url))
+        )
+        return f"{replacement}{trailing}" if replacement else matched
+
+    return re.sub(r"https?://[^\s\"'<>)]+'?", replace_match, value)
+
+
+def collect_local_product_image_urls(value: Any) -> list[str]:
+    urls: list[str] = []
+
+    def remember(candidate: Any) -> None:
+        url = normalize_product_image_url(candidate)
+        if is_local_product_image_url(url) and url not in urls:
+            urls.append(url)
+
+    def walk(item: Any) -> None:
+        if isinstance(item, str):
+            text = unescape(item).replace("\\/", "/")
+            remember(text)
+            pattern = rf"{re.escape(LOCAL_PRODUCT_IMAGE_URL_PREFIX)}/\d+/[^\s\"'<>),]+"
+            for match in re.findall(pattern, text):
+                remember(match.rstrip(".,;"))
+            return
+        if isinstance(item, list):
+            for child in item:
+                walk(child)
+            return
+        if isinstance(item, dict):
+            for child in item.values():
+                walk(child)
+
+    walk(value)
+    return urls
+
+
+def remove_unused_local_product_images(product_id: int, referenced_urls: list[str]) -> None:
+    image_dir = (LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id))).resolve()
+    root = LOCAL_PRODUCT_IMAGE_DIR.resolve()
+    try:
+        image_dir.relative_to(root)
+    except ValueError:
+        return
+    if not image_dir.exists() or not image_dir.is_dir():
+        return
+    referenced_paths = {
+        path.resolve()
+        for path in (local_product_image_path_from_url(url) for url in referenced_urls)
+        if path is not None
+    }
+    for path in image_dir.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            if path.resolve() not in referenced_paths:
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
 def normalize_product_image_url(value: Any, *, shop_code: str = "") -> str:
     text = unescape(str(value or "")).replace("\\/", "/").strip().strip("'\"")
     if text.startswith((LOCAL_PRODUCT_IMAGE_URL_PREFIX, LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX)):
@@ -3826,6 +4044,7 @@ def perform_product_delete_sync(
             warnings.extend(getattr(row, "_delete_warnings", []) or [])
             remove_listed_store_mark_for_store_product(session, row)
             success_ids.append(row.id)
+            clear_product_temp_image_files(row.id)
             session.delete(row)
             success_count += 1
             if task_id:
@@ -5360,6 +5579,8 @@ def load_product_image_bytes(image_url: str) -> dict[str, Any]:
             content = b"".join(chunks)
             suffix = Path(urlsplit(image_url).path).suffix.lower()
             content_type = normalize_text(response.headers.get("Content-Type")).split(";", 1)[0].lower()
+            if not suffix:
+                suffix = product_image_suffix_from_content_type(content_type)
         except requests.RequestException as exc:
             raise RuntimeError("读取商品图片失败。") from exc
         finally:
@@ -5381,6 +5602,17 @@ def load_product_image_bytes(image_url: str) -> dict[str, Any]:
     if len(content) > MAX_PRODUCT_IMAGE_BYTES:
         raise RuntimeError("图片大小不能超过 2MB。")
     return {"content": content, "suffix": suffix, "contentType": content_type}
+
+
+def product_image_suffix_from_content_type(content_type: str) -> str:
+    normalized = normalize_text(content_type).lower()
+    if normalized == "image/jpeg":
+        return ".jpg"
+    if normalized == "image/png":
+        return ".png"
+    if normalized == "image/gif":
+        return ".gif"
+    return ""
 
 
 def build_rakuten_item_upsert_payload(
@@ -5861,49 +6093,11 @@ def product_image_download_info(owner_username: str, product_id: int, image_inde
 
 
 def replace_product_image(owner_username: str, product_id: int, image_index: int, upload_file: Any) -> dict[str, Any]:
-    with session_scope() as session:
-        product = session.get(ProductModel, product_id)
-        if product is None or product.owner_username != owner_username:
-            raise RuntimeError("商品不存在。")
-        if product.review_status != "pending":
-            raise RuntimeError("只有待审核商品可以修改图片。")
-        raw_payload = product_raw_payload(product)
-        images = product_images_for_edit(product)
-        image_url_at_index(images, image_index)
-        saved_url = save_uploaded_product_image(product_id, image_index, upload_file)
-        old_url = images[image_index]
-        images[image_index] = saved_url
-        product.raw_payload_json = json.dumps(
-            set_product_image_urls_with_description_updates(raw_payload, images, replace_map={old_url: saved_url}),
-            ensure_ascii=False,
-        )
-        product.image_url = images[0] if images else ""
-        product.last_error = None
-        remove_local_product_image_if_unused(old_url, images)
-        session.flush()
-        return product_detail_to_public(product)
+    raise RuntimeError("图片替换请在待审核商品详情中操作，并点击保存后生效。")
 
 
 def delete_product_image(owner_username: str, product_id: int, image_index: int) -> dict[str, Any]:
-    with session_scope() as session:
-        product = session.get(ProductModel, product_id)
-        if product is None or product.owner_username != owner_username:
-            raise RuntimeError("商品不存在。")
-        if product.review_status != "pending":
-            raise RuntimeError("只有待审核商品可以修改图片。")
-        raw_payload = product_raw_payload(product)
-        images = product_images_for_edit(product)
-        removed_url = image_url_at_index(images, image_index)
-        next_images = [image for index, image in enumerate(images) if index != image_index]
-        product.raw_payload_json = json.dumps(
-            set_product_image_urls_with_description_updates(raw_payload, next_images, remove_urls=[removed_url]),
-            ensure_ascii=False,
-        )
-        product.image_url = next_images[0] if next_images else ""
-        product.last_error = None
-        remove_local_product_image_if_unused(removed_url, next_images)
-        session.flush()
-        return product_detail_to_public(product)
+    raise RuntimeError("图片删除请在待审核商品详情中操作，并点击保存后生效。")
 
 
 def image_url_at_index(images: list[str], image_index: int) -> str:
@@ -6766,15 +6960,19 @@ def run_task(task_id: str) -> None:
             for item in batch_items:
                 processed_count += 1
                 item_error = collected_item_error(item)
-                saved = save_collected_item(owner_username, task_id, item)
+                save_result = save_collected_item(owner_username, task_id, item)
+                saved = bool(save_result.get("saved"))
+                save_error = normalize_text(save_result.get("error"))
                 if saved:
                     saved_count += 1
-                if saved and item_error is None:
+                if saved and item_error is None and not save_error:
                     success_count += 1
                 else:
                     failed_count += 1
                     if item_error:
                         errors.append(item_error)
+                    elif save_error:
+                        errors.append(save_error)
                     elif not saved:
                         name = str(item.get("title") or item.get("source_url") or "商品").strip()
                         errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
@@ -6812,9 +7010,30 @@ def run_task(task_id: str) -> None:
         log_event(owner_username, task_id, "error", str(exc))
 
 
-def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any]) -> bool:
+def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any]) -> dict[str, Any]:
+    product_id: int | None = None
     with session_scope() as session:
-        return upsert_product(session, owner_username, task_id, item)
+        saved = upsert_product(session, owner_username, task_id, item)
+        if saved:
+            source_url = str(item.get("source_url") or "").strip()
+            if source_url:
+                product = session.scalar(
+                    select(ProductModel).where(
+                        ProductModel.owner_username == owner_username,
+                        ProductModel.source_url_hash == make_source_url_hash(source_url),
+                    )
+                )
+                product_id = product.id if product is not None else None
+        else:
+            return {"saved": False, "error": ""}
+    image_error = ""
+    if product_id is not None:
+        try:
+            image_error = localize_collected_product_images(owner_username, product_id)
+        except Exception as exc:
+            image_error = f"图片本地化失败：{exc}"
+            mark_product_local_image_error(owner_username, product_id, image_error)
+    return {"saved": True, "error": image_error}
 
 
 def chunk_items(items: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
