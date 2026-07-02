@@ -753,6 +753,8 @@ def localize_product_image_urls(product_id: int, image_urls: list[str], *, prefi
     for index, image_url in enumerate(source_urls, start=1):
         if is_product_image_draft_url(image_url):
             continue
+        if is_gif_image_url(image_url):
+            continue
         if is_local_product_image_url(image_url):
             if image_url not in local_urls:
                 local_urls.append(image_url)
@@ -787,6 +789,10 @@ def localize_product_description_images(
     removed_urls: list[str] = []
     known_replacements = existing_replacements or {}
     for index, image_url in enumerate(description_urls, start=1):
+        if is_gif_image_url(image_url):
+            removed_urls.append(image_url)
+            warnings.append(f"{image_url}: GIF 图片已从详情说明移除。")
+            continue
         if is_local_product_image_url(image_url):
             continue
         if image_url in known_replacements:
@@ -952,6 +958,17 @@ def normalize_product_image_url(value: Any, *, shop_code: str = "") -> str:
     if is_ignored_cabinet_image_filename(filename):
         return ""
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def is_gif_image_url(value: Any) -> bool:
+    text = normalize_text(value)
+    if not text:
+        return False
+    try:
+        path = urlsplit(text).path
+    except Exception:
+        path = text.split("?", 1)[0].split("#", 1)[0]
+    return path.lower().endswith(".gif")
 
 
 def is_cabinet_image_url(value: str) -> bool:
