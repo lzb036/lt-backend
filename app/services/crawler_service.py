@@ -125,8 +125,16 @@ DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
 RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES = {"-", "ー", "－", "―", "なし", "無し", "無", "不明", "n/a", "N/A", "na", "NA"}
-RAKUTEN_ATTRIBUTE_ALLOW_PLACEHOLDER_NAMES = {"ブランド名", "シリーズ名", "メーカー型番"}
+RAKUTEN_ATTRIBUTE_ALLOW_PLACEHOLDER_NAMES = {"ブランド名", "シリーズ名", "メーカー型番", "原産国／製造国"}
 RAKUTEN_ATTRIBUTE_TEXT_ONLY_NAMES = {"ブランド名", "シリーズ名", "メーカー型番"}
+RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES = {
+    "ブランド名": "-",
+    "シリーズ名": "-",
+    "メーカー型番": "-",
+    "原産国／製造国": "不明",
+    "総本数": "1",
+    "単品容量": "1",
+}
 RAKUTEN_ATTRIBUTE_DEFAULT_UNITS = {
     "本体横幅": "cm",
     "本体縦幅": "cm",
@@ -156,6 +164,14 @@ RAKUTEN_ATTRIBUTE_DEFAULT_UNITS = {
     "印面サイズ": "mm",
     "印面直径": "mm",
     "直径": "mm",
+    "腕時計のベルトの幅": "mm",
+    "腕時計のフェイスの縦のサイズ": "mm",
+    "腕時計のフェイスの横のサイズ": "mm",
+    "腕時計のケースの厚み": "mm",
+    "腕時計のケースの直径": "mm",
+    "スマートウォッチの画面サイズ": "インチ",
+    "バッテリー容量": "mAh",
+    "単品容量": "ml",
 }
 RAKUTEN_ATTRIBUTE_UNIT_ALIASES = {
     "mm": "mm",
@@ -171,7 +187,46 @@ RAKUTEN_ATTRIBUTE_UNIT_ALIASES = {
     "グラム": "g",
     "kg": "kg",
     "キログラム": "kg",
+    "ml": "ml",
+    "ミリリットル": "ml",
+    "l": "L",
+    "リットル": "L",
+    "mah": "mAh",
+    "ミリアンペア時": "mAh",
+    "インチ": "インチ",
+    "inch": "インチ",
+    "in": "インチ",
 }
+RAKUTEN_BRAND_INFERENCE_PATTERNS = (
+    (r"\bCASIO\b|カシオ|G-SHOCK|ジーショック|BABY-G", "CASIO"),
+    (r"\bSEIKO\b|セイコー", "SEIKO"),
+    (r"\bCITIZEN\b|シチズン", "CITIZEN"),
+    (r"\bHAMILTON\b|ハミルトン", "HAMILTON"),
+    (r"\bSUUNTO\b|スント", "SUUNTO"),
+    (r"\bAMAZFIT\b|アマズフィット", "Amazfit"),
+    (r"\bTIMEX\b|タイメックス", "TIMEX"),
+    (r"\bORIENT\b|オリエント", "ORIENT"),
+    (r"\bPUMA\b|プーマ", "PUMA"),
+)
+RAKUTEN_SERIES_INFERENCE_PATTERNS = (
+    (r"G-SHOCK|ジーショック", "G-SHOCK"),
+    (r"BABY-G", "BABY-G"),
+    (r"PRO TREK|プロトレック", "PRO TREK"),
+    (r"EDIFICE|エディフィス", "EDIFICE"),
+    (r"OCEANUS|オシアナス", "OCEANUS"),
+    (r"ASTRON|アストロン", "ASTRON"),
+    (r"PROMASTER|プロマスター", "PROMASTER"),
+)
+RAKUTEN_ORIGIN_INFERENCE_PATTERNS = (
+    (r"日本製|MADE\s+IN\s+JAPAN|JAPAN\s+MADE|原産国[:：]?\s*日本|製造国[:：]?\s*日本", "日本"),
+    (r"中国製|MADE\s+IN\s+CHINA|CHINA\s+MADE|原産国[:：]?\s*中国|製造国[:：]?\s*中国", "中国"),
+    (r"タイ製|MADE\s+IN\s+THAILAND|原産国[:：]?\s*タイ|製造国[:：]?\s*タイ", "タイ"),
+    (r"ベトナム製|MADE\s+IN\s+VIETNAM|原産国[:：]?\s*ベトナム|製造国[:：]?\s*ベトナム", "ベトナム"),
+    (r"フィリピン製|MADE\s+IN\s+PHILIPPINES|原産国[:：]?\s*フィリピン|製造国[:：]?\s*フィリピン", "フィリピン"),
+    (r"インドネシア製|MADE\s+IN\s+INDONESIA|原産国[:：]?\s*インドネシア|製造国[:：]?\s*インドネシア", "インドネシア"),
+    (r"韓国製|MADE\s+IN\s+KOREA|原産国[:：]?\s*韓国|製造国[:：]?\s*韓国", "韓国"),
+    (r"台湾製|MADE\s+IN\s+TAIWAN|原産国[:：]?\s*台湾|製造国[:：]?\s*台湾", "台湾"),
+)
 RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE = "代表カラー"
 RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK = "その他"
 SINGLE_PRODUCT_VARIANT_ID = "default"
@@ -5155,7 +5210,7 @@ def patch_payload_for_missing_mandatory_attributes(payload: dict[str, Any], erro
     missing_attributes = extract_missing_mandatory_attribute_names(error_text)
     supported_missing_attributes = [
         attribute for attribute in missing_attributes
-        if attribute in {RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE}
+        if attribute == RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE or attribute in RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES
     ]
     if not supported_missing_attributes:
         return payload
@@ -5175,11 +5230,115 @@ def patch_payload_for_missing_mandatory_attributes(payload: dict[str, Any], erro
             attributes = []
             variant["attributes"] = attributes
         existing_names = {normalize_text(attribute.get("name")) for attribute in attributes if isinstance(attribute, dict)}
-        if RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE in supported_missing_attributes and RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE not in existing_names:
-            color = infer_rakuten_representative_color(variant, payload) or RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK
-            attributes.append({"name": RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE, "values": [color]})
+        for attribute_name in supported_missing_attributes:
+            if attribute_name in existing_names:
+                continue
+            attribute = infer_missing_mandatory_attribute(attribute_name, variant, patched)
+            if not attribute:
+                continue
+            attributes.append(attribute)
+            existing_names.add(attribute_name)
             changed = True
     return patched if changed else payload
+
+
+def infer_missing_mandatory_attribute(attribute_name: str, variant: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
+    normalized_name = normalize_text(attribute_name)
+    if not normalized_name:
+        return None
+    if normalized_name == RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE:
+        value = infer_rakuten_representative_color(variant, payload) or RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK
+    elif normalized_name == "ブランド名":
+        value = infer_rakuten_brand_name(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
+    elif normalized_name == "シリーズ名":
+        value = infer_rakuten_series_name(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
+    elif normalized_name == "メーカー型番":
+        value = infer_rakuten_model_number(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
+    elif normalized_name == "原産国／製造国":
+        value = infer_rakuten_origin_country(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
+    elif normalized_name == "総本数":
+        value = infer_rakuten_total_count(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
+    elif normalized_name == "単品容量":
+        value = infer_rakuten_single_capacity(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
+    else:
+        value = RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES.get(normalized_name, "")
+    if not value:
+        return None
+    values, unit = normalize_rakuten_attribute_values_and_unit(normalized_name, value, "")
+    if not values:
+        values = [normalize_text(value)]
+    attribute: dict[str, Any] = {"name": normalized_name, "values": values}
+    if unit:
+        attribute["unit"] = unit
+    return attribute
+
+
+def rakuten_attribute_context_text(variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    values = [
+        first_text_from_keys(payload, ("title", "tagline", "itemNumber", "genreId")),
+        first_text_from_keys(variant, ("variantId", "merchantDefinedSkuId")),
+        first_text_from_keys(variant.get("articleNumber", {}) if isinstance(variant.get("articleNumber"), dict) else {}, ("value",)),
+        first_text_value(variant.get("selectorValues")),
+        first_text_value(variant.get("attributes")),
+    ]
+    return " ".join(value for value in unique_texts(values) if value)
+
+
+def infer_rakuten_brand_name(variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    context = rakuten_attribute_context_text(variant, payload)
+    normalized_context = unicodedata.normalize("NFKC", context)
+    for pattern, brand in RAKUTEN_BRAND_INFERENCE_PATTERNS:
+        if re.search(pattern, normalized_context, flags=re.I):
+            return brand
+    return ""
+
+
+def infer_rakuten_series_name(variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    context = rakuten_attribute_context_text(variant, payload)
+    normalized_context = unicodedata.normalize("NFKC", context)
+    for pattern, series in RAKUTEN_SERIES_INFERENCE_PATTERNS:
+        if re.search(pattern, normalized_context, flags=re.I):
+            return series
+    return ""
+
+
+def infer_rakuten_model_number(variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    candidates = [
+        first_text_from_keys(variant, ("variantId", "merchantDefinedSkuId")),
+        first_text_from_keys(variant.get("articleNumber", {}) if isinstance(variant.get("articleNumber"), dict) else {}, ("value",)),
+        first_text_from_keys(payload, ("title", "itemNumber")),
+    ]
+    context = unicodedata.normalize("NFKC", " ".join(candidate for candidate in candidates if candidate)).upper()
+    for match in re.finditer(r"\b[A-Z]{1,8}[-_ ]?[A-Z]*\d[A-Z0-9_-]*(?:[-_][A-Z0-9]+)*\b", context):
+        model = re.sub(r"\s+", "-", match.group(0)).strip("-_")
+        if not model or model.startswith(LISTING_MANAGE_NUMBER_PREFIX.upper()):
+            continue
+        if model in {"G-SHOCK", "BABY-G"}:
+            continue
+        return model[:64]
+    return ""
+
+
+def infer_rakuten_origin_country(variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    context = unicodedata.normalize("NFKC", rakuten_attribute_context_text(variant, payload))
+    for pattern, country in RAKUTEN_ORIGIN_INFERENCE_PATTERNS:
+        if re.search(pattern, context, flags=re.I):
+            return country
+    return ""
+
+
+def infer_rakuten_total_count(variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    context = unicodedata.normalize("NFKC", rakuten_attribute_context_text(variant, payload))
+    match = re.search(r"([1-9][0-9]{0,2})\s*(?:本|個|枚|袋|箱|セット)", context)
+    return match.group(1) if match else ""
+
+
+def infer_rakuten_single_capacity(variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    context = unicodedata.normalize("NFKC", rakuten_attribute_context_text(variant, payload))
+    match = re.search(r"([1-9][0-9]{0,4}(?:\.[0-9]+)?)\s*(ml|mL|ML|ミリリットル|L|リットル)", context)
+    if not match:
+        return ""
+    return f"{match.group(1)}{match.group(2)}"
 
 
 def patch_payload_for_attribute_unit_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
@@ -7482,11 +7641,6 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                 ProductModel.id.in_(product_ids or [-1]),
             )
         ).all()
-        success_count = 0
-        failed_count = 0
-        success_ids: list[int] = []
-        failed_ids: list[int] = []
-        errors: list[str] = []
         if store is None:
             task.status = "failed"
             task.failed_count = len(products)
@@ -7525,58 +7679,94 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                 product.last_error = task.message
                 clear_listing_product_lock(product, task_id)
             return
-        cabinet_context: dict[str, Any] = {}
-        try:
-            cabinet_usage = fetch_rakuten_cabinet_usage(service_secret, license_key)
-            cabinet_context["usage"] = cabinet_usage
-            apply_store_cabinet_usage(store, cabinet_usage)
-        except Exception as exc:
-            errors.append(f"R-Cabinet 使用量检测失败: {exc}")
         task.total_count = len(products)
         task.success_count = 0
         task.failed_count = 0
         task.message = f"上架中，已处理 0 / {len(products)} 条"
         session.flush()
-        for index, product in enumerate(products, start=1):
-            if product.review_status not in {"approved", "listed_master"} or product.listing_task_id != task_id:
+        task_store_id = int(store.id)
+        total_count = len(products)
+        ordered_product_ids = [int(product.id) for product in products]
+
+    success_count = 0
+    failed_count = 0
+    success_ids: list[int] = []
+    failed_ids: list[int] = []
+    errors: list[str] = []
+    cabinet_context: dict[str, Any] = {}
+
+    try:
+        cabinet_usage = fetch_rakuten_cabinet_usage(service_secret, license_key)
+        cabinet_context["usage"] = cabinet_usage
+        with session_scope() as session:
+            store = session.get(StoreModel, task_store_id)
+            if store is not None:
+                apply_store_cabinet_usage(store, cabinet_usage)
+    except Exception as exc:
+        errors.append(f"R-Cabinet 使用量检测失败: {exc}")
+
+    update_task_progress(
+        ListingTaskModel,
+        task_id,
+        total_count=total_count,
+        success_count=0,
+        failed_count=0,
+        message=f"上架中，已处理 0 / {total_count} 条",
+    )
+
+    for index, product_id in enumerate(ordered_product_ids, start=1):
+        with session_scope() as session:
+            store = session.get(StoreModel, task_store_id)
+            product = session.get(ProductModel, product_id)
+            if store is None or product is None or product.owner_username != owner_username:
+                failed_count += 1
+                failed_ids.append(product_id)
+                errors.append(f"{product_id}: 商品或店铺不存在，不能上架。")
+            elif product.review_status not in {"approved", "listed_master"} or product.listing_task_id != task_id:
                 product.last_error = "商品状态已变化或不属于当前上架任务，不能上架。"
                 clear_listing_product_lock(product, task_id)
                 failed_count += 1
                 failed_ids.append(product.id)
                 errors.append(f"{productCodeForError(product)}: {product.last_error}")
-                task.total_count = len(products)
+            else:
+                try:
+                    listing_result = create_store_product_on_rakuten(
+                        service_secret,
+                        license_key,
+                        store,
+                        product,
+                        cabinet_context=cabinet_context,
+                    )
+                    listed_product = upsert_listed_store_product_from_listing_result(session, owner_username, product, store, listing_result)
+                    session.flush()
+                    record_product_listed_store(product, listed_product, store, listing_result)
+                    success_count += 1
+                    success_ids.append(product.id)
+                except Exception as exc:
+                    error_text = str(exc)
+                    clear_listing_product_lock(product, task_id)
+                    product.last_error = error_text
+                    failed_count += 1
+                    failed_ids.append(product.id)
+                    errors.append(f"{productCodeForError(product)}: {error_text}")
+            task = session.get(ListingTaskModel, task_id)
+            if task is not None:
+                task.total_count = total_count
                 task.success_count = success_count
                 task.failed_count = failed_count
-                task.message = f"上架中，已处理 {index} / {len(products)} 条"
-                session.flush()
-                continue
-            try:
-                listing_result = create_store_product_on_rakuten(
-                    service_secret,
-                    license_key,
-                    store,
-                    product,
-                    cabinet_context=cabinet_context,
+                task.message = f"上架中，已处理 {index} / {total_count} 条"
+                task.product_ids_json = json.dumps(
+                    {"productIds": ordered_product_ids, "successIds": success_ids, "failedIds": failed_ids},
+                    ensure_ascii=False,
                 )
-                listed_product = upsert_listed_store_product_from_listing_result(session, owner_username, product, store, listing_result)
-                session.flush()
-                record_product_listed_store(product, listed_product, store, listing_result)
-                success_count += 1
-                success_ids.append(product.id)
-            except Exception as exc:
-                error_text = str(exc)
-                clear_listing_product_lock(product, task_id)
-                product.last_error = error_text
-                failed_count += 1
-                failed_ids.append(product.id)
-                errors.append(f"{productCodeForError(product)}: {error_text}")
-            task.total_count = len(products)
-            task.success_count = success_count
-            task.failed_count = failed_count
-            task.message = f"上架中，已处理 {index} / {len(products)} 条"
-            session.flush()
-        sync_store_cabinet_usage_fields(store, service_secret, license_key)
-        task.total_count = len(products)
+    with session_scope() as session:
+        store = session.get(StoreModel, task_store_id)
+        if store is not None:
+            sync_store_cabinet_usage_fields(store, service_secret, license_key)
+        task = session.get(ListingTaskModel, task_id)
+        if task is None:
+            return
+        task.total_count = total_count
         task.success_count = success_count
         task.failed_count = failed_count
         if success_count and failed_count:
@@ -7587,7 +7777,10 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             task.status = "failed"
         task.message = f"完成，上架 {success_count} 条，异常 {failed_count} 条"
         task.error_detail = "\n".join(errors[:50]) if errors else None
-        task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": success_ids, "failedIds": failed_ids}, ensure_ascii=False)
+        task.product_ids_json = json.dumps(
+            {"productIds": ordered_product_ids, "successIds": success_ids, "failedIds": failed_ids},
+            ensure_ascii=False,
+        )
         task.finished_at = datetime.now()
 
 
