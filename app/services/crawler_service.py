@@ -298,12 +298,19 @@ RAKUTEN_CABINET_LAST_REQUEST_AT = 0.0
 SCHEDULE_RUNNER_STARTED = False
 DRAFT_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
+TASK_CANCEL_REQUESTED_MARKER = "__LT_CANCEL_REQUESTED__"
+TASK_CANCEL_REQUESTED_MESSAGE = "已请求终止，等待任务停止"
+TASK_CANCELLED_MESSAGE = "任务已终止"
 
 
 class ProductImageUnavailableError(RuntimeError):
     def __init__(self, status_code: int) -> None:
         self.status_code = int(status_code)
         super().__init__(f"图片不存在或已失效（HTTP {self.status_code}）。")
+
+
+class TaskCancelled(RuntimeError):
+    pass
 
 
 def dispatch_crawl_task(task_id: str) -> None:
@@ -469,8 +476,9 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
         "successCount": row.success_count,
         "failedCount": row.failed_count,
         "warningCount": getattr(row, "warning_count", 0) or 0,
+        "cancelRequested": task_cancel_requested(row),
         "message": row.message,
-        "errorDetail": row.error_detail,
+        "errorDetail": task_public_error_detail(row),
         "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
         "finishedAt": row.finished_at.isoformat(sep=" ") if row.finished_at else None,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -478,7 +486,7 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
 
 
 def resolve_crawl_task_status(status: str, total_count: int, success_count: int, failed_count: int) -> str:
-    if status in {"queued", "running"}:
+    if status in {"queued", "running", "cancelled"}:
         return status
     total = max(0, int(total_count or 0))
     success = max(0, int(success_count or 0))
@@ -1474,8 +1482,9 @@ def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
         "productIds": product_ids,
         "successIds": success_ids,
         "failedIds": failed_ids,
+        "cancelRequested": task_cancel_requested(row),
         "message": row.message,
-        "errorDetail": row.error_detail,
+        "errorDetail": task_public_error_detail(row),
         "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
         "finishedAt": row.finished_at.isoformat(sep=" ") if row.finished_at else None,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -1503,8 +1512,9 @@ def sync_task_to_public(row: SyncTaskModel) -> dict[str, Any]:
         "payload": payload if isinstance(payload, dict) else {},
         "successIds": task_result.get("successIds") if isinstance(task_result.get("successIds"), list) else [],
         "failedIds": task_result.get("failedIds") if isinstance(task_result.get("failedIds"), list) else [],
+        "cancelRequested": task_cancel_requested(row),
         "message": row.message,
-        "errorDetail": row.error_detail,
+        "errorDetail": task_public_error_detail(row),
         "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
         "finishedAt": row.finished_at.isoformat(sep=" ") if row.finished_at else None,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -1530,6 +1540,7 @@ def update_task_progress(
                 task = session.get(model, task_id)
                 if task is None:
                     return
+                cancel_requested = task_cancel_requested(task)
                 if total_count is not None:
                     task.total_count = max(0, int(total_count))
                 if success_count is not None:
@@ -1538,9 +1549,9 @@ def update_task_progress(
                     task.failed_count = max(0, int(failed_count))
                 if warning_count is not None and hasattr(task, "warning_count"):
                     task.warning_count = max(0, int(warning_count))
-                if message is not None:
+                if message is not None and not cancel_requested:
                     task.message = message
-                if status is not None:
+                if status is not None and not cancel_requested:
                     task.status = status
             return
         except OperationalError as exc:
@@ -1550,6 +1561,62 @@ def update_task_progress(
             time.sleep(0.25 * (attempt + 1))
     if last_error is not None:
         raise last_error
+
+
+def task_cancel_requested(row: Any | None) -> bool:
+    if row is None:
+        return False
+    detail = normalize_text(getattr(row, "error_detail", ""))
+    if not detail:
+        return False
+    first_line = detail.splitlines()[0].strip()
+    return first_line == TASK_CANCEL_REQUESTED_MARKER
+
+
+def task_public_error_detail(row: Any | None) -> str | None:
+    if row is None:
+        return None
+    detail = strip_task_cancel_marker(getattr(row, "error_detail", ""))
+    return detail or None
+
+
+def strip_task_cancel_marker(error_detail: Any) -> str:
+    detail = normalize_text(error_detail)
+    if not detail:
+        return ""
+    lines = detail.splitlines()
+    if lines and lines[0].strip() == TASK_CANCEL_REQUESTED_MARKER:
+        return "\n".join(line for line in lines[1:] if line.strip()).strip()
+    return detail
+
+
+def with_task_cancel_marker(error_detail: Any) -> str:
+    detail = normalize_text(error_detail)
+    if detail.splitlines() and detail.splitlines()[0].strip() == TASK_CANCEL_REQUESTED_MARKER:
+        return detail
+    return f"{TASK_CANCEL_REQUESTED_MARKER}\n{detail}".strip() if detail else TASK_CANCEL_REQUESTED_MARKER
+
+
+def cancelled_task_error_detail(errors: list[str] | None = None, existing_error_detail: Any = None) -> str | None:
+    values: list[str] = []
+    existing = strip_task_cancel_marker(existing_error_detail)
+    if existing:
+        values.extend(existing.splitlines())
+    values.extend(str(error or "").strip() for error in (errors or []) if str(error or "").strip())
+    return summarize_task_errors(values, limit=50)
+
+
+def is_task_cancel_requested(model: Any, task_id: str) -> bool:
+    with session_scope() as session:
+        task = session.get(model, task_id)
+        if task is None:
+            return False
+        return getattr(task, "status", "") == "cancelled" or task_cancel_requested(task)
+
+
+def raise_if_task_cancelled(model: Any, task_id: str | None) -> None:
+    if task_id and is_task_cancel_requested(model, task_id):
+        raise TaskCancelled(TASK_CANCELLED_MESSAGE)
 
 
 def is_mysql_lock_wait_timeout(exc: OperationalError) -> bool:
@@ -2683,6 +2750,39 @@ def patch_rakuten_item_images(
         raise RuntimeError(message) from exc
 
 
+def patch_rakuten_item_visibility(
+    service_secret: str,
+    license_key: str,
+    manage_number: str,
+    *,
+    hide_item: bool,
+) -> None:
+    if not service_secret or not license_key:
+        raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+    normalized_manage_number = normalize_text(manage_number)
+    if not normalized_manage_number:
+        raise RuntimeError("商品管理编号为空，不能更新乐天商品显示状态。")
+    response = request_rakuten_write(
+        "PATCH",
+        RAKUTEN_ITEM_PATCH_URL.format(manageNumber=quote(normalized_manage_number, safe="")),
+        operation=f"乐天商品 {normalized_manage_number} 显示状态更新",
+        headers={
+            "Authorization": build_rakuten_authorization_header(service_secret, license_key),
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        json={"hideItem": bool(hide_item)},
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        detail = normalize_text(response.text)
+        message = f"乐天商品 {normalized_manage_number} 显示状态更新失败"
+        if detail:
+            message = f"{message}：{detail[:500]}"
+        raise RuntimeError(message) from exc
+
+
 def patch_local_item_detail(raw_payload: dict[str, Any], *, title: str, tagline: str, variants: list[Any]) -> dict[str, Any]:
     normalized_title = normalize_text(title)
     if not normalized_title:
@@ -3556,19 +3656,19 @@ def crawl_task_status_filter(status: str) -> Any:
         return CrawlTaskModel.status == normalized
     if normalized == "failed":
         return and_(
-            CrawlTaskModel.status.notin_(("queued", "running")),
+            CrawlTaskModel.status.notin_(("queued", "running", "cancelled")),
             CrawlTaskModel.failed_count > 0,
             CrawlTaskModel.success_count == 0,
         )
     if normalized == "partial":
         return and_(
-            CrawlTaskModel.status.notin_(("queued", "running")),
+            CrawlTaskModel.status.notin_(("queued", "running", "cancelled")),
             CrawlTaskModel.success_count > 0,
             CrawlTaskModel.failed_count > 0,
         )
     if normalized == "success":
         return and_(
-            CrawlTaskModel.status.notin_(("queued", "running")),
+            CrawlTaskModel.status.notin_(("queued", "running", "cancelled")),
             CrawlTaskModel.success_count > 0,
             CrawlTaskModel.failed_count == 0,
         )
@@ -3615,6 +3715,62 @@ def delete_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
             "failedIds": [task_id for task_id in normalized_ids if task_id not in found_ids],
             "deletedCount": len(deleted_ids),
         }
+
+
+def cancel_crawl_task(owner_username: str, task_id: str) -> dict[str, Any]:
+    return request_task_cancel(CrawlTaskModel, owner_username, task_id, serializer=task_to_public)
+
+
+def cancel_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
+    return request_task_cancel(ListingTaskModel, owner_username, task_id, serializer=listing_task_to_public)
+
+
+def cancel_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
+    return request_task_cancel(SyncTaskModel, owner_username, task_id, serializer=sync_task_to_public)
+
+
+def request_task_cancel(model: Any, owner_username: str, task_id: str, *, serializer: Callable[[Any], dict[str, Any]]) -> dict[str, Any]:
+    with session_scope() as session:
+        task = session.get(model, task_id)
+        if task is None:
+            raise RuntimeError("任务不存在。")
+        if task.owner_username != owner_username:
+            raise RuntimeError("不能终止其他用户的任务。")
+        if task.status == "cancelled":
+            return serializer(task)
+        if task.status not in {"queued", "running"}:
+            raise RuntimeError("只有待执行或执行中的任务可以终止。")
+        if task.status == "queued":
+            task.status = "cancelled"
+            task.message = TASK_CANCELLED_MESSAGE
+            task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
+            task.finished_at = datetime.now()
+            if model is ListingTaskModel:
+                release_listing_task_locks(session, owner_username, task)
+        else:
+            task.message = TASK_CANCEL_REQUESTED_MESSAGE
+            task.error_detail = with_task_cancel_marker(task.error_detail)
+        session.flush()
+        return serializer(task)
+
+
+def release_listing_task_locks(session: Any, owner_username: str, task: ListingTaskModel) -> None:
+    try:
+        product_ids_payload = json.loads(task.product_ids_json or "[]")
+    except ValueError:
+        product_ids_payload = []
+    if isinstance(product_ids_payload, dict):
+        product_ids = product_ids_payload.get("productIds") if isinstance(product_ids_payload.get("productIds"), list) else []
+    else:
+        product_ids = product_ids_payload if isinstance(product_ids_payload, list) else []
+    products = session.scalars(
+        select(ProductModel).where(
+            ProductModel.owner_username == owner_username,
+            ProductModel.id.in_(product_ids or [-1]),
+        )
+    ).all()
+    for product in products:
+        clear_listing_product_lock(product, task.id)
 
 
 def list_products(
@@ -3852,6 +4008,7 @@ def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:
 
 
 def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | None = None) -> dict[str, Any]:
+    raise_if_task_cancelled(SyncTaskModel, task_id)
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
@@ -3866,6 +4023,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
         license_key = decrypt_text(row.rakuten_license_key_encrypted)
         verify_store_credentials(row)
         items = fetch_rakuten_store_items(service_secret, license_key)
+        cancelled = False
         if task_id:
             update_task_progress(
                 SyncTaskModel,
@@ -3877,6 +4035,9 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
             )
         seen_manage_numbers: set[str] = set()
         for index, item in enumerate(items, start=1):
+            if task_id and is_task_cancel_requested(SyncTaskModel, task_id):
+                cancelled = True
+                break
             manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
             if manage_number:
                 seen_manage_numbers.add(manage_number)
@@ -3896,14 +4057,16 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
                     failed_count=failed_count,
                     message=f"同步中，已处理 {index} / {len(items)} 条",
                 )
-        mark_missing_store_products_removed(session, row, seen_manage_numbers)
-        reconcile_listed_master_store_marks_after_store_sync(session, owner_username, row, seen_manage_numbers)
+        if not cancelled:
+            mark_missing_store_products_removed(session, row, seen_manage_numbers)
+            reconcile_listed_master_store_marks_after_store_sync(session, owner_username, row, seen_manage_numbers)
         session.flush()
         return {
             "store": store_to_public(row),
             "totalCount": len(items),
             "syncedCount": synced_count,
             "failedCount": failed_count,
+            "cancelled": cancelled,
         }
 
 
@@ -4144,6 +4307,14 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             return
         if task.owner_username != owner_username:
             raise RuntimeError("不能执行其他用户的同步任务。")
+        if task.status == "cancelled":
+            return
+        if task_cancel_requested(task):
+            task.status = "cancelled"
+            task.message = TASK_CANCELLED_MESSAGE
+            task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
+            task.finished_at = datetime.now()
+            return
         task.status = "running"
         task.message = sync_task_running_message(task)
         task.error_detail = None
@@ -4170,8 +4341,12 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             success_count = int(result.get("successCount") or 0)
             failed_count = int(result.get("failedCount") or 0)
             action_label = "上架" if listing_status == "listed" else "下架"
-            status = "success" if failed_count == 0 else "partial"
-            message = f"完成，{action_label} {success_count} 条，异常 {failed_count} 条"
+            if result.get("cancelled"):
+                status = "cancelled"
+                message = cancelled_task_progress_message(action_label, total_count, success_count, failed_count)
+            else:
+                status = "success" if failed_count == 0 else "partial"
+                message = f"完成，{action_label} {success_count} 条，异常 {failed_count} 条"
             error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
         elif task_type == "product_listing_status":
             listing_status = normalize_text(payload.get("listingStatus"))
@@ -4185,8 +4360,12 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             success_count = int(result.get("successCount") or 0)
             failed_count = int(result.get("failedCount") or 0)
             action_label = "上架" if listing_status == "listed" else "下架"
-            status = "success" if failed_count == 0 else "partial"
-            message = f"完成，{action_label} {success_count} 条，异常 {failed_count} 条"
+            if result.get("cancelled"):
+                status = "cancelled"
+                message = cancelled_task_progress_message(action_label, total_count, success_count, failed_count)
+            else:
+                status = "success" if failed_count == 0 else "partial"
+                message = f"完成，{action_label} {success_count} 条，异常 {failed_count} 条"
             error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
         elif task_type == "product_delete":
             product_ids = normalize_product_ids(list(payload.get("productIds") or []))
@@ -4199,8 +4378,12 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             success_count = int(result.get("successCount") or 0)
             failed_count = int(result.get("failedCount") or 0)
             cabinet_deleted_count = int(result.get("cabinetDeletedCount") or 0)
-            status = "success" if failed_count == 0 else "partial"
-            message = f"完成，删除 {success_count} 条，异常 {failed_count} 条"
+            if result.get("cancelled"):
+                status = "cancelled"
+                message = cancelled_task_progress_message("删除", total_count, success_count, failed_count)
+            else:
+                status = "success" if failed_count == 0 else "partial"
+                message = f"完成，删除 {success_count} 条，异常 {failed_count} 条"
             if cabinet_deleted_count:
                 message = f"{message}，同步删除图片 {cabinet_deleted_count} 张"
             error_detail = summarize_task_errors(
@@ -4212,9 +4395,24 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             total_count = int(result.get("totalCount") or 0)
             success_count = int(result.get("syncedCount") or 0)
             failed_count = int(result.get("failedCount") or 0)
-            status = "success" if failed_count == 0 else "partial"
-            message = f"完成，同步 {success_count} 条，异常 {failed_count} 条"
+            if result.get("cancelled"):
+                status = "cancelled"
+                message = cancelled_task_progress_message("同步", total_count, success_count, failed_count)
+            else:
+                status = "success" if failed_count == 0 else "partial"
+                message = f"完成，同步 {success_count} 条，异常 {failed_count} 条"
             error_detail = None
+    except TaskCancelled:
+        with session_scope() as session:
+            task = session.get(SyncTaskModel, task_id)
+            if task is None:
+                return
+            total_count = int(task.total_count or 0)
+            success_count = int(task.success_count or 0)
+            failed_count = int(task.failed_count or 0)
+            status = "cancelled"
+            message = cancelled_task_progress_message("同步", total_count, success_count, failed_count)
+            error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
     except Exception as exc:
         total_count = 0
         success_count = 0
@@ -4257,6 +4455,14 @@ def sync_task_running_message(task: SyncTaskModel) -> str:
     return "正在同步店铺商品"
 
 
+def cancelled_task_progress_message(action_label: str, total_count: int, success_count: int, failed_count: int) -> str:
+    total = max(0, int(total_count or 0))
+    success = max(0, int(success_count or 0))
+    failed = max(0, int(failed_count or 0))
+    processed = min(total, success + failed) if total else success + failed
+    return f"已终止，{action_label}已处理 {processed} / {total} 条，成功 {success} 条，失败 {failed} 条"
+
+
 def perform_store_listing_status_sync(
     owner_username: str,
     store_id: int,
@@ -4264,6 +4470,7 @@ def perform_store_listing_status_sync(
     *,
     task_id: str | None = None,
 ) -> dict[str, Any]:
+    raise_if_task_cancelled(SyncTaskModel, task_id)
     if listing_status not in {"listed", "unlisted"}:
         raise RuntimeError("上架状态不合法。")
     with session_scope() as session:
@@ -4286,9 +4493,10 @@ def perform_store_listing_status_sync(
             products,
             listing_status,
             progress_callback=sync_task_progress_callback(task_id, len(products), "上下架同步") if task_id else None,
+            cancel_check=(lambda: is_task_cancel_requested(SyncTaskModel, task_id)) if task_id else None,
         )
         session.flush()
-        summary = listing_status_result_summary(result, len(products))
+        summary = listing_status_result_summary(result, len(products), cancelled=bool(result.get("cancelled")))
         return {
             "store": store_to_public(store),
             "totalCount": summary["total"],
@@ -4297,6 +4505,7 @@ def perform_store_listing_status_sync(
             "successIds": summary["successIds"],
             "failedIds": summary["failedIds"],
             "errors": summary["errors"],
+            "cancelled": bool(result.get("cancelled")),
         }
 
 
@@ -4308,6 +4517,7 @@ def perform_product_listing_status_sync(
     *,
     task_id: str | None = None,
 ) -> dict[str, Any]:
+    raise_if_task_cancelled(SyncTaskModel, task_id)
     if listing_status not in {"listed", "unlisted"}:
         raise RuntimeError("上架状态不合法。")
     if not product_ids:
@@ -4343,6 +4553,7 @@ def perform_product_listing_status_sync(
                 products,
                 listing_status,
                 progress_callback=sync_task_progress_callback(task_id, len(product_ids), "上下架同步", initial_failed=len(missing_ids)) if task_id else None,
+                cancel_check=(lambda: is_task_cancel_requested(SyncTaskModel, task_id)) if task_id else None,
             )
             if products
             else {"successIds": [], "errors": []}
@@ -4354,7 +4565,7 @@ def perform_product_listing_status_sync(
         failed_ids = [*list(result.get("failedIds") or []), *missing_ids]
         failed_ids = list(dict.fromkeys(failed_ids))
         success_count = len(success_ids)
-        failed_count = max(0, len(product_ids) - success_count)
+        failed_count = len(failed_ids) if result.get("cancelled") else max(0, len(product_ids) - success_count)
         return {
             "store": store_to_public(store),
             "totalCount": len(product_ids),
@@ -4363,6 +4574,7 @@ def perform_product_listing_status_sync(
             "successIds": success_ids,
             "failedIds": failed_ids,
             "errors": errors,
+            "cancelled": bool(result.get("cancelled")),
         }
 
 
@@ -4373,6 +4585,7 @@ def perform_product_delete_sync(
     *,
     task_id: str | None = None,
 ) -> dict[str, Any]:
+    raise_if_task_cancelled(SyncTaskModel, task_id)
     if not product_ids:
         raise RuntimeError("同步任务缺少商品。")
     with session_scope() as session:
@@ -4398,6 +4611,7 @@ def perform_product_delete_sync(
         cabinet_deleted_count = 0
         errors = [f"{product_id}: 商品不存在或不是店铺商品" for product_id in missing_ids]
         warnings: list[str] = []
+        cancelled = False
         credential_cache: dict[int, tuple[StoreModel, str, str]] = {}
         if task_id:
             update_task_progress(
@@ -4409,6 +4623,9 @@ def perform_product_delete_sync(
                 message=f"删除中，已处理 0 / {len(product_ids)} 条",
             )
         for index, row in enumerate(rows, start=1):
+            if task_id and is_task_cancel_requested(SyncTaskModel, task_id):
+                cancelled = True
+                break
             try:
                 delete_store_product_from_rakuten(session, row, credential_cache)
                 cabinet_deleted_count += int(getattr(row, "_deleted_cabinet_count", 0) or 0)
@@ -4454,6 +4671,7 @@ def perform_product_delete_sync(
             "cabinetDeletedCount": cabinet_deleted_count,
             "errors": errors,
             "warnings": warnings,
+            "cancelled": cancelled,
         }
 
 
@@ -5630,7 +5848,17 @@ def create_store_product_on_rakuten(
     uploaded_product_images: list[dict[str, str]] = []
     uploaded_description_images: list[dict[str, str]] = []
     item_write_started = False
+    payload: dict[str, Any] = {}
     try:
+        payload = build_rakuten_item_upsert_payload(
+            product,
+            raw_payload,
+            [],
+            manage_number=manage_number,
+            hide_item=True,
+        )
+        payload = put_rakuten_item_with_attribute_retry(service_secret, license_key, manage_number, payload)
+        item_write_started = True
         uploaded_product_images = upload_product_images_to_rakuten(
             service_secret,
             license_key,
@@ -5650,14 +5878,21 @@ def create_store_product_on_rakuten(
         )
         raw_payload = description_result["rawPayload"]
         uploaded_description_images = description_result["uploadedImages"]
-        payload = build_rakuten_item_upsert_payload(product, raw_payload, uploaded_product_images, manage_number=manage_number)
-        item_write_started = True
+        payload = build_rakuten_item_upsert_payload(
+            product,
+            raw_payload,
+            uploaded_product_images,
+            manage_number=manage_number,
+            hide_item=True,
+        )
         payload = put_rakuten_item_with_attribute_retry(service_secret, license_key, manage_number, payload)
         inventory_payloads = build_rakuten_inventory_upsert_payloads(
             manage_number,
             payload.get("variants") if isinstance(payload.get("variants"), dict) else {},
         )
         bulk_upsert_rakuten_inventories(service_secret, license_key, inventory_payloads)
+        patch_rakuten_item_visibility(service_secret, license_key, manage_number, hide_item=False)
+        payload["hideItem"] = False
     except Exception as exc:
         if item_write_started:
             try:
@@ -6675,6 +6910,7 @@ def build_rakuten_item_upsert_payload(
     uploaded_images: list[dict[str, str]],
     *,
     manage_number: str | None = None,
+    hide_item: bool = False,
 ) -> dict[str, Any]:
     title = first_text_from_keys(raw_payload, ("itemName", "title", "name")) or product.title
     title = normalize_text(title)
@@ -6693,7 +6929,7 @@ def build_rakuten_item_upsert_payload(
         "tagline": product_tagline(raw_payload)[:174],
         "itemType": "NORMAL",
         "genreId": normalize_text(genre_id),
-        "hideItem": False,
+        "hideItem": bool(hide_item),
         "unlimitedInventoryFlag": False,
         "images": build_rakuten_listing_images(uploaded_images, title),
         "productDescription": build_rakuten_product_description(raw_payload),
@@ -7546,13 +7782,18 @@ def apply_products_listing_status(
     listing_status: str,
     *,
     progress_callback: Callable[[int, int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     success_ids: list[int] = []
     failed_ids: list[int] = []
     errors: list[str] = []
     credential_cache: dict[int, tuple[str, str]] = {}
     failed_count = 0
+    cancelled = False
     for index, product in enumerate(products, start=1):
+        if cancel_check and cancel_check():
+            cancelled = True
+            break
         manage_number = normalize_text(product.rakuten_manage_number or product.item_number)
         if not product.store_id:
             errors.append(f"{product.title} 未关联店铺")
@@ -7620,7 +7861,7 @@ def apply_products_listing_status(
         success_ids.append(product.id)
         if progress_callback:
             progress_callback(index, len(success_ids), failed_count)
-    return {"successIds": success_ids, "failedIds": failed_ids, "errors": errors}
+    return {"successIds": success_ids, "failedIds": failed_ids, "errors": errors, "cancelled": cancelled}
 
 
 def sync_task_progress_callback(
@@ -7646,11 +7887,11 @@ def sync_task_progress_callback(
     return update
 
 
-def listing_status_result_summary(result: dict[str, Any], total_count: int) -> dict[str, Any]:
+def listing_status_result_summary(result: dict[str, Any], total_count: int, *, cancelled: bool = False) -> dict[str, Any]:
     success_ids = list(result.get("successIds") or [])
     failed_ids = list(result.get("failedIds") or [])
     success_count = len(success_ids)
-    failed_count = max(0, int(total_count) - success_count)
+    failed_count = len(failed_ids) if cancelled else max(0, int(total_count) - success_count)
     return {
         "total": int(total_count),
         "successCount": success_count,
@@ -7772,6 +8013,8 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
 def run_listing_task(owner_username: str, task_id: str) -> None:
     try:
         _run_listing_task(owner_username, task_id)
+    except TaskCancelled:
+        cancel_listing_task_from_worker(owner_username, task_id)
     except Exception as exc:
         fail_listing_task_unexpectedly(owner_username, task_id, exc)
 
@@ -7783,6 +8026,10 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             return
         if task.owner_username != owner_username:
             raise RuntimeError("不能执行其他用户的上架任务。")
+        if task.status == "cancelled":
+            return
+        if task_cancel_requested(task):
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         try:
             product_ids = json.loads(task.product_ids_json or "[]")
         except ValueError:
@@ -7849,15 +8096,25 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
     cabinet_context: dict[str, Any] = {}
 
     try:
+        raise_if_task_cancelled(ListingTaskModel, task_id)
         cabinet_usage = fetch_rakuten_cabinet_usage(service_secret, license_key)
+        raise_if_task_cancelled(ListingTaskModel, task_id)
         cabinet_context["usage"] = cabinet_usage
         with session_scope() as session:
             store = session.get(StoreModel, task_store_id)
             if store is not None:
                 apply_store_cabinet_usage(store, cabinet_usage)
+    except TaskCancelled:
+        raise
     except Exception as exc:
         errors.append(f"R-Cabinet 使用量检测失败: {exc}")
+        with session_scope() as session:
+            task = session.get(ListingTaskModel, task_id)
+            if task is not None:
+                next_error_detail = summarize_task_errors(errors, limit=50)
+                task.error_detail = with_task_cancel_marker(next_error_detail) if task_cancel_requested(task) else next_error_detail
 
+    raise_if_task_cancelled(ListingTaskModel, task_id)
     update_task_progress(
         ListingTaskModel,
         task_id,
@@ -7868,6 +8125,7 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
     )
 
     for index, product_id in enumerate(ordered_product_ids, start=1):
+        raise_if_task_cancelled(ListingTaskModel, task_id)
         with session_scope() as session:
             store = session.get(StoreModel, task_store_id)
             product = session.get(ProductModel, product_id)
@@ -7908,6 +8166,8 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                 task.success_count = success_count
                 task.failed_count = failed_count
                 task.message = f"上架中，已处理 {index} / {total_count} 条"
+                next_error_detail = summarize_task_errors(errors, limit=50)
+                task.error_detail = with_task_cancel_marker(next_error_detail) if task_cancel_requested(task) else next_error_detail
                 task.product_ids_json = json.dumps(
                     {"productIds": ordered_product_ids, "successIds": success_ids, "failedIds": failed_ids},
                     ensure_ascii=False,
@@ -7940,6 +8200,22 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
 def clear_listing_product_lock(product: ProductModel, task_id: str | None = None) -> None:
     if task_id is None or product.listing_task_id == task_id:
         product.listing_task_id = None
+
+
+def cancel_listing_task_from_worker(owner_username: str, task_id: str) -> None:
+    with session_scope() as session:
+        task = session.get(ListingTaskModel, task_id)
+        if task is None or task.owner_username != owner_username:
+            return
+        release_listing_task_locks(session, owner_username, task)
+        total_count = int(task.total_count or 0)
+        success_count = int(task.success_count or 0)
+        failed_count = int(task.failed_count or 0)
+        task.status = "cancelled"
+        task.message = cancelled_task_progress_message("上架", total_count, success_count, failed_count)
+        task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
+        task.finished_at = datetime.now()
+    log_event(owner_username, task_id, "info", TASK_CANCELLED_MESSAGE)
 
 
 def fail_listing_task_unexpectedly(owner_username: str, task_id: str, exc: Exception) -> None:
@@ -8209,13 +8485,29 @@ def summarize_task_errors(errors: list[str], limit: int = 20) -> str | None:
 
 
 def run_task(task_id: str) -> None:
+    owner_username = ""
+    success_count = 0
+    failed_count = 0
+    warning_count = 0
+    saved_count = 0
+    total_count = 0
+    errors: list[str] = []
     with session_scope() as session:
         task = session.get(CrawlTaskModel, task_id)
         if task is None:
             return
+        if task.status == "cancelled":
+            return
+        if task_cancel_requested(task):
+            task.status = "cancelled"
+            task.message = TASK_CANCELLED_MESSAGE
+            task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
+            task.finished_at = datetime.now()
+            return
         task.status = "running"
         task.started_at = datetime.now()
         task.message = "采集中"
+        task.error_detail = None
         if task.total_count <= 0:
             task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
         owner_username = task.owner_username
@@ -8223,28 +8515,28 @@ def run_task(task_id: str) -> None:
         target = task.target
 
     try:
+        raise_if_task_cancelled(CrawlTaskModel, task_id)
         items = collect_items(source_type, target, task_id=task_id)
+        total_count = len(items)
+        raise_if_task_cancelled(CrawlTaskModel, task_id)
         update_task_progress(
             CrawlTaskModel,
             task_id,
-            total_count=len(items),
+            total_count=total_count,
             success_count=0,
             failed_count=0,
             warning_count=0,
-            message=f"采集中，已处理 0 / {len(items)} 条",
+            message=f"采集中，已处理 0 / {total_count} 条",
         )
-        success_count = 0
-        failed_count = 0
-        warning_count = 0
-        saved_count = 0
-        errors: list[str] = []
         if not items:
             errors.append("未采集到商品，请检查采集内容、榜单时间或乐天页面结构。")
         batch_size = max(1, int(settings.crawler_batch_size))
         processed_count = 0
         batches = list(chunk_items(items, batch_size))
         for batch_index, batch_items in enumerate(batches, start=1):
+            raise_if_task_cancelled(CrawlTaskModel, task_id)
             for item in batch_items:
+                raise_if_task_cancelled(CrawlTaskModel, task_id)
                 processed_count += 1
                 item_error = collected_item_error(item)
                 save_result = save_collected_item(owner_username, task_id, item)
@@ -8269,13 +8561,14 @@ def run_task(task_id: str) -> None:
                 update_task_progress(
                     CrawlTaskModel,
                     task_id,
-                    total_count=len(items),
+                    total_count=total_count,
                     success_count=success_count,
                     failed_count=failed_count,
                     warning_count=warning_count,
-                    message=f"采集中，批次 {batch_index} / {len(batches)}，已处理 {processed_count} / {len(items)} 条",
+                    message=f"采集中，批次 {batch_index} / {len(batches)}，已处理 {processed_count} / {total_count} 条",
                 )
             if batch_index < len(batches) and settings.crawler_batch_pause_seconds > 0:
+                raise_if_task_cancelled(CrawlTaskModel, task_id)
                 time.sleep(settings.crawler_batch_pause_seconds)
         with session_scope() as session:
             task = session.get(CrawlTaskModel, task_id)
@@ -8289,6 +8582,20 @@ def run_task(task_id: str) -> None:
             task.message = f"完成，采集 {len(items)} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条"
             task.error_detail = summarize_task_errors(errors)
         log_event(owner_username, task_id, "info", f"任务完成，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条商品")
+    except TaskCancelled:
+        with session_scope() as session:
+            task = session.get(CrawlTaskModel, task_id)
+            if task is None:
+                return
+            task.total_count = max(int(task.total_count or 0), total_count)
+            task.success_count = success_count
+            task.failed_count = failed_count
+            task.warning_count = warning_count
+            task.status = "cancelled"
+            task.finished_at = datetime.now()
+            task.message = f"已终止，采集已处理 {success_count + failed_count} / {task.total_count or total_count} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条"
+            task.error_detail = cancelled_task_error_detail(errors, task.error_detail)
+        log_event(owner_username, task_id, "info", TASK_CANCELLED_MESSAGE)
     except Exception as exc:
         with session_scope() as session:
             task = session.get(CrawlTaskModel, task_id)
@@ -8351,6 +8658,7 @@ def initial_crawl_task_total_count(source_type: str, target: str) -> int:
 
 
 def collect_items(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
+    raise_if_task_cancelled(CrawlTaskModel, task_id)
     if source_type == "product_url":
         return [collect_product_detail(normalize_rakuten_product_target(target))]
     limit: int | None = 30
@@ -8374,7 +8682,8 @@ def collect_items(source_type: str, target: str, *, task_id: str | None = None) 
         if source_type == "shop":
             url = build_ranking_source_url(target, period)
     listing_limit = None if shop_code_filter else limit
-    items = collect_listing_items(url, listing_limit)
+    items = collect_listing_items(url, listing_limit, task_id=task_id)
+    raise_if_task_cancelled(CrawlTaskModel, task_id)
     if source_type in {"ranking", "shop"} and period == "realtime":
         keyword = normalize_text(target).lower()
         items = [item for item in items if keyword in normalize_text(item.get("title")).lower()]
@@ -8388,17 +8697,19 @@ def collect_items(source_type: str, target: str, *, task_id: str | None = None) 
             total_count=len(limited_items),
             message=f"已发现 {len(limited_items)} 个商品，开始采集详情",
         )
-    return enrich_collected_items_with_detail(limited_items)
+    return enrich_collected_items_with_detail(limited_items, task_id=task_id)
 
 
-def collect_listing_items(url: str, requested_limit: int | None) -> list[dict[str, Any]]:
+def collect_listing_items(url: str, requested_limit: int | None, *, task_id: str | None = None) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     ranking_total: int | None = None
     page_number = 1
     while page_number <= settings.crawler_max_ranking_pages:
+        raise_if_task_cancelled(CrawlTaskModel, task_id)
         page_url = ranking_page_url(url, page_number)
         html = fetch_listing_html(page_url)
+        raise_if_task_cancelled(CrawlTaskModel, task_id)
         assert_listing_page_available(html, page_url)
         if ranking_total is None:
             ranking_total = parse_ranking_total_count(html)
@@ -8475,16 +8786,20 @@ def product_url_shop_code(source_url: Any) -> str:
     return normalize_shop_code(parsed[0]) if parsed else ""
 
 
-def enrich_collected_items_with_detail(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def enrich_collected_items_with_detail(items: list[dict[str, Any]], *, task_id: str | None = None) -> list[dict[str, Any]]:
     enriched_items: list[dict[str, Any]] = []
     for item in items:
+        raise_if_task_cancelled(CrawlTaskModel, task_id)
         source_url = normalize_text(item.get("source_url"))
         if not source_url:
             enriched_items.append(item)
             continue
         try:
             detail = collect_product_detail(source_url)
+            raise_if_task_cancelled(CrawlTaskModel, task_id)
         except Exception as exc:
+            if isinstance(exc, TaskCancelled):
+                raise
             fallback = dict(item)
             raw = fallback.get("raw") if isinstance(fallback.get("raw"), dict) else {}
             fallback["raw"] = {**raw, "detailError": str(exc), "detailCollected": False}

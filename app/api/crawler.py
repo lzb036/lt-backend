@@ -240,6 +240,15 @@ def restart_task(task_id: str, user: dict = Depends(require_crawler_permission))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/tasks/{task_id}/cancel")
+def cancel_task(task_id: str, user: dict = Depends(require_crawler_permission)) -> dict:
+    try:
+        task = crawler_service.cancel_crawl_task(user["username"], task_id)
+        return {"task": task}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.api_route("/tasks", methods=["DELETE"])
 def delete_tasks(payload: TaskDeletePayload, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
@@ -574,6 +583,15 @@ def retry_sync_task(task_id: str, user: dict = Depends(require_products_or_store
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/sync-tasks/{task_id}/cancel")
+def cancel_sync_task(task_id: str, user: dict = Depends(require_products_or_stores_permission)) -> dict:
+    try:
+        task = crawler_service.cancel_sync_task(user["username"], task_id)
+        return {"syncTask": task}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.api_route("/sync-tasks", methods=["DELETE"])
 def delete_sync_tasks(payload: TaskDeletePayload, user: dict = Depends(require_products_or_stores_permission)) -> dict:
     try:
@@ -659,6 +677,15 @@ def create_listing_task(payload: ListingTaskPayload, user: dict = Depends(requir
 def retry_listing_task(task_id: str, user: dict = Depends(require_products_permission)) -> dict:
     try:
         task = crawler_service.retry_listing_task(user["username"], task_id)
+        return {"listingTask": task}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/listing-tasks/{task_id}/cancel")
+def cancel_listing_task(task_id: str, user: dict = Depends(require_products_permission)) -> dict:
+    try:
+        task = crawler_service.cancel_listing_task(user["username"], task_id)
         return {"listingTask": task}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
