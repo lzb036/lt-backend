@@ -229,7 +229,26 @@ RAKUTEN_ORIGIN_INFERENCE_PATTERNS = (
     (r"台湾製|MADE\s+IN\s+TAIWAN|原産国[:：]?\s*台湾|製造国[:：]?\s*台湾", "台湾"),
 )
 RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE = "代表カラー"
-RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK = "その他"
+RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK = "マルチカラー"
+RAKUTEN_REPRESENTATIVE_COLOR_ALLOWED_VALUES = {
+    "ブラック",
+    "ホワイト",
+    "グレー",
+    "シルバー",
+    "ゴールド",
+    "レッド",
+    "ピンク",
+    "オレンジ",
+    "イエロー",
+    "グリーン",
+    "ブルー",
+    "ネイビー",
+    "パープル",
+    "ブラウン",
+    "ベージュ",
+    "クリア",
+    "マルチカラー",
+}
 SINGLE_PRODUCT_VARIANT_ID = "default"
 LISTING_MANAGE_NUMBER_PREFIX = "fashiongoods"
 RAKUTEN_COLOR_SELECTOR_KEYWORDS = ("カラー", "色", "color", "colour")
@@ -247,9 +266,13 @@ RAKUTEN_COLOR_VALUE_MAP = {
     "灰": "グレー",
     "gray": "グレー",
     "grey": "グレー",
+    "グレイ": "グレー",
     "シルバー": "シルバー",
     "銀": "シルバー",
     "silver": "シルバー",
+    "ゴールド": "ゴールド",
+    "金": "ゴールド",
+    "gold": "ゴールド",
     "レッド": "レッド",
     "赤": "レッド",
     "red": "レッド",
@@ -281,10 +304,57 @@ RAKUTEN_COLOR_VALUE_MAP = {
     "クリア": "クリア",
     "透明": "クリア",
     "clear": "クリア",
+    "アイボリー": "ホワイト",
+    "ivory": "ホワイト",
+    "カーキ": "グリーン",
+    "khaki": "グリーン",
     "マルチ": "マルチカラー",
     "ミックス": "マルチカラー",
+    "複数色": "マルチカラー",
+    "多色": "マルチカラー",
     "multi": "マルチカラー",
+    "mix": "マルチカラー",
 }
+RAKUTEN_MACHINE_DEPENDENT_TRANSLATION = str.maketrans(
+    {
+        "\u301c": "\uff5e",
+        "\u2212": "-",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u00a0": " ",
+        "\u200b": "",
+        "\u200c": "",
+        "\u200d": "",
+        "\ufeff": "",
+        "\u2460": "(1)",
+        "\u2461": "(2)",
+        "\u2462": "(3)",
+        "\u2463": "(4)",
+        "\u2464": "(5)",
+        "\u2465": "(6)",
+        "\u2466": "(7)",
+        "\u2467": "(8)",
+        "\u2468": "(9)",
+        "\u2469": "(10)",
+        "\u2474": "(1)",
+        "\u2475": "(2)",
+        "\u2476": "(3)",
+        "\u2477": "(4)",
+        "\u2478": "(5)",
+        "\u2479": "(6)",
+        "\u247a": "(7)",
+        "\u247b": "(8)",
+        "\u247c": "(9)",
+        "\u247d": "(10)",
+        "\u3231": "(株)",
+        "\u3232": "(有)",
+        "\u337f": "株式会社",
+    }
+)
 RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集支持普通乐天商品链接、Rakuten Fashion 商品链接、带参数链接、店铺编码/商品编号。"
 RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺url代码、店铺url或sid。"
 RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
@@ -5853,11 +5923,236 @@ def put_rakuten_item_with_attribute_retry(
 
 
 def patch_payload_for_attribute_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
-    patched_payload = patch_payload_for_unknown_attribute_name_errors(payload, error_text)
+    patched_payload = patch_payload_for_machine_dependent_character_errors(payload, error_text)
+    patched_payload = patch_payload_for_invalid_selective_attribute_values(patched_payload, error_text)
+    patched_payload = patch_payload_for_unknown_attribute_name_errors(patched_payload, error_text)
     patched_payload = patch_payload_for_missing_mandatory_attributes(patched_payload, error_text)
     patched_payload = patch_payload_for_attribute_unit_errors(patched_payload, error_text)
     patched_payload = patch_payload_for_attribute_string_value_errors(patched_payload, error_text)
     return patched_payload
+
+
+def normalize_rakuten_machine_dependent_characters(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text.translate(RAKUTEN_MACHINE_DEPENDENT_TRANSLATION))
+    cleaned: list[str] = []
+    for char in normalized:
+        codepoint = ord(char)
+        category = unicodedata.category(char)
+        if char in {"\n", "\r", "\t"}:
+            cleaned.append(char)
+            continue
+        if category in {"Cc", "Cf", "Co", "Cs", "Cn"}:
+            continue
+        if (
+            0x1F000 <= codepoint <= 0x1FAFF
+            or 0x2600 <= codepoint <= 0x27BF
+            or 0xFE00 <= codepoint <= 0xFE0F
+            or 0xE0100 <= codepoint <= 0xE01EF
+            or codepoint in {0x3030, 0x303D, 0x3297, 0x3299}
+        ):
+            continue
+        cleaned.append(char)
+    return "".join(cleaned)
+
+
+def sanitize_rakuten_payload_text(value: Any) -> Any:
+    if isinstance(value, str):
+        return normalize_rakuten_machine_dependent_characters(value)
+    if isinstance(value, list):
+        return [sanitize_rakuten_payload_text(item) for item in value]
+    if isinstance(value, dict):
+        return {key: sanitize_rakuten_payload_text(item) for key, item in value.items()}
+    return value
+
+
+def patch_payload_for_machine_dependent_character_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
+    paths = extract_machine_dependent_character_error_paths(error_text)
+    if not paths:
+        return payload
+    patched = json.loads(json.dumps(payload, ensure_ascii=False))
+    changed = False
+    for path in paths:
+        if sanitize_payload_value_at_path(patched, path):
+            changed = True
+    return patched if changed else payload
+
+
+def extract_machine_dependent_character_error_paths(error_text: str) -> list[str]:
+    paths: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            if normalize_text(value.get("code")) == "IE0270":
+                metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+                path = normalize_text(metadata.get("propertyPath"))
+                if path and path not in paths:
+                    paths.append(path)
+            for child in value.values():
+                collect(child)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    text = normalize_text(error_text)
+    try:
+        json_start = text.find("{")
+        if json_start >= 0:
+            collect(json.loads(text[json_start:]))
+    except Exception:
+        pass
+    for match in re.finditer(r'"code"\s*:\s*"IE0270".*?"propertyPath"\s*:\s*"([^"]+)"', text):
+        path = normalize_text(match.group(1))
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def sanitize_payload_value_at_path(payload: dict[str, Any], path: str) -> bool:
+    target = payload
+    parts = [part for part in normalize_text(path).split(".") if part]
+    if not parts:
+        return False
+    for part in parts[:-1]:
+        if not isinstance(target, dict):
+            return False
+        next_value = target.get(part)
+        if not isinstance(next_value, dict):
+            return False
+        target = next_value
+    if not isinstance(target, dict):
+        return False
+    key = parts[-1]
+    if key not in target:
+        return False
+    next_value = sanitize_rakuten_payload_text(target.get(key))
+    if next_value == target.get(key):
+        return False
+    target[key] = next_value
+    return True
+
+
+def patch_payload_for_invalid_selective_attribute_values(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
+    errors = extract_invalid_selective_attribute_value_errors(error_text)
+    if not errors:
+        return payload
+    variants = payload.get("variants")
+    if not isinstance(variants, dict):
+        return payload
+    patched = json.loads(json.dumps(payload, ensure_ascii=False))
+    patched_variants = patched.get("variants")
+    if not isinstance(patched_variants, dict):
+        return payload
+    changed = False
+    for error in errors:
+        if normalize_text(error.get("attributeName")) != RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE:
+            continue
+        variant = patched_variants.get(normalize_text(error.get("variantId")))
+        if not isinstance(variant, dict):
+            continue
+        attributes = variant.get("attributes")
+        if not isinstance(attributes, list):
+            continue
+        attribute_index = error.get("attributeIndex")
+        targets: list[dict[str, Any]] = []
+        if isinstance(attribute_index, int) and 0 <= attribute_index < len(attributes):
+            attribute = attributes[attribute_index]
+            if isinstance(attribute, dict):
+                targets.append(attribute)
+        targets.extend(
+            attribute
+            for attribute in attributes
+            if isinstance(attribute, dict)
+            and normalize_text(attribute.get("name")) == RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE
+            and attribute not in targets
+        )
+        for attribute in targets:
+            current_value = first_text_value(attribute.get("values"))
+            next_value = normalize_rakuten_representative_color(current_value) or RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK
+            if next_value not in RAKUTEN_REPRESENTATIVE_COLOR_ALLOWED_VALUES:
+                next_value = RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK
+            if attribute.get("values") != [next_value]:
+                attribute["values"] = [next_value]
+                changed = True
+            if "unit" in attribute:
+                attribute.pop("unit", None)
+                changed = True
+    return patched if changed else payload
+
+
+def extract_invalid_selective_attribute_value_errors(error_text: str) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+
+    def add_error(property_path: Any, attribute_name: Any) -> None:
+        normalized_path = normalize_text(property_path)
+        match = re.fullmatch(r"variants\.([^.\\\[\]]+)\.attributes\[(\d+)\]", normalized_path)
+        if not match:
+            return
+        variant_id, attribute_index = match.groups()
+        error = {
+            "variantId": normalize_text(variant_id),
+            "attributeIndex": int(attribute_index),
+            "attributeName": normalize_text(attribute_name),
+        }
+        if error["variantId"] and error["attributeName"] and error not in errors:
+            errors.append(error)
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+            property_path = metadata.get("propertyPath")
+            details = metadata.get("details")
+            detail_items = details if isinstance(details, list) else [value]
+            for detail in detail_items:
+                if not isinstance(detail, dict):
+                    continue
+                if normalize_text(detail.get("code")) != "invalidSelectiveValue":
+                    continue
+                properties = detail.get("properties") if isinstance(detail.get("properties"), dict) else {}
+                add_error(property_path, properties.get("attributeName"))
+            for child in value.values():
+                collect(child)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    text = normalize_text(error_text)
+    try:
+        json_start = text.find("{")
+        if json_start >= 0:
+            collect(json.loads(text[json_start:]))
+    except Exception:
+        pass
+    pattern = (
+        r'"code"\s*:\s*"invalidSelectiveValue".*?'
+        r'"attributeName"\s*:\s*"([^"]+)".*?'
+        r'"propertyPath"\s*:\s*"variants\.([^.\\\[\]]+)\.attributes\[(\d+)\]"'
+    )
+    for match in re.finditer(pattern, text):
+        attribute_name, variant_id, attribute_index = match.groups()
+        error = {
+            "variantId": normalize_text(variant_id),
+            "attributeIndex": int(attribute_index),
+            "attributeName": normalize_text(attribute_name),
+        }
+        if error["variantId"] and error["attributeName"] and error not in errors:
+            errors.append(error)
+    if not errors and "invalidSelectiveValue" in text:
+        path_pattern = r"variants\.([^.\\\[\]]+)\.attributes\[(\d+)\]"
+        name_match = re.search(r'"attributeName"\s*:\s*"([^"]+)"', text)
+        if name_match:
+            for match in re.finditer(path_pattern, text):
+                variant_id, attribute_index = match.groups()
+                error = {
+                    "variantId": normalize_text(variant_id),
+                    "attributeIndex": int(attribute_index),
+                    "attributeName": normalize_text(name_match.group(1)),
+                }
+                if error["variantId"] and error not in errors:
+                    errors.append(error)
+    return errors
 
 
 _RAKUTEN_ATTRIBUTE_RULES_CACHE: dict[str, Any] | None = None
@@ -6156,6 +6451,12 @@ def normalize_rakuten_attribute_values_for_rule(values: Any, rule: dict[str, Any
         value_items = [value[:max_length] for value in value_items if value[:max_length]]
     max_values = rakuten_attribute_rule_int(rule, "maxValues")
     unique_values = unique_texts(value_items)
+    if normalize_text(rule.get("name")) == RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE:
+        for value in unique_values:
+            color = normalize_rakuten_representative_color(value)
+            if color:
+                return [color]
+        return [RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK]
     if max_values > 0:
         unique_values = unique_values[:max_values]
     return unique_values
@@ -7924,9 +8225,9 @@ def normalize_rakuten_representative_color(value: Any) -> str:
         return ""
     lowered = text.lower()
     for token, color in sorted(RAKUTEN_COLOR_VALUE_MAP.items(), key=lambda item: len(item[0]), reverse=True):
-        if token.lower() in lowered:
+        if token.lower() in lowered and color in RAKUTEN_REPRESENTATIVE_COLOR_ALLOWED_VALUES:
             return color
-    return text[:30] if len(text) <= 30 and re.search(r"[色カラーblackwhitebluegreenredpinkyelloworangepurplebrowngraygrey]", lowered, flags=re.I) else ""
+    return text if text in RAKUTEN_REPRESENTATIVE_COLOR_ALLOWED_VALUES else ""
 
 
 def normalize_rakuten_attribute_value(value: Any, *, allow_placeholder: bool = False) -> str:
@@ -8116,6 +8417,7 @@ def sanitize_rakuten_listing_description_html(value: Any, *, max_length: int) ->
     text = sanitize_rakuten_pc_description_html(text)
     text = re.sub(r"<\s*thcolspan(\s|>)", r'<th colspan="2"\1', text, flags=re.I)
     text = re.sub(r"</\s*thcolspan\s*>", "</th>", text, flags=re.I)
+    text = normalize_rakuten_machine_dependent_characters(text)
     return truncate_text(text, max_length)
 
 
@@ -8149,6 +8451,7 @@ def sanitize_rakuten_sp_description_html(value: Any, *, max_length: int) -> str:
             image.decompose()
     body = soup.body
     cleaned = body.decode_contents().strip() if body is not None else str(soup).strip()
+    cleaned = normalize_rakuten_machine_dependent_characters(cleaned)
     return truncate_text(cleaned, max_length)
 
 
