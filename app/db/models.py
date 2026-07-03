@@ -161,6 +161,7 @@ class CrawlTaskModel(TimestampMixin, Base):
     warning_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     message: Mapped[str] = mapped_column(Text, nullable=False, default="")
     error_detail: Mapped[str | None] = mapped_column(Text)
+    warning_detail: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
 

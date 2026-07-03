@@ -479,6 +479,7 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
         "cancelRequested": task_cancel_requested(row),
         "message": row.message,
         "errorDetail": task_public_error_detail(row),
+        "warningDetail": task_public_warning_detail(row),
         "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
         "finishedAt": row.finished_at.isoformat(sep=" ") if row.finished_at else None,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -1566,9 +1567,11 @@ def update_task_progress(
 def task_cancel_requested(row: Any | None) -> bool:
     if row is None:
         return False
-    detail = normalize_text(getattr(row, "error_detail", ""))
+    detail = normalize_task_detail_text(getattr(row, "error_detail", ""))
     if not detail:
         return False
+    if detail == TASK_CANCEL_REQUESTED_MARKER or detail.startswith(f"{TASK_CANCEL_REQUESTED_MARKER} "):
+        return True
     first_line = detail.splitlines()[0].strip()
     return first_line == TASK_CANCEL_REQUESTED_MARKER
 
@@ -1580,10 +1583,21 @@ def task_public_error_detail(row: Any | None) -> str | None:
     return detail or None
 
 
+def task_public_warning_detail(row: Any | None) -> str | None:
+    if row is None:
+        return None
+    detail = normalize_task_detail_text(getattr(row, "warning_detail", ""))
+    return detail or None
+
+
 def strip_task_cancel_marker(error_detail: Any) -> str:
-    detail = normalize_text(error_detail)
+    detail = normalize_task_detail_text(error_detail)
     if not detail:
         return ""
+    if detail == TASK_CANCEL_REQUESTED_MARKER:
+        return ""
+    if detail.startswith(f"{TASK_CANCEL_REQUESTED_MARKER} "):
+        return detail[len(TASK_CANCEL_REQUESTED_MARKER):].strip()
     lines = detail.splitlines()
     if lines and lines[0].strip() == TASK_CANCEL_REQUESTED_MARKER:
         return "\n".join(line for line in lines[1:] if line.strip()).strip()
@@ -1591,10 +1605,19 @@ def strip_task_cancel_marker(error_detail: Any) -> str:
 
 
 def with_task_cancel_marker(error_detail: Any) -> str:
-    detail = normalize_text(error_detail)
+    detail = normalize_task_detail_text(error_detail)
+    if detail == TASK_CANCEL_REQUESTED_MARKER or detail.startswith(f"{TASK_CANCEL_REQUESTED_MARKER} "):
+        return detail
     if detail.splitlines() and detail.splitlines()[0].strip() == TASK_CANCEL_REQUESTED_MARKER:
         return detail
     return f"{TASK_CANCEL_REQUESTED_MARKER}\n{detail}".strip() if detail else TASK_CANCEL_REQUESTED_MARKER
+
+
+def normalize_task_detail_text(value: Any) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
 
 
 def cancelled_task_error_detail(errors: list[str] | None = None, existing_error_detail: Any = None) -> str | None:
@@ -1604,6 +1627,15 @@ def cancelled_task_error_detail(errors: list[str] | None = None, existing_error_
         values.extend(existing.splitlines())
     values.extend(str(error or "").strip() for error in (errors or []) if str(error or "").strip())
     return summarize_task_errors(values, limit=50)
+
+
+def cancelled_task_warning_detail(warnings: list[str] | None = None, existing_warning_detail: Any = None) -> str | None:
+    values: list[str] = []
+    existing = normalize_task_detail_text(existing_warning_detail)
+    if existing:
+        values.extend(existing.splitlines())
+    values.extend(str(warning or "").strip() for warning in (warnings or []) if str(warning or "").strip())
+    return summarize_task_errors(values, limit=50, item_label="警告")
 
 
 def is_task_cancel_requested(model: Any, task_id: str) -> bool:
@@ -3744,6 +3776,8 @@ def request_task_cancel(model: Any, owner_username: str, task_id: str, *, serial
             task.status = "cancelled"
             task.message = TASK_CANCELLED_MESSAGE
             task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
+            if hasattr(task, "warning_detail"):
+                task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=task.warning_detail)
             task.finished_at = datetime.now()
             if model is ListingTaskModel:
                 release_listing_task_locks(session, owner_username, task)
@@ -5408,19 +5442,26 @@ def put_rakuten_item_with_attribute_retry(
     manage_number: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    try:
-        put_rakuten_item(service_secret, license_key, manage_number, payload)
-        return payload
-    except RuntimeError as exc:
-        patched_payload = patch_payload_for_attribute_errors(payload, str(exc))
-        if patched_payload == payload:
-            raise
-        put_rakuten_item(service_secret, license_key, manage_number, patched_payload)
-        return patched_payload
+    current_payload = payload
+    last_error: RuntimeError | None = None
+    for _ in range(3):
+        try:
+            put_rakuten_item(service_secret, license_key, manage_number, current_payload)
+            return current_payload
+        except RuntimeError as exc:
+            last_error = exc
+            patched_payload = patch_payload_for_attribute_errors(current_payload, str(exc))
+            if patched_payload == current_payload:
+                raise
+            current_payload = patched_payload
+    if last_error is not None:
+        raise last_error
+    return current_payload
 
 
 def patch_payload_for_attribute_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
-    patched_payload = patch_payload_for_missing_mandatory_attributes(payload, error_text)
+    patched_payload = patch_payload_for_unknown_attribute_name_errors(payload, error_text)
+    patched_payload = patch_payload_for_missing_mandatory_attributes(patched_payload, error_text)
     patched_payload = patch_payload_for_attribute_unit_errors(patched_payload, error_text)
     return patched_payload
 
@@ -5498,10 +5539,19 @@ def apply_rakuten_attribute_rules_to_payload(payload: dict[str, Any]) -> dict[st
         existing: dict[str, dict[str, Any]] = {}
         for attribute in list(attributes):
             if not isinstance(attribute, dict):
+                attributes.remove(attribute)
+                changed = True
                 continue
             name = normalize_text(attribute.get("name"))
-            if name:
-                existing[name] = attribute
+            if not name or name not in rule_map:
+                attributes.remove(attribute)
+                changed = True
+                continue
+            if name in existing:
+                attributes.remove(attribute)
+                changed = True
+                continue
+            existing[name] = attribute
         for name, rule in rule_map.items():
             if not bool(rule.get("required")) or name in existing:
                 continue
@@ -5577,6 +5627,37 @@ def patch_payload_for_missing_mandatory_attributes(payload: dict[str, Any], erro
             attributes.append(attribute)
             existing_names.add(attribute_name)
             changed = True
+    return patched if changed else payload
+
+
+def patch_payload_for_unknown_attribute_name_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
+    paths = extract_unknown_attribute_name_error_paths(error_text)
+    if not paths:
+        return payload
+    variants = payload.get("variants")
+    if not isinstance(variants, dict):
+        return payload
+    patched = json.loads(json.dumps(payload, ensure_ascii=False))
+    patched_variants = patched.get("variants")
+    if not isinstance(patched_variants, dict):
+        return payload
+    changed = False
+    by_variant: dict[str, set[int]] = {}
+    for variant_id, attribute_index in paths:
+        by_variant.setdefault(variant_id, set()).add(attribute_index)
+    for variant_id, indexes in by_variant.items():
+        variant = patched_variants.get(variant_id)
+        if not isinstance(variant, dict):
+            continue
+        attributes = variant.get("attributes")
+        if not isinstance(attributes, list):
+            continue
+        for attribute_index in sorted(indexes, reverse=True):
+            if 0 <= attribute_index < len(attributes):
+                attributes.pop(attribute_index)
+                changed = True
+        if not attributes:
+            variant.pop("attributes", None)
     return patched if changed else payload
 
 
@@ -5782,6 +5863,44 @@ def extract_attribute_unit_error_rules(error_text: str) -> dict[str, str]:
         code, attribute_name = match.groups()
         rules[normalize_text(attribute_name)] = "remove_unit" if code == "invalidNoInputUnit" else "require_unit"
     return rules
+
+
+def extract_unknown_attribute_name_error_paths(error_text: str) -> list[tuple[str, int]]:
+    paths: list[tuple[str, int]] = []
+
+    def add_path(property_path: Any) -> None:
+        match = re.fullmatch(r"variants\.([^.\\\[\]]+)\.attributes\[(\d+)\]\.name", normalize_text(property_path))
+        if not match:
+            return
+        variant_id, attribute_index = match.groups()
+        path = (normalize_text(variant_id), int(attribute_index))
+        if path[0] and path not in paths:
+            paths.append(path)
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            if normalize_text(value.get("code")) == "IE1002":
+                metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+                add_path(metadata.get("propertyPath"))
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    text = normalize_text(error_text)
+    try:
+        json_start = text.find("{")
+        if json_start >= 0:
+            walk(json.loads(text[json_start:]))
+    except Exception:
+        pass
+    for match in re.finditer(r"variants\.([^.\\\[\]]+)\.attributes\[(\d+)\]\.name", text):
+        variant_id, attribute_index = match.groups()
+        path = (normalize_text(variant_id), int(attribute_index))
+        if path[0] and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def extract_missing_mandatory_attribute_names(error_text: str) -> list[str]:
@@ -8447,6 +8566,7 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
         task.warning_count = 0
         task.message = "等待重新执行"
         task.error_detail = None
+        task.warning_detail = None
         task.started_at = None
         task.finished_at = None
     dispatch_crawl_task(task_id)
@@ -8467,7 +8587,7 @@ def collected_item_error(item: dict[str, Any]) -> str | None:
     return None
 
 
-def summarize_task_errors(errors: list[str], limit: int = 20) -> str | None:
+def summarize_task_errors(errors: list[str], limit: int = 20, *, item_label: str = "错误") -> str | None:
     unique_errors: list[str] = []
     seen: set[str] = set()
     for error in errors:
@@ -8480,7 +8600,7 @@ def summarize_task_errors(errors: list[str], limit: int = 20) -> str | None:
         return None
     visible_errors = unique_errors[:limit]
     if len(unique_errors) > limit:
-        visible_errors.append(f"另有 {len(unique_errors) - limit} 条错误未显示。")
+        visible_errors.append(f"另有 {len(unique_errors) - limit} 条{item_label}未显示。")
     return "\n".join(visible_errors)
 
 
@@ -8492,6 +8612,7 @@ def run_task(task_id: str) -> None:
     saved_count = 0
     total_count = 0
     errors: list[str] = []
+    warnings: list[str] = []
     with session_scope() as session:
         task = session.get(CrawlTaskModel, task_id)
         if task is None:
@@ -8502,12 +8623,14 @@ def run_task(task_id: str) -> None:
             task.status = "cancelled"
             task.message = TASK_CANCELLED_MESSAGE
             task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
+            task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=task.warning_detail)
             task.finished_at = datetime.now()
             return
         task.status = "running"
         task.started_at = datetime.now()
         task.message = "采集中"
         task.error_detail = None
+        task.warning_detail = None
         if task.total_count <= 0:
             task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
         owner_username = task.owner_username
@@ -8548,7 +8671,7 @@ def run_task(task_id: str) -> None:
                     item_warnings = [message for message in (item_error, save_error) if message]
                     if item_warnings:
                         warning_count += 1
-                        errors.extend(item_warnings)
+                        warnings.extend(item_warnings)
                 else:
                     failed_count += 1
                     if item_error:
@@ -8581,6 +8704,7 @@ def run_task(task_id: str) -> None:
             task.finished_at = datetime.now()
             task.message = f"完成，采集 {len(items)} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条"
             task.error_detail = summarize_task_errors(errors)
+            task.warning_detail = summarize_task_errors(warnings, item_label="警告")
         log_event(owner_username, task_id, "info", f"任务完成，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条商品")
     except TaskCancelled:
         with session_scope() as session:
@@ -8595,6 +8719,7 @@ def run_task(task_id: str) -> None:
             task.finished_at = datetime.now()
             task.message = f"已终止，采集已处理 {success_count + failed_count} / {task.total_count or total_count} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条"
             task.error_detail = cancelled_task_error_detail(errors, task.error_detail)
+            task.warning_detail = cancelled_task_warning_detail(warnings, task.warning_detail)
         log_event(owner_username, task_id, "info", TASK_CANCELLED_MESSAGE)
     except Exception as exc:
         with session_scope() as session:
@@ -8607,6 +8732,7 @@ def run_task(task_id: str) -> None:
             task.finished_at = datetime.now()
             task.message = "采集失败"
             task.error_detail = str(exc)
+            task.warning_detail = None
         log_event(owner_username, task_id, "error", str(exc))
 
 

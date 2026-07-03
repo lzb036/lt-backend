@@ -58,8 +58,6 @@ def parse_group_sheet(sheet: Any, source_name: str) -> tuple[str, dict[str, Any]
         unit_required_text = raw_text(row[8] if len(row) > 8 else None)
         required = required_text == "必須"
         unit_required = unit_required_text not in {"", "-"}
-        if not required and not unit_required:
-            continue
         recommended_unit = cell_text(row[9] if len(row) > 9 else None)
         multiple_text = raw_text(row[10] if len(row) > 10 else None)
         delimiter = cell_text(row[12] if len(row) > 12 else None)
