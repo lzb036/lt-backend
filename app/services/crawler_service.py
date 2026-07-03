@@ -5463,6 +5463,7 @@ def patch_payload_for_attribute_errors(payload: dict[str, Any], error_text: str)
     patched_payload = patch_payload_for_unknown_attribute_name_errors(payload, error_text)
     patched_payload = patch_payload_for_missing_mandatory_attributes(patched_payload, error_text)
     patched_payload = patch_payload_for_attribute_unit_errors(patched_payload, error_text)
+    patched_payload = patch_payload_for_attribute_string_value_errors(patched_payload, error_text)
     return patched_payload
 
 
@@ -5588,6 +5589,15 @@ def apply_rakuten_attribute_rules_to_payload(payload: dict[str, Any]) -> dict[st
             elif "unit" in attribute:
                 attribute.pop("unit", None)
                 changed = True
+            next_values = normalize_rakuten_attribute_values_for_rule(attribute.get("values"), rule)
+            if next_values:
+                if attribute.get("values") != next_values:
+                    attribute["values"] = next_values
+                    changed = True
+            elif not bool(rule.get("required")):
+                attributes.remove(attribute)
+                existing.pop(name, None)
+                changed = True
     return patched if changed else payload
 
 
@@ -5659,6 +5669,95 @@ def patch_payload_for_unknown_attribute_name_errors(payload: dict[str, Any], err
         if not attributes:
             variant.pop("attributes", None)
     return patched if changed else payload
+
+
+def patch_payload_for_attribute_string_value_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
+    errors = extract_attribute_string_value_errors(error_text)
+    if not errors:
+        return payload
+    variants = payload.get("variants")
+    if not isinstance(variants, dict):
+        return payload
+    patched = json.loads(json.dumps(payload, ensure_ascii=False))
+    patched_variants = patched.get("variants")
+    if not isinstance(patched_variants, dict):
+        return payload
+    rule_map = rakuten_attribute_rule_map_for_payload(patched)
+    changed = False
+    for error in errors:
+        variant_id = normalize_text(error.get("variantId"))
+        attribute_index = error.get("attributeIndex")
+        attribute_name = normalize_text(error.get("attributeName"))
+        max_length = int(error.get("maxLength") or 0)
+        target_variants = [patched_variants.get(variant_id)] if variant_id else list(patched_variants.values())
+        for variant in target_variants:
+            if not isinstance(variant, dict):
+                continue
+            attributes = variant.get("attributes")
+            if not isinstance(attributes, list):
+                continue
+            target_attributes: list[dict[str, Any]] = []
+            if isinstance(attribute_index, int) and 0 <= attribute_index < len(attributes):
+                attribute = attributes[attribute_index]
+                if isinstance(attribute, dict):
+                    target_attributes.append(attribute)
+            elif attribute_name:
+                target_attributes.extend(
+                    attribute for attribute in attributes
+                    if isinstance(attribute, dict) and normalize_text(attribute.get("name")) == attribute_name
+                )
+            for attribute in target_attributes:
+                name = normalize_text(attribute.get("name"))
+                rule = dict(rule_map.get(name) or {})
+                if max_length > 0:
+                    rule["maxLength"] = str(max_length)
+                next_values = normalize_rakuten_attribute_values_for_rule(attribute.get("values"), rule)
+                if next_values:
+                    if attribute.get("values") != next_values:
+                        attribute["values"] = next_values
+                        changed = True
+                elif not bool(rule.get("required")) and attribute in attributes:
+                    attributes.remove(attribute)
+                    changed = True
+    return patched if changed else payload
+
+
+def normalize_rakuten_attribute_values_for_rule(values: Any, rule: dict[str, Any]) -> list[str]:
+    value_items: list[str] = []
+    raw_values = values if isinstance(values, list) else [values]
+    multiple = bool(rule.get("multiple"))
+    delimiter = normalize_text(rule.get("delimiter"))
+    should_split = multiple and ("|" in delimiter or "バーティカルバー" in delimiter)
+    for value in raw_values:
+        text = normalize_rakuten_attribute_value(value, allow_placeholder=True)
+        if not text:
+            continue
+        parts = re.split(r"\s*[|｜]\s*", text) if should_split else [text]
+        for part in parts:
+            normalized = normalize_rakuten_attribute_value(part, allow_placeholder=True)
+            if normalized:
+                value_items.append(normalized)
+    max_length = rakuten_attribute_rule_int(rule, "maxLength")
+    if max_length > 0:
+        value_items = [value[:max_length] for value in value_items if value[:max_length]]
+    max_values = rakuten_attribute_rule_int(rule, "maxValues")
+    unique_values = unique_texts(value_items)
+    if max_values > 0:
+        unique_values = unique_values[:max_values]
+    return unique_values
+
+
+def rakuten_attribute_rule_int(rule: dict[str, Any], key: str) -> int:
+    text = normalize_text(rule.get(key))
+    if not text:
+        return 0
+    match = re.search(r"\d+", text)
+    if not match:
+        return 0
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return 0
 
 
 def infer_missing_mandatory_attribute(
@@ -5901,6 +6000,89 @@ def extract_unknown_attribute_name_error_paths(error_text: str) -> list[tuple[st
         if path[0] and path not in paths:
             paths.append(path)
     return paths
+
+
+def extract_attribute_string_value_errors(error_text: str) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+
+    def add_error(property_path: Any, attribute_name: Any, max_length: Any) -> None:
+        normalized_path = normalize_text(property_path)
+        match = re.fullmatch(r"variants\.([^.\\\[\]]+)\.attributes\[(\d+)\]", normalized_path)
+        if not match:
+            return
+        variant_id, attribute_index = match.groups()
+        max_length_value = rakuten_attribute_rule_int({"maxLength": max_length}, "maxLength")
+        error = {
+            "variantId": normalize_text(variant_id),
+            "attributeIndex": int(attribute_index),
+            "attributeName": normalize_text(attribute_name),
+            "maxLength": max_length_value,
+        }
+        if error["variantId"] and error not in errors:
+            errors.append(error)
+
+    def collect_from_detail(detail: Any, property_path: Any) -> None:
+        if not isinstance(detail, dict):
+            return
+        if normalize_text(detail.get("code")) != "invalidStringValue":
+            return
+        properties = detail.get("properties") if isinstance(detail.get("properties"), dict) else {}
+        add_error(property_path, properties.get("attributeName"), properties.get("maxLength"))
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+            property_path = metadata.get("propertyPath")
+            details = metadata.get("details")
+            if isinstance(details, list):
+                for detail in details:
+                    collect_from_detail(detail, property_path)
+            else:
+                collect_from_detail(value, property_path)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    text = normalize_text(error_text)
+    try:
+        json_start = text.find("{")
+        if json_start >= 0:
+            walk(json.loads(text[json_start:]))
+    except Exception:
+        pass
+    pattern = (
+        r'"code"\s*:\s*"invalidStringValue".*?'
+        r'"attributeName"\s*:\s*"([^"]+)".*?'
+        r'"maxLength"\s*:\s*"?(\d+)"?.*?'
+        r'"propertyPath"\s*:\s*"variants\.([^.\\\[\]]+)\.attributes\[(\d+)\]"'
+    )
+    for match in re.finditer(pattern, text):
+        attribute_name, max_length, variant_id, attribute_index = match.groups()
+        error = {
+            "variantId": normalize_text(variant_id),
+            "attributeIndex": int(attribute_index),
+            "attributeName": normalize_text(attribute_name),
+            "maxLength": int(max_length),
+        }
+        if error["variantId"] and error not in errors:
+            errors.append(error)
+    path_pattern = r"variants\.([^.\\\[\]]+)\.attributes\[(\d+)\]"
+    name_match = re.search(r'"attributeName"\s*:\s*"([^"]+)"', text)
+    max_match = re.search(r'"maxLength"\s*:\s*"?(\d+)"?', text)
+    if name_match and max_match:
+        for match in re.finditer(path_pattern, text):
+            variant_id, attribute_index = match.groups()
+            error = {
+                "variantId": normalize_text(variant_id),
+                "attributeIndex": int(attribute_index),
+                "attributeName": normalize_text(name_match.group(1)),
+                "maxLength": int(max_match.group(1)),
+            }
+            if error["variantId"] and error not in errors:
+                errors.append(error)
+    return errors
 
 
 def extract_missing_mandatory_attribute_names(error_text: str) -> list[str]:
