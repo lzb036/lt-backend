@@ -1528,19 +1528,54 @@ def scheduled_crawl_to_public(row: ScheduledCrawlModel) -> dict[str, Any]:
     }
 
 
-def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
+def normalize_listing_task_product_ids(value: Any) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    result: list[int] = []
+    seen: set[int] = set()
+    for item in value:
+        try:
+            product_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if product_id in seen:
+            continue
+        seen.add(product_id)
+        result.append(product_id)
+    return result
+
+
+def listing_task_product_ids_payload(product_ids_json: str | None) -> dict[str, list[int]]:
     try:
-        product_ids_payload = json.loads(row.product_ids_json or "[]")
-    except ValueError:
+        product_ids_payload = json.loads(product_ids_json or "[]")
+    except (TypeError, ValueError):
         product_ids_payload = []
     if isinstance(product_ids_payload, dict):
-        product_ids = product_ids_payload.get("productIds") if isinstance(product_ids_payload.get("productIds"), list) else []
-        success_ids = product_ids_payload.get("successIds") if isinstance(product_ids_payload.get("successIds"), list) else []
-        failed_ids = product_ids_payload.get("failedIds") if isinstance(product_ids_payload.get("failedIds"), list) else []
-    else:
-        product_ids = product_ids_payload if isinstance(product_ids_payload, list) else []
-        success_ids = []
-        failed_ids = []
+        return {
+            "productIds": normalize_listing_task_product_ids(product_ids_payload.get("productIds")),
+            "successIds": normalize_listing_task_product_ids(product_ids_payload.get("successIds")),
+            "failedIds": normalize_listing_task_product_ids(product_ids_payload.get("failedIds")),
+        }
+    return {
+        "productIds": normalize_listing_task_product_ids(product_ids_payload),
+        "successIds": [],
+        "failedIds": [],
+    }
+
+
+def listing_task_retry_product_ids(task: ListingTaskModel) -> list[int]:
+    product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
+    failed_ids = product_ids_payload["failedIds"]
+    if task.status in {"partial", "failed"} and failed_ids:
+        return failed_ids
+    return product_ids_payload["productIds"]
+
+
+def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
+    product_ids_payload = listing_task_product_ids_payload(row.product_ids_json)
+    product_ids = product_ids_payload["productIds"]
+    success_ids = product_ids_payload["successIds"]
+    failed_ids = product_ids_payload["failedIds"]
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -4252,14 +4287,7 @@ def request_task_cancel(model: Any, owner_username: str, task_id: str, *, serial
 
 
 def release_listing_task_locks(session: Any, owner_username: str, task: ListingTaskModel) -> None:
-    try:
-        product_ids_payload = json.loads(task.product_ids_json or "[]")
-    except ValueError:
-        product_ids_payload = []
-    if isinstance(product_ids_payload, dict):
-        product_ids = product_ids_payload.get("productIds") if isinstance(product_ids_payload.get("productIds"), list) else []
-    else:
-        product_ids = product_ids_payload if isinstance(product_ids_payload, list) else []
+    product_ids = listing_task_product_ids_payload(task.product_ids_json)["productIds"]
     products = session.scalars(
         select(ProductModel).where(
             ProductModel.owner_username == owner_username,
@@ -9101,10 +9129,7 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             return
         if task_cancel_requested(task):
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-        try:
-            product_ids = json.loads(task.product_ids_json or "[]")
-        except ValueError:
-            product_ids = []
+        product_ids = listing_task_product_ids_payload(task.product_ids_json)["productIds"]
         store = session.get(StoreModel, task.store_id) if task.store_id else None
         products = session.scalars(
             select(ProductModel).where(
@@ -9294,12 +9319,7 @@ def fail_listing_task_unexpectedly(owner_username: str, task_id: str, exc: Excep
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
         if task is not None and task.owner_username == owner_username:
-            try:
-                product_ids = json.loads(task.product_ids_json or "[]")
-            except ValueError:
-                product_ids = []
-            if isinstance(product_ids, dict):
-                product_ids = product_ids.get("productIds") if isinstance(product_ids.get("productIds"), list) else []
+            product_ids = listing_task_product_ids_payload(task.product_ids_json)["productIds"]
             products = session.scalars(
                 select(ProductModel).where(
                     ProductModel.owner_username == owner_username,
@@ -9337,10 +9357,9 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             exclude_task_id=task_id,
         )
         ensure_store_task_capacity(session, task.store_id, exclude_listing_task_id=task_id)
-        try:
-            product_ids = json.loads(task.product_ids_json or "[]")
-        except ValueError:
-            product_ids = []
+        product_ids = listing_task_retry_product_ids(task)
+        if not product_ids:
+            raise RuntimeError("没有可重试的商品。")
         products = session.scalars(
             select(ProductModel).where(
                 ProductModel.owner_username == owner_username,
@@ -9352,8 +9371,12 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
                 product.listing_task_id = task_id
                 product.last_error = None
         task.status = "running"
+        task.total_count = len(product_ids)
+        task.success_count = 0
+        task.failed_count = 0
         task.message = "重新执行中"
         task.error_detail = None
+        task.product_ids_json = json.dumps(product_ids, ensure_ascii=False)
         task.started_at = datetime.now()
         task.finished_at = None
     dispatch_listing_task(owner_username, task_id)
