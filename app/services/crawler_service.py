@@ -1555,12 +1555,43 @@ def listing_task_product_ids_payload(product_ids_json: str | None) -> dict[str, 
             "productIds": normalize_listing_task_product_ids(product_ids_payload.get("productIds")),
             "successIds": normalize_listing_task_product_ids(product_ids_payload.get("successIds")),
             "failedIds": normalize_listing_task_product_ids(product_ids_payload.get("failedIds")),
+            "retryIds": normalize_listing_task_product_ids(product_ids_payload.get("retryIds")),
         }
     return {
         "productIds": normalize_listing_task_product_ids(product_ids_payload),
         "successIds": [],
         "failedIds": [],
+        "retryIds": [],
     }
+
+
+def merge_listing_task_product_ids(*groups: list[int]) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for group in groups:
+        for product_id in group:
+            if product_id in seen:
+                continue
+            seen.add(product_id)
+            result.append(product_id)
+    return result
+
+
+def listing_task_result_payload(
+    product_ids: list[int],
+    success_ids: list[int],
+    failed_ids: list[int],
+    *,
+    retry_ids: list[int] | None = None,
+) -> dict[str, list[int]]:
+    result = {
+        "productIds": normalize_listing_task_product_ids(product_ids),
+        "successIds": normalize_listing_task_product_ids(success_ids),
+        "failedIds": normalize_listing_task_product_ids(failed_ids),
+    }
+    if retry_ids is not None:
+        result["retryIds"] = normalize_listing_task_product_ids(retry_ids)
+    return result
 
 
 def listing_task_retry_product_ids(task: ListingTaskModel) -> list[int]:
@@ -9129,7 +9160,18 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             return
         if task_cancel_requested(task):
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-        product_ids = listing_task_product_ids_payload(task.product_ids_json)["productIds"]
+        product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
+        task_product_ids = product_ids_payload["productIds"]
+        retry_product_ids = product_ids_payload["retryIds"]
+        product_ids = retry_product_ids or task_product_ids
+        if not task_product_ids:
+            task_product_ids = product_ids
+        retry_product_id_set = set(retry_product_ids)
+        base_success_ids = (
+            [product_id for product_id in product_ids_payload["successIds"] if product_id not in retry_product_id_set]
+            if retry_product_ids
+            else []
+        )
         store = session.get(StoreModel, task.store_id) if task.store_id else None
         products = session.scalars(
             select(ProductModel).where(
@@ -9138,25 +9180,33 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             )
         ).all()
         if store is None:
-            task.status = "failed"
-            task.failed_count = len(products)
-            task.total_count = len(products)
+            task.status = "partial" if base_success_ids else "failed"
+            task.success_count = len(base_success_ids)
+            task.failed_count = len(product_ids)
+            task.total_count = len(task_product_ids)
             task.message = "上架店铺不存在"
             task.error_detail = task.message
             task.finished_at = datetime.now()
-            task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
+            task.product_ids_json = json.dumps(
+                listing_task_result_payload(task_product_ids, base_success_ids, product_ids),
+                ensure_ascii=False,
+            )
             for product in products:
                 product.last_error = task.message
                 clear_listing_product_lock(product, task_id)
             return
         if not store.enabled:
-            task.status = "failed"
-            task.failed_count = len(products)
-            task.total_count = len(products)
+            task.status = "partial" if base_success_ids else "failed"
+            task.success_count = len(base_success_ids)
+            task.failed_count = len(product_ids)
+            task.total_count = len(task_product_ids)
             task.message = "上架店铺已停用"
             task.error_detail = task.message
             task.finished_at = datetime.now()
-            task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
+            task.product_ids_json = json.dumps(
+                listing_task_result_payload(task_product_ids, base_success_ids, product_ids),
+                ensure_ascii=False,
+            )
             for product in products:
                 product.last_error = task.message
                 clear_listing_product_lock(product, task_id)
@@ -9164,27 +9214,34 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
         service_secret = decrypt_text(store.rakuten_service_secret_encrypted)
         license_key = decrypt_text(store.rakuten_license_key_encrypted)
         if not service_secret or not license_key:
-            task.status = "failed"
-            task.failed_count = len(products)
-            task.total_count = len(products)
+            task.status = "partial" if base_success_ids else "failed"
+            task.success_count = len(base_success_ids)
+            task.failed_count = len(product_ids)
+            task.total_count = len(task_product_ids)
             task.message = "上架店铺缺少乐天 Secret 或乐天 Key"
             task.error_detail = task.message
             task.finished_at = datetime.now()
-            task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
+            task.product_ids_json = json.dumps(
+                listing_task_result_payload(task_product_ids, base_success_ids, product_ids),
+                ensure_ascii=False,
+            )
             for product in products:
                 product.last_error = task.message
                 clear_listing_product_lock(product, task_id)
             return
-        task.total_count = len(products)
-        task.success_count = 0
-        task.failed_count = 0
-        task.message = f"上架中，已处理 0 / {len(products)} 条"
+        task.total_count = len(task_product_ids)
+        task.success_count = len(base_success_ids)
+        task.failed_count = len(product_ids) if retry_product_ids else 0
+        task.message = f"上架中，已处理 0 / {len(product_ids)} 条"
         session.flush()
         task_store_id = int(store.id)
-        total_count = len(products)
+        total_count = len(task_product_ids)
         ordered_product_ids = [int(product.id) for product in products]
+        run_total_count = len(product_ids)
+        all_product_ids = task_product_ids
+        initial_success_ids = base_success_ids
+        initial_failed_count = run_total_count if retry_product_ids else 0
 
-    success_count = 0
     failed_count = 0
     success_ids: list[int] = []
     failed_ids: list[int] = []
@@ -9215,9 +9272,9 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
         ListingTaskModel,
         task_id,
         total_count=total_count,
-        success_count=0,
-        failed_count=0,
-        message=f"上架中，已处理 0 / {total_count} 条",
+        success_count=len(initial_success_ids),
+        failed_count=initial_failed_count,
+        message=f"上架中，已处理 0 / {run_total_count} 条",
     )
 
     for index, product_id in enumerate(ordered_product_ids, start=1):
@@ -9247,7 +9304,6 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     listed_product = upsert_listed_store_product_from_listing_result(session, owner_username, product, store, listing_result)
                     session.flush()
                     record_product_listed_store(product, listed_product, store, listing_result)
-                    success_count += 1
                     success_ids.append(product.id)
                 except Exception as exc:
                     error_text = str(exc)
@@ -9258,14 +9314,20 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     errors.append(f"{productCodeForError(product)}: {error_text}")
             task = session.get(ListingTaskModel, task_id)
             if task is not None:
+                cumulative_success_ids = merge_listing_task_product_ids(initial_success_ids, success_ids)
                 task.total_count = total_count
-                task.success_count = success_count
+                task.success_count = len(cumulative_success_ids)
                 task.failed_count = failed_count
-                task.message = f"上架中，已处理 {index} / {total_count} 条"
+                task.message = f"上架中，已处理 {index} / {run_total_count} 条"
                 next_error_detail = summarize_task_errors(errors, limit=50)
                 task.error_detail = with_task_cancel_marker(next_error_detail) if task_cancel_requested(task) else next_error_detail
                 task.product_ids_json = json.dumps(
-                    {"productIds": ordered_product_ids, "successIds": success_ids, "failedIds": failed_ids},
+                    listing_task_result_payload(
+                        all_product_ids,
+                        cumulative_success_ids,
+                        failed_ids,
+                        retry_ids=retry_product_ids or None,
+                    ),
                     ensure_ascii=False,
                 )
     with session_scope() as session:
@@ -9275,19 +9337,20 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
         task = session.get(ListingTaskModel, task_id)
         if task is None:
             return
+        final_success_ids = merge_listing_task_product_ids(initial_success_ids, success_ids)
         task.total_count = total_count
-        task.success_count = success_count
+        task.success_count = len(final_success_ids)
         task.failed_count = failed_count
-        if success_count and failed_count:
+        if task.success_count and failed_count:
             task.status = "partial"
-        elif success_count:
+        elif task.success_count:
             task.status = "success"
         else:
             task.status = "failed"
-        task.message = f"完成，上架 {success_count} 条，异常 {failed_count} 条"
+        task.message = f"完成，上架 {task.success_count} 条，异常 {failed_count} 条"
         task.error_detail = "\n".join(errors[:50]) if errors else None
         task.product_ids_json = json.dumps(
-            {"productIds": ordered_product_ids, "successIds": success_ids, "failedIds": failed_ids},
+            listing_task_result_payload(all_product_ids, final_success_ids, failed_ids),
             ensure_ascii=False,
         )
         task.finished_at = datetime.now()
@@ -9319,22 +9382,32 @@ def fail_listing_task_unexpectedly(owner_username: str, task_id: str, exc: Excep
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
         if task is not None and task.owner_username == owner_username:
-            product_ids = listing_task_product_ids_payload(task.product_ids_json)["productIds"]
+            product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
+            task_product_ids = product_ids_payload["productIds"]
+            failed_ids = product_ids_payload["retryIds"] or task_product_ids
+            if not task_product_ids:
+                task_product_ids = failed_ids
+            failed_id_set = set(failed_ids)
+            success_ids = [product_id for product_id in product_ids_payload["successIds"] if product_id not in failed_id_set]
             products = session.scalars(
                 select(ProductModel).where(
                     ProductModel.owner_username == owner_username,
-                    ProductModel.id.in_(product_ids or [-1]),
+                    ProductModel.id.in_(failed_ids or [-1]),
                 )
             ).all()
             for product in products:
                 clear_listing_product_lock(product, task_id)
                 product.last_error = message
-            task.status = "failed"
-            task.failed_count = len(products)
-            task.total_count = len(products)
-            task.message = "上架失败"
+            task.status = "partial" if success_ids and failed_ids else "failed"
+            task.success_count = len(success_ids)
+            task.failed_count = len(failed_ids)
+            task.total_count = len(task_product_ids)
+            task.message = f"完成，上架 {len(success_ids)} 条，异常 {len(failed_ids)} 条" if success_ids else "上架失败"
             task.error_detail = message
-            task.product_ids_json = json.dumps({"productIds": product_ids, "successIds": [], "failedIds": product_ids}, ensure_ascii=False)
+            task.product_ids_json = json.dumps(
+                listing_task_result_payload(task_product_ids, success_ids, failed_ids),
+                ensure_ascii=False,
+            )
             task.finished_at = datetime.now()
     log_event(owner_username, task_id, "error", message)
 
@@ -9357,13 +9430,21 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             exclude_task_id=task_id,
         )
         ensure_store_task_capacity(session, task.store_id, exclude_listing_task_id=task_id)
-        product_ids = listing_task_retry_product_ids(task)
-        if not product_ids:
+        product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
+        retry_product_ids = listing_task_retry_product_ids(task)
+        if not retry_product_ids:
             raise RuntimeError("没有可重试的商品。")
+        task_product_ids = product_ids_payload["productIds"] or retry_product_ids
+        retry_product_id_set = set(retry_product_ids)
+        base_success_ids = (
+            [product_id for product_id in product_ids_payload["successIds"] if product_id not in retry_product_id_set]
+            if task.status in {"partial", "failed"} and product_ids_payload["failedIds"]
+            else []
+        )
         products = session.scalars(
             select(ProductModel).where(
                 ProductModel.owner_username == owner_username,
-                ProductModel.id.in_(product_ids or [-1]),
+                ProductModel.id.in_(retry_product_ids or [-1]),
             )
         ).all()
         for product in products:
@@ -9371,12 +9452,20 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
                 product.listing_task_id = task_id
                 product.last_error = None
         task.status = "running"
-        task.total_count = len(product_ids)
-        task.success_count = 0
-        task.failed_count = 0
+        task.total_count = len(task_product_ids)
+        task.success_count = len(base_success_ids)
+        task.failed_count = len(retry_product_ids)
         task.message = "重新执行中"
         task.error_detail = None
-        task.product_ids_json = json.dumps(product_ids, ensure_ascii=False)
+        task.product_ids_json = json.dumps(
+            listing_task_result_payload(
+                task_product_ids,
+                base_success_ids,
+                retry_product_ids,
+                retry_ids=retry_product_ids,
+            ),
+            ensure_ascii=False,
+        )
         task.started_at = datetime.now()
         task.finished_at = None
     dispatch_listing_task(owner_username, task_id)
