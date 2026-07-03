@@ -64,6 +64,7 @@ LOCAL_PRODUCT_IMAGE_URL_PREFIX = "/api/static/product-images"
 LOCAL_PRODUCT_IMAGE_DIR = settings.backend_dir / "data" / "product-images"
 LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX = "/api/static/product-image-drafts"
 LOCAL_PRODUCT_IMAGE_DRAFT_DIR = settings.backend_dir / "data" / "product-image-drafts"
+RAKUTEN_ATTRIBUTE_RULES_PATH = settings.backend_dir / "app" / "resources" / "rakuten_attribute_rules.json"
 ALLOWED_PRODUCT_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
 ALLOWED_PRODUCT_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif"}
 MAX_PRODUCT_IMAGE_BYTES = 2 * 1024 * 1024
@@ -131,7 +132,7 @@ RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES = {
     "ブランド名": "-",
     "シリーズ名": "-",
     "メーカー型番": "-",
-    "原産国／製造国": "不明",
+    "原産国／製造国": "-",
     "総本数": "1",
     "単品容量": "1",
 }
@@ -5206,11 +5207,130 @@ def patch_payload_for_attribute_errors(payload: dict[str, Any], error_text: str)
     return patched_payload
 
 
+_RAKUTEN_ATTRIBUTE_RULES_CACHE: dict[str, Any] | None = None
+
+
+def load_rakuten_attribute_rules() -> dict[str, Any]:
+    global _RAKUTEN_ATTRIBUTE_RULES_CACHE
+    if _RAKUTEN_ATTRIBUTE_RULES_CACHE is not None:
+        return _RAKUTEN_ATTRIBUTE_RULES_CACHE
+    if not RAKUTEN_ATTRIBUTE_RULES_PATH.exists():
+        _RAKUTEN_ATTRIBUTE_RULES_CACHE = {}
+        return _RAKUTEN_ATTRIBUTE_RULES_CACHE
+    try:
+        _RAKUTEN_ATTRIBUTE_RULES_CACHE = json.loads(RAKUTEN_ATTRIBUTE_RULES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        _RAKUTEN_ATTRIBUTE_RULES_CACHE = {}
+    return _RAKUTEN_ATTRIBUTE_RULES_CACHE
+
+
+def rakuten_attribute_group_rule_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    genre_id = first_text_from_keys(payload, ("genreId", "genre_id", "genre"))
+    if not genre_id:
+        return {}
+    rules = load_rakuten_attribute_rules()
+    genres = rules.get("genres") if isinstance(rules.get("genres"), dict) else {}
+    genre = genres.get(genre_id)
+    if not isinstance(genre, dict):
+        return {}
+    group_key = normalize_text(genre.get("groupKey"))
+    groups = rules.get("groups") if isinstance(rules.get("groups"), dict) else {}
+    group = groups.get(group_key)
+    return group if isinstance(group, dict) else {}
+
+
+def rakuten_attribute_rule_map_for_payload(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    group = rakuten_attribute_group_rule_for_payload(payload)
+    attributes = group.get("attributes") if isinstance(group.get("attributes"), dict) else {}
+    return {normalize_text(name): rule for name, rule in attributes.items() if isinstance(rule, dict)}
+
+
+def rakuten_attribute_rule_for_name(payload: dict[str, Any], name: str) -> dict[str, Any]:
+    return rakuten_attribute_rule_map_for_payload(payload).get(normalize_text(name), {})
+
+
+def rakuten_attribute_default_unit(payload: dict[str, Any], name: str) -> str:
+    rule = rakuten_attribute_rule_for_name(payload, name)
+    if bool(rule.get("unitRequired")):
+        unit = normalize_rakuten_attribute_unit(rule.get("unit"))
+        if unit:
+            return unit
+    return RAKUTEN_ATTRIBUTE_DEFAULT_UNITS.get(normalize_text(name), "")
+
+
+def apply_rakuten_attribute_rules_to_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    rule_map = rakuten_attribute_rule_map_for_payload(payload)
+    if not rule_map:
+        return payload
+    variants = payload.get("variants")
+    if not isinstance(variants, dict):
+        return payload
+    patched = json.loads(json.dumps(payload, ensure_ascii=False))
+    patched_variants = patched.get("variants")
+    if not isinstance(patched_variants, dict):
+        return payload
+    changed = False
+    for variant in patched_variants.values():
+        if not isinstance(variant, dict):
+            continue
+        attributes = variant.get("attributes")
+        if not isinstance(attributes, list):
+            attributes = []
+            variant["attributes"] = attributes
+        existing: dict[str, dict[str, Any]] = {}
+        for attribute in list(attributes):
+            if not isinstance(attribute, dict):
+                continue
+            name = normalize_text(attribute.get("name"))
+            if name:
+                existing[name] = attribute
+        for name, rule in rule_map.items():
+            if not bool(rule.get("required")) or name in existing:
+                continue
+            attribute = infer_missing_mandatory_attribute(name, variant, patched, rule)
+            if not attribute:
+                continue
+            attributes.append(attribute)
+            existing[name] = attribute
+            changed = True
+        for name, attribute in list(existing.items()):
+            rule = rule_map.get(name)
+            if not rule:
+                continue
+            if bool(rule.get("unitRequired")):
+                values = attribute.get("values")
+                first_value = first_text_value(values)
+                next_values, next_unit = normalize_rakuten_attribute_values_and_unit(
+                    name,
+                    first_value,
+                    normalize_text(attribute.get("unit")),
+                    default_unit=normalize_text(rule.get("unit")),
+                )
+                if next_values and next_unit:
+                    if attribute.get("values") != next_values:
+                        attribute["values"] = next_values
+                        changed = True
+                    if attribute.get("unit") != next_unit:
+                        attribute["unit"] = next_unit
+                        changed = True
+                elif not bool(rule.get("required")):
+                    attributes.remove(attribute)
+                    existing.pop(name, None)
+                    changed = True
+            elif "unit" in attribute:
+                attribute.pop("unit", None)
+                changed = True
+    return patched if changed else payload
+
+
 def patch_payload_for_missing_mandatory_attributes(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
     missing_attributes = extract_missing_mandatory_attribute_names(error_text)
+    rule_map = rakuten_attribute_rule_map_for_payload(payload)
     supported_missing_attributes = [
         attribute for attribute in missing_attributes
-        if attribute == RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE or attribute in RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES
+        if attribute == RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE
+        or attribute in RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES
+        or attribute in rule_map
     ]
     if not supported_missing_attributes:
         return payload
@@ -5233,7 +5353,7 @@ def patch_payload_for_missing_mandatory_attributes(payload: dict[str, Any], erro
         for attribute_name in supported_missing_attributes:
             if attribute_name in existing_names:
                 continue
-            attribute = infer_missing_mandatory_attribute(attribute_name, variant, patched)
+            attribute = infer_missing_mandatory_attribute(attribute_name, variant, patched, rule_map.get(attribute_name))
             if not attribute:
                 continue
             attributes.append(attribute)
@@ -5242,7 +5362,12 @@ def patch_payload_for_missing_mandatory_attributes(payload: dict[str, Any], erro
     return patched if changed else payload
 
 
-def infer_missing_mandatory_attribute(attribute_name: str, variant: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
+def infer_missing_mandatory_attribute(
+    attribute_name: str,
+    variant: dict[str, Any],
+    payload: dict[str, Any],
+    rule: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     normalized_name = normalize_text(attribute_name)
     if not normalized_name:
         return None
@@ -5262,15 +5387,28 @@ def infer_missing_mandatory_attribute(attribute_name: str, variant: dict[str, An
         value = infer_rakuten_single_capacity(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
     else:
         value = RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES.get(normalized_name, "")
+        if not value:
+            value = rakuten_attribute_fallback_value(rule or {})
     if not value:
         return None
-    values, unit = normalize_rakuten_attribute_values_and_unit(normalized_name, value, "")
+    default_unit = normalize_rakuten_attribute_unit((rule or {}).get("unit")) if bool((rule or {}).get("unitRequired")) else ""
+    values, unit = normalize_rakuten_attribute_values_and_unit(normalized_name, value, "", default_unit=default_unit)
     if not values:
         values = [normalize_text(value)]
     attribute: dict[str, Any] = {"name": normalized_name, "values": values}
     if unit:
         attribute["unit"] = unit
     return attribute
+
+
+def rakuten_attribute_fallback_value(rule: dict[str, Any]) -> str:
+    example = normalize_text(rule.get("example"))
+    if example:
+        return example
+    value_format = normalize_text(rule.get("format")).lower()
+    if value_format == "number":
+        return "1"
+    return "-"
 
 
 def rakuten_attribute_context_text(variant: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -5374,7 +5512,12 @@ def patch_payload_for_attribute_unit_errors(payload: dict[str, Any], error_text:
                     changed = True
                 continue
             if action == "require_unit":
-                next_values, next_unit = normalize_rakuten_attribute_values_and_unit(name, first_value, normalize_text(attribute.get("unit")))
+                next_values, next_unit = normalize_rakuten_attribute_values_and_unit(
+                    name,
+                    first_value,
+                    normalize_text(attribute.get("unit")),
+                    default_unit=rakuten_attribute_default_unit(payload, name),
+                )
                 if next_values and next_unit:
                     if attribute.get("values") != next_values:
                         attribute["values"] = next_values
@@ -6558,6 +6701,7 @@ def build_rakuten_item_upsert_payload(
         "variantSelectors": build_rakuten_variant_selectors(raw_payload, variants),
         "variants": variants,
     }
+    payload = apply_rakuten_attribute_rules_to_payload(payload)
     return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
 
 
@@ -6799,13 +6943,20 @@ def normalize_rakuten_attribute_value(value: Any, *, allow_placeholder: bool = F
     return normalized
 
 
-def normalize_rakuten_attribute_values_and_unit(name: str, value: str, unit: str) -> tuple[list[str], str]:
+def normalize_rakuten_attribute_values_and_unit(
+    name: str,
+    value: str,
+    unit: str,
+    *,
+    default_unit: str = "",
+) -> tuple[list[str], str]:
     normalized_name = normalize_text(name)
     normalized_value = normalize_rakuten_attribute_value(
         value,
         allow_placeholder=normalized_name in RAKUTEN_ATTRIBUTE_ALLOW_PLACEHOLDER_NAMES,
     )
     normalized_unit = normalize_rakuten_attribute_unit(unit)
+    normalized_default_unit = normalize_rakuten_attribute_unit(default_unit)
     if not normalized_value:
         return [], ""
     if normalized_name in RAKUTEN_ATTRIBUTE_TEXT_ONLY_NAMES:
@@ -6813,6 +6964,8 @@ def normalize_rakuten_attribute_values_and_unit(name: str, value: str, unit: str
     parsed_number, parsed_unit = parse_rakuten_attribute_number_and_unit(normalized_value)
     if parsed_unit and not normalized_unit:
         normalized_unit = parsed_unit
+    if not normalized_unit:
+        normalized_unit = normalized_default_unit
     if not normalized_unit:
         normalized_unit = RAKUTEN_ATTRIBUTE_DEFAULT_UNITS.get(normalized_name, "")
     if normalized_unit:
