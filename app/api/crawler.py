@@ -32,7 +32,7 @@ class CreateTaskPayload(BaseModel):
     sourceId: int | None = None
     sourceType: str | None = None
     target: str | None = None
-    rankingPeriod: str | None = Field(default=None, pattern="^(realtime|daily|weekly|monthly)$")
+    rankingPeriod: str | None = Field(default=None, pattern="^(daily|weekly|monthly)$")
     crawlLimit: int | str | None = None
     mode: str = "manual"
 
@@ -58,7 +58,7 @@ class ScheduledCrawlPayload(BaseModel):
     crawlCondition: str = ""
     sourceType: str = Field(default="keyword", pattern="^(keyword|shop|ranking|product_url)$")
     target: str = ""
-    rankingPeriod: str = Field(default="daily", pattern="^(realtime|daily|weekly|monthly)$")
+    rankingPeriod: str = Field(default="daily", pattern="^(daily|weekly|monthly)$")
     crawlLimit: int | str | None = None
     enabled: bool = True
     intervalMinutes: int = Field(default=60, ge=5, le=1440)
