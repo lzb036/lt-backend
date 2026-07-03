@@ -664,6 +664,14 @@ def list_listing_tasks(
     return {"listingTasks": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
 
 
+@router.post("/listing-tasks/preflight")
+def preflight_listing_task(payload: ListingTaskPayload, user: dict = Depends(require_products_permission)) -> dict:
+    try:
+        return crawler_service.preflight_listing_task(user["username"], payload)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/listing-tasks")
 def create_listing_task(payload: ListingTaskPayload, user: dict = Depends(require_products_permission)) -> dict:
     try:

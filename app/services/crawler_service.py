@@ -3753,6 +3753,399 @@ def cancel_crawl_task(owner_username: str, task_id: str) -> dict[str, Any]:
     return request_task_cancel(CrawlTaskModel, owner_username, task_id, serializer=task_to_public)
 
 
+def listing_preflight_issue(
+    severity: str,
+    code: str,
+    message: str,
+    *,
+    field: str = "",
+    attribute_name: str = "",
+    variant_id: str = "",
+) -> dict[str, Any]:
+    issue = {
+        "severity": severity,
+        "code": code,
+        "message": message,
+    }
+    if field:
+        issue["field"] = field
+    if attribute_name:
+        issue["attributeName"] = attribute_name
+    if variant_id:
+        issue["variantId"] = variant_id
+    return issue
+
+
+def listing_preflight_product_stub(product_id: int, issue: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "productId": product_id,
+        "productCode": str(product_id),
+        "productTitle": "",
+        "status": "blocked",
+        "issueCount": 1,
+        "blockerCount": 1 if issue.get("severity") == "blocker" else 0,
+        "warningCount": 1 if issue.get("severity") == "warning" else 0,
+        "issues": [issue],
+        "preview": {},
+    }
+
+
+def listing_preflight_product_check(product: ProductModel, store: StoreModel | None) -> dict[str, Any]:
+    raw_payload = product_raw_payload(product)
+    issues: list[dict[str, Any]] = []
+    title = first_text_from_keys(raw_payload, ("itemName", "title", "name")) or product.title
+    genre_id = first_text_from_keys(raw_payload, ("genreId", "genre_id", "genre")) or product.genre_id
+    product._listing_store_id = store.id if store is not None else 0
+
+    if not normalize_text(title):
+        issues.append(listing_preflight_issue("blocker", "missing_title", "商品标题为空，不能上架。", field="title"))
+    if not re.fullmatch(r"\d{6}", normalize_text(genre_id)):
+        issues.append(listing_preflight_issue("blocker", "invalid_genre_id", "商品缺少 6 位乐天ジャンルID。", field="genreId"))
+    elif not rakuten_attribute_group_rule_for_payload({"genreId": normalize_text(genre_id)}):
+        issues.append(
+            listing_preflight_issue(
+                "blocker",
+                "unknown_genre_id",
+                f"ジャンルID {normalize_text(genre_id)} 未匹配到本地商品属性定义书。",
+                field="genreId",
+            )
+        )
+
+    variants = build_rakuten_listing_variants(raw_payload, product)
+    if not variants:
+        issues.append(listing_preflight_issue("blocker", "missing_sku_price", "商品缺少可上架的 SKU 价格信息。", field="variants"))
+    else:
+        invalid_variant_ids = [
+            variant_id
+            for variant_id, variant in variants.items()
+            if not normalize_rakuten_price(variant.get("standardPrice") if isinstance(variant, dict) else None)
+        ]
+        for variant_id in invalid_variant_ids[:5]:
+            issues.append(
+                listing_preflight_issue(
+                    "blocker",
+                    "invalid_sku_price",
+                    f"SKU {variant_id} 价格必须为大于 0 的日元整数。",
+                    field="variants",
+                    variant_id=variant_id,
+                )
+            )
+
+    images = product_images_for_edit(product)
+    non_gif_images = [image for image in images if not is_gif_image_url(image)]
+    usable_images = [image for image in non_gif_images if not is_missing_local_product_image_url(image)]
+    if not images:
+        issues.append(listing_preflight_issue("blocker", "missing_image", "商品缺少图片，不能上架。", field="images"))
+    elif not non_gif_images:
+        issues.append(listing_preflight_issue("blocker", "only_gif_images", "商品图片全部为 GIF，上架需替换为 jpg/png。", field="images"))
+    elif not usable_images:
+        issues.append(listing_preflight_issue("blocker", "missing_local_image", "商品本地图片文件不存在或已失效。", field="images"))
+    else:
+        skipped_gif_count = len(images) - len(non_gif_images)
+        if skipped_gif_count > 0:
+            issues.append(listing_preflight_issue("warning", "gif_images_skipped", f"{skipped_gif_count} 张 GIF 图片不会参与上架。", field="images"))
+        if len(non_gif_images) > RAKUTEN_LISTING_IMAGE_LIMIT:
+            issues.append(
+                listing_preflight_issue(
+                    "warning",
+                    "image_limit_trimmed",
+                    f"商品图超过 {RAKUTEN_LISTING_IMAGE_LIMIT} 张，正式上架只会使用前 {RAKUTEN_LISTING_IMAGE_LIMIT} 张。",
+                    field="images",
+                )
+            )
+
+    description_gif_count = sum(
+        1
+        for description in product_descriptions(raw_payload)
+        for image_url in description_image_urls(description.get("value"))
+        if is_gif_image_url(image_url)
+    )
+    if description_gif_count > 0:
+        issues.append(
+            listing_preflight_issue(
+                "warning",
+                "description_gif_removed",
+                f"{description_gif_count} 张说明图 GIF 会在上架时从商品说明中移除。",
+                field="descriptions",
+            )
+        )
+
+    if not any(issue.get("severity") == "blocker" and issue.get("field") in {"title", "genreId", "variants"} for issue in issues):
+        try:
+            payload = build_rakuten_item_upsert_payload(
+                product,
+                raw_payload,
+                [],
+                manage_number=generate_listing_manage_number(product, raw_payload),
+                hide_item=True,
+            )
+        except RuntimeError as exc:
+            issues.append(listing_preflight_issue("blocker", "payload_build_failed", str(exc)))
+        else:
+            issues.extend(listing_preflight_attribute_issues(payload))
+
+    blocker_count = sum(1 for issue in issues if issue.get("severity") == "blocker")
+    warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
+    if blocker_count:
+        status = "blocked"
+    elif warning_count:
+        status = "warning"
+    else:
+        status = "passed"
+    return {
+        "productId": product.id,
+        "productCode": productCodeForError(product),
+        "productTitle": product.title,
+        "status": status,
+        "issueCount": len(issues),
+        "blockerCount": blocker_count,
+        "warningCount": warning_count,
+        "issues": issues,
+        "preview": {
+            "title": normalize_text(title),
+            "genreId": normalize_text(genre_id),
+            "variantCount": len(variants),
+            "imageCount": len(usable_images),
+            "attributeGroup": normalize_text(rakuten_attribute_group_rule_for_payload({"genreId": normalize_text(genre_id)}).get("group")),
+        },
+    }
+
+
+def listing_preflight_attribute_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    rule_map = rakuten_attribute_rule_map_for_payload(payload)
+    if not rule_map:
+        return issues
+    variants = payload.get("variants")
+    if not isinstance(variants, dict):
+        return issues
+    required_names = [name for name, rule in rule_map.items() if bool(rule.get("required"))]
+    either_required_names = rakuten_either_required_attribute_names(rule_map)
+    for variant_id, variant in variants.items():
+        if not isinstance(variant, dict):
+            continue
+        attributes = variant.get("attributes") if isinstance(variant.get("attributes"), list) else []
+        attributes_by_name = {
+            normalize_text(attribute.get("name")): attribute
+            for attribute in attributes
+            if isinstance(attribute, dict) and normalize_text(attribute.get("name"))
+        }
+        for name in required_names:
+            rule = rule_map.get(name) or {}
+            attribute = attributes_by_name.get(name)
+            if not attribute or not rakuten_attribute_has_effective_values(attribute, rule):
+                issues.append(
+                    listing_preflight_issue(
+                        "blocker",
+                        "missing_required_attribute",
+                        f"SKU {variant_id} 缺少必填属性「{name}」。",
+                        field="attributes",
+                        attribute_name=name,
+                        variant_id=normalize_text(variant_id),
+                    )
+                )
+        if either_required_names and not any(
+            name in attributes_by_name and rakuten_attribute_has_effective_values(attributes_by_name[name], rule_map.get(name) or {})
+            for name in either_required_names
+        ):
+            issues.append(
+                listing_preflight_issue(
+                    "blocker",
+                    "missing_either_required_attribute",
+                    f"SKU {variant_id} 缺少几选一必填属性：{' / '.join(either_required_names)}。",
+                    field="attributes",
+                    attribute_name=" / ".join(either_required_names),
+                    variant_id=normalize_text(variant_id),
+                )
+            )
+        for name, attribute in attributes_by_name.items():
+            rule = rule_map.get(name)
+            if not rule:
+                continue
+            values = normalize_rakuten_attribute_values_for_rule(attribute.get("values"), rule)
+            if not values:
+                if bool(rule.get("required")):
+                    issues.append(
+                        listing_preflight_issue(
+                            "blocker",
+                            "empty_required_attribute",
+                            f"SKU {variant_id} 属性「{name}」没有有效值。",
+                            field="attributes",
+                            attribute_name=name,
+                            variant_id=normalize_text(variant_id),
+                        )
+                    )
+                continue
+            if any(value in RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES for value in values) and (
+                bool(rule.get("required")) or name in either_required_names
+            ):
+                issues.append(
+                    listing_preflight_issue(
+                        "warning",
+                        "placeholder_attribute_value",
+                        f"SKU {variant_id} 属性「{name}」使用了占位值，建议补真实值。",
+                        field="attributes",
+                        attribute_name=name,
+                        variant_id=normalize_text(variant_id),
+                    )
+                )
+            if bool(rule.get("unitRequired")) and not normalize_text(attribute.get("unit")):
+                issues.append(
+                    listing_preflight_issue(
+                        "blocker",
+                        "missing_attribute_unit",
+                        f"SKU {variant_id} 属性「{name}」需要单位「{normalize_text(rule.get('unit')) or '指定单位'}」。",
+                        field="attributes",
+                        attribute_name=name,
+                        variant_id=normalize_text(variant_id),
+                    )
+                )
+            recommended_values = rule.get("recommendedValues")
+            if (
+                normalize_text(rule.get("inputMethod")) == "選択式"
+                and isinstance(recommended_values, list)
+                and recommended_values
+            ):
+                recommended_set = {normalize_text(value) for value in recommended_values if normalize_text(value)}
+                invalid_values = [value for value in values if value not in recommended_set]
+                if invalid_values:
+                    issues.append(
+                        listing_preflight_issue(
+                            "blocker",
+                            "invalid_recommended_attribute_value",
+                            f"SKU {variant_id} 属性「{name}」的值不在楽天推荐值中：{', '.join(invalid_values[:3])}。",
+                            field="attributes",
+                            attribute_name=name,
+                            variant_id=normalize_text(variant_id),
+                        )
+                    )
+    return issues
+
+
+def listing_preflight_result(
+    product_checks: list[dict[str, Any]],
+    global_issues: list[dict[str, Any]],
+) -> dict[str, Any]:
+    product_issue_count = sum(int(check.get("issueCount") or 0) for check in product_checks)
+    product_blocker_count = sum(int(check.get("blockerCount") or 0) for check in product_checks)
+    product_warning_count = sum(int(check.get("warningCount") or 0) for check in product_checks)
+    global_blocker_count = sum(1 for issue in global_issues if issue.get("severity") == "blocker")
+    global_warning_count = sum(1 for issue in global_issues if issue.get("severity") == "warning")
+    blocker_count = product_blocker_count + global_blocker_count
+    warning_count = product_warning_count + global_warning_count
+    passed_count = sum(1 for check in product_checks if check.get("status") == "passed")
+    blocked_count = sum(1 for check in product_checks if check.get("status") == "blocked")
+    warning_product_count = sum(1 for check in product_checks if check.get("status") == "warning")
+    if blocker_count:
+        message = f"体检未通过：{blocker_count} 个阻断项，{warning_count} 个警告。"
+    elif warning_count:
+        message = f"体检通过但有 {warning_count} 个警告，建议确认后再上架。"
+    else:
+        message = "体检通过，可以创建上架任务。"
+    return {
+        "canProceed": blocker_count == 0,
+        "message": message,
+        "summary": {
+            "productCount": len(product_checks),
+            "passedCount": passed_count,
+            "blockedCount": blocked_count,
+            "warningProductCount": warning_product_count,
+            "issueCount": product_issue_count + len(global_issues),
+            "blockerCount": blocker_count,
+            "warningCount": warning_count,
+        },
+        "globalIssues": global_issues,
+        "products": product_checks,
+    }
+
+
+def listing_preflight_blocking_messages(product_checks: list[dict[str, Any]], global_issues: list[dict[str, Any]] | None = None) -> list[str]:
+    messages = [
+        normalize_text(issue.get("message"))
+        for issue in (global_issues or [])
+        if issue.get("severity") == "blocker" and normalize_text(issue.get("message"))
+    ]
+    for check in product_checks:
+        product_code = normalize_text(check.get("productCode")) or str(check.get("productId") or "")
+        for issue in check.get("issues") or []:
+            if not isinstance(issue, dict) or issue.get("severity") != "blocker":
+                continue
+            message = normalize_text(issue.get("message"))
+            if message:
+                messages.append(f"{product_code}: {message}" if product_code else message)
+    return messages
+
+
+def preflight_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
+    product_ids = [int(value) for value in (getattr(payload, "productIds", None) or [])]
+    store_id = getattr(payload, "storeId", None)
+    global_issues: list[dict[str, Any]] = []
+    product_checks: list[dict[str, Any]] = []
+    if not product_ids:
+        global_issues.append(listing_preflight_issue("blocker", "missing_products", "请选择要上架的商品。"))
+    if not store_id:
+        global_issues.append(listing_preflight_issue("blocker", "missing_store", "请选择上架店铺。"))
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id) if store_id else None
+        if store_id and store is None:
+            raise RuntimeError("上架店铺不存在。")
+        if store is not None:
+            if store.owner_username != owner_username:
+                raise RuntimeError("不能使用其他用户的店铺上架。")
+            if not store.enabled:
+                global_issues.append(listing_preflight_issue("blocker", "store_disabled", "上架店铺已停用。"))
+            if not decrypt_text(store.rakuten_service_secret_encrypted) or not decrypt_text(store.rakuten_license_key_encrypted):
+                global_issues.append(listing_preflight_issue("blocker", "missing_store_credentials", "上架店铺缺少乐天 Secret 或乐天 Key。"))
+            try:
+                ensure_user_task_capacity(
+                    session,
+                    ListingTaskModel,
+                    owner_username,
+                    limit=settings.max_running_listing_tasks_per_user,
+                    label="上架",
+                )
+            except RuntimeError as exc:
+                global_issues.append(listing_preflight_issue("blocker", "user_task_capacity", str(exc)))
+            try:
+                ensure_store_task_capacity(session, int(store.id))
+            except RuntimeError as exc:
+                global_issues.append(listing_preflight_issue("blocker", "store_task_capacity", str(exc)))
+
+        products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(product_ids or [-1]),
+            )
+        ).all()
+        products_by_id = {int(product.id): product for product in products}
+        for product_id in product_ids:
+            product = products_by_id.get(int(product_id))
+            if product is None:
+                product_checks.append(
+                    listing_preflight_product_stub(
+                        int(product_id),
+                        listing_preflight_issue("blocker", "product_not_found", "商品不存在或不属于当前用户。"),
+                    )
+                )
+                continue
+            base_issues: list[dict[str, Any]] = []
+            if product.review_status not in {"approved", "listed_master"}:
+                base_issues.append(listing_preflight_issue("blocker", "invalid_review_status", "只有已审核或已上架管理商品可以创建上架任务。"))
+            if product.listing_task_id:
+                base_issues.append(listing_preflight_issue("blocker", "product_listing_locked", "商品正在上架中，请等待当前任务完成。"))
+            if store is not None and any(int(item.get("storeId") or 0) == int(store.id) for item in product_listed_stores(product_raw_payload(product))):
+                base_issues.append(listing_preflight_issue("blocker", "duplicate_store_listing", "商品已上架过该店铺，请选择其他店铺。"))
+            check = listing_preflight_product_check(product, store)
+            if base_issues:
+                check["issues"] = [*base_issues, *(check.get("issues") or [])]
+                check["issueCount"] = len(check["issues"])
+                check["blockerCount"] = sum(1 for issue in check["issues"] if issue.get("severity") == "blocker")
+                check["warningCount"] = sum(1 for issue in check["issues"] if issue.get("severity") == "warning")
+                check["status"] = "blocked" if check["blockerCount"] else ("warning" if check["warningCount"] else "passed")
+            product_checks.append(check)
+    return listing_preflight_result(product_checks, global_issues)
+
+
 def cancel_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
     return request_task_cancel(ListingTaskModel, owner_username, task_id, serializer=listing_task_to_public)
 
@@ -5505,6 +5898,14 @@ def rakuten_attribute_rule_map_for_payload(payload: dict[str, Any]) -> dict[str,
     return {normalize_text(name): rule for name, rule in attributes.items() if isinstance(rule, dict)}
 
 
+def rakuten_either_required_attribute_names(rule_map: dict[str, dict[str, Any]]) -> list[str]:
+    return [
+        name
+        for name, rule in rule_map.items()
+        if "いずれか必須" in normalize_text(rule.get("requirement"))
+    ]
+
+
 def rakuten_attribute_rule_for_name(payload: dict[str, Any], name: str) -> dict[str, Any]:
     return rakuten_attribute_rule_map_for_payload(payload).get(normalize_text(name), {})
 
@@ -5562,6 +5963,19 @@ def apply_rakuten_attribute_rules_to_payload(payload: dict[str, Any]) -> dict[st
             attributes.append(attribute)
             existing[name] = attribute
             changed = True
+        either_required_names = rakuten_either_required_attribute_names(rule_map)
+        if either_required_names and not any(
+            name in existing and rakuten_attribute_has_effective_values(existing[name], rule_map.get(name) or {})
+            for name in either_required_names
+        ):
+            for name in either_required_names:
+                attribute = infer_missing_mandatory_attribute(name, variant, patched, rule_map.get(name))
+                if not attribute:
+                    continue
+                attributes.append(attribute)
+                existing[name] = attribute
+                changed = True
+                break
         for name, attribute in list(existing.items()):
             rule = rule_map.get(name)
             if not rule:
@@ -5747,6 +6161,33 @@ def normalize_rakuten_attribute_values_for_rule(values: Any, rule: dict[str, Any
     return unique_values
 
 
+def rakuten_attribute_has_effective_values(attribute: dict[str, Any], rule: dict[str, Any]) -> bool:
+    if not isinstance(attribute, dict):
+        return False
+    values = normalize_rakuten_attribute_values_for_rule(attribute.get("values"), rule)
+    if not values:
+        return False
+    if bool(rule.get("unitRequired")):
+        value = first_text_value(values)
+        default_unit = normalize_rakuten_attribute_unit(rule.get("unit"))
+        normalized_values, normalized_unit = normalize_rakuten_attribute_values_and_unit(
+            normalize_text(attribute.get("name") or rule.get("name")),
+            value,
+            normalize_text(attribute.get("unit")),
+            default_unit=default_unit,
+        )
+        return bool(normalized_values and normalized_unit)
+    recommended_values = rule.get("recommendedValues")
+    if (
+        normalize_text(rule.get("inputMethod")) == "選択式"
+        and isinstance(recommended_values, list)
+        and recommended_values
+    ):
+        recommended_set = {normalize_text(value) for value in recommended_values if normalize_text(value)}
+        return all(value in recommended_set for value in values)
+    return True
+
+
 def rakuten_attribute_rule_int(rule: dict[str, Any], key: str) -> int:
     text = normalize_text(rule.get(key))
     if not text:
@@ -5781,6 +6222,12 @@ def infer_missing_mandatory_attribute(
         value = infer_rakuten_origin_country(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
     elif normalized_name == "総本数":
         value = infer_rakuten_total_count(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
+    elif normalized_name == "総個数":
+        value = infer_rakuten_total_count(variant, payload) or rakuten_attribute_fallback_value(rule or {})
+    elif normalized_name == "総重量":
+        value = infer_rakuten_total_weight(variant, payload) or rakuten_attribute_fallback_value(rule or {})
+    elif normalized_name == "総容量":
+        value = infer_rakuten_total_capacity(variant, payload) or rakuten_attribute_fallback_value(rule or {})
     elif normalized_name == "単品容量":
         value = infer_rakuten_single_capacity(variant, payload) or RAKUTEN_MANDATORY_ATTRIBUTE_FALLBACK_VALUES[normalized_name]
     else:
@@ -5867,6 +6314,18 @@ def infer_rakuten_total_count(variant: dict[str, Any], payload: dict[str, Any]) 
     context = unicodedata.normalize("NFKC", rakuten_attribute_context_text(variant, payload))
     match = re.search(r"([1-9][0-9]{0,2})\s*(?:本|個|枚|袋|箱|セット)", context)
     return match.group(1) if match else ""
+
+
+def infer_rakuten_total_weight(variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    context = unicodedata.normalize("NFKC", rakuten_attribute_context_text(variant, payload))
+    match = re.search(r"([1-9][0-9]{0,5}(?:\.[0-9]+)?)\s*(kg|KG|Kg|g|G|グラム|キログラム)", context)
+    if not match:
+        return ""
+    return f"{match.group(1)}{match.group(2)}"
+
+
+def infer_rakuten_total_capacity(variant: dict[str, Any], payload: dict[str, Any]) -> str:
+    return infer_rakuten_single_capacity(variant, payload)
 
 
 def infer_rakuten_single_capacity(variant: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -8262,6 +8721,8 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
             raise RuntimeError("不能使用其他用户的店铺上架。")
         if not store.enabled:
             raise RuntimeError("上架店铺已停用。")
+        if not decrypt_text(store.rakuten_service_secret_encrypted) or not decrypt_text(store.rakuten_license_key_encrypted):
+            raise RuntimeError("上架店铺缺少乐天 Secret 或乐天 Key。")
         products = session.scalars(
             select(ProductModel).where(
                 ProductModel.owner_username == owner_username,
@@ -8285,6 +8746,12 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
         if duplicated_products:
             names = "、".join(productCodeForError(product) for product in duplicated_products[:5])
             raise RuntimeError(f"以下商品已上架过该店铺，请选择其他店铺：{names}")
+        preflight_checks = [listing_preflight_product_check(product, store) for product in products]
+        preflight_blockers = listing_preflight_blocking_messages(preflight_checks)
+        if preflight_blockers:
+            detail = "；".join(preflight_blockers[:5])
+            suffix = "；更多问题请先执行上架前体检。" if len(preflight_blockers) > 5 else ""
+            raise RuntimeError(f"上架前体检未通过：{detail}{suffix}")
         task_id = uuid.uuid4().hex
         for product in products:
             product.listing_task_id = task_id
