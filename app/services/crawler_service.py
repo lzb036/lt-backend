@@ -247,7 +247,9 @@ RAKUTEN_REPRESENTATIVE_COLOR_ALLOWED_VALUES = {
     "パープル",
     "ブラウン",
     "ベージュ",
-    "クリア",
+    "カーキグリーン",
+    "ワインレッド",
+    "透明",
     "マルチカラー",
 }
 SINGLE_PRODUCT_VARIANT_ID = "default"
@@ -285,6 +287,9 @@ RAKUTEN_COLOR_VALUE_MAP = {
     "イエロー": "イエロー",
     "黄": "イエロー",
     "yellow": "イエロー",
+    "カーキグリーン": "カーキグリーン",
+    "カーキ": "カーキグリーン",
+    "khaki": "カーキグリーン",
     "グリーン": "グリーン",
     "緑": "グリーン",
     "green": "グリーン",
@@ -297,18 +302,23 @@ RAKUTEN_COLOR_VALUE_MAP = {
     "パープル": "パープル",
     "紫": "パープル",
     "purple": "パープル",
+    "ワインレッド": "ワインレッド",
+    "ボルドー": "ワインレッド",
+    "バーガンディ": "ワインレッド",
+    "wine": "ワインレッド",
+    "bordeaux": "ワインレッド",
+    "burgundy": "ワインレッド",
     "ブラウン": "ブラウン",
     "茶": "ブラウン",
     "brown": "ブラウン",
     "ベージュ": "ベージュ",
     "beige": "ベージュ",
-    "クリア": "クリア",
-    "透明": "クリア",
-    "clear": "クリア",
+    "クリア": "透明",
+    "透明": "透明",
+    "無色": "透明",
+    "clear": "透明",
     "アイボリー": "ホワイト",
     "ivory": "ホワイト",
-    "カーキ": "グリーン",
-    "khaki": "グリーン",
     "マルチ": "マルチカラー",
     "ミックス": "マルチカラー",
     "複数色": "マルチカラー",
@@ -4459,7 +4469,7 @@ def list_stores(
         return paginate_query(
             session,
             query,
-            order_by=StoreModel.created_at.desc(),
+            order_by=StoreModel.id.asc(),
             page=page,
             page_size=page_size,
             response_key="stores",
@@ -5289,7 +5299,7 @@ def verify_all_stores(owner_username: str) -> dict[str, Any]:
         rows = session.scalars(
             select(StoreModel)
             .where(StoreModel.owner_username == owner_username)
-            .order_by(StoreModel.created_at.desc())
+            .order_by(StoreModel.id.asc())
         ).all()
         for row in rows:
             try:
