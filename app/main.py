@@ -61,6 +61,12 @@ def health() -> dict[str, object]:
             "productImageDraftRetentionDays": settings.product_image_draft_retention_days,
             "taskQueueMode": settings.task_queue_mode,
             "taskQueueName": settings.task_queue_name,
+            "taskQueueNames": {
+                "crawl": settings.task_queue_crawl_name,
+                "sync": settings.task_queue_sync_name,
+                "listing": settings.task_queue_listing_name,
+                "schedule": settings.task_queue_schedule_name,
+            },
             "crawlerBatchSize": settings.crawler_batch_size,
             "crawlerBatchPauseSeconds": settings.crawler_batch_pause_seconds,
         },

@@ -27,7 +27,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
-from app.core.task_queue import enqueue_task
+from app.core.task_queue import enqueue_task, task_queue_name_for_kind
 from app.db.database import session_scope
 from app.db.models import (
     CrawlLogModel,
@@ -386,7 +386,12 @@ class TaskCancelled(RuntimeError):
 def dispatch_crawl_task(task_id: str) -> None:
     if should_use_redis_task_queue():
         try:
-            enqueue_task(run_task, task_id, description=f"采集任务 {task_id}")
+            enqueue_task(
+                run_task,
+                task_id,
+                description=f"采集任务 {task_id}",
+                queue_name=task_queue_name_for_kind("crawl"),
+            )
         except Exception as exc:
             mark_background_task_dispatch_failed(CrawlTaskModel, task_id, exc)
             raise
@@ -403,6 +408,7 @@ def dispatch_sync_task(owner_username: str, task_id: str) -> None:
                 owner_username,
                 task_id,
                 description=f"同步任务 {task_id}",
+                queue_name=task_queue_name_for_kind("sync"),
             )
         except Exception as exc:
             mark_background_task_dispatch_failed(SyncTaskModel, task_id, exc)
@@ -420,6 +426,7 @@ def dispatch_listing_task(owner_username: str, task_id: str) -> None:
                 owner_username,
                 task_id,
                 description=f"上架任务 {task_id}",
+                queue_name=task_queue_name_for_kind("listing"),
             )
         except Exception as exc:
             mark_background_task_dispatch_failed(ListingTaskModel, task_id, exc)
@@ -438,6 +445,7 @@ def dispatch_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
                 schedule_id,
                 job_id=f"schedule-{schedule_id}-{uuid.uuid4().hex[:8]}",
                 description=f"定时采集 {schedule_id}",
+                queue_name=task_queue_name_for_kind("schedule"),
             )
         except Exception as exc:
             mark_scheduled_crawl_dispatch_failed(schedule_id, exc)
@@ -461,6 +469,8 @@ def mark_background_task_dispatch_failed(model: Any, task_id: str, exc: Exceptio
         task.message = "任务投递失败"
         task.error_detail = f"Redis 队列投递失败：{exc}"
         task.finished_at = datetime.now()
+        if model is ListingTaskModel:
+            release_listing_task_locks(session, task.owner_username, task)
 
 
 def mark_scheduled_crawl_dispatch_failed(schedule_id: int, exc: Exception) -> None:
@@ -5256,10 +5266,10 @@ def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
             exclude_task_id=task_id,
         )
         ensure_store_task_capacity(session, task.store_id, exclude_sync_task_id=task_id)
-        task.status = "running"
-        task.message = "重新同步中"
+        task.status = "queued"
+        task.message = "等待重新同步"
         task.error_detail = None
-        task.started_at = datetime.now()
+        task.started_at = None
         task.finished_at = None
     dispatch_sync_task(owner_username, task_id)
     with session_scope() as session:
@@ -9130,13 +9140,12 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
             owner_username=owner_username,
             store_id=store.id,
             task_name=task_name or f"上架任务 {datetime.now():%Y-%m-%d %H:%M}",
-            status="running",
+            status="queued",
             total_count=len(products),
             success_count=0,
             failed_count=0,
             product_ids_json=json.dumps([product.id for product in products], ensure_ascii=False),
-            message="正在同步到乐天",
-            started_at=datetime.now(),
+            message="等待同步到乐天",
         )
         session.add(task)
         session.flush()
@@ -9167,6 +9176,11 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             return
         if task_cancel_requested(task):
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+        task.status = "running"
+        task.message = "上架准备中"
+        task.error_detail = None
+        task.started_at = datetime.now()
+        task.finished_at = None
         product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
         task_product_ids = product_ids_payload["productIds"]
         retry_product_ids = product_ids_payload["retryIds"]
@@ -9458,11 +9472,11 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             if product.review_status in {"approved", "listed_master"} and not product.listing_task_id:
                 product.listing_task_id = task_id
                 product.last_error = None
-        task.status = "running"
+        task.status = "queued"
         task.total_count = len(task_product_ids)
         task.success_count = len(base_success_ids)
         task.failed_count = len(retry_product_ids)
-        task.message = "重新执行中"
+        task.message = "等待重新上架"
         task.error_detail = None
         task.product_ids_json = json.dumps(
             listing_task_result_payload(
@@ -9473,7 +9487,7 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             ),
             ensure_ascii=False,
         )
-        task.started_at = datetime.now()
+        task.started_at = None
         task.finished_at = None
     dispatch_listing_task(owner_username, task_id)
     with session_scope() as session:

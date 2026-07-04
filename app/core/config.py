@@ -87,6 +87,10 @@ class Settings(BaseModel):
     task_queue_mode: str = "thread"
     redis_url: str = "redis://127.0.0.1:6379/0"
     task_queue_name: str = "lt-tasks"
+    task_queue_crawl_name: str = "lt-tasks-crawl"
+    task_queue_sync_name: str = "lt-tasks-sync"
+    task_queue_listing_name: str = "lt-tasks-listing"
+    task_queue_schedule_name: str = "lt-tasks-schedule"
     task_queue_job_timeout_seconds: int = 60 * 60
     task_queue_result_ttl_seconds: int = 24 * 60 * 60
     task_queue_failure_ttl_seconds: int = 7 * 24 * 60 * 60
@@ -156,7 +160,11 @@ def build_settings() -> Settings:
         product_image_draft_retention_days=max(1, _env_int("LT_PRODUCT_IMAGE_DRAFT_RETENTION_DAYS", 7)),
         task_queue_mode=_env_text("LT_TASK_QUEUE_MODE", "thread").lower() or "thread",
         redis_url=_env_text("LT_REDIS_URL", "redis://127.0.0.1:6379/0"),
-        task_queue_name=_env_text("LT_TASK_QUEUE_NAME", "lt-tasks"),
+        task_queue_name=(base_task_queue_name := _env_text("LT_TASK_QUEUE_NAME", "lt-tasks")),
+        task_queue_crawl_name=_env_text("LT_TASK_QUEUE_CRAWL_NAME", f"{base_task_queue_name}-crawl"),
+        task_queue_sync_name=_env_text("LT_TASK_QUEUE_SYNC_NAME", f"{base_task_queue_name}-sync"),
+        task_queue_listing_name=_env_text("LT_TASK_QUEUE_LISTING_NAME", f"{base_task_queue_name}-listing"),
+        task_queue_schedule_name=_env_text("LT_TASK_QUEUE_SCHEDULE_NAME", f"{base_task_queue_name}-schedule"),
         task_queue_job_timeout_seconds=max(60, _env_int("LT_TASK_QUEUE_JOB_TIMEOUT_SECONDS", 60 * 60)),
         task_queue_result_ttl_seconds=max(0, _env_int("LT_TASK_QUEUE_RESULT_TTL_SECONDS", 24 * 60 * 60)),
         task_queue_failure_ttl_seconds=max(60, _env_int("LT_TASK_QUEUE_FAILURE_TTL_SECONDS", 7 * 24 * 60 * 60)),
