@@ -598,6 +598,10 @@ def resolve_crawl_task_status(status: str, total_count: int, success_count: int,
 def product_to_public(row: ProductModel) -> dict[str, Any]:
     listed_at = product_listed_at_text(row)
     raw_payload = product_raw_payload(row)
+    shop_code = product_shop_code(row, raw_payload)
+    image_urls = product_editable_image_urls(raw_payload, shop_code=shop_code)
+    if row.image_url and row.image_url not in image_urls:
+        image_urls.insert(0, row.image_url)
     price_range = price_range_from_rakuten_item(raw_payload)
     fallback_price = float(row.price) if row.price is not None else None
     price_min = price_range[0] if price_range else fallback_price
@@ -621,6 +625,7 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "itemNumber": row.item_number,
         "shopName": row.shop_name,
         "imageUrl": row.image_url,
+        "images": image_urls,
         "price": price_min,
         "priceMin": price_min,
         "priceMax": price_max,
