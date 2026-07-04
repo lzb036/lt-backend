@@ -60,6 +60,7 @@ RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 RAKUTEN_WRITE_MAX_RETRIES = 3
 RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT = 400
+_TASK_DETAIL_UNSET = object()
 LOCAL_PRODUCT_IMAGE_URL_PREFIX = "/api/static/product-images"
 LOCAL_PRODUCT_IMAGE_DIR = settings.backend_dir / "data" / "product-images"
 LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX = "/api/static/product-image-drafts"
@@ -1679,6 +1680,8 @@ def update_task_progress(
     warning_count: int | None = None,
     message: str | None = None,
     status: str | None = None,
+    error_detail: Any = _TASK_DETAIL_UNSET,
+    warning_detail: Any = _TASK_DETAIL_UNSET,
 ) -> None:
     last_error: OperationalError | None = None
     for attempt in range(3):
@@ -1700,6 +1703,10 @@ def update_task_progress(
                     task.message = message
                 if status is not None and not cancel_requested:
                     task.status = status
+                if error_detail is not _TASK_DETAIL_UNSET and hasattr(task, "error_detail"):
+                    task.error_detail = with_task_cancel_marker(error_detail) if cancel_requested else error_detail
+                if warning_detail is not _TASK_DETAIL_UNSET and hasattr(task, "warning_detail"):
+                    task.warning_detail = warning_detail
             return
         except OperationalError as exc:
             last_error = exc
@@ -9698,6 +9705,13 @@ def run_task(task_id: str) -> None:
     total_count = 0
     errors: list[str] = []
     warnings: list[str] = []
+
+    def current_error_detail() -> str | None:
+        return summarize_task_errors(errors, limit=50)
+
+    def current_warning_detail() -> str | None:
+        return summarize_task_errors(warnings, limit=50, item_label="警告")
+
     with session_scope() as session:
         task = session.get(CrawlTaskModel, task_id)
         if task is None:
@@ -9735,9 +9749,17 @@ def run_task(task_id: str) -> None:
             failed_count=0,
             warning_count=0,
             message=f"采集中，已处理 0 / {total_count} 条",
+            error_detail=current_error_detail(),
+            warning_detail=current_warning_detail(),
         )
         if not items:
             errors.append("未采集到商品，请检查采集内容、榜单时间或乐天页面结构。")
+            update_task_progress(
+                CrawlTaskModel,
+                task_id,
+                error_detail=current_error_detail(),
+                warning_detail=current_warning_detail(),
+            )
         batch_size = max(1, int(settings.crawler_batch_size))
         processed_count = 0
         batches = list(chunk_items(items, batch_size))
@@ -9774,6 +9796,8 @@ def run_task(task_id: str) -> None:
                     failed_count=failed_count,
                     warning_count=warning_count,
                     message=f"采集中，批次 {batch_index} / {len(batches)}，已处理 {processed_count} / {total_count} 条",
+                    error_detail=current_error_detail(),
+                    warning_detail=current_warning_detail(),
                 )
             if batch_index < len(batches) and settings.crawler_batch_pause_seconds > 0:
                 raise_if_task_cancelled(CrawlTaskModel, task_id)
@@ -9788,8 +9812,8 @@ def run_task(task_id: str) -> None:
             task.status = resolve_crawl_task_status("failed" if not items else "success", len(items), success_count, failed_count)
             task.finished_at = datetime.now()
             task.message = f"完成，采集 {len(items)} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条"
-            task.error_detail = summarize_task_errors(errors)
-            task.warning_detail = summarize_task_errors(warnings, item_label="警告")
+            task.error_detail = current_error_detail()
+            task.warning_detail = current_warning_detail()
         log_event(owner_username, task_id, "info", f"任务完成，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条商品")
     except TaskCancelled:
         with session_scope() as session:
@@ -9807,18 +9831,20 @@ def run_task(task_id: str) -> None:
             task.warning_detail = cancelled_task_warning_detail(warnings, task.warning_detail)
         log_event(owner_username, task_id, "info", TASK_CANCELLED_MESSAGE)
     except Exception as exc:
+        error_text = str(exc)
+        errors.append(error_text)
         with session_scope() as session:
             task = session.get(CrawlTaskModel, task_id)
             if task is None:
                 return
             task.status = "failed"
-            task.failed_count = 1
-            task.warning_count = 0
+            task.failed_count = max(1, failed_count)
+            task.warning_count = warning_count
             task.finished_at = datetime.now()
             task.message = "采集失败"
-            task.error_detail = str(exc)
-            task.warning_detail = None
-        log_event(owner_username, task_id, "error", str(exc))
+            task.error_detail = current_error_detail()
+            task.warning_detail = current_warning_detail()
+        log_event(owner_username, task_id, "error", error_text)
 
 
 def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any]) -> dict[str, Any]:
