@@ -61,6 +61,7 @@ RAKUTEN_WRITE_MAX_RETRIES = 3
 RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT = 400
 _TASK_DETAIL_UNSET = object()
+_STORE_SNAPSHOT_UNSET = object()
 LOCAL_PRODUCT_IMAGE_URL_PREFIX = "/api/static/product-images"
 LOCAL_PRODUCT_IMAGE_DIR = settings.backend_dir / "data" / "product-images"
 LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX = "/api/static/product-image-drafts"
@@ -614,6 +615,7 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "listedStores": product_listed_stores(raw_payload),
         "storeLastSeenAt": row.store_last_seen_at.isoformat(sep=" ") if row.store_last_seen_at else None,
         "title": row.title,
+        "tagline": product_tagline(raw_payload),
         "sourceUrl": row.source_url,
         "rakutenItemUrl": product_rakuten_item_url(row, raw_payload),
         "itemNumber": row.item_number,
@@ -1623,7 +1625,39 @@ def listing_task_retry_product_ids(task: ListingTaskModel) -> list[int]:
     return product_ids_payload["productIds"]
 
 
-def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
+def listing_task_store_snapshot(row: StoreModel | None) -> dict[str, str]:
+    if row is None:
+        return {"storeCode": "", "storeName": "", "aliasName": ""}
+    return {
+        "storeCode": row.store_code,
+        "storeName": row.store_name,
+        "aliasName": row.alias_name,
+    }
+
+
+def listing_task_store_snapshot_by_id(store_id: int | None) -> dict[str, str]:
+    if not store_id:
+        return listing_task_store_snapshot(None)
+    with session_scope() as session:
+        return listing_task_store_snapshot(session.get(StoreModel, store_id))
+
+
+def listing_task_store_snapshots(session: Any, rows: list[ListingTaskModel]) -> dict[int, dict[str, str]]:
+    store_ids = sorted({int(row.store_id) for row in rows if row.store_id})
+    if not store_ids:
+        return {}
+    stores = session.scalars(select(StoreModel).where(StoreModel.id.in_(store_ids))).all()
+    return {int(store.id): listing_task_store_snapshot(store) for store in stores}
+
+
+def listing_task_to_public(
+    row: ListingTaskModel,
+    store_snapshot: dict[str, str] | object = _STORE_SNAPSHOT_UNSET,
+) -> dict[str, Any]:
+    if store_snapshot is _STORE_SNAPSHOT_UNSET:
+        store_snapshot = listing_task_store_snapshot_by_id(row.store_id)
+    if not isinstance(store_snapshot, dict):
+        store_snapshot = listing_task_store_snapshot(None)
     product_ids_payload = listing_task_product_ids_payload(row.product_ids_json)
     product_ids = product_ids_payload["productIds"]
     success_ids = product_ids_payload["successIds"]
@@ -1632,6 +1666,9 @@ def listing_task_to_public(row: ListingTaskModel) -> dict[str, Any]:
         "id": row.id,
         "ownerUsername": row.owner_username,
         "storeId": row.store_id,
+        "storeCode": store_snapshot.get("storeCode", ""),
+        "storeName": store_snapshot.get("storeName", ""),
+        "aliasName": store_snapshot.get("aliasName", ""),
         "taskName": row.task_name,
         "status": row.status,
         "totalCount": row.total_count,
@@ -9062,15 +9099,35 @@ def listing_status_result_summary(result: dict[str, Any], total_count: int, *, c
 def list_listing_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         query = select(ListingTaskModel).where(ListingTaskModel.owner_username == owner_username)
-        return paginate_query(
-            session,
-            query,
-            order_by=ListingTaskModel.created_at.desc(),
-            page=page,
-            page_size=page_size,
-            response_key="listingTasks",
-            serializer=listing_task_to_public,
-        )
+        normalized_page, normalized_page_size = normalize_page_params(page, page_size)
+        order_by = ListingTaskModel.created_at.desc()
+        if not normalized_page_size:
+            rows = session.scalars(query.order_by(order_by)).all()
+            store_snapshots = listing_task_store_snapshots(session, rows)
+            return [
+                listing_task_to_public(row, store_snapshots.get(row.store_id, listing_task_store_snapshot(None)))
+                for row in rows
+            ]
+
+        total = int(session.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0)
+        if total:
+            max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+            normalized_page = min(normalized_page, max_page)
+        rows = session.scalars(
+            query.order_by(order_by)
+            .offset((normalized_page - 1) * normalized_page_size)
+            .limit(normalized_page_size)
+        ).all()
+        store_snapshots = listing_task_store_snapshots(session, rows)
+        return {
+            "listingTasks": [
+                listing_task_to_public(row, store_snapshots.get(row.store_id, listing_task_store_snapshot(None)))
+                for row in rows
+            ],
+            "total": total,
+            "page": normalized_page,
+            "pageSize": normalized_page_size,
+        }
 
 
 def delete_listing_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
