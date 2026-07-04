@@ -4366,6 +4366,10 @@ def cancel_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
     return request_task_cancel(SyncTaskModel, owner_username, task_id, serializer=sync_task_to_public)
 
 
+def listing_task_cancel_requested(task_id: str) -> bool:
+    return is_task_cancel_requested(ListingTaskModel, task_id)
+
+
 def request_task_cancel(model: Any, owner_username: str, task_id: str, *, serializer: Callable[[Any], dict[str, Any]]) -> dict[str, Any]:
     with session_scope() as session:
         task = session.get(model, task_id)
@@ -4394,7 +4398,9 @@ def request_task_cancel(model: Any, owner_username: str, task_id: str, *, serial
 
 
 def release_listing_task_locks(session: Any, owner_username: str, task: ListingTaskModel) -> None:
-    product_ids = listing_task_product_ids_payload(task.product_ids_json)["productIds"]
+    product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
+    success_ids = set(product_ids_payload["successIds"])
+    product_ids = [product_id for product_id in product_ids_payload["productIds"] if product_id not in success_ids]
     products = session.scalars(
         select(ProductModel).where(
             ProductModel.owner_username == owner_username,
@@ -6103,6 +6109,17 @@ def sanitize_rakuten_payload_text(value: Any) -> Any:
     return value
 
 
+def sanitize_rakuten_image_alt(value: Any, *, max_length: int = 255) -> str:
+    text = unescape(str(value or ""))
+    if not text:
+        return ""
+    soup = BeautifulSoup(text, "lxml")
+    text = soup.get_text(" ", strip=True)
+    text = re.sub(r"<[^>]*>", " ", text)
+    text = normalize_rakuten_machine_dependent_characters(normalize_text(text))
+    return truncate_text(text, max_length)
+
+
 def patch_payload_for_machine_dependent_character_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:
     paths = extract_machine_dependent_character_error_paths(error_text)
     if not paths:
@@ -7037,6 +7054,7 @@ def create_store_product_on_rakuten(
     store: StoreModel,
     product: ProductModel,
     cabinet_context: dict[str, Any] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     raw_payload = product_raw_payload(product)
     product._listing_store_id = store.id
@@ -7046,6 +7064,8 @@ def create_store_product_on_rakuten(
     item_write_started = False
     payload: dict[str, Any] = {}
     try:
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         payload = build_rakuten_item_upsert_payload(
             product,
             raw_payload,
@@ -7053,8 +7073,12 @@ def create_store_product_on_rakuten(
             manage_number=manage_number,
             hide_item=True,
         )
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         payload = put_rakuten_item_with_attribute_retry(service_secret, license_key, manage_number, payload)
         item_write_started = True
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         uploaded_product_images = upload_product_images_to_rakuten(
             service_secret,
             license_key,
@@ -7062,7 +7086,10 @@ def create_store_product_on_rakuten(
             product,
             manage_number,
             cabinet_context=cabinet_context,
+            cancel_check=cancel_check,
         )
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         description_result = upload_product_description_images_to_rakuten(
             service_secret,
             license_key,
@@ -7071,9 +7098,12 @@ def create_store_product_on_rakuten(
             manage_number,
             raw_payload,
             cabinet_context=cabinet_context,
+            cancel_check=cancel_check,
         )
         raw_payload = description_result["rawPayload"]
         uploaded_description_images = description_result["uploadedImages"]
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         payload = build_rakuten_item_upsert_payload(
             product,
             raw_payload,
@@ -7081,14 +7111,31 @@ def create_store_product_on_rakuten(
             manage_number=manage_number,
             hide_item=True,
         )
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         payload = put_rakuten_item_with_attribute_retry(service_secret, license_key, manage_number, payload)
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         inventory_payloads = build_rakuten_inventory_upsert_payloads(
             manage_number,
             payload.get("variants") if isinstance(payload.get("variants"), dict) else {},
         )
         bulk_upsert_rakuten_inventories(service_secret, license_key, inventory_payloads)
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         patch_rakuten_item_visibility(service_secret, license_key, manage_number, hide_item=False)
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         payload["hideItem"] = False
+    except TaskCancelled:
+        if item_write_started:
+            try:
+                delete_rakuten_item(service_secret, license_key, manage_number)
+            except Exception:
+                pass
+        uploaded_images_for_rollback = [*uploaded_product_images, *uploaded_description_images]
+        rollback_uploaded_listing_images(service_secret, license_key, uploaded_images_for_rollback)
+        raise
     except Exception as exc:
         if item_write_started:
             try:
@@ -7384,6 +7431,7 @@ def upload_product_images_to_rakuten(
     manage_number: str,
     cabinet_context: dict[str, Any] | None = None,
     source_images: list[str] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> list[dict[str, str]]:
     images = [
         image for image in recover_missing_local_product_images(product, source_images or product_images_for_edit(product))
@@ -7403,8 +7451,11 @@ def upload_product_images_to_rakuten(
     folder_path = normalize_text(cabinet_folder.get("directoryName") or cabinet_folder.get("folderPath") or cabinet_folder.get("folderName"))
     if not folder_id or not folder_path:
         raise RuntimeError("R-Cabinet 上架文件夹不可用。")
+    image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
         for index, image_url in enumerate(images, start=1):
+            if cancel_check and cancel_check():
+                raise TaskCancelled(TASK_CANCELLED_MESSAGE)
             try:
                 image_data = prepare_rakuten_cabinet_image(
                     load_product_image_bytes(
@@ -7419,6 +7470,8 @@ def upload_product_images_to_rakuten(
                 if should_skip_listing_image_error(exc):
                     continue
                 raise
+            if cancel_check and cancel_check():
+                raise TaskCancelled(TASK_CANCELLED_MESSAGE)
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="p")
             file_name = normalize_cabinet_file_name(f"{product.title[:24]}-{index}")
@@ -7437,7 +7490,7 @@ def upload_product_images_to_rakuten(
                 {
                     "type": "CABINET",
                     "location": location,
-                    "alt": product.title[:255],
+                    "alt": image_alt,
                     "fileId": str(result.get("fileId") or ""),
                     "folderId": str(folder_id),
                     "folderPath": folder_path,
@@ -7445,6 +7498,11 @@ def upload_product_images_to_rakuten(
                     "fileUrl": result.get("fileUrl") or build_rakuten_cabinet_image_url(store.store_code, location),
                 }
             )
+            if cancel_check and cancel_check():
+                raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+    except TaskCancelled:
+        rollback_uploaded_listing_images(service_secret, license_key, uploaded_images)
+        raise
     except Exception as exc:
         rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_images)
         if rollback_message:
@@ -7464,6 +7522,7 @@ def upload_product_description_images_to_rakuten(
     manage_number: str,
     raw_payload: dict[str, Any],
     cabinet_context: dict[str, Any] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     description_items = product_descriptions(raw_payload)
     all_description_image_urls = unique_texts([
@@ -7497,8 +7556,11 @@ def upload_product_description_images_to_rakuten(
     folder_path = normalize_text(cabinet_folder.get("directoryName") or cabinet_folder.get("folderPath") or cabinet_folder.get("folderName"))
     if not folder_id or not folder_path:
         raise RuntimeError("R-Cabinet 上架说明图文件夹不可用。")
+    image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
         for index, image_url in enumerate(image_urls, start=1):
+            if cancel_check and cancel_check():
+                raise TaskCancelled(TASK_CANCELLED_MESSAGE)
             try:
                 image_data = prepare_rakuten_cabinet_image(
                     load_product_image_bytes(
@@ -7515,6 +7577,8 @@ def upload_product_description_images_to_rakuten(
                     removed_image_urls.append(image_url)
                     continue
                 raise
+            if cancel_check and cancel_check():
+                raise TaskCancelled(TASK_CANCELLED_MESSAGE)
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="d")
             file_name = normalize_cabinet_file_name(f"{product.title[:20]}-说明-{index}")
@@ -7534,7 +7598,7 @@ def upload_product_description_images_to_rakuten(
                 {
                     "type": "CABINET_DESCRIPTION",
                     "location": location,
-                    "alt": product.title[:255],
+                    "alt": image_alt,
                     "fileId": str(result.get("fileId") or ""),
                     "folderId": str(folder_id),
                     "folderPath": folder_path,
@@ -7543,6 +7607,11 @@ def upload_product_description_images_to_rakuten(
                 }
             )
             replacement_map[image_url] = file_url
+            if cancel_check and cancel_check():
+                raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+    except TaskCancelled:
+        rollback_uploaded_listing_images(service_secret, license_key, uploaded_images)
+        raise
     except Exception as exc:
         rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_images)
         if rollback_message:
@@ -8143,7 +8212,8 @@ def build_rakuten_listing_images(uploaded_images: list[dict[str, str]], title: s
         location = normalize_rakuten_item_image_location(image.get("location"))
         if not location:
             continue
-        images.append({"type": "CABINET", "location": location, "alt": image.get("alt") or title[:255]})
+        alt = sanitize_rakuten_image_alt(image.get("alt") or title) or "商品画像"
+        images.append({"type": "CABINET", "location": location, "alt": alt})
         if len(images) >= RAKUTEN_LISTING_IMAGE_LIMIT:
             break
     return images
@@ -9378,6 +9448,7 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
     )
 
     for index, product_id in enumerate(ordered_product_ids, start=1):
+        cancel_after_progress = False
         raise_if_task_cancelled(ListingTaskModel, task_id)
         with session_scope() as session:
             store = session.get(StoreModel, task_store_id)
@@ -9400,11 +9471,14 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                         store,
                         product,
                         cabinet_context=cabinet_context,
+                        cancel_check=lambda: listing_task_cancel_requested(task_id),
                     )
                     listed_product = upsert_listed_store_product_from_listing_result(session, owner_username, product, store, listing_result)
                     session.flush()
                     record_product_listed_store(product, listed_product, store, listing_result)
                     success_ids.append(product.id)
+                except TaskCancelled:
+                    raise
                 except Exception as exc:
                     error_text = str(exc)
                     clear_listing_product_lock(product, task_id)
@@ -9415,12 +9489,13 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             task = session.get(ListingTaskModel, task_id)
             if task is not None:
                 cumulative_success_ids = merge_listing_task_product_ids(initial_success_ids, success_ids)
+                cancel_requested = task_cancel_requested(task) or listing_task_cancel_requested(task_id)
                 task.total_count = total_count
                 task.success_count = len(cumulative_success_ids)
                 task.failed_count = failed_count
-                task.message = f"上架中，已处理 {index} / {run_total_count} 条"
+                task.message = TASK_CANCEL_REQUESTED_MESSAGE if cancel_requested else f"上架中，已处理 {index} / {run_total_count} 条"
                 next_error_detail = summarize_task_errors(errors, limit=50)
-                task.error_detail = with_task_cancel_marker(next_error_detail) if task_cancel_requested(task) else next_error_detail
+                task.error_detail = with_task_cancel_marker(next_error_detail) if cancel_requested else next_error_detail
                 task.product_ids_json = json.dumps(
                     listing_task_result_payload(
                         all_product_ids,
@@ -9430,13 +9505,25 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     ),
                     ensure_ascii=False,
                 )
+                cancel_after_progress = cancel_requested
+        if cancel_after_progress:
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+        raise_if_task_cancelled(ListingTaskModel, task_id)
+    raise_if_task_cancelled(ListingTaskModel, task_id)
     with session_scope() as session:
+        task = session.get(ListingTaskModel, task_id)
+        if task is None:
+            return
+        if task_cancel_requested(task):
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         store = session.get(StoreModel, task_store_id)
         if store is not None:
             sync_store_cabinet_usage_fields(store, service_secret, license_key)
         task = session.get(ListingTaskModel, task_id)
         if task is None:
             return
+        if task_cancel_requested(task) or listing_task_cancel_requested(task_id):
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         final_success_ids = merge_listing_task_product_ids(initial_success_ids, success_ids)
         task.total_count = total_count
         task.success_count = len(final_success_ids)
