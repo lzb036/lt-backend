@@ -2469,7 +2469,7 @@ def ensure_listing_cabinet_folder(
     candidates = [
         folder
         for folder in folders
-        if any(value.lower().startswith(prefix) for value in listing_cabinet_folder_directory_candidates(folder))
+        if listing_cabinet_folder_matches_directory_prefix(folder, prefix)
     ]
     for folder in sorted(candidates, key=cabinet_listing_folder_sort_key):
         if cabinet_folder_remaining_slots(folder) >= slots:
@@ -2528,6 +2528,13 @@ def listing_cabinet_folder_directory_candidates(folder: dict[str, Any]) -> list[
     return [value for value in values if value]
 
 
+def listing_cabinet_folder_matches_directory_prefix(folder: dict[str, Any], prefix: str) -> bool:
+    return any(
+        normalize_cabinet_directory_name(value).startswith(prefix)
+        for value in listing_cabinet_folder_directory_candidates(folder)
+    )
+
+
 def prepare_listing_cabinet_folder(folder: dict[str, Any]) -> dict[str, Any]:
     folder["directoryName"] = listing_cabinet_folder_directory(folder)
     return folder
@@ -2556,7 +2563,7 @@ def listing_cabinet_folder_display_name(store: StoreModel, batch: int) -> str:
 
 
 def cabinet_listing_folder_sort_key(folder: dict[str, Any]) -> tuple[int, int]:
-    directory = listing_cabinet_folder_directory(folder)
+    directory = normalize_cabinet_directory_name(listing_cabinet_folder_directory(folder))
     match = re.search(r"-(\d{3})$", directory)
     batch = int(match.group(1)) if match else 0
     return (batch, int(folder.get("folderId") or 0))
@@ -2565,7 +2572,7 @@ def cabinet_listing_folder_sort_key(folder: dict[str, Any]) -> tuple[int, int]:
 def next_listing_cabinet_batch_number(folders: list[dict[str, Any]]) -> int:
     max_batch = 0
     for folder in folders:
-        directory = listing_cabinet_folder_directory(folder)
+        directory = normalize_cabinet_directory_name(listing_cabinet_folder_directory(folder))
         match = re.search(r"-(\d{3})$", directory)
         if match:
             max_batch = max(max_batch, int(match.group(1)))
