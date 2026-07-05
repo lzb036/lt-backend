@@ -253,6 +253,8 @@ RAKUTEN_REPRESENTATIVE_COLOR_ALLOWED_VALUES = {
     "透明",
     "マルチカラー",
 }
+RAKUTEN_CHEST_HEIGHT_LOW_VALUE = "ロー（～ 99cm）"
+RAKUTEN_CHEST_HEIGHT_HIGH_VALUE = "ハイ（100cm ～）"
 SINGLE_PRODUCT_VARIANT_ID = "default"
 LISTING_MANAGE_NUMBER_PREFIX = "fashiongoods"
 RAKUTEN_COLOR_SELECTOR_KEYWORDS = ("カラー", "色", "color", "colour")
@@ -6290,9 +6292,11 @@ def patch_payload_for_invalid_selective_attribute_values(payload: dict[str, Any]
     patched_variants = patched.get("variants")
     if not isinstance(patched_variants, dict):
         return payload
+    rule_map = rakuten_attribute_rule_map_for_payload(patched)
     changed = False
     for error in errors:
-        if normalize_text(error.get("attributeName")) != RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE:
+        attribute_name = normalize_text(error.get("attributeName"))
+        if not attribute_name:
             continue
         variant = patched_variants.get(normalize_text(error.get("variantId")))
         if not isinstance(variant, dict):
@@ -6304,25 +6308,42 @@ def patch_payload_for_invalid_selective_attribute_values(payload: dict[str, Any]
         targets: list[dict[str, Any]] = []
         if isinstance(attribute_index, int) and 0 <= attribute_index < len(attributes):
             attribute = attributes[attribute_index]
-            if isinstance(attribute, dict):
+            if isinstance(attribute, dict) and (
+                not attribute_name or normalize_text(attribute.get("name")) == attribute_name
+            ):
                 targets.append(attribute)
         targets.extend(
             attribute
             for attribute in attributes
             if isinstance(attribute, dict)
-            and normalize_text(attribute.get("name")) == RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE
+            and normalize_text(attribute.get("name")) == attribute_name
             and attribute not in targets
         )
         for attribute in targets:
             current_value = first_text_value(attribute.get("values"))
-            next_value = normalize_rakuten_representative_color(current_value) or RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK
-            if next_value not in RAKUTEN_REPRESENTATIVE_COLOR_ALLOWED_VALUES:
-                next_value = RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK
-            if attribute.get("values") != [next_value]:
-                attribute["values"] = [next_value]
-                changed = True
-            if "unit" in attribute:
-                attribute.pop("unit", None)
+            if attribute_name == RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE:
+                next_value = normalize_rakuten_representative_color(current_value) or RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK
+                if next_value not in RAKUTEN_REPRESENTATIVE_COLOR_ALLOWED_VALUES:
+                    next_value = RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK
+                if attribute.get("values") != [next_value]:
+                    attribute["values"] = [next_value]
+                    changed = True
+                if "unit" in attribute:
+                    attribute.pop("unit", None)
+                    changed = True
+                continue
+            next_value = normalize_rakuten_selective_attribute_value(attribute_name, current_value)
+            if next_value:
+                if attribute.get("values") != [next_value]:
+                    attribute["values"] = [next_value]
+                    changed = True
+                if "unit" in attribute:
+                    attribute.pop("unit", None)
+                    changed = True
+                continue
+            rule = rule_map.get(attribute_name, {})
+            if not bool(rule.get("required")) and attribute in attributes:
+                attributes.remove(attribute)
                 changed = True
     return patched if changed else payload
 
@@ -6702,9 +6723,39 @@ def normalize_rakuten_attribute_values_for_rule(values: Any, rule: dict[str, Any
             if color:
                 return [color]
         return [RAKUTEN_REPRESENTATIVE_COLOR_FALLBACK]
+    if normalize_text(rule.get("inputMethod")) == "選択式":
+        unique_values = unique_texts([
+            normalize_rakuten_selective_attribute_value(rule.get("name"), value) or value
+            for value in unique_values
+        ])
+        recommended_values = rule.get("recommendedValues")
+        if isinstance(recommended_values, list) and recommended_values:
+            recommended_set = {normalize_text(value) for value in recommended_values if normalize_text(value)}
+            unique_values = [value for value in unique_values if value in recommended_set]
     if max_values > 0:
         unique_values = unique_values[:max_values]
     return unique_values
+
+
+def normalize_rakuten_selective_attribute_value(attribute_name: Any, value: Any) -> str:
+    normalized_name = normalize_text(attribute_name)
+    text = unicodedata.normalize("NFKC", normalize_text(value))
+    if not normalized_name or not text:
+        return ""
+    if normalized_name == "チェストの高さ":
+        if text in {RAKUTEN_CHEST_HEIGHT_LOW_VALUE, RAKUTEN_CHEST_HEIGHT_HIGH_VALUE}:
+            return text
+        match = re.search(r"\d+(?:\.\d+)?", text)
+        if match:
+            try:
+                return (
+                    RAKUTEN_CHEST_HEIGHT_HIGH_VALUE
+                    if Decimal(match.group(0)) >= Decimal("100")
+                    else RAKUTEN_CHEST_HEIGHT_LOW_VALUE
+                )
+            except Exception:
+                return ""
+    return ""
 
 
 def rakuten_attribute_has_effective_values(attribute: dict[str, Any], rule: dict[str, Any]) -> bool:
