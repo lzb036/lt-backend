@@ -3372,8 +3372,9 @@ def xml_escape_text(value: Any) -> str:
 
 def normalize_cabinet_file_name(value: str) -> str:
     text = normalize_text(value) or "product"
-    text = re.sub(r"<[^>]*>", "", text).replace("　", " ")
+    text = unicodedata.normalize("NFKC", re.sub(r"<[^>]*>", "", text)).replace("　", " ")
     text = re.sub(r"[\x00-\x1f\x7f]", "", text).strip()
+    text = re.sub(r"[^A-Za-z0-9_-]+", "-", text).strip("-_")
     if not text:
         text = "product"
     encoded = text.encode("utf-8")
@@ -7618,7 +7619,7 @@ def upload_product_images_to_rakuten(
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="p")
-            file_name = normalize_cabinet_file_name(f"{product.title[:24]}-{index}")
+            file_name = listing_cabinet_upload_file_name(file_path)
             result = insert_rakuten_cabinet_file(
                 service_secret,
                 license_key,
@@ -7725,7 +7726,7 @@ def upload_product_description_images_to_rakuten(
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="d")
-            file_name = normalize_cabinet_file_name(f"{product.title[:20]}-说明-{index}")
+            file_name = listing_cabinet_upload_file_name(file_path)
             result = insert_rakuten_cabinet_file(
                 service_secret,
                 license_key,
@@ -8015,6 +8016,10 @@ def listing_cabinet_upload_file_path(manage_number: str, index: int, suffix: str
     digest = hashlib.sha1(normalize_text(manage_number).encode("utf-8")).hexdigest()[:8]
     stem = f"{normalized_kind}{digest}{max(1, index):03d}"
     return normalize_cabinet_file_path(f"{stem}{normalized_suffix}")
+
+
+def listing_cabinet_upload_file_name(file_path: str) -> str:
+    return normalize_cabinet_file_name(Path(normalize_text(file_path)).stem)
 
 
 def rollback_uploaded_listing_images(
