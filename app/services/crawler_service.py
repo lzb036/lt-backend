@@ -27,7 +27,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
-from app.core.task_queue import enqueue_task, task_queue_name_for_kind
+from app.core.task_queue import enqueue_task, enqueue_task_in, task_queue_name_for_kind
 from app.db.database import session_scope
 from app.db.models import (
     CrawlLogModel,
@@ -383,6 +383,8 @@ ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 TASK_CANCEL_REQUESTED_MARKER = "__LT_CANCEL_REQUESTED__"
 TASK_CANCEL_REQUESTED_MESSAGE = "已请求终止，等待任务停止"
 TASK_CANCELLED_MESSAGE = "任务已终止"
+TASK_START_RETRY_DELAY_SECONDS = 5.0
+TASK_STALE_CANCEL_REQUEST_SECONDS = 10 * 60
 
 
 class ProductImageUnavailableError(RuntimeError):
@@ -395,12 +397,23 @@ class TaskCancelled(RuntimeError):
     pass
 
 
-def dispatch_crawl_task(task_id: str) -> None:
+def start_background_task(target: Callable[..., Any], *args: Any, delay_seconds: float = 0.0) -> None:
+    if delay_seconds > 0:
+        timer = threading.Timer(delay_seconds, target, args=args)
+        timer.daemon = True
+        timer.start()
+        return
+    worker = threading.Thread(target=target, args=args, daemon=True)
+    worker.start()
+
+
+def dispatch_crawl_task(task_id: str, *, delay_seconds: float = 0.0) -> None:
     if should_use_redis_task_queue():
         try:
-            enqueue_task(
-                run_task,
-                task_id,
+            enqueue = enqueue_task_in if delay_seconds > 0 else enqueue_task
+            enqueue_args = (delay_seconds, run_task, task_id) if delay_seconds > 0 else (run_task, task_id)
+            enqueue(
+                *enqueue_args,
                 description=f"采集任务 {task_id}",
                 queue_name=task_queue_name_for_kind("crawl"),
             )
@@ -408,17 +421,16 @@ def dispatch_crawl_task(task_id: str) -> None:
             mark_background_task_dispatch_failed(CrawlTaskModel, task_id, exc)
             raise
         return
-    worker = threading.Thread(target=run_task, args=(task_id,), daemon=True)
-    worker.start()
+    start_background_task(run_task, task_id, delay_seconds=delay_seconds)
 
 
-def dispatch_sync_task(owner_username: str, task_id: str) -> None:
+def dispatch_sync_task(owner_username: str, task_id: str, *, delay_seconds: float = 0.0) -> None:
     if should_use_redis_task_queue():
         try:
-            enqueue_task(
-                run_sync_task,
-                owner_username,
-                task_id,
+            enqueue = enqueue_task_in if delay_seconds > 0 else enqueue_task
+            enqueue_args = (delay_seconds, run_sync_task, owner_username, task_id) if delay_seconds > 0 else (run_sync_task, owner_username, task_id)
+            enqueue(
+                *enqueue_args,
                 description=f"同步任务 {task_id}",
                 queue_name=task_queue_name_for_kind("sync"),
             )
@@ -426,17 +438,16 @@ def dispatch_sync_task(owner_username: str, task_id: str) -> None:
             mark_background_task_dispatch_failed(SyncTaskModel, task_id, exc)
             raise
         return
-    worker = threading.Thread(target=run_sync_task, args=(owner_username, task_id), daemon=True)
-    worker.start()
+    start_background_task(run_sync_task, owner_username, task_id, delay_seconds=delay_seconds)
 
 
-def dispatch_listing_task(owner_username: str, task_id: str) -> None:
+def dispatch_listing_task(owner_username: str, task_id: str, *, delay_seconds: float = 0.0) -> None:
     if should_use_redis_task_queue():
         try:
-            enqueue_task(
-                run_listing_task,
-                owner_username,
-                task_id,
+            enqueue = enqueue_task_in if delay_seconds > 0 else enqueue_task
+            enqueue_args = (delay_seconds, run_listing_task, owner_username, task_id) if delay_seconds > 0 else (run_listing_task, owner_username, task_id)
+            enqueue(
+                *enqueue_args,
                 description=f"上架任务 {task_id}",
                 queue_name=task_queue_name_for_kind("listing"),
             )
@@ -444,8 +455,7 @@ def dispatch_listing_task(owner_username: str, task_id: str) -> None:
             mark_background_task_dispatch_failed(ListingTaskModel, task_id, exc)
             raise
         return
-    worker = threading.Thread(target=run_listing_task, args=(owner_username, task_id), daemon=True)
-    worker.start()
+    start_background_task(run_listing_task, owner_username, task_id, delay_seconds=delay_seconds)
 
 
 def dispatch_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
@@ -1843,6 +1853,61 @@ def cancelled_task_warning_detail(warnings: list[str] | None = None, existing_wa
     return summarize_task_errors(values, limit=50, item_label="警告")
 
 
+def finalize_stale_cancel_requested_tasks(
+    session: Any,
+    model: Any,
+    *,
+    action_label: str,
+    owner_username: str | None = None,
+    store_id: int | None = None,
+) -> int:
+    cutoff = datetime.now() - timedelta(seconds=TASK_STALE_CANCEL_REQUEST_SECONDS)
+    query = select(model).where(
+        model.status == "running",
+        model.updated_at <= cutoff,
+    )
+    if owner_username is not None:
+        query = query.where(model.owner_username == owner_username)
+    if store_id is not None and hasattr(model, "store_id"):
+        query = query.where(model.store_id == store_id)
+    rows = session.scalars(query).all()
+    finalized = 0
+    for task in rows:
+        if not task_cancel_requested(task):
+            continue
+        if model is ListingTaskModel:
+            release_listing_task_locks(session, task.owner_username, task)
+        total_count = int(getattr(task, "total_count", 0) or 0)
+        success_count = int(getattr(task, "success_count", 0) or 0)
+        failed_count = int(getattr(task, "failed_count", 0) or 0)
+        task.status = "cancelled"
+        task.message = cancelled_task_progress_message(action_label, total_count, success_count, failed_count)
+        task.error_detail = cancelled_task_error_detail(existing_error_detail=getattr(task, "error_detail", None))
+        if hasattr(task, "warning_detail"):
+            task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=getattr(task, "warning_detail", None))
+        task.finished_at = datetime.now()
+        finalized += 1
+    return finalized
+
+
+def finalize_stale_store_cancel_requested_tasks(session: Any, store_id: int | None) -> int:
+    if not store_id:
+        return 0
+    sync_count = finalize_stale_cancel_requested_tasks(
+        session,
+        SyncTaskModel,
+        action_label="同步",
+        store_id=store_id,
+    )
+    listing_count = finalize_stale_cancel_requested_tasks(
+        session,
+        ListingTaskModel,
+        action_label="上架",
+        store_id=store_id,
+    )
+    return sync_count + listing_count
+
+
 def is_task_cancel_requested(model: Any, task_id: str) -> bool:
     with session_scope() as session:
         task = session.get(model, task_id)
@@ -1862,50 +1927,72 @@ def is_mysql_lock_wait_timeout(exc: OperationalError) -> bool:
     return code == 1205 or "Lock wait timeout exceeded" in str(exc)
 
 
-def ensure_user_task_capacity(
+def running_user_task_count(
     session: Any,
     model: Any,
     owner_username: str,
     *,
-    limit: int,
-    label: str,
     exclude_task_id: str | None = None,
-) -> None:
+) -> int:
     query = select(func.count()).where(
         model.owner_username == owner_username,
-        model.status.in_(("queued", "running")),
+        model.status == "running",
     )
     if exclude_task_id:
         query = query.where(model.id != exclude_task_id)
-    count = int(session.scalar(query) or 0)
-    if count >= limit:
-        raise RuntimeError(f"当前用户已有 {count} 个{label}任务正在执行，请等待任务完成后再创建。")
+    return int(session.scalar(query) or 0)
 
 
-def ensure_store_task_capacity(
+def running_store_task_count(
     session: Any,
     store_id: int | None,
     *,
     exclude_sync_task_id: str | None = None,
     exclude_listing_task_id: str | None = None,
-) -> None:
+) -> int:
     if not store_id:
-        return
+        return 0
     sync_query = select(func.count()).where(
         SyncTaskModel.store_id == store_id,
-        SyncTaskModel.status.in_(("queued", "running")),
+        SyncTaskModel.status == "running",
     )
     if exclude_sync_task_id:
         sync_query = sync_query.where(SyncTaskModel.id != exclude_sync_task_id)
     listing_query = select(func.count()).where(
         ListingTaskModel.store_id == store_id,
-        ListingTaskModel.status.in_(("queued", "running")),
+        ListingTaskModel.status == "running",
     )
     if exclude_listing_task_id:
         listing_query = listing_query.where(ListingTaskModel.id != exclude_listing_task_id)
-    count = int(session.scalar(sync_query) or 0) + int(session.scalar(listing_query) or 0)
-    if count > 0:
-        raise RuntimeError("该店铺已有同步、上架、上下架或删除任务正在执行，请等待完成后再操作。")
+    return int(session.scalar(sync_query) or 0) + int(session.scalar(listing_query) or 0)
+
+
+def task_start_wait_reason(
+    session: Any,
+    model: Any,
+    owner_username: str,
+    task_id: str,
+    *,
+    limit: int,
+    label: str,
+    store_id: int | None = None,
+    exclude_sync_task_id: str | None = None,
+    exclude_listing_task_id: str | None = None,
+) -> str:
+    finalize_stale_cancel_requested_tasks(session, model, action_label=label, owner_username=owner_username)
+    finalize_stale_store_cancel_requested_tasks(session, store_id)
+    running_count = running_user_task_count(session, model, owner_username, exclude_task_id=task_id)
+    if running_count >= limit:
+        return f"排队中，等待当前{label}任务完成"
+    store_running_count = running_store_task_count(
+        session,
+        store_id,
+        exclude_sync_task_id=exclude_sync_task_id,
+        exclude_listing_task_id=exclude_listing_task_id,
+    )
+    if store_running_count > 0:
+        return "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
+    return ""
 
 
 def role_to_public(row: RoleModel) -> dict[str, Any]:
@@ -3868,6 +3955,7 @@ def list_tasks(
     created_at_to: str | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
+        finalize_stale_cancel_requested_tasks(session, CrawlTaskModel, action_label="采集", owner_username=owner_username)
         query = select(CrawlTaskModel).where(CrawlTaskModel.owner_username == owner_username)
         created_at_from_value = parse_datetime_filter(created_at_from)
         created_at_to_value = parse_datetime_filter(created_at_to)
@@ -4308,20 +4396,6 @@ def preflight_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
                 global_issues.append(listing_preflight_issue("blocker", "store_disabled", "上架店铺已停用。"))
             if not decrypt_text(store.rakuten_service_secret_encrypted) or not decrypt_text(store.rakuten_license_key_encrypted):
                 global_issues.append(listing_preflight_issue("blocker", "missing_store_credentials", "上架店铺缺少乐天 Secret 或乐天 Key。"))
-            try:
-                ensure_user_task_capacity(
-                    session,
-                    ListingTaskModel,
-                    owner_username,
-                    limit=settings.max_running_listing_tasks_per_user,
-                    label="上架",
-                )
-            except RuntimeError as exc:
-                global_issues.append(listing_preflight_issue("blocker", "user_task_capacity", str(exc)))
-            try:
-                ensure_store_task_capacity(session, int(store.id))
-            except RuntimeError as exc:
-                global_issues.append(listing_preflight_issue("blocker", "store_task_capacity", str(exc)))
 
         products = session.scalars(
             select(ProductModel).where(
@@ -4710,6 +4784,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
 
 def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
+        finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步", owner_username=owner_username)
         query = select(SyncTaskModel).where(SyncTaskModel.owner_username == owner_username)
         return paginate_query(
             session,
@@ -4909,14 +4984,6 @@ def create_sync_task_record(
     payload: dict[str, Any] | None = None,
 ) -> str:
     with session_scope() as session:
-        ensure_user_task_capacity(
-            session,
-            SyncTaskModel,
-            owner_username,
-            limit=settings.max_running_sync_tasks_per_user,
-            label="同步",
-        )
-        ensure_store_task_capacity(session, store_id)
         store = session.get(StoreModel, store_id)
         if store is None:
             raise RuntimeError("店铺不存在。")
@@ -4939,6 +5006,7 @@ def create_sync_task_record(
 
 
 def run_sync_task(owner_username: str, task_id: str) -> None:
+    defer_start = False
     with session_scope() as session:
         task = session.get(SyncTaskModel, task_id)
         if task is None:
@@ -4947,23 +5015,43 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             raise RuntimeError("不能执行其他用户的同步任务。")
         if task.status == "cancelled":
             return
+        if task.status != "queued":
+            return
         if task_cancel_requested(task):
             task.status = "cancelled"
             task.message = TASK_CANCELLED_MESSAGE
             task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
             task.finished_at = datetime.now()
             return
-        task.status = "running"
-        task.message = sync_task_running_message(task)
-        task.error_detail = None
-        task.started_at = datetime.now()
-        task.finished_at = None
+        wait_reason = task_start_wait_reason(
+            session,
+            SyncTaskModel,
+            owner_username,
+            task_id,
+            limit=settings.max_running_sync_tasks_per_user,
+            label="同步",
+            store_id=task.store_id,
+            exclude_sync_task_id=task_id,
+        )
+        if wait_reason:
+            task.message = wait_reason
+            defer_start = True
+        else:
+            task.status = "running"
+            task.message = sync_task_running_message(task)
+            task.error_detail = None
+            task.started_at = datetime.now()
+            task.finished_at = None
         store_id = task.store_id
         task_type = task.task_type or "store_sync"
         try:
             payload = json.loads(task.payload_json or "{}")
         except ValueError:
             payload = {}
+
+    if defer_start:
+        dispatch_sync_task(owner_username, task_id, delay_seconds=TASK_START_RETRY_DELAY_SECONDS)
+        return
 
     try:
         if store_id is None:
@@ -5322,15 +5410,6 @@ def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("不能重试其他用户的同步任务。")
         if task.status in {"queued", "running"}:
             raise RuntimeError("同步任务正在执行中，不能重试。")
-        ensure_user_task_capacity(
-            session,
-            SyncTaskModel,
-            owner_username,
-            limit=settings.max_running_sync_tasks_per_user,
-            label="同步",
-            exclude_task_id=task_id,
-        )
-        ensure_store_task_capacity(session, task.store_id, exclude_sync_task_id=task_id)
         task.status = "queued"
         task.message = "等待重新同步"
         task.error_detail = None
@@ -5444,6 +5523,8 @@ def run_scheduled_crawl(owner_username: str, schedule_id: int) -> dict[str, Any]
 
 
 def run_scheduled_crawl_job(owner_username: str, schedule_id: int) -> None:
+    row_enabled = False
+    schedule_time = "09:00"
     with session_scope() as session:
         row = session.get(ScheduledCrawlModel, schedule_id)
         if row is None:
@@ -5455,17 +5536,29 @@ def run_scheduled_crawl_job(owner_username: str, schedule_id: int) -> None:
         session.flush()
         source_type = row.source_type
         target = row.target
+        row_enabled = bool(row.enabled)
+        schedule_time = row.schedule_time
 
     task_payload = type("TaskPayload", (), {"sourceId": None, "sourceType": source_type, "target": target, "mode": "scheduled"})()
-    create_task(owner_username, task_payload)
-
-    with session_scope() as session:
-        row = session.get(ScheduledCrawlModel, schedule_id)
-        if row is None:
-            raise RuntimeError("定时任务不存在。")
-        row.status = "idle" if row.enabled else "disabled"
-        row.next_run_at = next_daily_run_at(row.schedule_time) if row.enabled else None
-        session.flush()
+    try:
+        create_task(owner_username, task_payload)
+    except Exception as exc:
+        with session_scope() as session:
+            row = session.get(ScheduledCrawlModel, schedule_id)
+            if row is not None:
+                row.status = "failed"
+                row.notes = str(exc)
+                row.next_run_at = next_daily_run_at(row.schedule_time or schedule_time) if row.enabled or row_enabled else None
+        raise
+    else:
+        with session_scope() as session:
+            row = session.get(ScheduledCrawlModel, schedule_id)
+            if row is None:
+                raise RuntimeError("定时任务不存在。")
+            row.status = "idle" if row.enabled else "disabled"
+            row.notes = ""
+            row.next_run_at = next_daily_run_at(row.schedule_time) if row.enabled else None
+            session.flush()
 
 
 def run_due_scheduled_crawls_once() -> int:
@@ -9173,6 +9266,7 @@ def listing_status_result_summary(result: dict[str, Any], total_count: int, *, c
 
 def list_listing_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
+        finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架", owner_username=owner_username)
         query = select(ListingTaskModel).where(ListingTaskModel.owner_username == owner_username)
         normalized_page, normalized_page_size = normalize_page_params(page, page_size)
         order_by = ListingTaskModel.created_at.desc()
@@ -9234,14 +9328,6 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
     if not store_id:
         raise RuntimeError("请选择上架店铺。")
     with session_scope() as session:
-        ensure_user_task_capacity(
-            session,
-            ListingTaskModel,
-            owner_username,
-            limit=settings.max_running_listing_tasks_per_user,
-            label="上架",
-        )
-        ensure_store_task_capacity(session, int(store_id))
         store = session.get(StoreModel, store_id)
         if store is None:
             raise RuntimeError("上架店铺不存在。")
@@ -9323,8 +9409,25 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             raise RuntimeError("不能执行其他用户的上架任务。")
         if task.status == "cancelled":
             return
+        if task.status != "queued":
+            return
         if task_cancel_requested(task):
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+        wait_reason = task_start_wait_reason(
+            session,
+            ListingTaskModel,
+            owner_username,
+            task_id,
+            limit=settings.max_running_listing_tasks_per_user,
+            label="上架",
+            store_id=task.store_id,
+            exclude_listing_task_id=task_id,
+        )
+        if wait_reason:
+            task.message = wait_reason
+            session.flush()
+            dispatch_listing_task(owner_username, task_id, delay_seconds=TASK_START_RETRY_DELAY_SECONDS)
+            return
         task.status = "running"
         task.message = "上架准备中"
         task.error_detail = None
@@ -9608,15 +9711,6 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("不能重试其他用户的上架任务。")
         if task.status in {"queued", "running"}:
             raise RuntimeError("上架任务正在执行中，不能重试。")
-        ensure_user_task_capacity(
-            session,
-            ListingTaskModel,
-            owner_username,
-            limit=settings.max_running_listing_tasks_per_user,
-            label="上架",
-            exclude_task_id=task_id,
-        )
-        ensure_store_task_capacity(session, task.store_id, exclude_listing_task_id=task_id)
         product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
         retry_product_ids = listing_task_retry_product_ids(task)
         if not retry_product_ids:
@@ -9746,13 +9840,6 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
     source_type = str(getattr(payload, "sourceType", "") or "").strip()
     target = str(getattr(payload, "target", "") or "").strip()
     with session_scope() as session:
-        ensure_user_task_capacity(
-            session,
-            CrawlTaskModel,
-            owner_username,
-            limit=settings.max_running_crawl_tasks_per_user,
-            label="采集",
-        )
         source = session.get(CrawlSourceModel, source_id) if source_id else None
         if source is not None:
             if source.owner_username != owner_username:
@@ -9802,14 +9889,6 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("不能重启其他用户的采集任务。")
         if task.status in {"queued", "running"}:
             raise RuntimeError("采集任务正在执行中，不能重新采集。")
-        ensure_user_task_capacity(
-            session,
-            CrawlTaskModel,
-            owner_username,
-            limit=settings.max_running_crawl_tasks_per_user,
-            label="采集",
-            exclude_task_id=task_id,
-        )
         task.status = "queued"
         task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
         task.success_count = 0
@@ -9877,12 +9956,27 @@ def run_task(task_id: str) -> None:
             return
         if task.status == "cancelled":
             return
+        if task.status != "queued":
+            return
         if task_cancel_requested(task):
             task.status = "cancelled"
             task.message = TASK_CANCELLED_MESSAGE
             task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
             task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=task.warning_detail)
             task.finished_at = datetime.now()
+            return
+        wait_reason = task_start_wait_reason(
+            session,
+            CrawlTaskModel,
+            task.owner_username,
+            task_id,
+            limit=settings.max_running_crawl_tasks_per_user,
+            label="采集",
+        )
+        if wait_reason:
+            task.message = wait_reason
+            session.flush()
+            dispatch_crawl_task(task_id, delay_seconds=TASK_START_RETRY_DELAY_SECONDS)
             return
         task.status = "running"
         task.started_at = datetime.now()

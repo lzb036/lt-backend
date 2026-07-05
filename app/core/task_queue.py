@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from collections.abc import Iterable
+from datetime import timedelta
 from typing import Any
 
 from app.core.config import settings
@@ -83,6 +84,27 @@ def enqueue_task(
     queue_name: str | None = None,
 ) -> str:
     job = task_queue(queue_name).enqueue(
+        func,
+        args=args,
+        job_id=job_id,
+        job_timeout=settings.task_queue_job_timeout_seconds,
+        result_ttl=settings.task_queue_result_ttl_seconds,
+        failure_ttl=settings.task_queue_failure_ttl_seconds,
+        description=description or None,
+    )
+    return job.id
+
+
+def enqueue_task_in(
+    delay_seconds: float,
+    func: Callable[..., Any],
+    *args: Any,
+    job_id: str | None = None,
+    description: str = "",
+    queue_name: str | None = None,
+) -> str:
+    job = task_queue(queue_name).enqueue_in(
+        timedelta(seconds=max(0.0, float(delay_seconds or 0))),
         func,
         args=args,
         job_id=job_id,
