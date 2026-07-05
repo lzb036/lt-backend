@@ -16,6 +16,12 @@ from app.services.crawler_service import LOCAL_PRODUCT_IMAGE_DIR, LOCAL_PRODUCT_
 app = FastAPI(title=settings.app_name, version=settings.app_version)
 LOCAL_PRODUCT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_PRODUCT_IMAGE_DRAFT_DIR.mkdir(parents=True, exist_ok=True)
+DESIGNKIT_IMAGE_CORS_ORIGINS = {
+    "https://designkit.cn",
+    "https://www.designkit.cn",
+    "https://pre.designkit.cn",
+    "https://beta.designkit.cn",
+}
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +36,22 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(profile_router, prefix="/api")
 app.include_router(crawler_router, prefix="/api")
+
+
+@app.middleware("http")
+async def add_product_image_cors_headers(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith(("/api/static/product-images", "/api/static/product-image-drafts")):
+        origin = request.headers.get("origin")
+        if origin in DESIGNKIT_IMAGE_CORS_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+            response.headers["Vary"] = "Origin"
+    return response
+
+
 app.mount("/api/static/product-images", StaticFiles(directory=LOCAL_PRODUCT_IMAGE_DIR), name="product-images")
 app.mount("/api/static/product-image-drafts", StaticFiles(directory=LOCAL_PRODUCT_IMAGE_DRAFT_DIR), name="product-image-drafts")
 
