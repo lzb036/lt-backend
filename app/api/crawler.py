@@ -107,6 +107,11 @@ class ProductImageChangesPayload(BaseModel):
     removeUrls: list[str] = Field(default_factory=list)
 
 
+class ProductImageBase64DraftPayload(BaseModel):
+    imageBase64: str = Field(min_length=1)
+    ext: str = ""
+
+
 class ProductDetailEditPayload(BaseModel):
     title: str = Field(min_length=1, max_length=500)
     tagline: str = ""
@@ -462,6 +467,25 @@ def upload_product_image_draft(
 ) -> dict:
     try:
         return {"url": crawler_service.save_product_image_draft(user["username"], product_id, file)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/products/{product_id}/images/draft-base64")
+def upload_product_image_draft_base64(
+    product_id: int,
+    payload: ProductImageBase64DraftPayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return {
+            "url": crawler_service.save_product_image_draft_base64(
+                user["username"],
+                product_id,
+                payload.imageBase64,
+                payload.ext,
+            )
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

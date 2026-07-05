@@ -4,6 +4,7 @@ import json
 import re
 import uuid
 import base64
+import binascii
 import hashlib
 import mimetypes
 import random
@@ -8983,6 +8984,23 @@ def save_product_image_draft(owner_username: str, product_id: int, upload_file: 
     )
 
 
+def save_product_image_draft_base64(owner_username: str, product_id: int, image_base64: str, ext: str = "") -> str:
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            raise RuntimeError("商品不存在。")
+        if product.review_status != "pending":
+            raise RuntimeError("只有待审核商品可以修改图片。")
+    image_data = decode_product_image_base64(image_base64, ext)
+    return save_product_image_bytes(
+        image_data["content"],
+        image_data["suffix"],
+        LOCAL_PRODUCT_IMAGE_DRAFT_DIR / str(product_id),
+        lambda filename: local_product_image_draft_url(product_id, filename),
+        name_prefix="meitu",
+    )
+
+
 def save_uploaded_product_image(product_id: int, image_index: int, upload_file: Any) -> str:
     return save_uploaded_product_image_file(
         upload_file,
@@ -9027,6 +9045,81 @@ def save_uploaded_product_image_file(upload_file: Any, image_dir: Path, url_buil
         target_path.unlink(missing_ok=True)
         raise RuntimeError("上传的图片为空。")
     return url_builder(safe_name)
+
+
+def save_product_image_bytes(content: bytes, suffix: str, image_dir: Path, url_builder: Callable[[str], str], *, name_prefix: str) -> str:
+    normalized_suffix = normalize_product_image_suffix(suffix)
+    if normalized_suffix not in ALLOWED_PRODUCT_IMAGE_EXTENSIONS:
+        raise RuntimeError("图片格式只支持 jpg、jpeg、png、gif。")
+    if not content:
+        raise RuntimeError("图片内容为空。")
+    if len(content) > MAX_PRODUCT_IMAGE_BYTES:
+        raise RuntimeError("图片大小不能超过 2MB。")
+    image_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = f"{name_prefix}-{uuid.uuid4().hex[:12]}{normalized_suffix}"
+    target_path = image_dir / safe_name
+    target_path.write_bytes(content)
+    return url_builder(safe_name)
+
+
+def decode_product_image_base64(image_base64: str, ext: str = "") -> dict[str, Any]:
+    raw_value = str(image_base64 or "").strip()
+    if not raw_value:
+        raise RuntimeError("图片内容为空。")
+    data_url_match = re.match(r"^data:(image/[a-z0-9.+-]+);base64,(.+)$", raw_value, flags=re.IGNORECASE | re.DOTALL)
+    encoded_value = data_url_match.group(2) if data_url_match else raw_value
+    encoded_value = re.sub(r"\s+", "", encoded_value)
+    if not encoded_value:
+        raise RuntimeError("图片内容为空。")
+    padding = len(encoded_value) % 4
+    if padding:
+        encoded_value += "=" * (4 - padding)
+    try:
+        content = base64.b64decode(encoded_value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise RuntimeError("图片 base64 内容无效。") from exc
+    if len(content) > MAX_PRODUCT_IMAGE_BYTES:
+        raise RuntimeError("图片大小不能超过 2MB。")
+    detected_suffix = detect_product_image_suffix(content)
+    requested_suffix = normalize_product_image_suffix(ext)
+    suffix = detected_suffix or requested_suffix
+    if suffix not in ALLOWED_PRODUCT_IMAGE_EXTENSIONS:
+        raise RuntimeError("图片格式只支持 jpg、jpeg、png、gif。")
+    return {"content": content, "suffix": suffix, "contentType": product_image_content_type_from_suffix(suffix)}
+
+
+def detect_product_image_suffix(content: bytes) -> str:
+    try:
+        from PIL import Image, UnidentifiedImageError
+        with Image.open(BytesIO(content)) as image:
+            image.verify()
+            image_format = normalize_text(image.format).upper()
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+        raise RuntimeError("图片文件类型不正确。") from exc
+    format_suffixes = {
+        "JPEG": ".jpg",
+        "PNG": ".png",
+        "GIF": ".gif",
+    }
+    return format_suffixes.get(image_format, "")
+
+
+def normalize_product_image_suffix(value: str) -> str:
+    suffix = normalize_text(value).lower().strip()
+    if suffix and not suffix.startswith("."):
+        suffix = f".{suffix}"
+    if suffix == ".jpeg":
+        suffix = ".jpg"
+    return suffix
+
+
+def product_image_content_type_from_suffix(suffix: str) -> str:
+    normalized_suffix = normalize_product_image_suffix(suffix)
+    if normalized_suffix == ".png":
+        return "image/png"
+    if normalized_suffix == ".gif":
+        return "image/gif"
+    return "image/jpeg"
 
 
 def local_product_image_url(product_id: int, filename: str) -> str:
