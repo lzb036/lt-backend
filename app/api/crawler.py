@@ -18,6 +18,7 @@ router = APIRouter(prefix="/crawler", tags=["crawler"])
 require_crawler_permission = require_permission("crawler.manage")
 require_products_permission = require_permission("products.manage")
 require_stores_permission = require_permission("stores.manage")
+require_settings_permission = require_permission("settings.manage")
 require_products_or_stores_permission = require_any_permission("products.manage", "stores.manage")
 
 
@@ -137,6 +138,11 @@ class RolePayload(BaseModel):
     notes: str = ""
 
 
+class TimeSettingsPayload(BaseModel):
+    cleanupWeekday: int = Field(ge=0, le=6)
+    cleanupTime: str = Field(pattern=r"^\d{2}:\d{2}$")
+
+
 def resolve_target_username(user: dict, owner_username: str | None = None, *, require_child_owner: bool = False) -> str:
     if owner_username and not has_permission(user, "stores.manage"):
         raise HTTPException(status_code=403, detail="没有管理店铺所属用户的权限")
@@ -161,6 +167,19 @@ def get_dashboard_summary(user: dict = Depends(require_any_permission("crawler.m
             include_sync_tasks=has_permission(user, "products.manage") or has_permission(user, "stores.manage"),
         )
     }
+
+
+@router.get("/settings/time")
+def get_time_settings(user: dict = Depends(require_any_permission("crawler.manage", "settings.manage"))) -> dict:
+    return {"settings": crawler_service.get_time_settings()}
+
+
+@router.put("/settings/time")
+def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(require_settings_permission)) -> dict:
+    try:
+        return {"settings": crawler_service.save_time_settings(payload)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/sources")

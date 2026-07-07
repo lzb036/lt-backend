@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit,
 
 import requests
 from bs4 import BeautifulSoup, Comment
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
@@ -40,6 +40,7 @@ from app.db.models import (
     ScheduledCrawlModel,
     StoreModel,
     SyncTaskModel,
+    SystemSettingModel,
     make_source_url_hash,
 )
 
@@ -375,6 +376,7 @@ RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺url
 RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
 CRAWLER_HTTP_RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
 SCHEDULE_RUN_LOCK = threading.Lock()
+SCHEDULED_CRAWL_TASK_CLEANUP_LOCK = threading.Lock()
 CRAWLER_REQUEST_LOCK = threading.Lock()
 RAKUTEN_CABINET_REQUEST_LOCK = threading.Lock()
 CRAWLER_SESSION_LOCAL = threading.local()
@@ -393,6 +395,10 @@ SCHEDULE_IMPORT_TEMPLATE_FILENAME = "scheduled-crawl-template.xlsx"
 SCHEDULE_FALLBACK_SHOP_URL_KEY = "fallbackShopUrl"
 SCHEDULE_IMPORTED_NOTE_KEY = "importedSchedule"
 SCHEDULE_FALLBACK_TARGET_PREFIX = "__LT_FALLBACK_SHOP_URL__:"
+SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY = "scheduledCrawlTaskCleanup"
+SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY = 6
+SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME = "09:00"
+SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS = 7
 
 
 class ProductImageUnavailableError(RuntimeError):
@@ -1492,6 +1498,44 @@ def next_daily_run_at(schedule_time: str, *, now: datetime | None = None) -> dat
     candidate = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= reference:
         candidate += timedelta(days=1)
+    return candidate
+
+
+def datetime_to_public(value: datetime | None) -> str | None:
+    return value.isoformat(sep=" ", timespec="seconds") if value else None
+
+
+def parse_public_datetime(value: Any) -> datetime | None:
+    text = normalize_text(value)
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def normalize_cleanup_weekday(value: Any) -> int:
+    try:
+        weekday = int(value)
+    except (TypeError, ValueError):
+        raise RuntimeError("定时清理星期不合法。") from None
+    if weekday < 0 or weekday > 6:
+        raise RuntimeError("定时清理星期不合法。")
+    return weekday
+
+
+def next_weekly_run_at(weekday: int, schedule_time: str, *, now: datetime | None = None) -> datetime:
+    reference = now or datetime.now()
+    normalized_weekday = normalize_cleanup_weekday(weekday)
+    normalized_time = normalize_schedule_time(schedule_time)
+    hour, minute = [int(part) for part in normalized_time.split(":", 1)]
+    days_until = (normalized_weekday - reference.weekday()) % 7
+    candidate = (reference + timedelta(days=days_until)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= reference:
+        candidate += timedelta(days=7)
     return candidate
 
 
@@ -4342,6 +4386,146 @@ def delete_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
         }
 
 
+def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any]:
+    reference = now or datetime.now()
+    next_cleanup_at = next_weekly_run_at(
+        SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY,
+        SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME,
+        now=reference,
+    )
+    return {
+        "cleanupWeekday": SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY,
+        "cleanupTime": SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME,
+        "retentionDays": SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS,
+        "nextCleanupAt": datetime_to_public(next_cleanup_at),
+        "lastCleanupAt": None,
+        "lastCleanupDeletedCount": 0,
+    }
+
+
+def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime | None = None) -> dict[str, Any]:
+    reference = now or datetime.now()
+    try:
+        raw_payload = json.loads(row.value_json or "{}") if row is not None else {}
+    except ValueError:
+        raw_payload = {}
+    payload = raw_payload if isinstance(raw_payload, dict) else {}
+    default_payload = default_time_settings_value(now=reference)
+
+    try:
+        cleanup_weekday = normalize_cleanup_weekday(payload.get("cleanupWeekday", default_payload["cleanupWeekday"]))
+    except RuntimeError:
+        cleanup_weekday = default_payload["cleanupWeekday"]
+    try:
+        cleanup_time = normalize_schedule_time(payload.get("cleanupTime", default_payload["cleanupTime"]))
+    except RuntimeError:
+        cleanup_time = default_payload["cleanupTime"]
+
+    next_cleanup_at = parse_public_datetime(payload.get("nextCleanupAt"))
+    if next_cleanup_at is None:
+        next_cleanup_at = next_weekly_run_at(cleanup_weekday, cleanup_time, now=reference)
+    last_cleanup_deleted_count = payload.get("lastCleanupDeletedCount", 0)
+    try:
+        last_cleanup_deleted_count = max(0, int(last_cleanup_deleted_count or 0))
+    except (TypeError, ValueError):
+        last_cleanup_deleted_count = 0
+
+    return {
+        "cleanupWeekday": cleanup_weekday,
+        "cleanupTime": cleanup_time,
+        "retentionDays": SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS,
+        "nextCleanupAt": datetime_to_public(next_cleanup_at),
+        "lastCleanupAt": datetime_to_public(parse_public_datetime(payload.get("lastCleanupAt"))),
+        "lastCleanupDeletedCount": last_cleanup_deleted_count,
+    }
+
+
+def time_settings_to_public(row: SystemSettingModel | None, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **payload,
+        "serverNow": datetime_to_public(datetime.now()),
+        "updatedAt": datetime_to_public(row.updated_at if row is not None else None),
+    }
+
+
+def upsert_time_settings_row(session: Any, payload: dict[str, Any]) -> SystemSettingModel:
+    row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+    if row is None:
+        row = SystemSettingModel(key=SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+        session.add(row)
+    row.value_json = json.dumps(payload, ensure_ascii=False)
+    return row
+
+
+def get_time_settings() -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+        payload = load_time_settings_payload(row)
+        if row is None or (row.value_json or "") != json.dumps(payload, ensure_ascii=False):
+            row = upsert_time_settings_row(session, payload)
+            session.flush()
+        return time_settings_to_public(row, payload)
+
+
+def save_time_settings(payload: Any) -> dict[str, Any]:
+    cleanup_weekday = normalize_cleanup_weekday(getattr(payload, "cleanupWeekday", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY))
+    cleanup_time = normalize_schedule_time(getattr(payload, "cleanupTime", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME))
+    now = datetime.now()
+    with session_scope() as session:
+        row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+        existing = load_time_settings_payload(row, now=now)
+        updated_payload = {
+            **existing,
+            "cleanupWeekday": cleanup_weekday,
+            "cleanupTime": cleanup_time,
+            "retentionDays": SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS,
+            "nextCleanupAt": datetime_to_public(next_weekly_run_at(cleanup_weekday, cleanup_time, now=now)),
+        }
+        row = upsert_time_settings_row(session, updated_payload)
+        session.flush()
+        return time_settings_to_public(row, updated_payload)
+
+
+def cleanup_completed_scheduled_crawl_tasks_if_due() -> int:
+    if not SCHEDULED_CRAWL_TASK_CLEANUP_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        now = datetime.now()
+        with session_scope() as session:
+            row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+            payload = load_time_settings_payload(row, now=now)
+            row = upsert_time_settings_row(session, payload)
+            next_cleanup_at = parse_public_datetime(payload.get("nextCleanupAt"))
+            if next_cleanup_at is not None and next_cleanup_at > now:
+                return 0
+
+            cutoff = now - timedelta(days=SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS)
+            rows = session.scalars(
+                select(CrawlTaskModel).where(
+                    CrawlTaskModel.mode == "scheduled",
+                    CrawlTaskModel.finished_at.is_not(None),
+                    CrawlTaskModel.finished_at < cutoff,
+                    CrawlTaskModel.status.notin_(("queued", "running")),
+                )
+            ).all()
+            task_ids = [task.id for task in rows]
+            if task_ids:
+                session.execute(update(ProductModel).where(ProductModel.task_id.in_(task_ids)).values(task_id=None))
+                session.execute(update(CrawlLogModel).where(CrawlLogModel.task_id.in_(task_ids)).values(task_id=None))
+                for task in rows:
+                    session.delete(task)
+
+            payload["lastCleanupAt"] = datetime_to_public(now)
+            payload["lastCleanupDeletedCount"] = len(task_ids)
+            payload["nextCleanupAt"] = datetime_to_public(
+                next_weekly_run_at(payload["cleanupWeekday"], payload["cleanupTime"], now=now)
+            )
+            row.value_json = json.dumps(payload, ensure_ascii=False)
+            return len(task_ids)
+    finally:
+        SCHEDULED_CRAWL_TASK_CLEANUP_LOCK.release()
+
+
 def cancel_crawl_task(owner_username: str, task_id: str) -> dict[str, Any]:
     return request_task_cancel(CrawlTaskModel, owner_username, task_id, serializer=task_to_public)
 
@@ -6118,6 +6302,7 @@ def run_due_scheduled_crawls_once() -> int:
 def run_periodic_maintenance_once() -> None:
     cleanup_expired_product_image_drafts_if_due()
     cleanup_orphan_product_image_dirs_if_due()
+    cleanup_completed_scheduled_crawl_tasks_if_due()
 
 
 def cleanup_expired_product_image_drafts_if_due() -> int:

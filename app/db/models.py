@@ -79,6 +79,13 @@ class RoleModel(TimestampMixin, Base):
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
 
+class SystemSettingModel(TimestampMixin, Base):
+    __tablename__ = "lt_system_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+
 class StoreModel(TimestampMixin, Base):
     __tablename__ = "lt_stores"
     __table_args__ = (
