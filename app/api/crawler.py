@@ -126,6 +126,7 @@ class ProductDetailEditPayload(BaseModel):
 class ListingTaskPayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
     storeId: int | None = None
+    storeIds: list[int] = Field(default_factory=list)
     taskName: str = ""
 
 
@@ -289,6 +290,7 @@ def list_products(
     status: str | None = Query(default=None),
     keyword: str | None = Query(default=None),
     storeId: int | None = Query(default=None),
+    listedStoreId: str | None = Query(default=None),
     listingStatus: str | None = Query(default=None),
     listedAtFrom: str | None = Query(default=None),
     listedAtTo: str | None = Query(default=None),
@@ -307,6 +309,7 @@ def list_products(
         status=status,
         keyword=keyword,
         store_id=storeId,
+        listed_store_id=listedStoreId,
         listing_status=listingStatus,
         listed_at_from=listedAtFrom,
         listed_at_to=listedAtTo,
