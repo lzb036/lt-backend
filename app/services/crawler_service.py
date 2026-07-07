@@ -1515,10 +1515,12 @@ def crawl_limit_label(value: Any, *, default: str = "全部") -> str:
 def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
     service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
     license_key = decrypt_text(row.rakuten_license_key_encrypted)
+    checked_at = row.last_checked_at or row.last_synced_at
+    product_synced_at = row.last_product_synced_at
     availability_status = "unchecked"
     if row.last_error:
         availability_status = "error"
-    elif row.last_synced_at:
+    elif checked_at or product_synced_at:
         availability_status = "available"
     return {
         "id": row.id,
@@ -1539,7 +1541,12 @@ def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
         "cabinetUsedFolderCount": row.cabinet_used_folder_count,
         "cabinetRemainingFolderCount": row.cabinet_remaining_folder_count,
         "cabinetUsageCheckedAt": row.cabinet_usage_checked_at.isoformat(sep=" ") if row.cabinet_usage_checked_at else None,
-        "lastSyncedAt": row.last_synced_at.isoformat(sep=" ") if row.last_synced_at else None,
+        "rakutenProductTotalCount": row.rakuten_product_total_count,
+        "rakutenProductListedCount": row.rakuten_product_listed_count,
+        "rakutenProductUnlistedCount": row.rakuten_product_unlisted_count,
+        "lastCheckedAt": checked_at.isoformat(sep=" ") if checked_at else None,
+        "lastProductSyncedAt": product_synced_at.isoformat(sep=" ") if product_synced_at else None,
+        "lastSyncedAt": product_synced_at.isoformat(sep=" ") if product_synced_at else None,
         "lastError": row.last_error,
         "availabilityStatus": availability_status,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -4679,31 +4686,55 @@ def delete_store(owner_username: str, store_id: int) -> None:
         clear_product_temp_image_files(int(product_id))
 
 
-def verify_store_credentials(row: StoreModel) -> None:
+def verify_store_credentials(row: StoreModel, *, include_product_counts: bool = True) -> None:
     service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
     license_key = decrypt_text(row.rakuten_license_key_encrypted)
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+    checked_at = datetime.now()
     shop_meta = fetch_rakuten_shop_meta(service_secret, license_key)
     row.store_code = shop_meta["shopCode"]
     row.store_name = shop_meta["shopName"]
     if not row.alias_name:
         row.alias_name = row.store_name
     row.store_url = build_rakuten_store_url(row.store_code)
-    update_store_cabinet_usage(row, service_secret, license_key)
-    row.last_synced_at = datetime.now()
+    update_store_cabinet_usage(row, service_secret, license_key, checked_at=checked_at)
+    if include_product_counts:
+        items = fetch_rakuten_store_items(service_secret, license_key)
+        apply_store_product_counts(row, items, checked_at=checked_at)
+    row.last_checked_at = checked_at
     row.last_error = None
 
 
-def update_store_cabinet_usage(row: StoreModel, service_secret: str, license_key: str) -> None:
+def update_store_cabinet_usage(
+    row: StoreModel,
+    service_secret: str,
+    license_key: str,
+    *,
+    checked_at: datetime | None = None,
+) -> None:
     usage = fetch_rakuten_cabinet_usage(service_secret, license_key)
-    apply_store_cabinet_usage(row, usage)
+    apply_store_cabinet_usage(row, usage, checked_at=checked_at)
 
 
-def apply_store_cabinet_usage(row: StoreModel, usage: dict[str, int]) -> None:
+def apply_store_cabinet_usage(row: StoreModel, usage: dict[str, int], *, checked_at: datetime | None = None) -> None:
     row.cabinet_used_folder_count = usage["usedFolderCount"]
     row.cabinet_remaining_folder_count = usage["remainingFolderCount"]
-    row.cabinet_usage_checked_at = datetime.now()
+    row.cabinet_usage_checked_at = checked_at or datetime.now()
+
+
+def apply_store_product_counts(
+    row: StoreModel,
+    items: list[dict[str, Any]],
+    *,
+    checked_at: datetime | None = None,
+) -> None:
+    total_count = len(items)
+    listed_count = sum(1 for item in items if rakuten_listing_status_from_item(item) == "listed")
+    row.rakuten_product_total_count = total_count
+    row.rakuten_product_listed_count = listed_count
+    row.rakuten_product_unlisted_count = max(0, total_count - listed_count)
+    row.last_checked_at = checked_at or datetime.now()
 
 
 def sync_store_cabinet_usage_fields(row: StoreModel, service_secret: str, license_key: str) -> None:
@@ -4737,8 +4768,9 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
         failed_count = 0
         service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
         license_key = decrypt_text(row.rakuten_license_key_encrypted)
-        verify_store_credentials(row)
+        verify_store_credentials(row, include_product_counts=False)
         items = fetch_rakuten_store_items(service_secret, license_key)
+        apply_store_product_counts(row, items)
         cancelled = False
         if task_id:
             update_task_progress(
@@ -4776,6 +4808,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
         if not cancelled:
             mark_missing_store_products_removed(session, row, seen_manage_numbers)
             reconcile_listed_master_store_marks_after_store_sync(session, owner_username, row, seen_manage_numbers)
+        row.last_product_synced_at = datetime.now()
         session.flush()
         return {
             "store": store_to_public(row),
@@ -5154,7 +5187,6 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             task = session.get(SyncTaskModel, task_id)
             store = session.get(StoreModel, task.store_id) if task and task.store_id else None
             if store is not None:
-                store.last_synced_at = datetime.now()
                 store.last_error = error_detail
 
     with session_scope() as session:
@@ -5436,7 +5468,7 @@ def verify_all_stores(owner_username: str) -> dict[str, Any]:
             try:
                 verify_store_credentials(row)
             except Exception as exc:
-                row.last_synced_at = datetime.now()
+                row.last_checked_at = datetime.now()
                 row.last_error = str(exc)
         session.flush()
         stores = [store_to_public(row) for row in rows]

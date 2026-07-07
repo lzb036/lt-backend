@@ -89,6 +89,16 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("ALTER TABLE lt_stores ADD COLUMN cabinet_remaining_folder_count INT NULL"))
         if "cabinet_usage_checked_at" not in store_columns:
             connection.execute(text("ALTER TABLE lt_stores ADD COLUMN cabinet_usage_checked_at DATETIME NULL"))
+        if "rakuten_product_total_count" not in store_columns:
+            connection.execute(text("ALTER TABLE lt_stores ADD COLUMN rakuten_product_total_count INT NULL"))
+        if "rakuten_product_listed_count" not in store_columns:
+            connection.execute(text("ALTER TABLE lt_stores ADD COLUMN rakuten_product_listed_count INT NULL"))
+        if "rakuten_product_unlisted_count" not in store_columns:
+            connection.execute(text("ALTER TABLE lt_stores ADD COLUMN rakuten_product_unlisted_count INT NULL"))
+        if "last_checked_at" not in store_columns:
+            connection.execute(text("ALTER TABLE lt_stores ADD COLUMN last_checked_at DATETIME NULL"))
+        if "last_product_synced_at" not in store_columns:
+            connection.execute(text("ALTER TABLE lt_stores ADD COLUMN last_product_synced_at DATETIME NULL"))
 
         store_unique_constraints = set(
             connection.execute(

@@ -108,6 +108,11 @@ class StoreModel(TimestampMixin, Base):
     cabinet_used_folder_count: Mapped[int | None] = mapped_column(Integer)
     cabinet_remaining_folder_count: Mapped[int | None] = mapped_column(Integer)
     cabinet_usage_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    rakuten_product_total_count: Mapped[int | None] = mapped_column(Integer)
+    rakuten_product_listed_count: Mapped[int | None] = mapped_column(Integer)
+    rakuten_product_unlisted_count: Mapped[int | None] = mapped_column(Integer)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    last_product_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     last_error: Mapped[str | None] = mapped_column(Text)
 
