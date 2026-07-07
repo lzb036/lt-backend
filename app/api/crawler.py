@@ -617,6 +617,15 @@ def verify_stores(
     return crawler_service.verify_all_stores(target_username)
 
 
+@router.post("/stores/product-counts")
+def refresh_store_product_counts(
+    ownerUsername: str | None = Query(default=None),
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    target_username = resolve_target_username(user, ownerUsername)
+    return crawler_service.refresh_all_store_product_counts(target_username)
+
+
 @router.post("/stores/{store_id}/verify")
 def verify_store(
     store_id: int,
@@ -626,6 +635,19 @@ def verify_store(
     try:
         target_username = resolve_target_username(user, ownerUsername)
         return {"store": crawler_service.verify_store(target_username, store_id)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/stores/{store_id}/product-counts")
+def refresh_single_store_product_counts(
+    store_id: int,
+    ownerUsername: str | None = Query(default=None),
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        target_username = resolve_target_username(user, ownerUsername)
+        return {"store": crawler_service.refresh_store_product_counts(target_username, store_id)}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -717,6 +739,39 @@ def download_schedule_import_template(user: dict = Depends(require_crawler_permi
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     filename = crawler_service.SCHEDULE_IMPORT_TEMPLATE_FILENAME
+    encoded_filename = quote(filename)
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}; filename*=UTF-8''{encoded_filename}",
+        },
+    )
+
+
+@router.get("/schedules/export")
+def export_schedules(
+    keyword: str | None = Query(default=None),
+    enabledStatus: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    scheduleTime: str | None = Query(default=None),
+    createdAtFrom: str | None = Query(default=None),
+    createdAtTo: str | None = Query(default=None),
+    user: dict = Depends(require_crawler_permission),
+) -> StreamingResponse:
+    try:
+        content = crawler_service.scheduled_crawl_export_bytes(
+            user["username"],
+            keyword=keyword,
+            enabled_status=enabledStatus,
+            status=status,
+            schedule_time=scheduleTime,
+            created_at_from=createdAtFrom,
+            created_at_to=createdAtTo,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    filename = crawler_service.SCHEDULE_EXPORT_FILENAME
     encoded_filename = quote(filename)
     return StreamingResponse(
         BytesIO(content),

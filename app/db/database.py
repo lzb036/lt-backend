@@ -95,6 +95,8 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("ALTER TABLE lt_stores ADD COLUMN rakuten_product_listed_count INT NULL"))
         if "rakuten_product_unlisted_count" not in store_columns:
             connection.execute(text("ALTER TABLE lt_stores ADD COLUMN rakuten_product_unlisted_count INT NULL"))
+        if "rakuten_product_total_exceeds_limit" not in store_columns:
+            connection.execute(text("ALTER TABLE lt_stores ADD COLUMN rakuten_product_total_exceeds_limit TINYINT(1) NOT NULL DEFAULT 0"))
         if "last_checked_at" not in store_columns:
             connection.execute(text("ALTER TABLE lt_stores ADD COLUMN last_checked_at DATETIME NULL"))
         if "last_product_synced_at" not in store_columns:

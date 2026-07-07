@@ -58,6 +58,7 @@ RAKUTEN_CABINET_FOLDERS_GET_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/
 RAKUTEN_CABINET_FOLDER_INSERT_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/folder/insert"
 RAKUTEN_INVENTORY_BULK_UPSERT_URL = "https://api.rms.rakuten.co.jp/es/2.1/inventories/bulk-upsert"
 RAKUTEN_ITEM_SEARCH_HITS = 100
+RAKUTEN_ITEM_SEARCH_MAX_FETCHED_ITEMS = 10000
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 RAKUTEN_WRITE_MAX_RETRIES = 3
 RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -394,6 +395,7 @@ TASK_START_RETRY_DELAY_SECONDS = 5.0
 TASK_STALE_CANCEL_REQUEST_SECONDS = 10 * 60
 TASK_REDIS_MISSING_JOB_GRACE_SECONDS = 60
 SCHEDULE_IMPORT_TEMPLATE_FILENAME = "scheduled-crawl-template.xlsx"
+SCHEDULE_EXPORT_FILENAME = "scheduled-crawl-shops.xlsx"
 SCHEDULE_FALLBACK_SHOP_URL_KEY = "fallbackShopUrl"
 SCHEDULE_IMPORTED_NOTE_KEY = "importedSchedule"
 SCHEDULE_FALLBACK_TARGET_PREFIX = "__LT_FALLBACK_SHOP_URL__:"
@@ -1672,6 +1674,7 @@ def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
         "rakutenProductTotalCount": row.rakuten_product_total_count,
         "rakutenProductListedCount": row.rakuten_product_listed_count,
         "rakutenProductUnlistedCount": row.rakuten_product_unlisted_count,
+        "rakutenProductTotalExceedsLimit": bool(row.rakuten_product_total_exceeds_limit),
         "lastCheckedAt": checked_at.isoformat(sep=" ") if checked_at else None,
         "lastProductSyncedAt": product_synced_at.isoformat(sep=" ") if product_synced_at else None,
         "lastSyncedAt": product_synced_at.isoformat(sep=" ") if product_synced_at else None,
@@ -3414,6 +3417,14 @@ def parse_rakuten_shop_master_xml(xml_text: str) -> dict[str, str]:
 
 
 def fetch_rakuten_store_items(service_secret: str, license_key: str) -> list[dict[str, Any]]:
+    items, _ = fetch_rakuten_store_items_with_total(service_secret, license_key)
+    return items
+
+
+def fetch_rakuten_store_items_with_total(
+    service_secret: str,
+    license_key: str,
+) -> tuple[list[dict[str, Any]], int | None]:
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
     headers = {
@@ -3424,7 +3435,7 @@ def fetch_rakuten_store_items(service_secret: str, license_key: str) -> list[dic
     seen: set[str] = set()
     offset = 0
     total_count: int | None = None
-    while True:
+    while offset < RAKUTEN_ITEM_SEARCH_MAX_FETCHED_ITEMS:
         payload = request_rakuten_items_page(headers, offset)
         total_count = total_count if total_count is not None else parse_rakuten_total_count(payload)
 
@@ -3446,7 +3457,7 @@ def fetch_rakuten_store_items(service_secret: str, license_key: str) -> list[dic
             break
         if len(page_items) < RAKUTEN_ITEM_SEARCH_HITS:
             break
-    return items
+    return items, total_count
 
 
 def request_rakuten_items_page(headers: dict[str, str], offset: int) -> dict[str, Any]:
@@ -5671,17 +5682,23 @@ def remember_store_product_link(previous_links: dict[str, dict[str, Any]], row: 
             previous_links[identifier] = link
 
 
-def verify_store_credentials(row: StoreModel, *, include_product_counts: bool = True) -> None:
+def verify_store_credentials(
+    row: StoreModel,
+    *,
+    include_product_counts: bool = True,
+    include_cabinet_usage: bool = True,
+) -> None:
     service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
     license_key = decrypt_text(row.rakuten_license_key_encrypted)
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
     checked_at = datetime.now()
     verify_store_key_and_update_meta(row, service_secret, license_key)
-    update_store_cabinet_usage(row, service_secret, license_key, checked_at=checked_at)
+    if include_cabinet_usage:
+        update_store_cabinet_usage(row, service_secret, license_key, checked_at=checked_at)
     if include_product_counts:
-        items = fetch_rakuten_store_items(service_secret, license_key)
-        apply_store_product_counts(row, items, checked_at=checked_at)
+        items, rakuten_total_count = fetch_rakuten_store_items_with_total(service_secret, license_key)
+        apply_store_product_counts(row, items, rakuten_total_count=rakuten_total_count, checked_at=checked_at)
     row.last_checked_at = checked_at
     row.last_error = None
 
@@ -5717,13 +5734,18 @@ def apply_store_product_counts(
     row: StoreModel,
     items: list[dict[str, Any]],
     *,
+    rakuten_total_count: int | None = None,
     checked_at: datetime | None = None,
 ) -> None:
-    total_count = len(items)
+    fetched_count = len(items)
+    total_count = max(rakuten_total_count or fetched_count, fetched_count)
     listed_count = sum(1 for item in items if rakuten_listing_status_from_item(item) == "listed")
     row.rakuten_product_total_count = total_count
     row.rakuten_product_listed_count = listed_count
-    row.rakuten_product_unlisted_count = max(0, total_count - listed_count)
+    row.rakuten_product_unlisted_count = max(0, fetched_count - listed_count)
+    row.rakuten_product_total_exceeds_limit = bool(
+        rakuten_total_count is not None and rakuten_total_count > RAKUTEN_ITEM_SEARCH_MAX_FETCHED_ITEMS
+    )
     row.last_checked_at = checked_at or datetime.now()
 
 
@@ -5760,8 +5782,8 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
         service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
         license_key = decrypt_text(row.rakuten_license_key_encrypted)
         verify_store_credentials(row, include_product_counts=False)
-        items = fetch_rakuten_store_items(service_secret, license_key)
-        apply_store_product_counts(row, items)
+        items, rakuten_total_count = fetch_rakuten_store_items_with_total(service_secret, license_key)
+        apply_store_product_counts(row, items, rakuten_total_count=rakuten_total_count)
         if task_id:
             update_task_progress(
                 SyncTaskModel,
@@ -6450,7 +6472,7 @@ def verify_all_stores(owner_username: str) -> dict[str, Any]:
         ).all()
         for row in rows:
             try:
-                verify_store_credentials(row)
+                verify_store_credentials(row, include_product_counts=False, include_cabinet_usage=False)
             except Exception as exc:
                 row.last_checked_at = datetime.now()
                 row.last_error = str(exc)
@@ -6475,7 +6497,49 @@ def verify_store(owner_username: str, store_id: int) -> dict[str, Any]:
         if row.owner_username != owner_username:
             raise RuntimeError("不能检测其他用户的店铺。")
         try:
-            verify_store_credentials(row)
+            verify_store_credentials(row, include_product_counts=False, include_cabinet_usage=False)
+        except Exception as exc:
+            row.last_checked_at = datetime.now()
+            row.last_error = str(exc)
+        session.flush()
+        return store_to_public(row)
+
+
+def refresh_all_store_product_counts(owner_username: str) -> dict[str, Any]:
+    with session_scope() as session:
+        rows = session.scalars(
+            select(StoreModel)
+            .where(StoreModel.owner_username == owner_username)
+            .order_by(StoreModel.id.asc())
+        ).all()
+        for row in rows:
+            try:
+                verify_store_credentials(row, include_product_counts=True)
+            except Exception as exc:
+                row.last_checked_at = datetime.now()
+                row.last_error = str(exc)
+        session.flush()
+        stores = [store_to_public(row) for row in rows]
+        return {
+            "stores": stores,
+            "summary": {
+                "total": len(stores),
+                "available": sum(1 for store in stores if store["availabilityStatus"] == "available"),
+                "error": sum(1 for store in stores if store["availabilityStatus"] == "error"),
+                "unchecked": sum(1 for store in stores if store["availabilityStatus"] == "unchecked"),
+            },
+        }
+
+
+def refresh_store_product_counts(owner_username: str, store_id: int) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(StoreModel, store_id)
+        if row is None:
+            raise RuntimeError("店铺不存在。")
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能获取其他用户店铺的数量。")
+        try:
+            verify_store_credentials(row, include_product_counts=True)
         except Exception as exc:
             row.last_checked_at = datetime.now()
             row.last_error = str(exc)
@@ -6493,6 +6557,46 @@ def scheduled_crawl_import_template_bytes() -> bytes:
     sheet.title = "定时采集导入"
     sheet.append(["店铺名称", "店铺URL"])
     sheet.append(["示例店铺名称", "https://www.rakuten.co.jp/example-shop/"])
+    sheet.column_dimensions["A"].width = 30
+    sheet.column_dimensions["B"].width = 52
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def scheduled_crawl_export_bytes(
+    owner_username: str,
+    *,
+    keyword: str | None = None,
+    enabled_status: str | None = None,
+    status: str | None = None,
+    schedule_time: str | None = None,
+    created_at_from: str | None = None,
+    created_at_to: str | None = None,
+) -> bytes:
+    try:
+        from openpyxl import Workbook
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 openpyxl，无法生成导出表格。") from exc
+
+    with session_scope() as session:
+        query = scheduled_crawls_query(
+            owner_username,
+            keyword=keyword,
+            enabled_status=enabled_status,
+            status=status,
+            schedule_time=schedule_time,
+            created_at_from=created_at_from,
+            created_at_to=created_at_to,
+        )
+        rows = session.scalars(query.order_by(ScheduledCrawlModel.created_at.desc())).all()
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "采集店铺导出"
+    sheet.append(["店铺名称", "店铺URL"])
+    for row in rows:
+        sheet.append([scheduled_crawl_export_shop_name(row), scheduled_crawl_export_shop_url(row)])
     sheet.column_dimensions["A"].width = 30
     sheet.column_dimensions["B"].width = 52
     buffer = BytesIO()
@@ -6654,6 +6758,103 @@ def import_cell_text(value: Any) -> str:
     return str(value).strip()
 
 
+def schedule_import_shop_name(notes: Any) -> str:
+    text = normalize_text(notes)
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = {}
+    if isinstance(payload, dict):
+        return normalize_text(payload.get("shopName"))
+    return ""
+
+
+def scheduled_crawl_export_shop_name(row: ScheduledCrawlModel) -> str:
+    return (
+        schedule_import_shop_name(row.notes)
+        or normalize_text(row.crawl_content)
+        or scheduled_crawl_target_value(row)
+        or normalize_text(row.name)
+    )
+
+
+def scheduled_crawl_export_shop_url(row: ScheduledCrawlModel) -> str:
+    fallback_url = schedule_fallback_shop_url(row.notes)
+    if fallback_url:
+        return fallback_url
+    for value in (row.crawl_content, row.target):
+        normalized = exportable_shop_target_value(value)
+        if normalized:
+            return normalized
+    return ""
+
+
+def scheduled_crawl_target_value(row: ScheduledCrawlModel) -> str:
+    return exportable_shop_target_value(row.target, build_shop_url=False)
+
+
+def exportable_shop_target_value(value: Any, *, build_shop_url: bool = True) -> str:
+    base_target, fallback_target = split_shop_fallback_target(normalize_text(value))
+    if fallback_target:
+        return fallback_target
+    parsed_target, _, _ = parse_ranking_target(strip_shop_ranking_prefix(base_target))
+    normalized = normalize_text(parsed_target or base_target)
+    if not normalized:
+        return ""
+    if normalized.startswith(("http://", "https://")):
+        return normalized
+    if re.fullmatch(r"[0-9]+", normalized):
+        return normalized
+    if build_shop_url and looks_like_rakuten_shop_code(normalized):
+        return build_rakuten_store_url(normalized)
+    return normalized if not build_shop_url else ""
+
+
+def scheduled_crawls_query(
+    owner_username: str,
+    *,
+    keyword: str | None = None,
+    enabled_status: str | None = None,
+    status: str | None = None,
+    schedule_time: str | None = None,
+    created_at_from: str | None = None,
+    created_at_to: str | None = None,
+) -> Any:
+    query = select(ScheduledCrawlModel).where(
+        ScheduledCrawlModel.owner_username == owner_username,
+        ScheduledCrawlModel.source_type == "shop",
+    )
+    created_at_from_value = parse_datetime_filter(created_at_from)
+    created_at_to_value = parse_datetime_filter(created_at_to)
+    normalized_keyword = normalize_text(keyword)
+    if normalized_keyword:
+        like_value = f"%{normalized_keyword}%"
+        query = query.where(
+            or_(
+                ScheduledCrawlModel.name.like(like_value),
+                ScheduledCrawlModel.crawl_content.like(like_value),
+                ScheduledCrawlModel.target.like(like_value),
+                ScheduledCrawlModel.notes.like(like_value),
+            )
+        )
+    if enabled_status == "enabled":
+        query = query.where(ScheduledCrawlModel.enabled.is_(True))
+    elif enabled_status == "disabled":
+        query = query.where(ScheduledCrawlModel.enabled.is_(False))
+    if status in {"idle", "running", "disabled", "failed"}:
+        query = query.where(ScheduledCrawlModel.status == status)
+    normalized_schedule_time = normalize_text(schedule_time)
+    if normalized_schedule_time:
+        query = query.where(ScheduledCrawlModel.schedule_time == normalized_schedule_time)
+    if created_at_from_value is not None:
+        query = query.where(ScheduledCrawlModel.created_at >= created_at_from_value)
+    if created_at_to_value is not None:
+        query = query.where(ScheduledCrawlModel.created_at <= created_at_to_value)
+    return query
+
+
 def list_scheduled_crawls(
     owner_username: str,
     *,
@@ -6668,36 +6869,15 @@ def list_scheduled_crawls(
 ) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         reconcile_interrupted_scheduled_crawls(session, owner_username=owner_username)
-        query = select(ScheduledCrawlModel).where(
-            ScheduledCrawlModel.owner_username == owner_username,
-            ScheduledCrawlModel.source_type == "shop",
+        query = scheduled_crawls_query(
+            owner_username,
+            keyword=keyword,
+            enabled_status=enabled_status,
+            status=status,
+            schedule_time=schedule_time,
+            created_at_from=created_at_from,
+            created_at_to=created_at_to,
         )
-        created_at_from_value = parse_datetime_filter(created_at_from)
-        created_at_to_value = parse_datetime_filter(created_at_to)
-        normalized_keyword = normalize_text(keyword)
-        if normalized_keyword:
-            like_value = f"%{normalized_keyword}%"
-            query = query.where(
-                or_(
-                    ScheduledCrawlModel.name.like(like_value),
-                    ScheduledCrawlModel.crawl_content.like(like_value),
-                    ScheduledCrawlModel.target.like(like_value),
-                    ScheduledCrawlModel.notes.like(like_value),
-                )
-            )
-        if enabled_status == "enabled":
-            query = query.where(ScheduledCrawlModel.enabled.is_(True))
-        elif enabled_status == "disabled":
-            query = query.where(ScheduledCrawlModel.enabled.is_(False))
-        if status in {"idle", "running", "disabled", "failed"}:
-            query = query.where(ScheduledCrawlModel.status == status)
-        normalized_schedule_time = normalize_text(schedule_time)
-        if normalized_schedule_time:
-            query = query.where(ScheduledCrawlModel.schedule_time == normalized_schedule_time)
-        if created_at_from_value is not None:
-            query = query.where(ScheduledCrawlModel.created_at >= created_at_from_value)
-        if created_at_to_value is not None:
-            query = query.where(ScheduledCrawlModel.created_at <= created_at_to_value)
         return paginate_query(
             session,
             query,

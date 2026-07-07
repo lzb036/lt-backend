@@ -118,6 +118,7 @@ class StoreModel(TimestampMixin, Base):
     rakuten_product_total_count: Mapped[int | None] = mapped_column(Integer)
     rakuten_product_listed_count: Mapped[int | None] = mapped_column(Integer)
     rakuten_product_unlisted_count: Mapped[int | None] = mapped_column(Integer)
+    rakuten_product_total_exceeds_limit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     last_product_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
