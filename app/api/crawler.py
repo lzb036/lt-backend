@@ -45,6 +45,10 @@ class TaskDeletePayload(BaseModel):
     taskIds: list[str] = Field(default_factory=list)
 
 
+class ScheduleDeletePayload(BaseModel):
+    scheduleIds: list[int] = Field(default_factory=list)
+
+
 class StorePayload(BaseModel):
     ownerUsername: str | None = None
     aliasName: str = ""
@@ -666,9 +670,25 @@ def delete_sync_tasks(payload: TaskDeletePayload, user: dict = Depends(require_p
 def list_schedules(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
+    keyword: str | None = Query(default=None),
+    enabledStatus: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    scheduleTime: str | None = Query(default=None),
+    createdAtFrom: str | None = Query(default=None),
+    createdAtTo: str | None = Query(default=None),
     user: dict = Depends(require_crawler_permission),
 ) -> dict:
-    result = crawler_service.list_scheduled_crawls(user["username"], page=page, page_size=pageSize)
+    result = crawler_service.list_scheduled_crawls(
+        user["username"],
+        page=page,
+        page_size=pageSize,
+        keyword=keyword,
+        enabled_status=enabledStatus,
+        status=status,
+        schedule_time=scheduleTime,
+        created_at_from=createdAtFrom,
+        created_at_to=createdAtTo,
+    )
     if isinstance(result, dict):
         return result
     return {"schedules": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
@@ -705,6 +725,14 @@ def create_schedule(payload: ScheduledCrawlPayload, user: dict = Depends(require
     try:
         schedule = crawler_service.save_scheduled_crawl(user["username"], payload)
         return {"schedule": schedule}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.api_route("/schedules", methods=["DELETE"])
+def delete_schedules(payload: ScheduleDeletePayload, user: dict = Depends(require_crawler_permission)) -> dict:
+    try:
+        return crawler_service.delete_scheduled_crawls(user["username"], payload.scheduleIds)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

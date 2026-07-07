@@ -6488,13 +6488,50 @@ def import_cell_text(value: Any) -> str:
     return str(value).strip()
 
 
-def list_scheduled_crawls(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
+def list_scheduled_crawls(
+    owner_username: str,
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    keyword: str | None = None,
+    enabled_status: str | None = None,
+    status: str | None = None,
+    schedule_time: str | None = None,
+    created_at_from: str | None = None,
+    created_at_to: str | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         reconcile_interrupted_scheduled_crawls(session, owner_username=owner_username)
         query = select(ScheduledCrawlModel).where(
             ScheduledCrawlModel.owner_username == owner_username,
             ScheduledCrawlModel.source_type == "shop",
         )
+        created_at_from_value = parse_datetime_filter(created_at_from)
+        created_at_to_value = parse_datetime_filter(created_at_to)
+        normalized_keyword = normalize_text(keyword)
+        if normalized_keyword:
+            like_value = f"%{normalized_keyword}%"
+            query = query.where(
+                or_(
+                    ScheduledCrawlModel.name.like(like_value),
+                    ScheduledCrawlModel.crawl_content.like(like_value),
+                    ScheduledCrawlModel.target.like(like_value),
+                    ScheduledCrawlModel.notes.like(like_value),
+                )
+            )
+        if enabled_status == "enabled":
+            query = query.where(ScheduledCrawlModel.enabled.is_(True))
+        elif enabled_status == "disabled":
+            query = query.where(ScheduledCrawlModel.enabled.is_(False))
+        if status in {"idle", "running", "disabled", "failed"}:
+            query = query.where(ScheduledCrawlModel.status == status)
+        normalized_schedule_time = normalize_text(schedule_time)
+        if normalized_schedule_time:
+            query = query.where(ScheduledCrawlModel.schedule_time == normalized_schedule_time)
+        if created_at_from_value is not None:
+            query = query.where(ScheduledCrawlModel.created_at >= created_at_from_value)
+        if created_at_to_value is not None:
+            query = query.where(ScheduledCrawlModel.created_at <= created_at_to_value)
         return paginate_query(
             session,
             query,
@@ -6553,6 +6590,37 @@ def delete_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
         if row.owner_username != owner_username:
             raise RuntimeError("不能删除其他用户的定时任务。")
         session.delete(row)
+
+
+def delete_scheduled_crawls(owner_username: str, schedule_ids: list[int]) -> dict[str, Any]:
+    normalized_ids: list[int] = []
+    seen: set[int] = set()
+    for value in schedule_ids or []:
+        try:
+            schedule_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if schedule_id <= 0 or schedule_id in seen:
+            continue
+        seen.add(schedule_id)
+        normalized_ids.append(schedule_id)
+    if not normalized_ids:
+        raise RuntimeError("请选择要删除的采集店铺。")
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ScheduledCrawlModel).where(
+                ScheduledCrawlModel.owner_username == owner_username,
+                ScheduledCrawlModel.id.in_(normalized_ids),
+            )
+        ).all()
+        found_ids = {int(row.id) for row in rows}
+        for row in rows:
+            session.delete(row)
+        return {
+            "deletedIds": sorted(found_ids),
+            "failedIds": [schedule_id for schedule_id in normalized_ids if schedule_id not in found_ids],
+            "deletedCount": len(found_ids),
+        }
 
 
 def run_scheduled_crawl(owner_username: str, schedule_id: int) -> dict[str, Any]:
