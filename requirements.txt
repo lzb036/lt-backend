@@ -12,3 +12,5 @@ playwright==1.60.0
 redis==5.2.1
 rq==2.1.0
 Pillow==12.2.0
+openpyxl==3.1.5
+xlrd==2.0.1

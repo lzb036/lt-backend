@@ -389,6 +389,10 @@ TASK_CANCELLED_MESSAGE = "任务已终止"
 TASK_START_RETRY_DELAY_SECONDS = 5.0
 TASK_STALE_CANCEL_REQUEST_SECONDS = 10 * 60
 TASK_REDIS_MISSING_JOB_GRACE_SECONDS = 60
+SCHEDULE_IMPORT_TEMPLATE_FILENAME = "scheduled-crawl-template.xlsx"
+SCHEDULE_FALLBACK_SHOP_URL_KEY = "fallbackShopUrl"
+SCHEDULE_IMPORTED_NOTE_KEY = "importedSchedule"
+SCHEDULE_FALLBACK_TARGET_PREFIX = "__LT_FALLBACK_SHOP_URL__:"
 
 
 class ProductImageUnavailableError(RuntimeError):
@@ -1511,6 +1515,68 @@ def crawl_limit_label(value: Any, *, default: str = "全部") -> str:
     if not match:
         return default
     return f"前 {max(1, int(match.group(1)))}"
+
+
+def default_imported_schedule_target(shop_name: str) -> str:
+    return f"店铺:{normalize_text(shop_name)} 日榜 全部"
+
+
+def schedule_import_notes(shop_name: str, fallback_shop_url: str) -> str:
+    return json.dumps(
+        {
+            SCHEDULE_IMPORTED_NOTE_KEY: True,
+            "shopName": normalize_text(shop_name),
+            SCHEDULE_FALLBACK_SHOP_URL_KEY: normalize_text(fallback_shop_url),
+        },
+        ensure_ascii=False,
+    )
+
+
+def schedule_fallback_shop_url(notes: Any) -> str:
+    text = normalize_text(notes)
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = {}
+    if isinstance(payload, dict):
+        return normalize_text(payload.get(SCHEDULE_FALLBACK_SHOP_URL_KEY))
+    return ""
+
+
+def append_shop_fallback_target(target: str, fallback_shop_url: str) -> str:
+    base_target, _ = split_shop_fallback_target(target)
+    fallback = normalize_text(fallback_shop_url)
+    if not fallback:
+        return base_target
+    return f"{base_target}\n{SCHEDULE_FALLBACK_TARGET_PREFIX}{fallback}"
+
+
+def split_shop_fallback_target(target: str) -> tuple[str, str]:
+    lines = [line.strip() for line in str(target or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    visible_lines: list[str] = []
+    fallback = ""
+    for line in lines:
+        if line.startswith(SCHEDULE_FALLBACK_TARGET_PREFIX):
+            fallback = normalize_text(line[len(SCHEDULE_FALLBACK_TARGET_PREFIX):])
+            continue
+        if line:
+            visible_lines.append(line)
+    return "\n".join(visible_lines).strip(), fallback
+
+
+def fallback_shop_target(primary_target: str, fallback_shop_url: str) -> str:
+    base_target, _ = split_shop_fallback_target(primary_target)
+    parsed_target, limit, period = parse_ranking_target(strip_shop_ranking_prefix(base_target))
+    if not parsed_target:
+        parsed_target = base_target
+    return f"店铺:{fallback_shop_url} {ranking_period_label(period)} {crawl_limit_label(limit, default='全部')}"
+
+
+def scheduled_crawl_task_target(row: ScheduledCrawlModel) -> str:
+    fallback = schedule_fallback_shop_url(row.notes)
+    return append_shop_fallback_target(row.target, fallback)
 
 
 def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
@@ -5725,7 +5791,178 @@ def verify_all_stores(owner_username: str) -> dict[str, Any]:
                 "error": sum(1 for store in stores if store["availabilityStatus"] == "error"),
                 "unchecked": sum(1 for store in stores if store["availabilityStatus"] == "unchecked"),
             },
-        }
+    }
+
+
+def scheduled_crawl_import_template_bytes() -> bytes:
+    try:
+        from openpyxl import Workbook
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 openpyxl，无法生成导入模板。") from exc
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "定时采集导入"
+    sheet.append(["店铺名称", "店铺URL"])
+    sheet.append(["示例店铺名称", "https://www.rakuten.co.jp/example-shop/"])
+    sheet.column_dimensions["A"].width = 30
+    sheet.column_dimensions["B"].width = 52
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def import_scheduled_crawls(owner_username: str, filename: str, content: bytes) -> dict[str, Any]:
+    rows = parse_scheduled_crawl_import_rows(filename, content)
+    created_count = 0
+    updated_count = 0
+    failed_rows: list[dict[str, Any]] = []
+    imported_rows: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    with session_scope() as session:
+        for row in rows:
+            row_number = int(row.get("rowNumber") or 0)
+            shop_name = normalize_text(row.get("shopName"))
+            shop_url = normalize_text(row.get("shopUrl"))
+            if not shop_name or not shop_url:
+                failed_rows.append({"rowNumber": row_number, "message": "店铺名称和店铺URL不能为空。"})
+                continue
+            if shop_name in seen_names:
+                failed_rows.append({"rowNumber": row_number, "message": f"表格中店铺名称重复：{shop_name}"})
+                continue
+            seen_names.add(shop_name)
+            try:
+                normalize_rakuten_shop_target(shop_url)
+            except RuntimeError as exc:
+                failed_rows.append({"rowNumber": row_number, "message": str(exc)})
+                continue
+            existing = session.scalar(
+                select(ScheduledCrawlModel).where(
+                    ScheduledCrawlModel.owner_username == owner_username,
+                    ScheduledCrawlModel.source_type == "shop",
+                    ScheduledCrawlModel.crawl_content == shop_name,
+                )
+            )
+            is_new = existing is None
+            schedule = existing or ScheduledCrawlModel(owner_username=owner_username)
+            if is_new:
+                session.add(schedule)
+            apply_imported_scheduled_crawl(schedule, owner_username, shop_name, shop_url)
+            imported_rows.append(
+                {
+                    "rowNumber": row_number,
+                    "shopName": shop_name,
+                    "shopUrl": shop_url,
+                    "action": "created" if is_new else "updated",
+                }
+            )
+            if is_new:
+                created_count += 1
+            else:
+                updated_count += 1
+        session.flush()
+    return {
+        "totalRows": len(rows),
+        "createdCount": created_count,
+        "updatedCount": updated_count,
+        "failedCount": len(failed_rows),
+        "failedRows": failed_rows,
+        "importedRows": imported_rows,
+    }
+
+
+def apply_imported_scheduled_crawl(
+    row: ScheduledCrawlModel,
+    owner_username: str,
+    shop_name: str,
+    shop_url: str,
+) -> None:
+    normalized_shop_name = normalize_text(shop_name)
+    normalized_shop_url = normalize_text(shop_url)
+    row.owner_username = owner_username
+    row.source_id = None
+    row.source_type = "shop"
+    row.name = f"{normalized_shop_name} 每日20:00定时采集"
+    row.crawl_content = normalized_shop_name
+    row.crawl_condition = "店铺采集；名称失败时使用店铺URL"
+    row.target = default_imported_schedule_target(normalized_shop_name)
+    row.enabled = True
+    row.interval_minutes = 1440
+    row.schedule_time = "20:00"
+    row.notes = schedule_import_notes(normalized_shop_name, normalized_shop_url)
+    row.status = "idle"
+    row.next_run_at = next_daily_run_at(row.schedule_time)
+
+
+def parse_scheduled_crawl_import_rows(filename: str, content: bytes) -> list[dict[str, Any]]:
+    normalized_filename = normalize_text(filename).lower()
+    if not content:
+        raise RuntimeError("导入文件为空。")
+    if normalized_filename.endswith((".xlsx", ".xlsm")):
+        return parse_scheduled_crawl_xlsx_rows(content)
+    if normalized_filename.endswith(".xls"):
+        return parse_scheduled_crawl_xls_rows(content)
+    raise RuntimeError("只支持导入 .xls 或 .xlsx 文件。")
+
+
+def parse_scheduled_crawl_xlsx_rows(content: bytes) -> list[dict[str, Any]]:
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 openpyxl，无法读取 xlsx 文件。") from exc
+    workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+    sheet = workbook.active
+    values = list(sheet.iter_rows(values_only=True))
+    return scheduled_crawl_rows_from_table(values)
+
+
+def parse_scheduled_crawl_xls_rows(content: bytes) -> list[dict[str, Any]]:
+    try:
+        import xlrd
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 xlrd，无法读取 xls 文件。") from exc
+    workbook = xlrd.open_workbook(file_contents=content)
+    sheet = workbook.sheet_by_index(0)
+    values = [[sheet.cell_value(row_index, col_index) for col_index in range(sheet.ncols)] for row_index in range(sheet.nrows)]
+    return scheduled_crawl_rows_from_table(values)
+
+
+def scheduled_crawl_rows_from_table(values: list[Any]) -> list[dict[str, Any]]:
+    if not values:
+        raise RuntimeError("导入文件没有内容。")
+    header = [schedule_import_header_key(value) for value in values[0]]
+    try:
+        name_index = header.index("shopName")
+        url_index = header.index("shopUrl")
+    except ValueError as exc:
+        raise RuntimeError("导入文件表头必须包含：店铺名称、店铺URL。") from exc
+    rows: list[dict[str, Any]] = []
+    for row_offset, row in enumerate(values[1:], start=2):
+        row_values = list(row or [])
+        shop_name = import_cell_text(row_values[name_index] if name_index < len(row_values) else "")
+        shop_url = import_cell_text(row_values[url_index] if url_index < len(row_values) else "")
+        if not shop_name and not shop_url:
+            continue
+        rows.append({"rowNumber": row_offset, "shopName": shop_name, "shopUrl": shop_url})
+    if not rows:
+        raise RuntimeError("导入文件没有可导入的店铺数据。")
+    return rows
+
+
+def schedule_import_header_key(value: Any) -> str:
+    normalized = re.sub(r"\s+", "", normalize_text(value)).lower()
+    if normalized in {"店铺名称", "店铺名", "名称", "shopname", "storename"}:
+        return "shopName"
+    if normalized in {"店铺url", "店铺链接", "店铺网址", "url", "shopurl", "storeurl"}:
+        return "shopUrl"
+    return normalized
+
+
+def import_cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value)).strip()
+    return str(value).strip()
 
 
 def list_scheduled_crawls(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
@@ -5816,7 +6053,7 @@ def run_scheduled_crawl_job(owner_username: str, schedule_id: int) -> None:
         row.last_run_at = datetime.now()
         session.flush()
         source_type = row.source_type
-        target = row.target
+        target = scheduled_crawl_task_target(row)
         row_enabled = bool(row.enabled)
         schedule_time = row.schedule_time
 
@@ -10508,7 +10745,7 @@ def chunk_items(items: list[dict[str, Any]], batch_size: int) -> list[list[dict[
 
 def initial_crawl_task_total_count(source_type: str, target: str) -> int:
     normalized_source_type = normalize_text(source_type)
-    normalized_target = normalize_text(target)
+    normalized_target = normalize_text(split_shop_fallback_target(target)[0] if normalized_source_type == "shop" else target)
     if not normalized_source_type or not normalized_target:
         return 0
     if normalized_source_type == "product_url":
@@ -10522,6 +10759,21 @@ def initial_crawl_task_total_count(source_type: str, target: str) -> int:
 
 
 def collect_items(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
+    if source_type == "shop":
+        primary_target, fallback_target = split_shop_fallback_target(target)
+        try:
+            items = collect_items_for_target(source_type, primary_target, task_id=task_id)
+        except Exception as exc:
+            if isinstance(exc, TaskCancelled) or not fallback_target:
+                raise
+            return collect_items_for_target(source_type, fallback_shop_target(primary_target, fallback_target), task_id=task_id)
+        if items or not fallback_target:
+            return items
+        return collect_items_for_target(source_type, fallback_shop_target(primary_target, fallback_target), task_id=task_id)
+    return collect_items_for_target(source_type, target, task_id=task_id)
+
+
+def collect_items_for_target(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
     raise_if_task_cancelled(CrawlTaskModel, task_id)
     if source_type == "product_url":
         return [collect_product_detail(normalize_rakuten_product_target(target))]

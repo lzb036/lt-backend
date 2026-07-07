@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from io import BytesIO
+from urllib.parse import quote
+
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
@@ -634,6 +637,32 @@ def list_schedules(
     if isinstance(result, dict):
         return result
     return {"schedules": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
+
+
+@router.get("/schedules/import-template")
+def download_schedule_import_template(user: dict = Depends(require_crawler_permission)) -> StreamingResponse:
+    try:
+        content = crawler_service.scheduled_crawl_import_template_bytes()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    filename = crawler_service.SCHEDULE_IMPORT_TEMPLATE_FILENAME
+    encoded_filename = quote(filename)
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}; filename*=UTF-8''{encoded_filename}",
+        },
+    )
+
+
+@router.post("/schedules/import")
+async def import_schedules(file: UploadFile = File(...), user: dict = Depends(require_crawler_permission)) -> dict:
+    try:
+        content = await file.read()
+        return crawler_service.import_scheduled_crawls(user["username"], file.filename or "", content)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/schedules")
