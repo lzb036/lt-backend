@@ -4686,6 +4686,41 @@ def delete_store(owner_username: str, store_id: int) -> None:
         clear_product_temp_image_files(int(product_id))
 
 
+def clear_store_products_for_reimport(
+    session: Any,
+    owner_username: str,
+    store: StoreModel,
+) -> tuple[dict[str, dict[str, Any]], list[int]]:
+    rows = session.scalars(
+        select(ProductModel).where(
+            ProductModel.owner_username == owner_username,
+            ProductModel.store_id == store.id,
+        )
+    ).all()
+    previous_links: dict[str, dict[str, Any]] = {}
+    deleted_ids: list[int] = []
+    for row in rows:
+        remember_store_product_link(previous_links, row)
+        remove_listed_store_mark_for_store_product(session, row)
+        deleted_ids.append(row.id)
+        session.delete(row)
+    if deleted_ids:
+        session.flush()
+    return previous_links, deleted_ids
+
+
+def remember_store_product_link(previous_links: dict[str, dict[str, Any]], row: ProductModel) -> None:
+    if not row.parent_product_id:
+        return
+    link = {
+        "parentProductId": row.parent_product_id,
+        "listedAt": row.listed_at,
+    }
+    for identifier in (normalize_text(row.rakuten_manage_number), normalize_text(row.item_number)):
+        if identifier:
+            previous_links[identifier] = link
+
+
 def verify_store_credentials(row: StoreModel, *, include_product_counts: bool = True) -> None:
     service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
     license_key = decrypt_text(row.rakuten_license_key_encrypted)
@@ -4756,6 +4791,7 @@ def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:
 
 def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | None = None) -> dict[str, Any]:
     raise_if_task_cancelled(SyncTaskModel, task_id)
+    deleted_product_ids: list[int] = []
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
@@ -4771,7 +4807,6 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
         verify_store_credentials(row, include_product_counts=False)
         items = fetch_rakuten_store_items(service_secret, license_key)
         apply_store_product_counts(row, items)
-        cancelled = False
         if task_id:
             update_task_progress(
                 SyncTaskModel,
@@ -4781,18 +4816,11 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
                 failed_count=0,
                 message=f"同步中，已处理 0 / {len(items)} 条",
             )
-        seen_manage_numbers: set[str] = set()
+        raise_if_task_cancelled(SyncTaskModel, task_id)
+        previous_store_links, deleted_product_ids = clear_store_products_for_reimport(session, owner_username, row)
         for index, item in enumerate(items, start=1):
-            if task_id and is_task_cancel_requested(SyncTaskModel, task_id):
-                cancelled = True
-                break
-            manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
-            if manage_number:
-                seen_manage_numbers.add(manage_number)
-            item_number = first_text_from_keys(item, ("itemNumber",))
-            if item_number:
-                seen_manage_numbers.add(item_number)
-            if upsert_store_product(session, owner_username, row, item):
+            raise_if_task_cancelled(SyncTaskModel, task_id)
+            if upsert_store_product(session, owner_username, row, item, previous_store_links=previous_store_links):
                 synced_count += 1
             else:
                 failed_count += 1
@@ -4805,18 +4833,18 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
                     failed_count=failed_count,
                     message=f"同步中，已处理 {index} / {len(items)} 条",
                 )
-        if not cancelled:
-            mark_missing_store_products_removed(session, row, seen_manage_numbers)
-            reconcile_listed_master_store_marks_after_store_sync(session, owner_username, row, seen_manage_numbers)
         row.last_product_synced_at = datetime.now()
         session.flush()
-        return {
+        result = {
             "store": store_to_public(row),
             "totalCount": len(items),
             "syncedCount": synced_count,
             "failedCount": failed_count,
-            "cancelled": cancelled,
+            "cancelled": False,
         }
+    for product_id in deleted_product_ids:
+        clear_product_temp_image_files(product_id)
+    return result
 
 
 def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
@@ -7504,86 +7532,6 @@ def remove_listed_store_mark_for_store_product(session: Any, store_product: Prod
     parent = session.get(ProductModel, store_product.parent_product_id) if store_product.parent_product_id else None
     if parent is not None and parent.owner_username == store_product.owner_username:
         remove_product_listed_store_mark(parent, int(store_product.store_id))
-
-
-def reconcile_listed_master_store_marks_after_store_sync(
-    session: Any,
-    owner_username: str,
-    store: StoreModel,
-    seen_identifiers: set[str],
-) -> None:
-    normalized_seen = {normalize_text(value) for value in seen_identifiers if normalize_text(value)}
-    products = session.scalars(
-        select(ProductModel).where(
-            ProductModel.owner_username == owner_username,
-            ProductModel.review_status == "listed_master",
-        )
-    ).all()
-    for product in products:
-        store_records = [
-            record for record in product_listed_stores(product_raw_payload(product))
-            if int(record.get("storeId") or 0) == int(store.id)
-        ]
-        if not store_records:
-            continue
-        for record in store_records:
-            if listed_store_record_is_seen_after_sync(session, product, record, normalized_seen):
-                continue
-            remove_product_listed_store_mark(product, int(store.id))
-            break
-
-
-def listed_store_record_is_seen_after_sync(
-    session: Any,
-    product: ProductModel,
-    record: dict[str, Any],
-    seen_identifiers: set[str],
-) -> bool:
-    if not seen_identifiers:
-        return False
-    record_identifiers = {
-        normalize_text(record.get("manageNumber")),
-        normalize_text(record.get("itemNumber")),
-    }
-    if any(identifier and identifier in seen_identifiers for identifier in record_identifiers):
-        return True
-    store_product = linked_store_product_from_listed_store_record(session, product, record)
-    if store_product is None:
-        return False
-    product_identifiers = {
-        normalize_text(store_product.rakuten_manage_number),
-        normalize_text(store_product.item_number),
-    }
-    return any(identifier and identifier in seen_identifiers for identifier in product_identifiers)
-
-
-def linked_store_product_from_listed_store_record(
-    session: Any,
-    product: ProductModel,
-    record: dict[str, Any],
-) -> ProductModel | None:
-    product_id = record.get("productId")
-    try:
-        normalized_product_id = int(product_id or 0)
-    except (TypeError, ValueError):
-        normalized_product_id = 0
-    if normalized_product_id:
-        row = session.get(ProductModel, normalized_product_id)
-        if (
-            row is not None
-            and row.owner_username == product.owner_username
-            and row.parent_product_id == product.id
-            and int(row.store_id or 0) == int(record.get("storeId") or 0)
-        ):
-            return row
-    return session.scalar(
-        select(ProductModel).where(
-            ProductModel.owner_username == product.owner_username,
-            ProductModel.parent_product_id == product.id,
-            ProductModel.store_id == int(record.get("storeId") or 0),
-            ProductModel.review_status == "listed",
-        )
-    )
 
 
 def generate_listing_manage_number(product: ProductModel, raw_payload: dict[str, Any]) -> str:
@@ -11979,17 +11927,26 @@ def extract_item_number(url: str) -> str:
     return parts[-1][:255] if parts else ""
 
 
-def upsert_store_product(session: Any, owner_username: str, store: StoreModel, item: dict[str, Any]) -> bool:
+def upsert_store_product(
+    session: Any,
+    owner_username: str,
+    store: StoreModel,
+    item: dict[str, Any],
+    *,
+    previous_store_links: dict[str, dict[str, Any]] | None = None,
+) -> bool:
     item_number = first_text_from_keys(item, ("itemNumber", "manageNumber"))
     manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
     source_url = (
         first_url_from_keys(item, ("itemUrl", "itemPageUrl", "url"))
         or build_public_item_page_url(store.store_code, item_number or manage_number)
     )
+    source_hash_url = f"{source_url}#store={store.id}&manage={quote(manage_number or item_number, safe='')}"
     title = first_text_from_keys(item, ("itemName", "title", "name"))
     normalized = {
         "title": title,
         "source_url": source_url,
+        "source_url_hash_key": source_hash_url,
         "image_url": first_rakuten_image_url(item, store.store_code),
         "price": price_from_rakuten_item(item),
         "shop_name": store.store_name,
@@ -12009,23 +11966,35 @@ def upsert_store_product(session: Any, owner_username: str, store: StoreModel, i
             )
         )
         if row is not None:
+            restore_store_product_link(session, row, previous_store_links, manage_number, item_number)
             ensure_product_listed_store_mark_from_store_product(session, row, store)
     return saved
 
 
-def mark_missing_store_products_removed(session: Any, store: StoreModel, seen_manage_numbers: set[str]) -> None:
-    query = select(ProductModel).where(
-        ProductModel.store_id == store.id,
-        ProductModel.review_status == "listed",
-        ProductModel.rakuten_manage_number.is_not(None),
-    )
-    if seen_manage_numbers:
-        query = query.where(ProductModel.rakuten_manage_number.not_in(seen_manage_numbers))
-    rows = session.scalars(query).all()
-    for row in rows:
-        row.store_product_status = "removed"
-        row.last_error = "本次更新未从乐天店铺后台返回，可能已在乐天下架或删除。"
-        remove_listed_store_mark_for_store_product(session, row)
+def restore_store_product_link(
+    session: Any,
+    row: ProductModel,
+    previous_store_links: dict[str, dict[str, Any]] | None,
+    *identifiers: str,
+) -> None:
+    if not previous_store_links:
+        return
+    link: dict[str, Any] | None = None
+    for identifier in identifiers:
+        normalized = normalize_text(identifier)
+        if normalized and normalized in previous_store_links:
+            link = previous_store_links[normalized]
+            break
+    if not link:
+        return
+    parent_product_id = int(link.get("parentProductId") or 0)
+    if parent_product_id and not row.parent_product_id:
+        parent = session.get(ProductModel, parent_product_id)
+        if parent is not None and parent.owner_username == row.owner_username:
+            row.parent_product_id = parent.id
+    listed_at = link.get("listedAt")
+    if isinstance(listed_at, datetime) and row.listed_at is None:
+        row.listed_at = listed_at
 
 
 def upsert_product(
@@ -12041,7 +12010,8 @@ def upsert_product(
     title = str(item.get("title") or "").strip()
     if not source_url or not title:
         return False
-    source_url_hash = make_source_url_hash(source_url)
+    source_url_hash_key = str(item.get("source_url_hash_key") or source_url).strip()
+    source_url_hash = make_source_url_hash(source_url_hash_key)
     rakuten_manage_number = str(item.get("rakuten_manage_number") or "").strip() or None
     row = None
     if store_id is not None and rakuten_manage_number:
@@ -12051,7 +12021,7 @@ def upsert_product(
                 ProductModel.rakuten_manage_number == rakuten_manage_number,
             )
         )
-    if row is None:
+    if row is None and store_id is None:
         row = session.scalar(
             select(ProductModel).where(
                 ProductModel.owner_username == owner_username,
