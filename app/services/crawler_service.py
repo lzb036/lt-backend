@@ -2058,40 +2058,42 @@ def finalize_stale_cancel_requested_tasks(
     return finalized
 
 
-def reconcile_redis_failed_sync_tasks(
+def reconcile_interrupted_running_tasks(
     session: Any,
+    model: Any,
     *,
     owner_username: str | None = None,
     store_id: int | None = None,
 ) -> int:
     if not should_use_redis_task_queue():
         return 0
-    query = select(SyncTaskModel).where(SyncTaskModel.status == "running")
+    queue_kind = task_model_queue_kind(model)
+    if not queue_kind:
+        return 0
+    query = select(model).where(model.status == "running")
     if owner_username is not None:
-        query = query.where(SyncTaskModel.owner_username == owner_username)
-    if store_id is not None:
-        query = query.where(SyncTaskModel.store_id == store_id)
+        query = query.where(model.owner_username == owner_username)
+    if store_id is not None and hasattr(model, "store_id"):
+        query = query.where(model.store_id == store_id)
     rows = session.scalars(query).all()
     if not rows:
         return 0
-    task_ids = {row.id for row in rows}
+    task_ids = {str(row.id) for row in rows}
     try:
-        task_states = redis_sync_task_states(task_ids)
+        task_states = redis_task_states(task_ids, queue_kind, job_id_prefixes=task_model_job_id_prefixes(model))
     except Exception:
         return 0
     finalized = 0
-    missing_cutoff = datetime.now() - timedelta(
-        seconds=max(
-            settings.task_queue_job_timeout_seconds + TASK_REDIS_MISSING_JOB_GRACE_SECONDS,
-            TASK_STALE_CANCEL_REQUEST_SECONDS,
-        )
-    )
+    missing_cutoff = interrupted_task_missing_cutoff()
     for task in rows:
-        state = task_states.get(task.id)
+        task_id = str(task.id)
+        state = task_states.get(task_id)
         if state and state.get("status") == "failed":
-            finalize_interrupted_sync_task(
+            finalize_interrupted_task(
+                session,
+                model,
                 task,
-                redis_failed_sync_task_reason(state),
+                redis_failed_task_reason(state, task_model_action_label(model, task)),
             )
             finalized += 1
             continue
@@ -2100,22 +2102,127 @@ def reconcile_redis_failed_sync_tasks(
         task_touched_at = task.updated_at or task.started_at or task.created_at
         if task_touched_at and task_touched_at > missing_cutoff:
             continue
-        finalize_interrupted_sync_task(
+        finalize_interrupted_task(
+            session,
+            model,
             task,
-            "后台同步任务已不在 Redis 队列中，且超过任务超时时间，系统已自动标记为失败。",
+            redis_missing_task_reason(task_model_action_label(model, task)),
         )
         finalized += 1
     return finalized
 
 
-def redis_sync_task_states(task_ids: set[str]) -> dict[str, dict[str, Any]]:
+def reconcile_redis_failed_sync_tasks(
+    session: Any,
+    *,
+    owner_username: str | None = None,
+    store_id: int | None = None,
+) -> int:
+    return reconcile_interrupted_running_tasks(
+        session,
+        SyncTaskModel,
+        owner_username=owner_username,
+        store_id=store_id,
+    )
+
+
+def reconcile_interrupted_scheduled_crawls(session: Any, *, owner_username: str | None = None) -> int:
+    if not should_use_redis_task_queue():
+        return 0
+    query = select(ScheduledCrawlModel).where(ScheduledCrawlModel.status == "running")
+    if owner_username is not None:
+        query = query.where(ScheduledCrawlModel.owner_username == owner_username)
+    rows = session.scalars(query).all()
+    if not rows:
+        return 0
+    schedule_ids = {str(row.id) for row in rows}
+    try:
+        schedule_states = redis_task_states(schedule_ids, "schedule", job_id_prefixes=("schedule-",))
+    except Exception:
+        return 0
+    finalized = 0
+    missing_cutoff = interrupted_task_missing_cutoff()
+    for row in rows:
+        schedule_id = str(row.id)
+        state = schedule_states.get(schedule_id)
+        if state and state.get("status") == "failed":
+            finalize_interrupted_scheduled_crawl(row, redis_failed_task_reason(state, "定时采集"))
+            finalized += 1
+            continue
+        if state is not None:
+            continue
+        task_touched_at = row.updated_at or row.last_run_at or row.created_at
+        if task_touched_at and task_touched_at > missing_cutoff:
+            continue
+        finalize_interrupted_scheduled_crawl(row, redis_missing_task_reason("定时采集"))
+        finalized += 1
+    return finalized
+
+
+def reconcile_interrupted_background_tasks_once() -> int:
+    with session_scope() as session:
+        return (
+            reconcile_interrupted_running_tasks(session, CrawlTaskModel)
+            + reconcile_interrupted_running_tasks(session, SyncTaskModel)
+            + reconcile_interrupted_running_tasks(session, ListingTaskModel)
+            + reconcile_interrupted_scheduled_crawls(session)
+        )
+
+
+def task_model_queue_kind(model: Any) -> str:
+    if model is CrawlTaskModel:
+        return "crawl"
+    if model is SyncTaskModel:
+        return "sync"
+    if model is ListingTaskModel:
+        return "listing"
+    return ""
+
+
+def task_model_action_label(model: Any, task: Any | None = None) -> str:
+    if model is CrawlTaskModel:
+        return "采集"
+    if model is SyncTaskModel and task is not None:
+        return sync_task_action_label(task)
+    if model is SyncTaskModel:
+        return "同步"
+    if model is ListingTaskModel:
+        return "上架"
+    return "任务"
+
+
+def task_model_job_id_prefixes(model: Any) -> tuple[str, ...]:
+    if model is CrawlTaskModel:
+        return ("crawl-", "crawl:")
+    if model is SyncTaskModel:
+        return ("sync-", "sync:")
+    if model is ListingTaskModel:
+        return ("listing-", "listing:")
+    return ()
+
+
+def interrupted_task_missing_cutoff() -> datetime:
+    return datetime.now() - timedelta(
+        seconds=max(
+            settings.task_queue_job_timeout_seconds + TASK_REDIS_MISSING_JOB_GRACE_SECONDS,
+            TASK_STALE_CANCEL_REQUEST_SECONDS,
+        )
+    )
+
+
+def redis_task_states(
+    task_ids: set[str],
+    queue_kind: str,
+    *,
+    job_id_prefixes: tuple[str, ...] = (),
+) -> dict[str, dict[str, Any]]:
     if not task_ids:
         return {}
     from rq import Queue
     from rq.registry import DeferredJobRegistry, FailedJobRegistry, ScheduledJobRegistry, StartedJobRegistry
 
     connection = redis_connection()
-    queue_name = task_queue_name_for_kind("sync")
+    queue_name = task_queue_name_for_kind(queue_kind)
     queue = Queue(queue_name, connection=connection)
     states: dict[str, dict[str, Any]] = {}
     active_sources = [
@@ -2129,7 +2236,7 @@ def redis_sync_task_states(task_ids: set[str]) -> dict[str, dict[str, Any]]:
             job = fetch_rq_job(connection, job_id)
             if job is None:
                 continue
-            task_id = sync_task_id_from_rq_job(job, task_ids)
+            task_id = task_id_from_rq_job(job, task_ids, job_id_prefixes=job_id_prefixes)
             if task_id:
                 states[task_id] = rq_job_state(job, status)
     failed_registry = FailedJobRegistry(queue_name, connection=connection)
@@ -2137,7 +2244,7 @@ def redis_sync_task_states(task_ids: set[str]) -> dict[str, dict[str, Any]]:
         job = fetch_rq_job(connection, job_id)
         if job is None:
             continue
-        task_id = sync_task_id_from_rq_job(job, task_ids)
+        task_id = task_id_from_rq_job(job, task_ids, job_id_prefixes=job_id_prefixes)
         if task_id and task_id not in states:
             states[task_id] = rq_job_state(job, "failed")
     return states
@@ -2152,22 +2259,29 @@ def fetch_rq_job(connection: Any, job_id: str) -> Any | None:
         return None
 
 
-def sync_task_id_from_rq_job(job: Any, task_ids: set[str]) -> str | None:
+def task_id_from_rq_job(
+    job: Any,
+    task_ids: set[str],
+    *,
+    job_id_prefixes: tuple[str, ...] = (),
+) -> str | None:
     job_id = str(getattr(job, "id", "") or "")
     if job_id in task_ids:
         return job_id
-    for prefix in ("sync-", "sync:"):
-        if job_id.startswith(prefix):
-            normalized = job_id[len(prefix):]
-            if normalized in task_ids:
-                return normalized
+    for prefix in job_id_prefixes:
+        if not job_id.startswith(prefix):
+            continue
+        normalized = job_id[len(prefix):]
+        for task_id in task_ids:
+            if normalized == task_id or normalized.startswith(f"{task_id}-"):
+                return task_id
     for value in getattr(job, "args", ()) or ():
         text = str(value)
         if text in task_ids:
             return text
     description = str(getattr(job, "description", "") or "")
     for task_id in task_ids:
-        if task_id in description:
+        if re.search(rf"(?<![\w-]){re.escape(task_id)}(?![\w-])", description):
             return task_id
     return None
 
@@ -2184,14 +2298,14 @@ def rq_job_state(job: Any, status: str) -> dict[str, Any]:
     }
 
 
-def redis_failed_sync_task_reason(state: dict[str, Any]) -> str:
-    description = str(state.get("description") or "同步任务")
+def redis_failed_task_reason(state: dict[str, Any], action_label: str) -> str:
+    description = str(state.get("description") or f"{action_label}任务")
     job_id = str(state.get("jobId") or "")
     ended_at = state.get("endedAt")
     exc_info = normalize_task_detail_text(state.get("excInfo"))
-    reason = "后台同步任务进程异常退出，系统已自动标记为失败。"
+    reason = f"后台{action_label}任务进程异常退出，系统已自动标记为失败。"
     if "Work-horse terminated unexpectedly" in exc_info:
-        reason = "后台同步任务进程异常退出或超时，系统已自动标记为失败。"
+        reason = f"后台{action_label}任务进程异常退出或超时，系统已自动标记为失败。"
     details = [reason]
     if description:
         details.append(f"任务：{description}")
@@ -2202,6 +2316,22 @@ def redis_failed_sync_task_reason(state: dict[str, Any]) -> str:
     if exc_info:
         details.append(f"队列错误：{exc_info[-500:]}")
     return "\n".join(details)
+
+
+def redis_missing_task_reason(action_label: str) -> str:
+    return f"后台{action_label}任务已不在 Redis 队列中，且超过任务超时时间，系统已自动标记为失败。"
+
+
+def finalize_interrupted_task(session: Any, model: Any, task: Any, reason: str) -> None:
+    if model is SyncTaskModel:
+        finalize_interrupted_sync_task(task, reason)
+        return
+    if model is ListingTaskModel:
+        finalize_interrupted_listing_task(session, task, reason)
+        return
+    if model is CrawlTaskModel:
+        finalize_interrupted_crawl_task(task, reason)
+        return
 
 
 def finalize_interrupted_sync_task(task: SyncTaskModel, reason: str) -> None:
@@ -2222,6 +2352,80 @@ def finalize_interrupted_sync_task(task: SyncTaskModel, reason: str) -> None:
     task.finished_at = datetime.now()
 
 
+def finalize_interrupted_crawl_task(task: CrawlTaskModel, reason: str) -> None:
+    total_count = int(task.total_count or 0)
+    success_count = int(task.success_count or 0)
+    failed_count = int(task.failed_count or 0)
+    unfinished_count = max(0, total_count - success_count - failed_count)
+    task.failed_count = max(failed_count + unfinished_count, 1)
+    task.status = "failed"
+    task.message = interrupted_progress_message("采集", total_count, success_count, failed_count, unfinished_count=unfinished_count)
+    task.error_detail = interrupted_task_error_detail(reason, task.error_detail)
+    task.finished_at = datetime.now()
+
+
+def finalize_interrupted_listing_task(session: Any, task: ListingTaskModel, reason: str) -> None:
+    product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
+    task_product_ids = product_ids_payload["productIds"]
+    success_ids = product_ids_payload["successIds"]
+    failed_ids = product_ids_payload["failedIds"]
+    retry_ids = product_ids_payload["retryIds"]
+    active_ids = retry_ids or task_product_ids
+    handled_ids = set(success_ids) | set(failed_ids)
+    unfinished_ids = [product_id for product_id in active_ids if product_id not in handled_ids]
+    final_failed_ids = merge_listing_task_product_ids(failed_ids, unfinished_ids)
+    release_listing_task_locks(session, task.owner_username, task)
+
+    total_count = max(int(task.total_count or 0), len(task_product_ids))
+    success_count = len(success_ids)
+    failed_count = max(len(final_failed_ids), 0 if success_count else 1)
+    task.status = "partial" if success_count else "failed"
+    task.total_count = total_count
+    task.success_count = success_count
+    task.failed_count = failed_count
+    task.message = interrupted_progress_message(
+        "上架",
+        total_count,
+        success_count,
+        failed_count,
+        unfinished_count=len(unfinished_ids),
+    )
+    task.error_detail = interrupted_task_error_detail(reason, task.error_detail)
+    task.product_ids_json = json.dumps(
+        listing_task_result_payload(task_product_ids, success_ids, final_failed_ids),
+        ensure_ascii=False,
+    )
+    task.finished_at = datetime.now()
+
+
+def finalize_interrupted_scheduled_crawl(row: ScheduledCrawlModel, reason: str) -> None:
+    row.status = "failed"
+    row.notes = interrupted_task_error_detail(reason, row.notes) or reason
+    if row.enabled and row.next_run_at is None:
+        row.next_run_at = next_daily_run_at(row.schedule_time)
+
+
+def interrupted_progress_message(
+    action_label: str,
+    total_count: int,
+    success_count: int,
+    failed_count: int,
+    *,
+    unfinished_count: int = 0,
+) -> str:
+    total = max(0, int(total_count or 0))
+    success = max(0, int(success_count or 0))
+    failed = max(0, int(failed_count or 0))
+    unfinished = max(0, int(unfinished_count or 0))
+    if total > 0:
+        processed = min(total, success + failed)
+        return (
+            f"{action_label}异常中断，已处理 {processed} / {total} 条，"
+            f"成功 {success} 条，异常 {failed} 条，未完成 {unfinished} 条"
+        )
+    return f"{action_label}异常中断"
+
+
 def finalize_stale_store_cancel_requested_tasks(session: Any, store_id: int | None) -> int:
     if not store_id:
         return 0
@@ -2231,13 +2435,14 @@ def finalize_stale_store_cancel_requested_tasks(session: Any, store_id: int | No
         action_label="同步",
         store_id=store_id,
     )
-    sync_count += reconcile_redis_failed_sync_tasks(session, store_id=store_id)
+    sync_count += reconcile_interrupted_running_tasks(session, SyncTaskModel, store_id=store_id)
     listing_count = finalize_stale_cancel_requested_tasks(
         session,
         ListingTaskModel,
         action_label="上架",
         store_id=store_id,
     )
+    listing_count += reconcile_interrupted_running_tasks(session, ListingTaskModel, store_id=store_id)
     return sync_count + listing_count
 
 
@@ -2314,8 +2519,7 @@ def task_start_wait_reason(
 ) -> str:
     finalize_stale_cancel_requested_tasks(session, model, action_label=label, owner_username=owner_username)
     finalize_stale_store_cancel_requested_tasks(session, store_id)
-    if model is SyncTaskModel:
-        reconcile_redis_failed_sync_tasks(session, owner_username=owner_username)
+    reconcile_interrupted_running_tasks(session, model, owner_username=owner_username)
     running_count = running_user_task_count(session, model, owner_username, exclude_task_id=task_id)
     if running_count >= limit:
         return f"排队中，等待当前{label}任务完成"
@@ -4195,6 +4399,7 @@ def dashboard_summary(
             ) or 0)
         crawl_tasks = empty_task_counts.copy()
         if include_crawler:
+            reconcile_interrupted_running_tasks(session, CrawlTaskModel, owner_username=owner_username)
             crawl_tasks = _count_grouped_status(
                 session,
                 CrawlTaskModel,
@@ -4216,6 +4421,7 @@ def dashboard_summary(
                 start_at,
                 end_at,
             )
+            reconcile_interrupted_running_tasks(session, ListingTaskModel, owner_username=owner_username)
             listing_tasks = _count_grouped_status(
                 session,
                 ListingTaskModel,
@@ -4230,7 +4436,7 @@ def dashboard_summary(
             )
         sync_tasks = empty_task_counts.copy()
         if include_sync_tasks:
-            reconcile_redis_failed_sync_tasks(session, owner_username=owner_username)
+            reconcile_interrupted_running_tasks(session, SyncTaskModel, owner_username=owner_username)
             sync_tasks = _count_grouped_status(
                 session,
                 SyncTaskModel,
@@ -4293,6 +4499,7 @@ def list_tasks(
 ) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, CrawlTaskModel, action_label="采集", owner_username=owner_username)
+        reconcile_interrupted_running_tasks(session, CrawlTaskModel, owner_username=owner_username)
         query = select(CrawlTaskModel).where(CrawlTaskModel.owner_username == owner_username)
         created_at_from_value = parse_datetime_filter(created_at_from)
         created_at_to_value = parse_datetime_filter(created_at_to)
@@ -5316,7 +5523,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
 def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步", owner_username=owner_username)
-        reconcile_redis_failed_sync_tasks(session, owner_username=owner_username)
+        reconcile_interrupted_running_tasks(session, SyncTaskModel, owner_username=owner_username)
         query = select(SyncTaskModel).where(SyncTaskModel.owner_username == owner_username)
         return paginate_query(
             session,
@@ -6151,6 +6358,7 @@ def import_cell_text(value: Any) -> str:
 
 def list_scheduled_crawls(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
+        reconcile_interrupted_scheduled_crawls(session, owner_username=owner_username)
         query = select(ScheduledCrawlModel).where(
             ScheduledCrawlModel.owner_username == owner_username,
             ScheduledCrawlModel.source_type == "shop",
@@ -6269,6 +6477,7 @@ def run_due_scheduled_crawls_once() -> int:
     try:
         now = datetime.now()
         with session_scope() as session:
+            reconcile_interrupted_scheduled_crawls(session)
             rows = session.scalars(
                 select(ScheduledCrawlModel).where(
                     ScheduledCrawlModel.enabled.is_(True),
@@ -6300,6 +6509,7 @@ def run_due_scheduled_crawls_once() -> int:
 
 
 def run_periodic_maintenance_once() -> None:
+    reconcile_interrupted_background_tasks_once()
     cleanup_expired_product_image_drafts_if_due()
     cleanup_orphan_product_image_dirs_if_due()
     cleanup_completed_scheduled_crawl_tasks_if_due()
@@ -10035,6 +10245,7 @@ def listing_status_result_summary(result: dict[str, Any], total_count: int, *, c
 def list_listing_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架", owner_username=owner_username)
+        reconcile_interrupted_running_tasks(session, ListingTaskModel, owner_username=owner_username)
         query = select(ListingTaskModel).where(ListingTaskModel.owner_username == owner_username)
         normalized_page, normalized_page_size = normalize_page_params(page, page_size)
         order_by = ListingTaskModel.created_at.desc()
