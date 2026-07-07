@@ -378,6 +378,7 @@ RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
 CRAWLER_HTTP_RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
 SCHEDULE_RUN_LOCK = threading.Lock()
 SCHEDULED_CRAWL_TASK_CLEANUP_LOCK = threading.Lock()
+STORE_UNLISTED_PRODUCT_CLEANUP_LOCK = threading.Lock()
 CRAWLER_REQUEST_LOCK = threading.Lock()
 RAKUTEN_CABINET_REQUEST_LOCK = threading.Lock()
 CRAWLER_SESSION_LOCAL = threading.local()
@@ -400,6 +401,8 @@ SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY = "scheduledCrawlTaskCleanup"
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY = 6
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME = "09:00"
 SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS = 7
+STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY = 1
+STORE_UNLISTED_PRODUCT_CLEANUP_TIME = "01:00"
 
 
 class ProductImageUnavailableError(RuntimeError):
@@ -1537,6 +1540,19 @@ def next_weekly_run_at(weekday: int, schedule_time: str, *, now: datetime | None
     candidate = (reference + timedelta(days=days_until)).replace(hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= reference:
         candidate += timedelta(days=7)
+    return candidate
+
+
+def next_monthly_run_at(month_day: int, schedule_time: str, *, now: datetime | None = None) -> datetime:
+    reference = now or datetime.now()
+    normalized_time = normalize_schedule_time(schedule_time)
+    hour, minute = [int(part) for part in normalized_time.split(":", 1)]
+    day = max(1, min(28, int(month_day or 1)))
+    candidate = reference.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= reference:
+        year = reference.year + (1 if reference.month == 12 else 0)
+        month = 1 if reference.month == 12 else reference.month + 1
+        candidate = candidate.replace(year=year, month=month, day=day)
     return candidate
 
 
@@ -4661,6 +4677,11 @@ def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any
         SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME,
         now=reference,
     )
+    next_unlisted_cleanup_at = next_monthly_run_at(
+        STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY,
+        STORE_UNLISTED_PRODUCT_CLEANUP_TIME,
+        now=reference,
+    )
     return {
         "cleanupWeekday": SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY,
         "cleanupTime": SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME,
@@ -4668,6 +4689,12 @@ def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any
         "nextCleanupAt": datetime_to_public(next_cleanup_at),
         "lastCleanupAt": None,
         "lastCleanupDeletedCount": 0,
+        "unlistedCleanupMonthDay": STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY,
+        "unlistedCleanupTime": STORE_UNLISTED_PRODUCT_CLEANUP_TIME,
+        "unlistedNextCleanupAt": datetime_to_public(next_unlisted_cleanup_at),
+        "unlistedLastCleanupAt": None,
+        "unlistedLastDeletedCount": 0,
+        "unlistedLastTaskCount": 0,
     }
 
 
@@ -4697,6 +4724,24 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         last_cleanup_deleted_count = max(0, int(last_cleanup_deleted_count or 0))
     except (TypeError, ValueError):
         last_cleanup_deleted_count = 0
+    unlisted_month_day = STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY
+    try:
+        unlisted_cleanup_time = normalize_schedule_time(payload.get("unlistedCleanupTime", STORE_UNLISTED_PRODUCT_CLEANUP_TIME))
+    except RuntimeError:
+        unlisted_cleanup_time = STORE_UNLISTED_PRODUCT_CLEANUP_TIME
+    unlisted_next_cleanup_at = parse_public_datetime(payload.get("unlistedNextCleanupAt"))
+    if unlisted_next_cleanup_at is None:
+        unlisted_next_cleanup_at = next_monthly_run_at(unlisted_month_day, unlisted_cleanup_time, now=reference)
+    unlisted_last_deleted_count = payload.get("unlistedLastDeletedCount", 0)
+    try:
+        unlisted_last_deleted_count = max(0, int(unlisted_last_deleted_count or 0))
+    except (TypeError, ValueError):
+        unlisted_last_deleted_count = 0
+    unlisted_last_task_count = payload.get("unlistedLastTaskCount", 0)
+    try:
+        unlisted_last_task_count = max(0, int(unlisted_last_task_count or 0))
+    except (TypeError, ValueError):
+        unlisted_last_task_count = 0
 
     return {
         "cleanupWeekday": cleanup_weekday,
@@ -4705,6 +4750,12 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         "nextCleanupAt": datetime_to_public(next_cleanup_at),
         "lastCleanupAt": datetime_to_public(parse_public_datetime(payload.get("lastCleanupAt"))),
         "lastCleanupDeletedCount": last_cleanup_deleted_count,
+        "unlistedCleanupMonthDay": unlisted_month_day,
+        "unlistedCleanupTime": unlisted_cleanup_time,
+        "unlistedNextCleanupAt": datetime_to_public(unlisted_next_cleanup_at),
+        "unlistedLastCleanupAt": datetime_to_public(parse_public_datetime(payload.get("unlistedLastCleanupAt"))),
+        "unlistedLastDeletedCount": unlisted_last_deleted_count,
+        "unlistedLastTaskCount": unlisted_last_task_count,
     }
 
 
@@ -4754,7 +4805,7 @@ def save_time_settings(payload: Any) -> dict[str, Any]:
         return time_settings_to_public(row, updated_payload)
 
 
-def cleanup_completed_scheduled_crawl_tasks_if_due() -> int:
+def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:
     if not SCHEDULED_CRAWL_TASK_CLEANUP_LOCK.acquire(blocking=False):
         return 0
     try:
@@ -4764,7 +4815,7 @@ def cleanup_completed_scheduled_crawl_tasks_if_due() -> int:
             payload = load_time_settings_payload(row, now=now)
             row = upsert_time_settings_row(session, payload)
             next_cleanup_at = parse_public_datetime(payload.get("nextCleanupAt"))
-            if next_cleanup_at is not None and next_cleanup_at > now:
+            if not force and next_cleanup_at is not None and next_cleanup_at > now:
                 return 0
 
             cutoff = now - timedelta(days=SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS)
@@ -4792,6 +4843,121 @@ def cleanup_completed_scheduled_crawl_tasks_if_due() -> int:
             return len(task_ids)
     finally:
         SCHEDULED_CRAWL_TASK_CLEANUP_LOCK.release()
+
+
+def cleanup_completed_scheduled_crawl_tasks_if_due() -> int:
+    return cleanup_completed_scheduled_crawl_tasks(force=False)
+
+
+def run_completed_scheduled_crawl_tasks_cleanup_now() -> dict[str, Any]:
+    cleanup_completed_scheduled_crawl_tasks(force=True)
+    return get_time_settings()
+
+
+def create_store_unlisted_product_delete_tasks(session: Any, now: datetime) -> tuple[list[tuple[str, str]], int]:
+    rows = session.execute(
+        select(
+            ProductModel.owner_username,
+            ProductModel.store_id,
+            ProductModel.id,
+            StoreModel.alias_name,
+            StoreModel.store_name,
+        )
+        .join(StoreModel, ProductModel.store_id == StoreModel.id)
+        .where(
+            StoreModel.enabled.is_(True),
+            ProductModel.owner_username == StoreModel.owner_username,
+            ProductModel.store_id.is_not(None),
+            ProductModel.review_status == "listed",
+            ProductModel.rakuten_listing_status == "unlisted",
+        )
+        .order_by(ProductModel.store_id.asc(), ProductModel.id.asc())
+    ).all()
+    groups: dict[tuple[str, int], dict[str, Any]] = {}
+    for owner_username, store_id, product_id, alias_name, store_name in rows:
+        if store_id is None:
+            continue
+        key = (str(owner_username), int(store_id))
+        group = groups.setdefault(
+            key,
+            {
+                "storeName": normalize_text(alias_name or store_name) or f"店铺 {store_id}",
+                "productIds": [],
+            },
+        )
+        group["productIds"].append(int(product_id))
+
+    task_refs: list[tuple[str, str]] = []
+    product_count = 0
+    for (owner_username, store_id), group in groups.items():
+        product_ids = normalize_product_ids(group["productIds"])
+        if not product_ids:
+            continue
+        product_count += len(product_ids)
+        task_id = uuid.uuid4().hex
+        task = SyncTaskModel(
+            id=task_id,
+            owner_username=owner_username,
+            store_id=store_id,
+            store_name=group["storeName"],
+            task_name=f"月度删除未上架 {group['storeName']} {now:%Y-%m-%d %H:%M}",
+            task_type="product_delete",
+            payload_json=json.dumps({"productIds": product_ids, "autoMonthlyUnlistedCleanup": True}, ensure_ascii=False),
+            status="queued",
+            message="等待执行月度未上架商品删除",
+        )
+        session.add(task)
+        task_refs.append((owner_username, task_id))
+    return task_refs, product_count
+
+
+def cleanup_store_unlisted_products(*, force: bool = False) -> dict[str, int]:
+    if not STORE_UNLISTED_PRODUCT_CLEANUP_LOCK.acquire(blocking=False):
+        return {"taskCount": 0, "productCount": 0}
+    task_refs: list[tuple[str, str]] = []
+    product_count = 0
+    try:
+        now = datetime.now()
+        with session_scope() as session:
+            row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+            payload = load_time_settings_payload(row, now=now)
+            row = upsert_time_settings_row(session, payload)
+            next_cleanup_at = parse_public_datetime(payload.get("unlistedNextCleanupAt"))
+            if not force and next_cleanup_at is not None and next_cleanup_at > now:
+                return {"taskCount": 0, "productCount": 0}
+
+            task_refs, product_count = create_store_unlisted_product_delete_tasks(session, now)
+            payload["unlistedLastCleanupAt"] = datetime_to_public(now)
+            payload["unlistedLastDeletedCount"] = product_count
+            payload["unlistedLastTaskCount"] = len(task_refs)
+            payload["unlistedNextCleanupAt"] = datetime_to_public(
+                next_monthly_run_at(
+                    payload["unlistedCleanupMonthDay"],
+                    payload["unlistedCleanupTime"],
+                    now=now,
+                )
+            )
+            row.value_json = json.dumps(payload, ensure_ascii=False)
+        for owner_username, task_id in task_refs:
+            dispatch_sync_task(owner_username, task_id)
+        return {"taskCount": len(task_refs), "productCount": product_count}
+    finally:
+        STORE_UNLISTED_PRODUCT_CLEANUP_LOCK.release()
+
+
+def cleanup_store_unlisted_products_if_due() -> dict[str, int]:
+    return cleanup_store_unlisted_products(force=False)
+
+
+def run_store_unlisted_product_cleanup_now() -> dict[str, Any]:
+    summary = cleanup_store_unlisted_products(force=True)
+    return {
+        "settings": get_time_settings(),
+        "summary": {
+            "taskCount": summary["taskCount"],
+            "productCount": summary["productCount"],
+        },
+    }
 
 
 def cancel_crawl_task(owner_username: str, task_id: str) -> dict[str, Any]:
@@ -6713,6 +6879,7 @@ def run_periodic_maintenance_once() -> None:
     cleanup_expired_product_image_drafts_if_due()
     cleanup_orphan_product_image_dirs_if_due()
     cleanup_completed_scheduled_crawl_tasks_if_due()
+    cleanup_store_unlisted_products_if_due()
 
 
 def cleanup_expired_product_image_drafts_if_due() -> int:

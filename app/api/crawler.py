@@ -187,6 +187,22 @@ def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(requ
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/settings/time/scheduled-task-cleanup/run")
+def run_scheduled_task_cleanup(user: dict = Depends(require_settings_permission)) -> dict:
+    try:
+        return {"settings": crawler_service.run_completed_scheduled_crawl_tasks_cleanup_now()}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/settings/time/unlisted-products/run")
+def run_unlisted_product_cleanup(user: dict = Depends(require_settings_permission)) -> dict:
+    try:
+        return crawler_service.run_store_unlisted_product_cleanup_now()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/sources")
 def list_sources(
     page: int | None = Query(default=None, ge=1),
