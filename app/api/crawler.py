@@ -594,6 +594,19 @@ def verify_stores(
     return crawler_service.verify_all_stores(target_username)
 
 
+@router.post("/stores/{store_id}/verify")
+def verify_store(
+    store_id: int,
+    ownerUsername: str | None = Query(default=None),
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        target_username = resolve_target_username(user, ownerUsername)
+        return {"store": crawler_service.verify_store(target_username, store_id)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/stores/{store_id}/sync")
 def sync_store(
     store_id: int,

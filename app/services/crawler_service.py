@@ -5400,18 +5400,23 @@ def verify_store_credentials(row: StoreModel, *, include_product_counts: bool = 
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
     checked_at = datetime.now()
-    shop_meta = fetch_rakuten_shop_meta(service_secret, license_key)
-    row.store_code = shop_meta["shopCode"]
-    row.store_name = shop_meta["shopName"]
-    if not row.alias_name:
-        row.alias_name = row.store_name
-    row.store_url = build_rakuten_store_url(row.store_code)
+    verify_store_key_and_update_meta(row, service_secret, license_key)
     update_store_cabinet_usage(row, service_secret, license_key, checked_at=checked_at)
     if include_product_counts:
         items = fetch_rakuten_store_items(service_secret, license_key)
         apply_store_product_counts(row, items, checked_at=checked_at)
     row.last_checked_at = checked_at
     row.last_error = None
+
+
+def verify_store_key_and_update_meta(row: StoreModel, service_secret: str, license_key: str) -> None:
+    """Validate RMS credentials before any quantity or usage API calls."""
+    shop_meta = fetch_rakuten_shop_meta(service_secret, license_key)
+    row.store_code = shop_meta["shopCode"]
+    row.store_name = shop_meta["shopName"]
+    if not row.alias_name:
+        row.alias_name = row.store_name
+    row.store_url = build_rakuten_store_url(row.store_code)
 
 
 def update_store_cabinet_usage(
@@ -6183,6 +6188,22 @@ def verify_all_stores(owner_username: str) -> dict[str, Any]:
                 "unchecked": sum(1 for store in stores if store["availabilityStatus"] == "unchecked"),
             },
     }
+
+
+def verify_store(owner_username: str, store_id: int) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(StoreModel, store_id)
+        if row is None:
+            raise RuntimeError("店铺不存在。")
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能检测其他用户的店铺。")
+        try:
+            verify_store_credentials(row)
+        except Exception as exc:
+            row.last_checked_at = datetime.now()
+            row.last_error = str(exc)
+        session.flush()
+        return store_to_public(row)
 
 
 def scheduled_crawl_import_template_bytes() -> bytes:
