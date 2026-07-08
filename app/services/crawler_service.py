@@ -63,6 +63,7 @@ RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 RAKUTEN_WRITE_MAX_RETRIES = 3
 RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT = 400
+BATCH_TASK_PRODUCT_LIMIT = 200
 LISTED_STORE_NONE_FILTER = "__none__"
 _TASK_DETAIL_UNSET = object()
 _STORE_SNAPSHOT_UNSET = object()
@@ -4905,20 +4906,23 @@ def create_store_unlisted_product_delete_tasks(session: Any, now: datetime) -> t
         if not product_ids:
             continue
         product_count += len(product_ids)
-        task_id = uuid.uuid4().hex
-        task = SyncTaskModel(
-            id=task_id,
-            owner_username=owner_username,
-            store_id=store_id,
-            store_name=group["storeName"],
-            task_name=f"月度删除未上架 {group['storeName']} {now:%Y-%m-%d %H:%M}",
-            task_type="product_delete",
-            payload_json=json.dumps({"productIds": product_ids, "autoMonthlyUnlistedCleanup": True}, ensure_ascii=False),
-            status="queued",
-            message="等待执行月度未上架商品删除",
-        )
-        session.add(task)
-        task_refs.append((owner_username, task_id))
+        chunks = chunk_product_ids(product_ids)
+        for index, chunk_ids in enumerate(chunks, start=1):
+            task_id = uuid.uuid4().hex
+            part_label = "" if len(chunks) == 1 else f" {index}/{len(chunks)}"
+            task = SyncTaskModel(
+                id=task_id,
+                owner_username=owner_username,
+                store_id=store_id,
+                store_name=group["storeName"],
+                task_name=f"月度删除未上架{part_label} {group['storeName']} {now:%Y-%m-%d %H:%M}",
+                task_type="product_delete",
+                payload_json=json.dumps({"productIds": chunk_ids, "autoMonthlyUnlistedCleanup": True}, ensure_ascii=False),
+                status="queued",
+                message="等待执行月度未上架商品删除",
+            )
+            session.add(task)
+            task_refs.append((owner_username, task_id))
     return task_refs, product_count
 
 
@@ -5918,16 +5922,22 @@ def create_product_listing_status_sync_task(owner_username: str, product_ids: li
         raise RuntimeError("请先选择商品。")
     action_label = "批量上架" if listing_status == "listed" else "批量下架"
     store_id = validate_sync_task_products(owner_username, normalized_ids)
-    task_id = create_sync_task_record(
-        owner_username,
-        store_id,
-        task_type="product_listing_status",
-        task_name_prefix=action_label,
-        message=f"等待执行{action_label}",
-        payload={"listingStatus": listing_status, "productIds": normalized_ids},
-    )
-    dispatch_sync_task(owner_username, task_id)
-    return created_sync_task_response(task_id, message=f"{action_label}任务已创建")
+    chunks = chunk_product_ids(normalized_ids)
+    task_ids: list[str] = []
+    for index, chunk_ids in enumerate(chunks, start=1):
+        task_name_prefix = action_label if len(chunks) == 1 else f"{action_label} {index}/{len(chunks)}"
+        task_id = create_sync_task_record(
+            owner_username,
+            store_id,
+            task_type="product_listing_status",
+            task_name_prefix=task_name_prefix,
+            message=f"等待执行{action_label}",
+            payload={"listingStatus": listing_status, "productIds": chunk_ids},
+        )
+        task_ids.append(task_id)
+    for task_id in task_ids:
+        dispatch_sync_task(owner_username, task_id)
+    return created_sync_tasks_response(task_ids, message=f"{action_label}任务已创建", total=len(normalized_ids))
 
 
 def create_product_delete_sync_task(owner_username: str, product_ids: list[int]) -> dict[str, Any]:
@@ -5935,16 +5945,22 @@ def create_product_delete_sync_task(owner_username: str, product_ids: list[int])
     if not normalized_ids:
         raise RuntimeError("请先选择商品。")
     store_id = validate_sync_task_products(owner_username, normalized_ids)
-    task_id = create_sync_task_record(
-        owner_username,
-        store_id,
-        task_type="product_delete",
-        task_name_prefix="批量删除",
-        message="等待执行批量删除",
-        payload={"productIds": normalized_ids},
-    )
-    dispatch_sync_task(owner_username, task_id)
-    return created_sync_task_response(task_id, message="批量删除任务已创建")
+    chunks = chunk_product_ids(normalized_ids)
+    task_ids: list[str] = []
+    for index, chunk_ids in enumerate(chunks, start=1):
+        task_name_prefix = "批量删除" if len(chunks) == 1 else f"批量删除 {index}/{len(chunks)}"
+        task_id = create_sync_task_record(
+            owner_username,
+            store_id,
+            task_type="product_delete",
+            task_name_prefix=task_name_prefix,
+            message="等待执行批量删除",
+            payload={"productIds": chunk_ids},
+        )
+        task_ids.append(task_id)
+    for task_id in task_ids:
+        dispatch_sync_task(owner_username, task_id)
+    return created_sync_tasks_response(task_ids, message="批量删除任务已创建", total=len(normalized_ids))
 
 
 def normalize_product_ids(product_ids: list[int]) -> list[int]:
@@ -5957,6 +5973,12 @@ def normalize_product_ids(product_ids: list[int]) -> list[int]:
         seen.add(product_id)
         result.append(product_id)
     return result
+
+
+def chunk_product_ids(product_ids: list[int], *, chunk_size: int = BATCH_TASK_PRODUCT_LIMIT) -> list[list[int]]:
+    normalized_ids = normalize_product_ids(product_ids)
+    size = max(1, int(chunk_size or BATCH_TASK_PRODUCT_LIMIT))
+    return [normalized_ids[index : index + size] for index in range(0, len(normalized_ids), size)]
 
 
 def product_review_statuses(owner_username: str, product_ids: list[int]) -> set[str]:
@@ -6012,6 +6034,35 @@ def created_sync_task_response(task_id: str, *, message: str) -> dict[str, Any]:
                 "successCount": 0,
                 "failedCount": 0,
                 "message": message,
+                "errors": [],
+            },
+        }
+
+
+def created_sync_tasks_response(task_ids: list[str], *, message: str, total: int = 0) -> dict[str, Any]:
+    normalized_ids = [task_id for task_id in task_ids if task_id]
+    if not normalized_ids:
+        raise RuntimeError("同步任务创建失败。")
+    with session_scope() as session:
+        rows = session.scalars(
+            select(SyncTaskModel)
+            .where(SyncTaskModel.id.in_(normalized_ids))
+            .order_by(SyncTaskModel.created_at.asc())
+        ).all()
+        task_by_id = {row.id: row for row in rows}
+        tasks = [sync_task_to_public(task_by_id[task_id]) for task_id in normalized_ids if task_id in task_by_id]
+        first_task = task_by_id.get(normalized_ids[0])
+        store = session.get(StoreModel, first_task.store_id) if first_task and first_task.store_id else None
+        split_message = message if len(tasks) == 1 else f"{message}，已拆分为 {len(tasks)} 个任务，每个最多 {BATCH_TASK_PRODUCT_LIMIT} 条"
+        return {
+            "syncTask": tasks[0] if tasks else {"id": normalized_ids[0]},
+            "syncTasks": tasks,
+            "store": store_to_public(store) if store else None,
+            "summary": {
+                "total": int(total or 0),
+                "successCount": 0,
+                "failedCount": 0,
+                "message": split_message,
                 "errors": [],
             },
         }
@@ -10846,7 +10897,7 @@ def delete_listing_tasks(owner_username: str, task_ids: list[str]) -> dict[str, 
 
 
 def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
-    product_ids = [int(value) for value in (getattr(payload, "productIds", None) or [])]
+    product_ids = normalize_product_ids([int(value) for value in (getattr(payload, "productIds", None) or [])])
     store_ids = listing_task_payload_store_ids(payload)
     task_name = str(getattr(payload, "taskName", "") or "").strip()
     if not product_ids:
@@ -10904,37 +10955,64 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
             detail = "；".join(preflight_blockers[:5])
             suffix = "；更多问题请先执行上架前体检。" if len(preflight_blockers) > 5 else ""
             raise RuntimeError(f"上架前体检未通过：{detail}{suffix}")
-        task_id = uuid.uuid4().hex
-        for product in products:
-            product.listing_task_id = task_id
-            product.last_error = None
-        task = ListingTaskModel(
-            id=task_id,
-            owner_username=owner_username,
-            store_id=ordered_stores[0].id,
-            task_name=task_name or f"上架任务 {datetime.now():%Y-%m-%d %H:%M}",
-            status="queued",
-            total_count=len(products) * len(ordered_stores),
-            success_count=0,
-            failed_count=0,
-            product_ids_json=json.dumps(
-                listing_task_result_payload(
-                    [product.id for product in products],
-                    [],
-                    [],
-                    store_ids=store_ids,
+        product_by_id = {int(product.id): product for product in products}
+        ordered_products = [product_by_id[product_id] for product_id in product_ids]
+        product_chunks = [
+            ordered_products[index : index + BATCH_TASK_PRODUCT_LIMIT]
+            for index in range(0, len(ordered_products), BATCH_TASK_PRODUCT_LIMIT)
+        ]
+        base_task_name = task_name or f"上架任务 {datetime.now():%Y-%m-%d %H:%M}"
+        task_ids: list[str] = []
+        for index, product_chunk in enumerate(product_chunks, start=1):
+            task_id = uuid.uuid4().hex
+            chunk_product_ids = [int(product.id) for product in product_chunk]
+            for product in product_chunk:
+                product.listing_task_id = task_id
+                product.last_error = None
+            task = ListingTaskModel(
+                id=task_id,
+                owner_username=owner_username,
+                store_id=ordered_stores[0].id,
+                task_name=base_task_name if len(product_chunks) == 1 else f"{base_task_name} {index}/{len(product_chunks)}",
+                status="queued",
+                total_count=len(product_chunk) * len(ordered_stores),
+                success_count=0,
+                failed_count=0,
+                product_ids_json=json.dumps(
+                    listing_task_result_payload(
+                        chunk_product_ids,
+                        [],
+                        [],
+                        store_ids=store_ids,
+                    ),
+                    ensure_ascii=False,
                 ),
-                ensure_ascii=False,
-            ),
-            message="等待同步到乐天",
-        )
-        session.add(task)
+                message="等待同步到乐天",
+            )
+            session.add(task)
+            task_ids.append(task_id)
         session.flush()
 
-    dispatch_listing_task(owner_username, task_id)
+    for task_id in task_ids:
+        dispatch_listing_task(owner_username, task_id)
     with session_scope() as session:
-        task = session.get(ListingTaskModel, task_id)
-        return listing_task_to_public(task) if task else {"id": task_id}
+        rows = session.scalars(
+            select(ListingTaskModel)
+            .where(ListingTaskModel.id.in_(task_ids))
+            .order_by(ListingTaskModel.created_at.asc())
+        ).all()
+        task_by_id = {row.id: row for row in rows}
+        tasks = [listing_task_to_public(task_by_id[task_id]) for task_id in task_ids if task_id in task_by_id]
+        message = "上架任务已创建" if len(tasks) == 1 else f"上架任务已创建，已拆分为 {len(tasks)} 个任务，每个最多 {BATCH_TASK_PRODUCT_LIMIT} 条"
+        return {
+            "listingTask": tasks[0] if tasks else {"id": task_ids[0]},
+            "listingTasks": tasks,
+            "summary": {
+                "total": len(product_ids),
+                "taskCount": len(tasks),
+                "message": message,
+            },
+        }
 
 
 def run_listing_task(owner_username: str, task_id: str) -> None:

@@ -862,8 +862,10 @@ def preflight_listing_task(payload: ListingTaskPayload, user: dict = Depends(req
 @router.post("/listing-tasks")
 def create_listing_task(payload: ListingTaskPayload, user: dict = Depends(require_products_permission)) -> dict:
     try:
-        task = crawler_service.create_listing_task(user["username"], payload)
-        return {"listingTask": task}
+        result = crawler_service.create_listing_task(user["username"], payload)
+        if isinstance(result, dict) and "listingTask" in result:
+            return result
+        return {"listingTask": result}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
