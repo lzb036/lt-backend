@@ -1998,9 +1998,24 @@ def listing_task_to_public(
     }
 
 
+def sync_task_payload_product_count(payload: Any) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    return len(normalize_listing_task_product_ids(payload.get("productIds")))
+
+
+def sync_task_known_total_count(row: SyncTaskModel, payload: Any | None = None) -> int:
+    total_count = max(0, int(row.total_count or 0))
+    if payload is None:
+        payload = sync_task_payload(row)
+    payload_count = sync_task_payload_product_count(payload)
+    return max(total_count, payload_count)
+
+
 def sync_task_to_public(row: SyncTaskModel) -> dict[str, Any]:
     payload = sync_task_payload(row)
     task_result = payload.get("result") if isinstance(payload, dict) and isinstance(payload.get("result"), dict) else {}
+    total_count = sync_task_known_total_count(row, payload)
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -2009,7 +2024,7 @@ def sync_task_to_public(row: SyncTaskModel) -> dict[str, Any]:
         "taskName": row.task_name,
         "taskType": row.task_type,
         "status": row.status,
-        "totalCount": row.total_count,
+        "totalCount": total_count,
         "successCount": row.success_count,
         "failedCount": row.failed_count,
         "payload": payload if isinstance(payload, dict) else {},
@@ -5060,6 +5075,7 @@ def create_store_unlisted_product_delete_tasks(session: Any, now: datetime) -> t
                 task_type="product_delete",
                 payload_json=json.dumps({"productIds": chunk_ids, "autoMonthlyUnlistedCleanup": True}, ensure_ascii=False),
                 status="queued",
+                total_count=len(chunk_ids),
                 message="等待执行月度未上架商品删除",
             )
             session.add(task)
@@ -6081,6 +6097,7 @@ def create_product_listing_status_sync_task(owner_username: str, product_ids: li
             task_name_prefix=task_name_prefix,
             message=f"等待执行{action_label}",
             payload={"listingStatus": listing_status, "productIds": chunk_ids},
+            total_count=len(chunk_ids),
         )
         task_ids.append(task_id)
     dispatch_next_sync_task()
@@ -6103,6 +6120,7 @@ def create_product_delete_sync_task(owner_username: str, product_ids: list[int])
             task_name_prefix=task_name_prefix,
             message="等待执行批量删除",
             payload={"productIds": chunk_ids},
+            total_count=len(chunk_ids),
         )
         task_ids.append(task_id)
     dispatch_next_sync_task()
@@ -6222,6 +6240,7 @@ def create_sync_task_record(
     task_name_prefix: str,
     message: str,
     payload: dict[str, Any] | None = None,
+    total_count: int = 0,
 ) -> str:
     with session_scope() as session:
         store = session.get(StoreModel, store_id)
@@ -6229,6 +6248,10 @@ def create_sync_task_record(
             raise RuntimeError("店铺不存在。")
         if not store.enabled:
             raise RuntimeError("店铺已停用，不能创建同步任务。")
+        task_payload = payload or {}
+        initial_total_count = max(0, int(total_count or 0))
+        if initial_total_count <= 0:
+            initial_total_count = sync_task_payload_product_count(task_payload)
         task = SyncTaskModel(
             id=uuid.uuid4().hex,
             owner_username=owner_username,
@@ -6236,8 +6259,9 @@ def create_sync_task_record(
             store_name=store.alias_name or store.store_name,
             task_name=f"{task_name_prefix} {store.alias_name or store.store_name} {datetime.now():%Y-%m-%d %H:%M}",
             task_type=task_type,
-            payload_json=json.dumps(payload or {}, ensure_ascii=False),
+            payload_json=json.dumps(task_payload, ensure_ascii=False),
             status="queued",
+            total_count=initial_total_count,
             message=message,
         )
         session.add(task)
@@ -6371,7 +6395,7 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             message = cancelled_task_progress_message("同步", total_count, success_count, failed_count)
             error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
     except Exception as exc:
-        total_count = 0
+        total_count = sync_task_payload_product_count(payload)
         success_count = 0
         failed_count = 1
         status = "failed"
@@ -6380,6 +6404,8 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
         with session_scope() as session:
             task = session.get(SyncTaskModel, task_id)
             store = session.get(StoreModel, task.store_id) if task and task.store_id else None
+            if task is not None:
+                total_count = sync_task_known_total_count(task, payload)
             if store is not None:
                 store.last_error = error_detail
 
