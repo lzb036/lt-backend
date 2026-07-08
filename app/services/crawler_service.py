@@ -462,6 +462,53 @@ def dispatch_sync_task(owner_username: str, task_id: str, *, delay_seconds: floa
     start_background_task(run_sync_task, owner_username, task_id, delay_seconds=delay_seconds)
 
 
+def sync_task_has_active_background_job(task_id: str) -> bool:
+    if not should_use_redis_task_queue():
+        return False
+    try:
+        state = redis_task_states({str(task_id)}, "sync", job_id_prefixes=task_model_job_id_prefixes(SyncTaskModel)).get(str(task_id))
+    except Exception:
+        return False
+    return state is not None and state.get("status") in {"queued", "started", "deferred", "scheduled"}
+
+
+def dispatch_next_sync_task() -> None:
+    next_task: tuple[str, str] | None = None
+    with session_scope() as session:
+        finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步")
+        reconcile_interrupted_running_tasks(session, SyncTaskModel)
+        if running_sync_task_count(session) > 0:
+            return
+        rows = session.scalars(
+            select(SyncTaskModel)
+            .where(SyncTaskModel.status == "queued")
+            .order_by(SyncTaskModel.created_at.asc(), SyncTaskModel.id.asc())
+        ).all()
+        for task in rows:
+            if task_cancel_requested(task):
+                task.status = "cancelled"
+                task.message = TASK_CANCELLED_MESSAGE
+                task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
+                task.finished_at = datetime.now()
+                continue
+            if sync_task_has_active_background_job(task.id):
+                return
+            if running_store_task_count(session, task.store_id, exclude_sync_task_id=task.id) > 0:
+                task.message = "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
+                continue
+            next_task = (task.owner_username, task.id)
+            break
+    if next_task:
+        dispatch_sync_task(next_task[0], next_task[1])
+
+
+def dispatch_next_sync_task_safely() -> None:
+    try:
+        dispatch_next_sync_task()
+    except Exception:
+        return
+
+
 def dispatch_listing_task(owner_username: str, task_id: str, *, delay_seconds: float = 0.0) -> None:
     if should_use_redis_task_queue():
         try:
@@ -477,6 +524,54 @@ def dispatch_listing_task(owner_username: str, task_id: str, *, delay_seconds: f
             raise
         return
     start_background_task(run_listing_task, owner_username, task_id, delay_seconds=delay_seconds)
+
+
+def listing_task_has_active_background_job(task_id: str) -> bool:
+    if not should_use_redis_task_queue():
+        return False
+    try:
+        state = redis_task_states({str(task_id)}, "listing", job_id_prefixes=task_model_job_id_prefixes(ListingTaskModel)).get(str(task_id))
+    except Exception:
+        return False
+    return state is not None and state.get("status") in {"queued", "started", "deferred", "scheduled"}
+
+
+def dispatch_next_listing_task() -> None:
+    next_task: tuple[str, str] | None = None
+    with session_scope() as session:
+        finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架")
+        reconcile_interrupted_running_tasks(session, ListingTaskModel)
+        if running_listing_task_count(session) > 0:
+            return
+        rows = session.scalars(
+            select(ListingTaskModel)
+            .where(ListingTaskModel.status == "queued")
+            .order_by(ListingTaskModel.created_at.asc(), ListingTaskModel.id.asc())
+        ).all()
+        for task in rows:
+            if task_cancel_requested(task):
+                release_listing_task_locks(session, task.owner_username, task)
+                task.status = "cancelled"
+                task.message = TASK_CANCELLED_MESSAGE
+                task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
+                task.finished_at = datetime.now()
+                continue
+            if listing_task_has_active_background_job(task.id):
+                return
+            if running_store_task_count(session, task.store_id, exclude_listing_task_id=task.id) > 0:
+                task.message = "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
+                continue
+            next_task = (task.owner_username, task.id)
+            break
+    if next_task:
+        dispatch_listing_task(next_task[0], next_task[1])
+
+
+def dispatch_next_listing_task_safely() -> None:
+    try:
+        dispatch_next_listing_task()
+    except Exception:
+        return
 
 
 def dispatch_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
@@ -2560,6 +2655,52 @@ def running_user_task_count(
     if exclude_task_id:
         query = query.where(model.id != exclude_task_id)
     return int(session.scalar(query) or 0)
+
+
+def running_sync_task_count(session: Any, *, exclude_task_id: str | None = None) -> int:
+    query = select(func.count()).where(SyncTaskModel.status == "running")
+    if exclude_task_id:
+        query = query.where(SyncTaskModel.id != exclude_task_id)
+    return int(session.scalar(query) or 0)
+
+
+def running_listing_task_count(session: Any, *, exclude_task_id: str | None = None) -> int:
+    query = select(func.count()).where(ListingTaskModel.status == "running")
+    if exclude_task_id:
+        query = query.where(ListingTaskModel.id != exclude_task_id)
+    return int(session.scalar(query) or 0)
+
+
+def sync_task_start_wait_reason(session: Any, task_id: str, store_id: int | None) -> str:
+    finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步")
+    finalize_stale_store_cancel_requested_tasks(session, store_id)
+    reconcile_interrupted_running_tasks(session, SyncTaskModel)
+    if running_sync_task_count(session, exclude_task_id=task_id) > 0:
+        return "排队中，等待当前同步任务完成"
+    store_running_count = running_store_task_count(
+        session,
+        store_id,
+        exclude_sync_task_id=task_id,
+    )
+    if store_running_count > 0:
+        return "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
+    return ""
+
+
+def listing_task_start_wait_reason(session: Any, task_id: str, store_id: int | None) -> str:
+    finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架")
+    finalize_stale_store_cancel_requested_tasks(session, store_id)
+    reconcile_interrupted_running_tasks(session, ListingTaskModel)
+    if running_listing_task_count(session, exclude_task_id=task_id) > 0:
+        return "排队中，等待当前上架任务完成"
+    store_running_count = running_store_task_count(
+        session,
+        store_id,
+        exclude_listing_task_id=task_id,
+    )
+    if store_running_count > 0:
+        return "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
+    return ""
 
 
 def running_store_task_count(
@@ -4953,8 +5094,8 @@ def cleanup_store_unlisted_products(*, force: bool = False) -> dict[str, int]:
                 )
             )
             row.value_json = json.dumps(payload, ensure_ascii=False)
-        for owner_username, task_id in task_refs:
-            dispatch_sync_task(owner_username, task_id)
+        if task_refs:
+            dispatch_next_sync_task()
         return {"taskCount": len(task_refs), "productCount": product_count}
     finally:
         STORE_UNLISTED_PRODUCT_CLEANUP_LOCK.release()
@@ -5368,11 +5509,17 @@ def preflight_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
 
 
 def cancel_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
-    return request_task_cancel(ListingTaskModel, owner_username, task_id, serializer=listing_task_to_public)
+    result = request_task_cancel(ListingTaskModel, owner_username, task_id, serializer=listing_task_to_public)
+    dispatch_next_listing_task_safely()
+    dispatch_next_sync_task_safely()
+    return result
 
 
 def cancel_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
-    return request_task_cancel(SyncTaskModel, owner_username, task_id, serializer=sync_task_to_public)
+    result = request_task_cancel(SyncTaskModel, owner_username, task_id, serializer=sync_task_to_public)
+    dispatch_next_sync_task_safely()
+    dispatch_next_listing_task_safely()
+    return result
 
 
 def listing_task_cancel_requested(task_id: str) -> bool:
@@ -5829,6 +5976,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
 
 
 def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
+    dispatch_next_sync_task_safely()
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步", owner_username=owner_username)
         reconcile_interrupted_running_tasks(session, SyncTaskModel, owner_username=owner_username)
@@ -5873,7 +6021,7 @@ def create_sync_task(owner_username: str, store_id: int) -> dict[str, Any]:
         task_name_prefix="商品同步",
         message="等待同步店铺商品",
     )
-    dispatch_sync_task(owner_username, task_id)
+    dispatch_next_sync_task()
     with session_scope() as session:
         task = session.get(SyncTaskModel, task_id)
         store = session.get(StoreModel, task.store_id) if task and task.store_id else None
@@ -5897,7 +6045,7 @@ def create_listing_status_sync_task(owner_username: str, store_id: int, listing_
         message=f"等待执行{action_label}",
         payload={"listingStatus": listing_status},
     )
-    dispatch_sync_task(owner_username, task_id)
+    dispatch_next_sync_task()
     with session_scope() as session:
         task = session.get(SyncTaskModel, task_id)
         store = session.get(StoreModel, task.store_id) if task and task.store_id else None
@@ -5935,8 +6083,7 @@ def create_product_listing_status_sync_task(owner_username: str, product_ids: li
             payload={"listingStatus": listing_status, "productIds": chunk_ids},
         )
         task_ids.append(task_id)
-    for task_id in task_ids:
-        dispatch_sync_task(owner_username, task_id)
+    dispatch_next_sync_task()
     return created_sync_tasks_response(task_ids, message=f"{action_label}任务已创建", total=len(normalized_ids))
 
 
@@ -5958,8 +6105,7 @@ def create_product_delete_sync_task(owner_username: str, product_ids: list[int])
             payload={"productIds": chunk_ids},
         )
         task_ids.append(task_id)
-    for task_id in task_ids:
-        dispatch_sync_task(owner_username, task_id)
+    dispatch_next_sync_task()
     return created_sync_tasks_response(task_ids, message="批量删除任务已创建", total=len(normalized_ids))
 
 
@@ -6117,16 +6263,7 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
             task.finished_at = datetime.now()
             return
-        wait_reason = task_start_wait_reason(
-            session,
-            SyncTaskModel,
-            owner_username,
-            task_id,
-            limit=settings.max_running_sync_tasks_per_user,
-            label="同步",
-            store_id=task.store_id,
-            exclude_sync_task_id=task_id,
-        )
+        wait_reason = sync_task_start_wait_reason(session, task_id, task.store_id)
         if wait_reason:
             task.message = wait_reason
             defer_start = True
@@ -6144,7 +6281,7 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             payload = {}
 
     if defer_start:
-        dispatch_sync_task(owner_username, task_id, delay_seconds=TASK_START_RETRY_DELAY_SECONDS)
+        dispatch_next_sync_task_safely()
         return
 
     try:
@@ -6248,16 +6385,17 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
 
     with session_scope() as session:
         task = session.get(SyncTaskModel, task_id)
-        if task is None:
-            return
-        task.total_count = total_count
-        task.success_count = success_count
-        task.failed_count = failed_count
-        task.status = status
-        task.message = message
-        task.error_detail = error_detail
-        task.payload_json = json.dumps(payload, ensure_ascii=False)
-        task.finished_at = datetime.now()
+        if task is not None:
+            task.total_count = total_count
+            task.success_count = success_count
+            task.failed_count = failed_count
+            task.status = status
+            task.message = message
+            task.error_detail = error_detail
+            task.payload_json = json.dumps(payload, ensure_ascii=False)
+            task.finished_at = datetime.now()
+    dispatch_next_sync_task_safely()
+    dispatch_next_listing_task_safely()
 
 
 def sync_task_running_message(task: SyncTaskModel) -> str:
@@ -6503,12 +6641,31 @@ def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("不能重试其他用户的同步任务。")
         if task.status in {"queued", "running"}:
             raise RuntimeError("同步任务正在执行中，不能重试。")
+        if task.status == "success":
+            raise RuntimeError("成功的同步任务不需要重试。")
+        payload = sync_task_payload(task)
+        result_payload = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        if task.task_type in {"product_delete", "product_listing_status"}:
+            original_ids = normalize_product_ids(list(payload.get("productIds") or []))
+            failed_ids = normalize_product_ids(list(result_payload.get("failedIds") or []))
+            success_ids = set(normalize_product_ids(list(result_payload.get("successIds") or [])))
+            retry_ids = failed_ids or [product_id for product_id in original_ids if product_id not in success_ids]
+            if not retry_ids:
+                raise RuntimeError("该同步任务没有可重试的失败商品。")
+            payload["productIds"] = retry_ids
+            task.total_count = len(retry_ids)
+        else:
+            task.total_count = 0
+        payload.pop("result", None)
         task.status = "queued"
         task.message = "等待重新同步"
         task.error_detail = None
+        task.payload_json = json.dumps(payload, ensure_ascii=False)
+        task.success_count = 0
+        task.failed_count = 0
         task.started_at = None
         task.finished_at = None
-    dispatch_sync_task(owner_username, task_id)
+    dispatch_next_sync_task()
     with session_scope() as session:
         task = session.get(SyncTaskModel, task_id)
         return sync_task_to_public(task) if task else {"id": task_id}
@@ -10841,6 +10998,7 @@ def listing_status_result_summary(result: dict[str, Any], total_count: int, *, c
 
 
 def list_listing_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
+    dispatch_next_listing_task_safely()
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架", owner_username=owner_username)
         reconcile_interrupted_running_tasks(session, ListingTaskModel, owner_username=owner_username)
@@ -10993,8 +11151,7 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
             task_ids.append(task_id)
         session.flush()
 
-    for task_id in task_ids:
-        dispatch_listing_task(owner_username, task_id)
+    dispatch_next_listing_task()
     with session_scope() as session:
         rows = session.scalars(
             select(ListingTaskModel)
@@ -11022,6 +11179,9 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
         cancel_listing_task_from_worker(owner_username, task_id)
     except Exception as exc:
         fail_listing_task_unexpectedly(owner_username, task_id, exc)
+    finally:
+        dispatch_next_listing_task_safely()
+        dispatch_next_sync_task_safely()
 
 
 def _run_listing_task(owner_username: str, task_id: str) -> None:
@@ -11037,20 +11197,10 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             return
         if task_cancel_requested(task):
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-        wait_reason = task_start_wait_reason(
-            session,
-            ListingTaskModel,
-            owner_username,
-            task_id,
-            limit=settings.max_running_listing_tasks_per_user,
-            label="上架",
-            store_id=task.store_id,
-            exclude_listing_task_id=task_id,
-        )
+        wait_reason = listing_task_start_wait_reason(session, task_id, task.store_id)
         if wait_reason:
             task.message = wait_reason
             session.flush()
-            dispatch_listing_task(owner_username, task_id, delay_seconds=TASK_START_RETRY_DELAY_SECONDS)
             return
         task.status = "running"
         task.message = "上架准备中"
@@ -11379,7 +11529,7 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
         )
         task.started_at = None
         task.finished_at = None
-    dispatch_listing_task(owner_username, task_id)
+    dispatch_next_listing_task()
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
         return listing_task_to_public(task) if task else {"id": task_id}

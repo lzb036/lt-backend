@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_DIR = BACKEND_DIR.parent
+TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS = 3 * 60 * 60
 
 
 def _load_dotenv(path: Path) -> None:
@@ -91,7 +92,7 @@ class Settings(BaseModel):
     task_queue_sync_name: str = "lt-tasks-sync"
     task_queue_listing_name: str = "lt-tasks-listing"
     task_queue_schedule_name: str = "lt-tasks-schedule"
-    task_queue_job_timeout_seconds: int = 60 * 60
+    task_queue_job_timeout_seconds: int = TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS
     task_queue_result_ttl_seconds: int = 24 * 60 * 60
     task_queue_failure_ttl_seconds: int = 7 * 24 * 60 * 60
     rakuten_default_inventory_quantity: int = 1000
@@ -165,7 +166,10 @@ def build_settings() -> Settings:
         task_queue_sync_name=_env_text("LT_TASK_QUEUE_SYNC_NAME", f"{base_task_queue_name}-sync"),
         task_queue_listing_name=_env_text("LT_TASK_QUEUE_LISTING_NAME", f"{base_task_queue_name}-listing"),
         task_queue_schedule_name=_env_text("LT_TASK_QUEUE_SCHEDULE_NAME", f"{base_task_queue_name}-schedule"),
-        task_queue_job_timeout_seconds=max(60, _env_int("LT_TASK_QUEUE_JOB_TIMEOUT_SECONDS", 60 * 60)),
+        task_queue_job_timeout_seconds=max(
+            TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS,
+            _env_int("LT_TASK_QUEUE_JOB_TIMEOUT_SECONDS", TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS),
+        ),
         task_queue_result_ttl_seconds=max(0, _env_int("LT_TASK_QUEUE_RESULT_TTL_SECONDS", 24 * 60 * 60)),
         task_queue_failure_ttl_seconds=max(60, _env_int("LT_TASK_QUEUE_FAILURE_TTL_SECONDS", 7 * 24 * 60 * 60)),
         rakuten_default_inventory_quantity=max(0, _env_int("LT_RAKUTEN_DEFAULT_INVENTORY_QUANTITY", 1000)),
