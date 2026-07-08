@@ -1713,16 +1713,21 @@ def append_shop_fallback_target(target: str, fallback_shop_url: str) -> str:
 
 
 def split_shop_fallback_target(target: str) -> tuple[str, str]:
-    lines = [line.strip() for line in str(target or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    raw = str(target or "").replace("\r\n", "\n").replace("\r", "\n")
+    marker_index = raw.find(SCHEDULE_FALLBACK_TARGET_PREFIX)
+    if marker_index >= 0:
+        base = raw[:marker_index].strip()
+        fallback_tail = raw[marker_index + len(SCHEDULE_FALLBACK_TARGET_PREFIX):].strip()
+        match = re.match(r"https?://\S+", fallback_tail)
+        fallback = normalize_text(match.group(0) if match else fallback_tail)
+        return base, fallback
+
+    lines = [line.strip() for line in raw.split("\n")]
     visible_lines: list[str] = []
-    fallback = ""
     for line in lines:
-        if line.startswith(SCHEDULE_FALLBACK_TARGET_PREFIX):
-            fallback = normalize_text(line[len(SCHEDULE_FALLBACK_TARGET_PREFIX):])
-            continue
         if line:
             visible_lines.append(line)
-    return "\n".join(visible_lines).strip(), fallback
+    return "\n".join(visible_lines).strip(), ""
 
 
 def fallback_shop_target(primary_target: str, fallback_shop_url: str) -> str:
@@ -1731,6 +1736,17 @@ def fallback_shop_target(primary_target: str, fallback_shop_url: str) -> str:
     if not parsed_target:
         parsed_target = base_target
     return f"店铺:{fallback_shop_url} {ranking_period_label(period)} {crawl_limit_label(limit, default='全部')}"
+
+
+def is_rakuten_search_url(value: Any) -> bool:
+    normalized = normalize_text(value)
+    if not normalized.startswith(("http://", "https://")):
+        return False
+    try:
+        parsed = urlsplit(normalized)
+    except Exception:
+        return False
+    return parsed.netloc.lower() == "search.rakuten.co.jp" and parsed.path.rstrip("/").endswith("/search/mall")
 
 
 def scheduled_crawl_task_target(row: ScheduledCrawlModel) -> str:
@@ -7246,7 +7262,8 @@ def run_scheduled_crawl_job(owner_username: str, schedule_id: int) -> None:
             if row is None:
                 raise RuntimeError("定时任务不存在。")
             row.status = "idle" if row.enabled else "disabled"
-            row.notes = ""
+            if not schedule_fallback_shop_url(row.notes):
+                row.notes = ""
             row.next_run_at = next_daily_run_at(row.schedule_time) if row.enabled else None
             session.flush()
 
@@ -11657,7 +11674,8 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
         if source_type == "product_url":
             target = normalize_rakuten_product_target(target)
         elif source_type == "shop":
-            parsed_target, existing_limit, existing_period = parse_ranking_target(strip_shop_ranking_prefix(target))
+            primary_target, fallback_target = split_shop_fallback_target(target)
+            parsed_target, existing_limit, existing_period = parse_ranking_target(strip_shop_ranking_prefix(primary_target))
             raw_target = normalize_rakuten_shop_target(parsed_target)
             if not raw_target:
                 raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR)
@@ -11667,6 +11685,7 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
                 default="全部" if existing_limit is None else f"前 {existing_limit}",
             )
             target = f"店铺:{raw_target} {period_label} {limit_label}"
+            target = append_shop_fallback_target(target, fallback_target)
         task = CrawlTaskModel(
             id=uuid.uuid4().hex,
             owner_username=owner_username,
@@ -12002,24 +12021,32 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
         return [collect_product_detail(normalize_rakuten_product_target(target))]
     limit: int | None = 30
     shop_code_filter = ""
+    direct_shop_search_target = ""
     if source_type == "shop":
         target, limit, period = parse_ranking_target(strip_shop_ranking_prefix(target))
+        raw_shop_target = target
         normalized_shop_target = normalize_rakuten_shop_target(target)
-        if looks_like_rakuten_shop_code(normalized_shop_target):
+        direct_shop_search = is_rakuten_search_url(raw_shop_target) or bool(re.fullmatch(r"[0-9]+", normalized_shop_target))
+        if direct_shop_search:
+            direct_shop_search_target = raw_shop_target if is_rakuten_search_url(raw_shop_target) else normalized_shop_target
+        elif looks_like_rakuten_shop_code(normalized_shop_target):
             shop_code_filter = normalize_shop_code(normalized_shop_target)
-        target = resolve_rakuten_shop_search_keyword(target)
+        if not direct_shop_search:
+            target = resolve_rakuten_shop_search_keyword(target)
     elif source_type == "ranking":
         target, limit, period = parse_ranking_target(target)
     else:
         period = "daily"
     if source_type == "ranking":
         url = build_ranking_source_url(target, period)
+    elif source_type == "shop" and direct_shop_search_target:
+        url = build_source_url(source_type, direct_shop_search_target)
     elif source_type == "shop" and period == "realtime":
+        url = build_ranking_source_url(target, period)
+    elif source_type == "shop":
         url = build_ranking_source_url(target, period)
     else:
         url = build_source_url(source_type, target)
-        if source_type == "shop":
-            url = build_ranking_source_url(target, period)
     listing_limit = None if shop_code_filter else limit
     items = collect_listing_items(url, listing_limit, task_id=task_id)
     raise_if_task_cancelled(CrawlTaskModel, task_id)
