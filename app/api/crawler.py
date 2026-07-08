@@ -49,6 +49,15 @@ class ScheduleDeletePayload(BaseModel):
     scheduleIds: list[int] = Field(default_factory=list)
 
 
+class ScheduleRunAllPayload(BaseModel):
+    keyword: str | None = None
+    enabledStatus: str | None = None
+    status: str | None = None
+    scheduleTime: str | None = None
+    createdAtFrom: str | None = None
+    createdAtTo: str | None = None
+
+
 class StorePayload(BaseModel):
     ownerUsername: str | None = None
     aliasName: str = ""
@@ -826,6 +835,22 @@ def delete_schedule(schedule_id: int, user: dict = Depends(require_crawler_permi
     try:
         crawler_service.delete_scheduled_crawl(user["username"], schedule_id)
         return {"deleted": True}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/schedules/run-all")
+def run_all_schedules(payload: ScheduleRunAllPayload, user: dict = Depends(require_crawler_permission)) -> dict:
+    try:
+        return crawler_service.run_scheduled_crawls_now(
+            user["username"],
+            keyword=payload.keyword,
+            enabled_status=payload.enabledStatus,
+            status=payload.status,
+            schedule_time=payload.scheduleTime,
+            created_at_from=payload.createdAtFrom,
+            created_at_to=payload.createdAtTo,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

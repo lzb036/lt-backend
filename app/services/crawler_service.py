@@ -7228,6 +7228,67 @@ def run_scheduled_crawl(owner_username: str, schedule_id: int) -> dict[str, Any]
         return scheduled_crawl_to_public(row)
 
 
+def run_scheduled_crawls_now(
+    owner_username: str,
+    *,
+    keyword: str | None = None,
+    enabled_status: str | None = None,
+    status: str | None = None,
+    schedule_time: str | None = None,
+    created_at_from: str | None = None,
+    created_at_to: str | None = None,
+) -> dict[str, Any]:
+    if not SCHEDULE_RUN_LOCK.acquire(blocking=False):
+        raise RuntimeError("已有定时采集调度正在执行，请稍后再试。")
+    try:
+        now = datetime.now()
+        with session_scope() as session:
+            reconcile_interrupted_scheduled_crawls(session, owner_username=owner_username)
+            query = scheduled_crawls_query(
+                owner_username,
+                keyword=keyword,
+                enabled_status=enabled_status,
+                status=status,
+                schedule_time=schedule_time,
+                created_at_from=created_at_from,
+                created_at_to=created_at_to,
+            ).where(
+                ScheduledCrawlModel.enabled.is_(True),
+                ScheduledCrawlModel.status != "running",
+            )
+            rows = session.scalars(query.order_by(ScheduledCrawlModel.created_at.asc())).all()
+            if not rows:
+                raise RuntimeError("当前没有可立即执行的已启用采集店铺。")
+            due_items = [(row.owner_username, int(row.id)) for row in rows]
+            for row in rows:
+                row.status = "running"
+                row.last_run_at = now
+                row.next_run_at = next_daily_run_at(row.schedule_time, now=now)
+
+        dispatched_count = 0
+        failed_ids: list[int] = []
+        for item_owner_username, schedule_id in due_items:
+            try:
+                dispatch_scheduled_crawl(item_owner_username, schedule_id)
+                dispatched_count += 1
+            except Exception as exc:
+                failed_ids.append(schedule_id)
+                with session_scope() as session:
+                    row = session.get(ScheduledCrawlModel, schedule_id)
+                    if row is not None:
+                        row.status = "failed"
+                        row.notes = str(exc)
+            time.sleep(0.1)
+        return {
+            "total": len(due_items),
+            "dispatchedCount": dispatched_count,
+            "failedIds": failed_ids,
+            "failedCount": len(failed_ids),
+        }
+    finally:
+        SCHEDULE_RUN_LOCK.release()
+
+
 def run_scheduled_crawl_job(owner_username: str, schedule_id: int) -> None:
     row_enabled = False
     schedule_time = "09:00"
