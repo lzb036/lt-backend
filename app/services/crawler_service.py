@@ -12090,14 +12090,6 @@ def run_task(task_id: str) -> None:
             error_detail=current_error_detail(),
             warning_detail=current_warning_detail(),
         )
-        if not items:
-            errors.append("未采集到商品，请检查采集内容、榜单时间或乐天页面结构。")
-            update_task_progress(
-                CrawlTaskModel,
-                task_id,
-                error_detail=current_error_detail(),
-                warning_detail=current_warning_detail(),
-            )
         batch_size = max(1, int(settings.crawler_batch_size))
         processed_count = 0
         batches = list(chunk_items(items, batch_size))
@@ -12151,7 +12143,7 @@ def run_task(task_id: str) -> None:
             task.success_count = success_count
             task.failed_count = failed_count
             task.warning_count = warning_count
-            task.status = resolve_crawl_task_status("failed" if not items else "success", len(items), success_count, failed_count)
+            task.status = resolve_crawl_task_status("success", len(items), success_count, failed_count)
             task.finished_at = datetime.now()
             task.message = f"完成，采集 {len(items)} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条，跳过 {skipped_count} 条"
             task.error_detail = current_error_detail()
