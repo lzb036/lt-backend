@@ -1734,9 +1734,23 @@ def split_shop_fallback_target(target: str) -> tuple[str, str]:
 def fallback_shop_target(primary_target: str, fallback_shop_url: str) -> str:
     base_target, _ = split_shop_fallback_target(primary_target)
     parsed_target, limit, period = parse_ranking_target(strip_shop_ranking_prefix(base_target))
-    if not parsed_target:
-        parsed_target = base_target
-    return f"店铺:{fallback_shop_url} {ranking_period_label(period)} {crawl_limit_label(limit, default='全部')}"
+    fallback_target = safe_shop_ranking_target(fallback_shop_url)
+    if not fallback_target:
+        fallback_target = parsed_target or base_target
+    return f"店铺:{fallback_target} {ranking_period_label(period)} {crawl_limit_label(limit, default='全部')}"
+
+
+def safe_shop_ranking_target(value: Any) -> str:
+    normalized = normalize_text(value)
+    if not normalized:
+        return ""
+    try:
+        target = normalize_rakuten_shop_target(normalized)
+    except RuntimeError:
+        return normalized if not normalized.startswith(("http://", "https://")) else ""
+    if re.fullmatch(r"[0-9]+", target):
+        return fetch_rakuten_shop_display_name_by_sid(target) or target
+    return target
 
 
 def is_rakuten_search_url(value: Any) -> bool:
@@ -12266,26 +12280,18 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
         return [collect_product_detail(normalize_rakuten_product_target(target))]
     limit: int | None = 30
     shop_code_filter = ""
-    direct_shop_search_target = ""
     if source_type == "shop":
         target, limit, period = parse_ranking_target(strip_shop_ranking_prefix(target))
-        raw_shop_target = target
         normalized_shop_target = normalize_rakuten_shop_target(target)
-        direct_shop_search = is_rakuten_search_url(raw_shop_target) or bool(re.fullmatch(r"[0-9]+", normalized_shop_target))
-        if direct_shop_search:
-            direct_shop_search_target = raw_shop_target if is_rakuten_search_url(raw_shop_target) else normalized_shop_target
-        elif looks_like_rakuten_shop_code(normalized_shop_target):
+        if looks_like_rakuten_shop_code(normalized_shop_target) and not re.fullmatch(r"[0-9]+", normalized_shop_target):
             shop_code_filter = normalize_shop_code(normalized_shop_target)
-        if not direct_shop_search:
-            target = resolve_rakuten_shop_search_keyword(target)
+        target = resolve_rakuten_shop_search_keyword(target)
     elif source_type == "ranking":
         target, limit, period = parse_ranking_target(target)
     else:
         period = "daily"
     if source_type == "ranking":
         url = build_ranking_source_url(target, period)
-    elif source_type == "shop" and direct_shop_search_target:
-        url = build_source_url(source_type, direct_shop_search_target)
     elif source_type == "shop" and period == "realtime":
         url = build_ranking_source_url(target, period)
     elif source_type == "shop":
