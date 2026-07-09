@@ -28,7 +28,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
-from app.core.task_queue import enqueue_task, enqueue_task_in, redis_connection, task_queue_name_for_kind
+from app.core.task_queue import all_task_queue_names, enqueue_task, enqueue_task_in, redis_connection, task_queue_name_for_kind
 from app.db.database import session_scope
 from app.db.models import (
     CrawlLogModel,
@@ -395,6 +395,7 @@ TASK_CANCELLED_MESSAGE = "任务已终止"
 TASK_START_RETRY_DELAY_SECONDS = 5.0
 TASK_STALE_CANCEL_REQUEST_SECONDS = 10 * 60
 TASK_REDIS_MISSING_JOB_GRACE_SECONDS = 60
+TASK_QUEUED_REDIS_MISSING_JOB_GRACE_SECONDS = 2 * 60
 SCHEDULE_IMPORT_TEMPLATE_FILENAME = "scheduled-crawl-template.xlsx"
 SCHEDULE_EXPORT_FILENAME = "scheduled-crawl-shops.xlsx"
 SCHEDULE_FALLBACK_SHOP_URL_KEY = "fallbackShopUrl"
@@ -2371,6 +2372,9 @@ def reconcile_interrupted_background_tasks_once() -> int:
             reconcile_interrupted_running_tasks(session, CrawlTaskModel)
             + reconcile_interrupted_running_tasks(session, SyncTaskModel)
             + reconcile_interrupted_running_tasks(session, ListingTaskModel)
+            + reconcile_missing_queued_tasks(session, CrawlTaskModel)
+            + reconcile_missing_queued_tasks(session, SyncTaskModel)
+            + reconcile_missing_queued_tasks(session, ListingTaskModel)
             + reconcile_interrupted_scheduled_crawls(session)
         )
 
@@ -2414,6 +2418,70 @@ def interrupted_task_missing_cutoff() -> datetime:
             TASK_STALE_CANCEL_REQUEST_SECONDS,
         )
     )
+
+
+def queued_task_missing_cutoff() -> datetime:
+    return datetime.now() - timedelta(seconds=TASK_QUEUED_REDIS_MISSING_JOB_GRACE_SECONDS)
+
+
+def reconcile_missing_queued_tasks(
+    session: Any,
+    model: Any,
+    *,
+    owner_username: str | None = None,
+    store_id: int | None = None,
+    limit: int | None = None,
+) -> int:
+    if not should_use_redis_task_queue():
+        return 0
+    queue_kind = task_model_queue_kind(model)
+    if not queue_kind:
+        return 0
+    normalized_limit = max(1, int(limit or settings.task_queue_queued_requeue_limit))
+    cutoff = queued_task_missing_cutoff()
+    query = (
+        select(model)
+        .where(model.status == "queued", model.created_at <= cutoff)
+        .order_by(model.created_at.asc(), model.id.asc())
+        .limit(normalized_limit)
+    )
+    if owner_username is not None:
+        query = query.where(model.owner_username == owner_username)
+    if store_id is not None and hasattr(model, "store_id"):
+        query = query.where(model.store_id == store_id)
+    rows = session.scalars(query).all()
+    if not rows:
+        return 0
+    task_ids = {str(row.id) for row in rows}
+    try:
+        task_states = redis_task_states(task_ids, queue_kind, job_id_prefixes=task_model_job_id_prefixes(model))
+    except Exception:
+        return 0
+    requeued = 0
+    for task in rows:
+        task_id = str(task.id)
+        state = task_states.get(task_id)
+        if state is not None:
+            continue
+        if task_cancel_requested(task):
+            if model is ListingTaskModel:
+                release_listing_task_locks(session, task.owner_username, task)
+            task.status = "cancelled"
+            task.message = TASK_CANCELLED_MESSAGE
+            task.error_detail = cancelled_task_error_detail(existing_error_detail=getattr(task, "error_detail", None))
+            if hasattr(task, "warning_detail"):
+                task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=getattr(task, "warning_detail", None))
+            task.finished_at = datetime.now()
+            continue
+        task.message = f"{task_model_action_label(model, task)}队列已恢复，系统已重新投递任务"
+        if model is CrawlTaskModel:
+            dispatch_crawl_task(task_id)
+        elif model is SyncTaskModel:
+            dispatch_sync_task(task.owner_username, task_id)
+        elif model is ListingTaskModel:
+            dispatch_listing_task(task.owner_username, task_id)
+        requeued += 1
+    return requeued
 
 
 def redis_task_states(
@@ -2463,6 +2531,112 @@ def fetch_rq_job(connection: Any, job_id: str) -> Any | None:
         return Job.fetch(job_id, connection=connection)
     except Exception:
         return None
+
+
+def task_queue_health() -> dict[str, Any]:
+    checked_at = datetime.now()
+    base = {
+        "mode": settings.task_queue_mode,
+        "status": "ok",
+        "ok": True,
+        "summary": "后台队列正常",
+        "checkedAt": datetime_to_public(checked_at),
+        "workerCount": 0,
+        "redis": None,
+        "queues": [],
+        "error": "",
+    }
+    if not should_use_redis_task_queue():
+        return {
+            **base,
+            "status": "disabled",
+            "ok": True,
+            "summary": "当前使用本地线程模式，未启用 Redis 队列",
+        }
+    try:
+        from rq import Queue, Worker
+        from rq.registry import DeferredJobRegistry, FailedJobRegistry, ScheduledJobRegistry, StartedJobRegistry
+
+        connection = redis_connection()
+        connection.ping()
+        redis_info = connection.info(section="memory")
+        workers = Worker.all(connection=connection)
+        worker_count_by_queue: dict[str, int] = {}
+        for worker in workers:
+            for queue in getattr(worker, "queues", []) or []:
+                queue_name = str(getattr(queue, "name", "") or "")
+                if queue_name:
+                    worker_count_by_queue[queue_name] = worker_count_by_queue.get(queue_name, 0) + 1
+
+        expected_queue_names = {
+            task_queue_name_for_kind("crawl"),
+            task_queue_name_for_kind("sync"),
+            task_queue_name_for_kind("listing"),
+            task_queue_name_for_kind("schedule"),
+        }
+        queue_kind_by_name = {
+            task_queue_name_for_kind("crawl"): "采集",
+            task_queue_name_for_kind("sync"): "同步",
+            task_queue_name_for_kind("listing"): "上架",
+            task_queue_name_for_kind("schedule"): "定时",
+            settings.task_queue_name: "默认",
+        }
+        queues: list[dict[str, Any]] = []
+        issues: list[str] = []
+        for queue_name in all_task_queue_names():
+            queue = Queue(queue_name, connection=connection)
+            started = len(StartedJobRegistry(queue_name, connection=connection))
+            failed = len(FailedJobRegistry(queue_name, connection=connection))
+            deferred = len(DeferredJobRegistry(queue_name, connection=connection))
+            scheduled = len(ScheduledJobRegistry(queue_name, connection=connection))
+            queued = len(queue)
+            worker_count = int(worker_count_by_queue.get(queue_name, 0))
+            expected = queue_name in expected_queue_names
+            pending = queued + started + deferred + scheduled
+            queue_ok = (not expected or worker_count > 0) and not (pending > 0 and worker_count <= 0)
+            if not queue_ok:
+                if pending > 0 and worker_count <= 0:
+                    issues.append(f"{queue_name} 有待执行任务但没有可用 worker")
+                elif expected and worker_count <= 0:
+                    issues.append(f"{queue_name} 没有可用 worker")
+            queues.append(
+                {
+                    "name": queue_name,
+                    "kind": queue_kind_by_name.get(queue_name, queue_name),
+                    "workerCount": worker_count,
+                    "queued": queued,
+                    "started": started,
+                    "failed": failed,
+                    "deferred": deferred,
+                    "scheduled": scheduled,
+                    "pending": pending,
+                    "ok": queue_ok,
+                }
+            )
+
+        status = "ok" if not issues else "degraded"
+        return {
+            **base,
+            "status": status,
+            "ok": not issues,
+            "summary": "后台队列正常" if not issues else "；".join(issues[:3]),
+            "workerCount": len(workers),
+            "redis": {
+                "usedMemory": int(redis_info.get("used_memory", 0) or 0),
+                "usedMemoryHuman": str(redis_info.get("used_memory_human", "") or ""),
+                "maxMemory": int(redis_info.get("maxmemory", 0) or 0),
+                "maxMemoryHuman": str(redis_info.get("maxmemory_human", "") or ""),
+            },
+            "queues": queues,
+        }
+    except Exception as exc:
+        return {
+            **base,
+            "status": "error",
+            "ok": False,
+            "summary": "Redis 队列连接异常",
+            "error": str(exc),
+        }
 
 
 def task_id_from_rq_job(
@@ -4948,6 +5122,7 @@ def time_settings_to_public(row: SystemSettingModel | None, payload: dict[str, A
         **payload,
         "serverNow": datetime_to_public(datetime.now()),
         "updatedAt": datetime_to_public(row.updated_at if row is not None else None),
+        "queueHealth": task_queue_health(),
     }
 
 
@@ -7259,8 +7434,12 @@ def run_scheduled_crawls_now(
             rows = session.scalars(query.order_by(ScheduledCrawlModel.created_at.asc())).all()
             if not rows:
                 raise RuntimeError("当前没有可立即执行的已启用采集店铺。")
-            due_items = [(row.owner_username, int(row.id)) for row in rows]
+            batch_size = max(1, int(settings.scheduled_crawl_dispatch_batch_size))
+            batch_rows = rows[:batch_size]
+            due_items = [(row.owner_username, int(row.id)) for row in batch_rows]
             for row in rows:
+                row.next_run_at = now
+            for row in batch_rows:
                 row.status = "running"
                 row.last_run_at = now
                 row.next_run_at = next_daily_run_at(row.schedule_time, now=now)
@@ -7278,10 +7457,13 @@ def run_scheduled_crawls_now(
                     if row is not None:
                         row.status = "failed"
                         row.notes = str(exc)
-            time.sleep(0.1)
+            time.sleep(settings.scheduled_crawl_dispatch_pause_seconds)
         return {
-            "total": len(due_items),
+            "total": len(rows),
             "dispatchedCount": dispatched_count,
+            "matchedCount": len(rows),
+            "pendingDispatchCount": max(0, len(rows) - dispatched_count),
+            "batchSize": batch_size,
             "failedIds": failed_ids,
             "failedCount": len(failed_ids),
         }
@@ -7344,6 +7526,8 @@ def run_due_scheduled_crawls_once() -> int:
                     ScheduledCrawlModel.next_run_at <= now,
                     ScheduledCrawlModel.status != "running",
                 )
+                .order_by(ScheduledCrawlModel.next_run_at.asc(), ScheduledCrawlModel.created_at.asc(), ScheduledCrawlModel.id.asc())
+                .limit(max(1, int(settings.scheduled_crawl_dispatch_batch_size)))
             ).all()
             due_items = [(row.owner_username, row.id) for row in rows]
             for row in rows:
@@ -7360,7 +7544,7 @@ def run_due_scheduled_crawls_once() -> int:
                     if row is not None:
                         row.status = "failed"
                         row.notes = str(exc)
-            time.sleep(0.1)
+            time.sleep(settings.scheduled_crawl_dispatch_pause_seconds)
         return len(due_items)
     finally:
         SCHEDULE_RUN_LOCK.release()

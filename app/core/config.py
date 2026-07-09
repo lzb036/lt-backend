@@ -93,8 +93,11 @@ class Settings(BaseModel):
     task_queue_listing_name: str = "lt-tasks-listing"
     task_queue_schedule_name: str = "lt-tasks-schedule"
     task_queue_job_timeout_seconds: int = TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS
-    task_queue_result_ttl_seconds: int = 24 * 60 * 60
-    task_queue_failure_ttl_seconds: int = 7 * 24 * 60 * 60
+    task_queue_result_ttl_seconds: int = 60 * 60
+    task_queue_failure_ttl_seconds: int = 24 * 60 * 60
+    task_queue_queued_requeue_limit: int = 25
+    scheduled_crawl_dispatch_batch_size: int = 50
+    scheduled_crawl_dispatch_pause_seconds: float = 0.1
     rakuten_default_inventory_quantity: int = 1000
     rakuten_default_normal_delivery_time_id: int = 0
     rakuten_default_back_order_delivery_time_id: int = 0
@@ -170,8 +173,11 @@ def build_settings() -> Settings:
             TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS,
             _env_int("LT_TASK_QUEUE_JOB_TIMEOUT_SECONDS", TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS),
         ),
-        task_queue_result_ttl_seconds=max(0, _env_int("LT_TASK_QUEUE_RESULT_TTL_SECONDS", 24 * 60 * 60)),
-        task_queue_failure_ttl_seconds=max(60, _env_int("LT_TASK_QUEUE_FAILURE_TTL_SECONDS", 7 * 24 * 60 * 60)),
+        task_queue_result_ttl_seconds=max(0, _env_int("LT_TASK_QUEUE_RESULT_TTL_SECONDS", 60 * 60)),
+        task_queue_failure_ttl_seconds=max(60, _env_int("LT_TASK_QUEUE_FAILURE_TTL_SECONDS", 24 * 60 * 60)),
+        task_queue_queued_requeue_limit=max(1, _env_int("LT_TASK_QUEUE_QUEUED_REQUEUE_LIMIT", 25)),
+        scheduled_crawl_dispatch_batch_size=max(1, _env_int("LT_SCHEDULED_CRAWL_DISPATCH_BATCH_SIZE", 50)),
+        scheduled_crawl_dispatch_pause_seconds=max(0, float(_env_text("LT_SCHEDULED_CRAWL_DISPATCH_PAUSE_SECONDS", "0.1") or "0")),
         rakuten_default_inventory_quantity=max(0, _env_int("LT_RAKUTEN_DEFAULT_INVENTORY_QUANTITY", 1000)),
         rakuten_default_normal_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_NORMAL_DELIVERY_TIME_ID", 0)),
         rakuten_default_back_order_delivery_time_id=max(0, _env_int("LT_RAKUTEN_DEFAULT_BACK_ORDER_DELIVERY_TIME_ID", 0)),
