@@ -5191,17 +5191,15 @@ def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:
             if not force and next_cleanup_at is not None and next_cleanup_at > now:
                 return 0
 
-            cutoff = now - timedelta(days=SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS)
             rows = session.scalars(
                 select(CrawlTaskModel).where(
                     CrawlTaskModel.mode == "scheduled",
-                    CrawlTaskModel.finished_at.is_not(None),
-                    CrawlTaskModel.finished_at < cutoff,
-                    CrawlTaskModel.status.notin_(("queued", "running")),
+                    CrawlTaskModel.status != "running",
                 )
             ).all()
             task_ids = [task.id for task in rows]
             if task_ids:
+                remove_crawl_queue_jobs_for_task_ids(set(task_ids))
                 session.execute(update(ProductModel).where(ProductModel.task_id.in_(task_ids)).values(task_id=None))
                 session.execute(update(CrawlLogModel).where(CrawlLogModel.task_id.in_(task_ids)).values(task_id=None))
                 for task in rows:
@@ -5216,6 +5214,50 @@ def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:
             return len(task_ids)
     finally:
         SCHEDULED_CRAWL_TASK_CLEANUP_LOCK.release()
+
+
+def remove_crawl_queue_jobs_for_task_ids(task_ids: set[str]) -> int:
+    if not task_ids or not should_use_redis_task_queue():
+        return 0
+    try:
+        from rq import Queue
+        from rq.registry import DeferredJobRegistry, FailedJobRegistry, ScheduledJobRegistry
+    except Exception:
+        return 0
+    try:
+        connection = redis_connection()
+        queue_name = task_queue_name_for_kind("crawl")
+        queue = Queue(queue_name, connection=connection)
+        removed = 0
+
+        for job_id in list(queue.job_ids):
+            job = fetch_rq_job(connection, job_id)
+            if job is None or not task_id_from_rq_job(job, task_ids):
+                continue
+            try:
+                job.cancel()
+                job.delete(remove_from_queue=True)
+                removed += 1
+            except Exception:
+                continue
+
+        for registry in (
+            DeferredJobRegistry(queue_name, connection=connection),
+            ScheduledJobRegistry(queue_name, connection=connection),
+            FailedJobRegistry(queue_name, connection=connection),
+        ):
+            for job_id in list(registry.get_job_ids()):
+                job = fetch_rq_job(connection, job_id)
+                if job is None or not task_id_from_rq_job(job, task_ids):
+                    continue
+                try:
+                    registry.remove(job_id, delete_job=True)
+                    removed += 1
+                except Exception:
+                    continue
+        return removed
+    except Exception:
+        return 0
 
 
 def cleanup_completed_scheduled_crawl_tasks_if_due() -> int:
