@@ -340,5 +340,96 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
         self.assertIsNone(task.queue_job_id)
 
 
+class CrawlRecoveryTests(CrawlDispatchDatabaseTestCase):
+    def test_missing_job_recovery_ignores_unreserved_backlog(self):
+        self.add_task(
+            "waiting",
+            created_at=datetime.now() - timedelta(minutes=10),
+        )
+        states = Mock(return_value={})
+        direct_dispatch = Mock()
+
+        with (
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(crawler_service, "redis_task_states", states),
+            patch.object(crawler_service, "dispatch_crawl_task", direct_dispatch),
+        ):
+            with self.session_scope() as session:
+                recovered = crawler_service.reconcile_missing_queued_tasks(
+                    session,
+                    CrawlTaskModel,
+                )
+
+        self.assertEqual(recovered, 0)
+        states.assert_not_called()
+        direct_dispatch.assert_not_called()
+        self.assertIsNone(self.get_task("waiting").queue_job_id)
+
+    def test_missing_reserved_job_clears_reservation_without_direct_requeue(self):
+        self.add_task(
+            "reserved",
+            queue_job_id="crawl-reserved-missing",
+            created_at=datetime.now() - timedelta(minutes=10),
+        )
+        direct_dispatch = Mock()
+
+        with (
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(crawler_service, "redis_task_states", return_value={}),
+            patch.object(crawler_service, "dispatch_crawl_task", direct_dispatch),
+        ):
+            with self.session_scope() as session:
+                recovered = crawler_service.reconcile_missing_queued_tasks(
+                    session,
+                    CrawlTaskModel,
+                )
+
+        self.assertEqual(recovered, 1)
+        direct_dispatch.assert_not_called()
+        task = self.get_task("reserved")
+        self.assertIsNone(task.queue_job_id)
+        self.assertEqual(task.status, "queued")
+        self.assertIn("等待重新投递", task.message)
+
+    def test_periodic_maintenance_refills_crawl_capacity(self):
+        refill = Mock(return_value=3)
+
+        with (
+            patch.object(
+                crawler_service,
+                "reconcile_interrupted_background_tasks_once",
+                return_value=0,
+            ),
+            patch.object(
+                crawler_service,
+                "cleanup_expired_product_image_drafts_if_due",
+                return_value=0,
+            ),
+            patch.object(
+                crawler_service,
+                "cleanup_orphan_product_image_dirs_if_due",
+                return_value=0,
+            ),
+            patch.object(
+                crawler_service,
+                "cleanup_completed_scheduled_crawl_tasks_if_due",
+                return_value=0,
+            ),
+            patch.object(
+                crawler_service,
+                "cleanup_store_unlisted_products_if_due",
+                return_value=0,
+            ),
+            patch.object(
+                crawler_service,
+                "dispatch_queued_crawl_tasks_safely",
+                refill,
+            ),
+        ):
+            crawler_service.run_periodic_maintenance_once()
+
+        refill.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

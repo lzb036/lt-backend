@@ -2610,6 +2610,8 @@ def reconcile_missing_queued_tasks(
         .order_by(model.created_at.asc(), model.id.asc())
         .limit(normalized_limit)
     )
+    if model is CrawlTaskModel:
+        query = query.where(CrawlTaskModel.queue_job_id.is_not(None))
     if owner_username is not None:
         query = query.where(model.owner_username == owner_username)
     if store_id is not None and hasattr(model, "store_id"):
@@ -2631,6 +2633,8 @@ def reconcile_missing_queued_tasks(
         if task_cancel_requested(task):
             if model is ListingTaskModel:
                 release_listing_task_locks(session, task.owner_username, task)
+            if model is CrawlTaskModel:
+                task.queue_job_id = None
             task.status = "cancelled"
             task.message = TASK_CANCELLED_MESSAGE
             task.error_detail = cancelled_task_error_detail(existing_error_detail=getattr(task, "error_detail", None))
@@ -2638,12 +2642,14 @@ def reconcile_missing_queued_tasks(
                 task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=getattr(task, "warning_detail", None))
             task.finished_at = datetime.now()
             continue
-        task.message = f"{task_model_action_label(model, task)}队列已恢复，系统已重新投递任务"
         if model is CrawlTaskModel:
-            dispatch_crawl_task(task_id)
+            task.queue_job_id = None
+            task.message = "采集队列已恢复，等待重新投递"
         elif model is SyncTaskModel:
+            task.message = f"{task_model_action_label(model, task)}队列已恢复，系统已重新投递任务"
             dispatch_sync_task(task.owner_username, task_id)
         elif model is ListingTaskModel:
+            task.message = f"{task_model_action_label(model, task)}队列已恢复，系统已重新投递任务"
             dispatch_listing_task(task.owner_username, task_id)
         requeued += 1
     return requeued
@@ -7757,6 +7763,7 @@ def run_due_scheduled_crawls_once() -> int:
 
 def run_periodic_maintenance_once() -> None:
     reconcile_interrupted_background_tasks_once()
+    dispatch_queued_crawl_tasks_safely()
     cleanup_expired_product_image_drafts_if_due()
     cleanup_orphan_product_image_dirs_if_due()
     cleanup_completed_scheduled_crawl_tasks_if_due()
