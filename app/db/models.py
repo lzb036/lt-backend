@@ -168,6 +168,7 @@ class CrawlTaskModel(TimestampMixin, Base):
     target: Mapped[str] = mapped_column(Text, nullable=False)
     mode: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    queue_job_id: Mapped[str | None] = mapped_column(String(64))
     total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
