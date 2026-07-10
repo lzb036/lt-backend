@@ -149,6 +149,10 @@ class CrawlDispatcherTests(CrawlDispatchDatabaseTestCase):
         self.assertEqual(dispatched, 1)
         self.assertEqual(enqueue.call_count, 1)
         self.assertEqual(enqueue.call_args.args[1], "oldest-unreserved")
+        self.assertEqual(
+            enqueue.call_args.args[2],
+            "crawl-oldest-unreserved-12345678",
+        )
         reserved = self.get_task("oldest-unreserved")
         newer = self.get_task("newer-unreserved")
         self.assertEqual(
@@ -292,7 +296,7 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
                 reconcile,
             ),
         ):
-            crawler_service.run_task("waiting")
+            crawler_service.run_task("waiting", "crawl-waiting-reserved")
 
         direct_dispatch.assert_not_called()
         reconcile.assert_not_called()
@@ -301,6 +305,68 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
         self.assertEqual(task.status, "queued")
         self.assertIsNone(task.queue_job_id)
         self.assertIn("排队中", task.message)
+
+    def test_thread_mode_concurrency_rejection_keeps_delayed_retry(self):
+        now = datetime.now()
+        self.add_task(
+            "running-thread",
+            status="running",
+            created_at=now - timedelta(minutes=2),
+        )
+        self.add_task(
+            "waiting-thread",
+            created_at=now - timedelta(minutes=1),
+        )
+        direct_dispatch = Mock()
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(crawler_service.settings, "task_queue_mode", "thread"),
+            patch.object(
+                crawler_service.settings,
+                "max_running_crawl_tasks_per_user",
+                1,
+            ),
+            patch.object(
+                crawler_service,
+                "dispatch_crawl_task",
+                direct_dispatch,
+            ),
+        ):
+            crawler_service.run_task("waiting-thread")
+
+        direct_dispatch.assert_called_once_with(
+            "waiting-thread",
+            delay_seconds=5.0,
+        )
+        task = self.get_task("waiting-thread")
+        self.assertEqual(task.status, "queued")
+        self.assertIn("排队中", task.message)
+
+    def test_stale_job_cannot_clear_newer_reservation(self):
+        self.add_task(
+            "reserved",
+            queue_job_id="crawl-reserved-new",
+        )
+        collect = Mock(return_value=[])
+        refill = Mock(return_value=0)
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(crawler_service, "collect_items", collect),
+            patch.object(
+                crawler_service,
+                "dispatch_queued_crawl_tasks_safely",
+                refill,
+            ),
+        ):
+            crawler_service.run_task("reserved", "crawl-reserved-old")
+
+        collect.assert_not_called()
+        task = self.get_task("reserved")
+        self.assertEqual(task.status, "queued")
+        self.assertEqual(task.queue_job_id, "crawl-reserved-new")
 
     def test_completed_task_refills_crawl_capacity(self):
         self.add_task(
@@ -331,7 +397,7 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
                 reconcile,
             ),
         ):
-            crawler_service.run_task("complete")
+            crawler_service.run_task("complete", "crawl-complete-reserved")
 
         reconcile.assert_not_called()
         refill.assert_called_once_with("owner")
@@ -375,7 +441,8 @@ class CrawlRecoveryTests(CrawlDispatchDatabaseTestCase):
 
         with (
             patch.object(crawler_service.settings, "task_queue_mode", "redis"),
-            patch.object(crawler_service, "redis_task_states", return_value={}),
+            patch.object(crawler_service, "redis_connection", return_value=object()),
+            patch.object(crawler_service, "fetch_rq_job", return_value=None),
             patch.object(crawler_service, "dispatch_crawl_task", direct_dispatch),
         ):
             with self.session_scope() as session:
@@ -391,25 +458,59 @@ class CrawlRecoveryTests(CrawlDispatchDatabaseTestCase):
         self.assertEqual(task.status, "queued")
         self.assertIn("等待重新投递", task.message)
 
+    def test_reserved_job_recovery_fetches_exact_persisted_job_id(self):
+        self.add_task(
+            "exact-reservation",
+            queue_job_id="crawl-exact-reservation",
+            created_at=datetime.now() - timedelta(minutes=10),
+        )
+        connection = object()
+        fetch = Mock(return_value=None)
+        bulk_states = Mock(
+            return_value={
+                "exact-reservation": {
+                    "status": "queued",
+                }
+            }
+        )
+
+        with (
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(crawler_service, "redis_connection", return_value=connection),
+            patch.object(crawler_service, "fetch_rq_job", fetch),
+            patch.object(crawler_service, "redis_task_states", bulk_states),
+            patch.object(crawler_service, "dispatch_crawl_task"),
+        ):
+            with self.session_scope() as session:
+                recovered = crawler_service.reconcile_missing_queued_tasks(
+                    session,
+                    CrawlTaskModel,
+                )
+
+        self.assertEqual(recovered, 1)
+        fetch.assert_called_once_with(connection, "crawl-exact-reservation")
+        bulk_states.assert_not_called()
+        self.assertIsNone(self.get_task("exact-reservation").queue_job_id)
+
     def test_failed_reserved_job_clears_reservation(self):
         self.add_task(
             "failed-reservation",
             queue_job_id="crawl-failed-reservation",
             created_at=datetime.now() - timedelta(minutes=10),
         )
+        failed_job = SimpleNamespace(
+            id="crawl-failed-reservation",
+            description="采集任务 failed-reservation",
+            started_at=None,
+            ended_at=None,
+            exc_info="worker failed before task start",
+            get_status=lambda refresh=True: "failed",
+        )
 
         with (
             patch.object(crawler_service.settings, "task_queue_mode", "redis"),
-            patch.object(
-                crawler_service,
-                "redis_task_states",
-                return_value={
-                    "failed-reservation": {
-                        "status": "failed",
-                        "error": "worker failed before task start",
-                    }
-                },
-            ),
+            patch.object(crawler_service, "redis_connection", return_value=object()),
+            patch.object(crawler_service, "fetch_rq_job", return_value=failed_job),
             patch.object(crawler_service, "dispatch_crawl_task") as direct_dispatch,
         ):
             with self.session_scope() as session:

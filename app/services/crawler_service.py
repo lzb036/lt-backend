@@ -404,6 +404,7 @@ ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 TASK_CANCEL_REQUESTED_MARKER = "__LT_CANCEL_REQUESTED__"
 TASK_CANCEL_REQUESTED_MESSAGE = "已请求终止，等待任务停止"
 TASK_CANCELLED_MESSAGE = "任务已终止"
+TASK_START_RETRY_DELAY_SECONDS = 5.0
 TASK_STALE_CANCEL_REQUEST_SECONDS = 10 * 60
 TASK_REDIS_MISSING_JOB_GRACE_SECONDS = 60
 TASK_QUEUED_REDIS_MISSING_JOB_GRACE_SECONDS = 2 * 60
@@ -453,7 +454,11 @@ def dispatch_crawl_task(
     if should_use_redis_task_queue():
         try:
             enqueue = enqueue_task_in if delay_seconds > 0 else enqueue_task
-            enqueue_args = (delay_seconds, run_task, task_id) if delay_seconds > 0 else (run_task, task_id)
+            enqueue_args = (
+                (delay_seconds, run_task, task_id, job_id)
+                if delay_seconds > 0
+                else (run_task, task_id, job_id)
+            )
             enqueue(
                 *enqueue_args,
                 job_id=job_id,
@@ -2619,18 +2624,28 @@ def reconcile_missing_queued_tasks(
     rows = session.scalars(query).all()
     if not rows:
         return 0
-    task_ids = {str(row.id) for row in rows}
-    try:
-        task_states = redis_task_states(task_ids, queue_kind, job_id_prefixes=task_model_job_id_prefixes(model))
-    except Exception:
-        return 0
+    if model is CrawlTaskModel:
+        connection = redis_connection()
+        task_states = {
+            str(row.id): state
+            for row in rows
+            if row.queue_job_id
+            and (state := reserved_crawl_job_state(connection, row.queue_job_id)) is not None
+        }
+    else:
+        task_ids = {str(row.id) for row in rows}
+        try:
+            task_states = redis_task_states(task_ids, queue_kind, job_id_prefixes=task_model_job_id_prefixes(model))
+        except Exception:
+            return 0
     requeued = 0
     for task in rows:
         task_id = str(task.id)
         state = task_states.get(task_id)
-        if state is not None and not (
-            model is CrawlTaskModel and state.get("status") == "failed"
-        ):
+        if model is CrawlTaskModel:
+            if state is not None and state.get("status") in {"queued", "started", "deferred", "scheduled", "unknown"}:
+                continue
+        elif state is not None:
             continue
         if task_cancel_requested(task):
             if model is ListingTaskModel:
@@ -2704,6 +2719,22 @@ def fetch_rq_job(connection: Any, job_id: str) -> Any | None:
         return Job.fetch(job_id, connection=connection)
     except Exception:
         return None
+
+
+def normalized_rq_job_status(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip().lower()
+
+
+def reserved_crawl_job_state(connection: Any, job_id: str) -> dict[str, Any] | None:
+    job = fetch_rq_job(connection, job_id)
+    if job is None:
+        return None
+    try:
+        status = normalized_rq_job_status(job.get_status(refresh=True))
+    except Exception:
+        status = "unknown"
+    return rq_job_state(job, status or "unknown")
 
 
 def task_queue_health() -> dict[str, Any]:
@@ -12561,12 +12592,13 @@ def summarize_task_errors(errors: list[str], limit: int = 20, *, item_label: str
     return "\n".join(visible_errors)
 
 
-def run_task(task_id: str) -> None:
+def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
     owner_username = ""
     source_type = ""
     target = ""
     should_run = False
     should_refill = False
+    should_retry_thread_task = False
     success_count = 0
     failed_count = 0
     warning_count = 0
@@ -12588,43 +12620,50 @@ def run_task(task_id: str) -> None:
             return
         owner_username = task.owner_username
         should_refill = should_use_redis_task_queue()
-        task.queue_job_id = None
-        if task.status == "cancelled":
+        reservation_matches = task.queue_job_id == reserved_job_id
+        if not reservation_matches:
             pass
-        elif task.status != "queued":
-            pass
-        elif task_cancel_requested(task):
-            task.status = "cancelled"
-            task.message = TASK_CANCELLED_MESSAGE
-            task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
-            task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=task.warning_detail)
-            task.finished_at = datetime.now()
         else:
-            wait_reason = task_start_wait_reason(
-                session,
-                CrawlTaskModel,
-                task.owner_username,
-                task_id,
-                limit=settings.max_running_crawl_tasks_per_user,
-                label="采集",
-            )
-            if wait_reason:
-                task.message = wait_reason
+            task.queue_job_id = None
+            if task.status == "cancelled":
+                pass
+            elif task.status != "queued":
+                pass
+            elif task_cancel_requested(task):
+                task.status = "cancelled"
+                task.message = TASK_CANCELLED_MESSAGE
+                task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
+                task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=task.warning_detail)
+                task.finished_at = datetime.now()
             else:
-                task.status = "running"
-                task.started_at = datetime.now()
-                task.message = "采集中"
-                task.error_detail = None
-                task.warning_detail = None
-                if task.total_count <= 0:
-                    task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
-                source_type = task.source_type
-                target = task.target
-                should_run = True
+                wait_reason = task_start_wait_reason(
+                    session,
+                    CrawlTaskModel,
+                    task.owner_username,
+                    task_id,
+                    limit=settings.max_running_crawl_tasks_per_user,
+                    label="采集",
+                )
+                if wait_reason:
+                    task.message = wait_reason
+                    should_retry_thread_task = not should_refill
+                else:
+                    task.status = "running"
+                    task.started_at = datetime.now()
+                    task.message = "采集中"
+                    task.error_detail = None
+                    task.warning_detail = None
+                    if task.total_count <= 0:
+                        task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
+                    source_type = task.source_type
+                    target = task.target
+                    should_run = True
 
     if not should_run:
         if should_refill:
             dispatch_queued_crawl_tasks_safely(owner_username)
+        elif should_retry_thread_task:
+            dispatch_crawl_task(task_id, delay_seconds=TASK_START_RETRY_DELAY_SECONDS)
         return
 
     try:

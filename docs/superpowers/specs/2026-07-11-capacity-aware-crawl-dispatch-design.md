@@ -65,12 +65,15 @@ the existing queued-task recovery pass.
 
 ## Worker Behavior
 
-When an RQ crawl job starts, `run_task()` clears the task's `queue_job_id` and
-then changes the task from `queued` to `running`.
+The dispatcher passes the reserved job ID into `run_task()`. A worker may clear
+`queue_job_id` and change the task from `queued` to `running` only when that
+argument exactly matches the persisted reservation. A stale or duplicate RQ
+job exits without clearing a newer reservation.
 
-The per-user running-count check remains as a final safety guard. If it rejects
-a task, the task stays queued without creating a five-second retry job. The
-dispatcher will submit it after a real slot becomes available.
+The per-user running-count check remains as a final safety guard. In Redis mode,
+a rejected task stays queued without creating a five-second retry job, and the
+dispatcher submits it after a real slot becomes available. Legacy thread mode
+retains its existing delayed in-process retry.
 
 After every success, partial result, failure, cancellation, or rejected start,
 the worker asks the dispatcher to fill newly available capacity. Dispatch
@@ -96,7 +99,7 @@ capacity-aware dispatcher.
 1. Pull and install the verified backend revision without starting a second
    application instance.
 2. Update the managed crawl Supervisor configuration with a long graceful-stop
-   timeout and `numprocs=3`.
+   timeout, parent-only `TERM` handling, and `numprocs=3`.
 3. Gracefully stop the current crawl workers and wait for active workhorses to
    exit.
 4. Confirm no crawl worker remains active.

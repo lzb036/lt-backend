@@ -262,15 +262,18 @@ Periodic maintenance remains responsible for interrupted-task reconciliation.
 
 - [ ] **Step 4: Refactor the start decision**
 
-At the beginning of `run_task()`:
+At the beginning of `run_task(task_id, reserved_job_id=None)`:
 
 1. load the task;
 2. capture `owner_username`;
-3. clear `queue_job_id`;
-4. finalize cancellation or duplicate/non-queued starts;
-5. leave concurrency-rejected tasks in `queued` without calling
+3. require `reserved_job_id` to equal the persisted `queue_job_id` whenever
+   either value is non-null;
+4. clear `queue_job_id` only after that identity check passes;
+5. finalize cancellation or duplicate/non-queued starts;
+6. leave Redis-mode concurrency-rejected tasks in `queued` without calling
    `dispatch_crawl_task(..., delay_seconds=5)`; and
-6. mark accepted tasks `running`.
+7. retain the five-second delayed retry only for legacy thread mode; and
+8. mark accepted tasks `running`.
 
 After a rejected or cancelled start, call
 `dispatch_queued_crawl_tasks_safely(owner_username)` and return.
@@ -409,7 +412,7 @@ Back up the Supervisor profile. Set:
 numprocs=3
 stopsignal=TERM
 stopwaitsecs=10830
-stopasgroup=true
+stopasgroup=false
 killasgroup=true
 ```
 
