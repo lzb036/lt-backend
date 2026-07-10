@@ -12621,6 +12621,8 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
         owner_username = task.owner_username
         should_refill = should_use_redis_task_queue()
         reservation_matches = task.queue_job_id == reserved_job_id
+        if should_refill:
+            reservation_matches = bool(reserved_job_id) and reservation_matches
         if not reservation_matches:
             pass
         else:

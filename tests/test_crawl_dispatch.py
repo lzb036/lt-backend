@@ -368,6 +368,29 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
         self.assertEqual(task.status, "queued")
         self.assertEqual(task.queue_job_id, "crawl-reserved-new")
 
+    def test_redis_job_without_reservation_cannot_start_task(self):
+        self.add_task("unreserved")
+        collect = Mock(return_value=[])
+        refill = Mock(return_value=0)
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(crawler_service, "collect_items", collect),
+            patch.object(
+                crawler_service,
+                "dispatch_queued_crawl_tasks_safely",
+                refill,
+            ),
+        ):
+            crawler_service.run_task("unreserved")
+
+        collect.assert_not_called()
+        refill.assert_called_once_with("owner")
+        task = self.get_task("unreserved")
+        self.assertEqual(task.status, "queued")
+        self.assertIsNone(task.queue_job_id)
+
     def test_completed_task_refills_crawl_capacity(self):
         self.add_task(
             "complete",

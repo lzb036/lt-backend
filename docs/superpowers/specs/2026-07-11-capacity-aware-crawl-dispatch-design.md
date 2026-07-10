@@ -65,10 +65,10 @@ the existing queued-task recovery pass.
 
 ## Worker Behavior
 
-The dispatcher passes the reserved job ID into `run_task()`. A worker may clear
-`queue_job_id` and change the task from `queued` to `running` only when that
-argument exactly matches the persisted reservation. A stale or duplicate RQ
-job exits without clearing a newer reservation.
+The dispatcher passes the reserved job ID into `run_task()`. In Redis mode, a
+worker may clear `queue_job_id` and change the task from `queued` to `running`
+only when both IDs are non-null and exactly equal. A stale, duplicate, or
+unreserved RQ job exits without clearing a newer reservation.
 
 The per-user running-count check remains as a final safety guard. In Redis mode,
 a rejected task stays queued without creating a five-second retry job, and the
