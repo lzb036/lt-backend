@@ -78,6 +78,8 @@ class CrawlDispatchDatabaseTestCase(unittest.TestCase):
         status: str = "queued",
         queue_job_id: str | None = None,
         created_at: datetime | None = None,
+        finished_at: datetime | None = None,
+        mode: str = "scheduled",
     ) -> None:
         with self.session_scope() as session:
             session.add(
@@ -86,7 +88,7 @@ class CrawlDispatchDatabaseTestCase(unittest.TestCase):
                     owner_username="owner",
                     source_type="shop",
                     target=f"店铺:https://www.rakuten.co.jp/{task_id}/ 全部",
-                    mode="scheduled",
+                    mode=mode,
                     status=status,
                     queue_job_id=queue_job_id,
                     total_count=0,
@@ -95,6 +97,7 @@ class CrawlDispatchDatabaseTestCase(unittest.TestCase):
                     warning_count=0,
                     message="等待执行",
                     created_at=created_at or datetime.now(),
+                    finished_at=finished_at,
                 )
             )
 
@@ -586,6 +589,71 @@ class CrawlRecoveryTests(CrawlDispatchDatabaseTestCase):
             crawler_service.run_periodic_maintenance_once()
 
         refill.assert_called_once_with()
+
+
+class ScheduledCrawlCleanupTests(CrawlDispatchDatabaseTestCase):
+    def test_cleanup_deletes_only_old_terminal_scheduled_tasks(self):
+        now = datetime.now()
+        old = now - timedelta(days=8)
+        recent = now - timedelta(days=1)
+        self.add_task(
+            "queued-old",
+            status="queued",
+            queue_job_id="crawl-queued-old",
+            created_at=old,
+        )
+        self.add_task(
+            "running-old",
+            status="running",
+            created_at=old,
+        )
+        self.add_task(
+            "success-recent",
+            status="success",
+            created_at=old,
+            finished_at=recent,
+        )
+        self.add_task(
+            "success-old",
+            status="success",
+            created_at=old,
+            finished_at=old,
+        )
+        self.add_task(
+            "failed-old",
+            status="failed",
+            created_at=old,
+            finished_at=old,
+        )
+        self.add_task(
+            "manual-old",
+            status="success",
+            created_at=old,
+            finished_at=old,
+            mode="manual",
+        )
+        remove_jobs = Mock(return_value=2)
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(
+                crawler_service,
+                "remove_crawl_queue_jobs_for_task_ids",
+                remove_jobs,
+            ),
+        ):
+            deleted = crawler_service.cleanup_completed_scheduled_crawl_tasks(
+                force=True
+            )
+
+        self.assertEqual(deleted, 2)
+        remove_jobs.assert_called_once_with({"success-old", "failed-old"})
+        self.assertIsNotNone(self.get_task("queued-old"))
+        self.assertIsNotNone(self.get_task("running-old"))
+        self.assertIsNotNone(self.get_task("success-recent"))
+        self.assertIsNone(self.get_task("success-old"))
+        self.assertIsNone(self.get_task("failed-old"))
+        self.assertIsNotNone(self.get_task("manual-old"))
 
 
 if __name__ == "__main__":

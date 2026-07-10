@@ -5380,10 +5380,26 @@ def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:
             if not force and next_cleanup_at is not None and next_cleanup_at > now:
                 return 0
 
+            retention_days = max(
+                1,
+                int(
+                    payload.get("retentionDays")
+                    or SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS
+                ),
+            )
+            cleanup_cutoff = now - timedelta(days=retention_days)
             rows = session.scalars(
                 select(CrawlTaskModel).where(
                     CrawlTaskModel.mode == "scheduled",
-                    CrawlTaskModel.status != "running",
+                    CrawlTaskModel.status.in_(
+                        ("success", "partial", "failed", "cancelled")
+                    ),
+                    func.coalesce(
+                        CrawlTaskModel.finished_at,
+                        CrawlTaskModel.updated_at,
+                        CrawlTaskModel.created_at,
+                    )
+                    <= cleanup_cutoff,
                 )
             ).all()
             task_ids = [task.id for task in rows]

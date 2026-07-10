@@ -91,6 +91,11 @@ When a reserved RQ job is missing or failed, recovery clears its
 eligible task. Periodic maintenance also invokes the dispatcher, allowing the
 queue to recover after backend, worker, or Redis restarts.
 
+The weekly scheduled-task cleanup deletes only terminal
+`success`/`partial`/`failed`/`cancelled` rows whose completion timestamp is
+older than the configured seven-day retention period. Queued, reserved, and
+running crawl tasks are never cleanup candidates.
+
 ## Production Migration
 
 Deployment must not combine the old full-backlog RQ queue with the new
