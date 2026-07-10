@@ -408,6 +408,9 @@ TASK_START_RETRY_DELAY_SECONDS = 5.0
 TASK_STALE_CANCEL_REQUEST_SECONDS = 10 * 60
 TASK_REDIS_MISSING_JOB_GRACE_SECONDS = 60
 TASK_QUEUED_REDIS_MISSING_JOB_GRACE_SECONDS = 2 * 60
+CRAWL_DISPATCH_LOCK_NAME = "lt:crawl-dispatch"
+CRAWL_DISPATCH_LOCK_TIMEOUT_SECONDS = 30
+CRAWL_DISPATCH_LOCK_BLOCKING_TIMEOUT_SECONDS = 3
 SCHEDULE_IMPORT_TEMPLATE_FILENAME = "scheduled-crawl-template.xlsx"
 SCHEDULE_EXPORT_FILENAME = "scheduled-crawl-shops.xlsx"
 SCHEDULE_FALLBACK_SHOP_URL_KEY = "fallbackShopUrl"
@@ -441,21 +444,151 @@ def start_background_task(target: Callable[..., Any], *args: Any, delay_seconds:
     worker.start()
 
 
-def dispatch_crawl_task(task_id: str, *, delay_seconds: float = 0.0) -> None:
+def dispatch_crawl_task(
+    task_id: str,
+    *,
+    delay_seconds: float = 0.0,
+    job_id: str | None = None,
+    mark_failed_on_error: bool = True,
+) -> None:
     if should_use_redis_task_queue():
         try:
             enqueue = enqueue_task_in if delay_seconds > 0 else enqueue_task
             enqueue_args = (delay_seconds, run_task, task_id) if delay_seconds > 0 else (run_task, task_id)
             enqueue(
                 *enqueue_args,
+                job_id=job_id,
                 description=f"采集任务 {task_id}",
                 queue_name=task_queue_name_for_kind("crawl"),
             )
         except Exception as exc:
-            mark_background_task_dispatch_failed(CrawlTaskModel, task_id, exc)
+            if mark_failed_on_error:
+                mark_background_task_dispatch_failed(CrawlTaskModel, task_id, exc)
             raise
         return
     start_background_task(run_task, task_id, delay_seconds=delay_seconds)
+
+
+def crawl_dispatch_job_id(task_id: str) -> str:
+    return f"crawl-{task_id}-{uuid.uuid4().hex[:8]}"
+
+
+def crawl_dispatch_available_slots(
+    running_count: int,
+    reserved_count: int,
+    limit: int | None = None,
+) -> int:
+    capacity = max(1, int(limit or settings.max_running_crawl_tasks_per_user))
+    return max(0, capacity - max(0, int(running_count or 0)) - max(0, int(reserved_count or 0)))
+
+
+def reserve_queued_crawl_tasks(
+    session: Any,
+    owner_username: str | None = None,
+) -> list[tuple[str, str]]:
+    owner_query = (
+        select(
+            CrawlTaskModel.owner_username,
+            func.min(CrawlTaskModel.created_at).label("oldest_created_at"),
+        )
+        .where(CrawlTaskModel.status == "queued")
+        .group_by(CrawlTaskModel.owner_username)
+        .order_by(func.min(CrawlTaskModel.created_at).asc(), CrawlTaskModel.owner_username.asc())
+    )
+    if owner_username:
+        owner_query = owner_query.where(CrawlTaskModel.owner_username == owner_username)
+    owners = [str(row.owner_username) for row in session.execute(owner_query)]
+    reservations: list[tuple[str, str]] = []
+    for task_owner in owners:
+        running_count = int(
+            session.scalar(
+                select(func.count()).where(
+                    CrawlTaskModel.owner_username == task_owner,
+                    CrawlTaskModel.status == "running",
+                )
+            )
+            or 0
+        )
+        reserved_count = int(
+            session.scalar(
+                select(func.count()).where(
+                    CrawlTaskModel.owner_username == task_owner,
+                    CrawlTaskModel.status == "queued",
+                    CrawlTaskModel.queue_job_id.is_not(None),
+                )
+            )
+            or 0
+        )
+        available_slots = crawl_dispatch_available_slots(running_count, reserved_count)
+        if available_slots <= 0:
+            continue
+        rows = session.scalars(
+            select(CrawlTaskModel)
+            .where(
+                CrawlTaskModel.owner_username == task_owner,
+                CrawlTaskModel.status == "queued",
+                CrawlTaskModel.queue_job_id.is_(None),
+            )
+            .order_by(CrawlTaskModel.created_at.asc(), CrawlTaskModel.id.asc())
+            .limit(available_slots)
+            .with_for_update()
+        ).all()
+        for task in rows:
+            job_id = crawl_dispatch_job_id(str(task.id))
+            task.queue_job_id = job_id
+            task.message = "已进入采集队列，等待 Worker"
+            reservations.append((str(task.id), job_id))
+    return reservations
+
+
+def dispatch_queued_crawl_tasks(owner_username: str | None = None) -> int:
+    if not should_use_redis_task_queue():
+        return 0
+    connection = redis_connection()
+    lock = connection.lock(
+        CRAWL_DISPATCH_LOCK_NAME,
+        timeout=CRAWL_DISPATCH_LOCK_TIMEOUT_SECONDS,
+    )
+    acquired = lock.acquire(
+        blocking=True,
+        blocking_timeout=CRAWL_DISPATCH_LOCK_BLOCKING_TIMEOUT_SECONDS,
+    )
+    if not acquired:
+        return 0
+    try:
+        with session_scope() as session:
+            reservations = reserve_queued_crawl_tasks(session, owner_username)
+        dispatched_count = 0
+        for task_id, job_id in reservations:
+            try:
+                dispatch_crawl_task(
+                    task_id,
+                    job_id=job_id,
+                    mark_failed_on_error=False,
+                )
+                dispatched_count += 1
+            except Exception as exc:
+                logger.warning("采集任务 %s 投递失败，等待系统重试：%s", task_id, exc)
+                with session_scope() as session:
+                    task = session.get(CrawlTaskModel, task_id)
+                    if task is None or task.status != "queued" or task.queue_job_id != job_id:
+                        continue
+                    task.queue_job_id = None
+                    task.message = "采集队列投递失败，等待系统重试"
+        return dispatched_count
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            logger.warning("释放采集派发锁失败", exc_info=True)
+
+
+def dispatch_queued_crawl_tasks_safely(owner_username: str | None = None) -> int:
+    try:
+        return dispatch_queued_crawl_tasks(owner_username)
+    except Exception:
+        logger.warning("采集队列容量派发失败", exc_info=True)
+        return 0
 
 
 def dispatch_sync_task(owner_username: str, task_id: str, *, delay_seconds: float = 0.0) -> None:
@@ -12356,7 +12489,10 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
         session.flush()
         task_public = task_to_public(task)
 
-    dispatch_crawl_task(task_public["id"])
+    if should_use_redis_task_queue():
+        dispatch_queued_crawl_tasks_safely(owner_username)
+    else:
+        dispatch_crawl_task(task_public["id"])
     return task_public
 
 
@@ -12370,6 +12506,7 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
         if task.status in {"queued", "running"}:
             raise RuntimeError("采集任务正在执行中，不能重新采集。")
         task.status = "queued"
+        task.queue_job_id = None
         task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
         task.success_count = 0
         task.failed_count = 0
@@ -12379,7 +12516,10 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
         task.warning_detail = None
         task.started_at = None
         task.finished_at = None
-    dispatch_crawl_task(task_id)
+    if should_use_redis_task_queue():
+        dispatch_queued_crawl_tasks_safely(owner_username)
+    else:
+        dispatch_crawl_task(task_id)
     with session_scope() as session:
         task = session.get(CrawlTaskModel, task_id)
         return task_to_public(task) if task else {"id": task_id}
