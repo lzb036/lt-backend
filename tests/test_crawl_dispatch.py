@@ -391,6 +391,39 @@ class CrawlRecoveryTests(CrawlDispatchDatabaseTestCase):
         self.assertEqual(task.status, "queued")
         self.assertIn("等待重新投递", task.message)
 
+    def test_failed_reserved_job_clears_reservation(self):
+        self.add_task(
+            "failed-reservation",
+            queue_job_id="crawl-failed-reservation",
+            created_at=datetime.now() - timedelta(minutes=10),
+        )
+
+        with (
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(
+                crawler_service,
+                "redis_task_states",
+                return_value={
+                    "failed-reservation": {
+                        "status": "failed",
+                        "error": "worker failed before task start",
+                    }
+                },
+            ),
+            patch.object(crawler_service, "dispatch_crawl_task") as direct_dispatch,
+        ):
+            with self.session_scope() as session:
+                recovered = crawler_service.reconcile_missing_queued_tasks(
+                    session,
+                    CrawlTaskModel,
+                )
+
+        self.assertEqual(recovered, 1)
+        direct_dispatch.assert_not_called()
+        task = self.get_task("failed-reservation")
+        self.assertIsNone(task.queue_job_id)
+        self.assertEqual(task.status, "queued")
+
     def test_periodic_maintenance_refills_crawl_capacity(self):
         refill = Mock(return_value=3)
 

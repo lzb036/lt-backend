@@ -2628,7 +2628,9 @@ def reconcile_missing_queued_tasks(
     for task in rows:
         task_id = str(task.id)
         state = task_states.get(task_id)
-        if state is not None:
+        if state is not None and not (
+            model is CrawlTaskModel and state.get("status") == "failed"
+        ):
             continue
         if task_cancel_requested(task):
             if model is ListingTaskModel:
