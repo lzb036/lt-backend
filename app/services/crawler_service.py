@@ -6,6 +6,7 @@ import uuid
 import base64
 import binascii
 import hashlib
+import logging
 import mimetypes
 import random
 import shutil
@@ -43,6 +44,17 @@ from app.db.models import (
     SystemSettingModel,
     make_source_url_hash,
 )
+from app.services.product_image_storage import (
+    DRAFT_IMAGE_OBJECT_PREFIX,
+    DRAFT_IMAGE_URL_PREFIX,
+    PRODUCT_IMAGE_OBJECT_PREFIX,
+    PRODUCT_IMAGE_URL_PREFIX,
+    StoredObject,
+    parse_product_image_url,
+    product_image_storage,
+)
+
+logger = logging.getLogger(__name__)
 
 RAKUTEN_SEARCH_BASE = "https://search.rakuten.co.jp/search/mall/"
 RAKUTEN_RANKING_BASE = "https://ranking.rakuten.co.jp/search"
@@ -67,9 +79,9 @@ BATCH_TASK_PRODUCT_LIMIT = 50
 LISTED_STORE_NONE_FILTER = "__none__"
 _TASK_DETAIL_UNSET = object()
 _STORE_SNAPSHOT_UNSET = object()
-LOCAL_PRODUCT_IMAGE_URL_PREFIX = "/api/static/product-images"
+LOCAL_PRODUCT_IMAGE_URL_PREFIX = PRODUCT_IMAGE_URL_PREFIX
 LOCAL_PRODUCT_IMAGE_DIR = settings.backend_dir / "data" / "product-images"
-LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX = "/api/static/product-image-drafts"
+LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX = DRAFT_IMAGE_URL_PREFIX
 LOCAL_PRODUCT_IMAGE_DRAFT_DIR = settings.backend_dir / "data" / "product-image-drafts"
 RAKUTEN_ATTRIBUTE_RULES_PATH = settings.backend_dir / "app" / "resources" / "rakuten_attribute_rules.json"
 ALLOWED_PRODUCT_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
@@ -1088,6 +1100,7 @@ def set_product_image_urls_with_description_updates(
 
 
 def localize_collected_product_images(owner_username: str, product_id: int) -> str:
+    referenced_local_urls: list[str] = []
     with session_scope() as session:
         product = session.get(ProductModel, product_id)
         if product is None or product.owner_username != owner_username:
@@ -1151,9 +1164,11 @@ def localize_collected_product_images(owner_username: str, product_id: int) -> s
         product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
         if image_result["urls"]:
             product.image_url = image_result["urls"][0]
-        remove_unused_local_product_images(product.id, collect_local_product_image_urls(updated_payload))
+        referenced_local_urls = collect_local_product_image_urls(updated_payload)
         session.flush()
-        return product.last_error or ""
+        result = product.last_error or ""
+    remove_unused_local_product_images(product_id, referenced_local_urls)
+    return result
 
 
 def localize_product_image_urls(product_id: int, image_urls: list[str], *, prefix: str) -> dict[str, Any]:
@@ -1227,16 +1242,20 @@ def save_remote_product_image(product_id: int, image_url: str, name_prefix: str)
         max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
         size_error_message="图片下载大小不能超过 20MB。",
     )
-    image_dir = LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id))
-    image_dir.mkdir(parents=True, exist_ok=True)
     safe_name = f"{name_prefix}-{uuid.uuid4().hex[:12]}{image_data['suffix']}"
-    target_path = image_dir / safe_name
-    target_path.write_bytes(image_data["content"])
-    return local_product_image_url(product_id, safe_name)
+    target_url = local_product_image_url(product_id, safe_name)
+    store_product_image_content(
+        target_url,
+        image_data["content"],
+        image_data["contentType"],
+        LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id)) / safe_name,
+    )
+    return target_url
 
 
 def is_local_product_image_url(image_url: str) -> bool:
-    return normalize_text(image_url).startswith(LOCAL_PRODUCT_IMAGE_URL_PREFIX)
+    stored_image = parse_product_image_url(image_url)
+    return bool(stored_image and stored_image.kind == PRODUCT_IMAGE_OBJECT_PREFIX)
 
 
 def summarize_local_image_errors(product_title: str, source_url: str, product_id: int, errors: list[str]) -> str:
@@ -6057,8 +6076,7 @@ def delete_store(owner_username: str, store_id: int) -> None:
                 ProductModel.store_id == store_id,
             ).delete(synchronize_session=False)
         session.delete(row)
-    for product_id in product_ids:
-        clear_product_temp_image_files(int(product_id))
+    cleanup_product_image_ids([int(product_id) for product_id in product_ids])
 
 
 def clear_store_products_for_reimport(
@@ -6233,8 +6251,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
             "failedCount": failed_count,
             "cancelled": False,
         }
-    for product_id in deleted_product_ids:
-        clear_product_temp_image_files(product_id)
+    cleanup_product_image_ids(deleted_product_ids)
     return result
 
 
@@ -6878,7 +6895,6 @@ def perform_product_delete_sync(
             warnings.extend(getattr(row, "_delete_warnings", []) or [])
             remove_listed_store_mark_for_store_product(session, row)
             success_ids.append(row.id)
-            clear_product_temp_image_files(row.id)
             session.delete(row)
             success_count += 1
             if task_id:
@@ -6891,7 +6907,7 @@ def perform_product_delete_sync(
                     message=f"删除中，已处理 {index + len(missing_ids)} / {len(product_ids)} 条",
                 )
         session.flush()
-        return {
+        result = {
             "store": store_to_public(store),
             "totalCount": len(product_ids),
             "successCount": success_count,
@@ -6903,6 +6919,8 @@ def perform_product_delete_sync(
             "warnings": warnings,
             "cancelled": cancelled,
         }
+    cleanup_product_image_ids(success_ids)
+    return result
 
 
 def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
@@ -7735,14 +7753,13 @@ def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, An
                 for child in child_rows:
                     child.parent_product_id = None
             deleted_ids.append(row.id)
-            clear_product_temp_image_files(row.id)
             session.delete(row)
             success_count += 1
         session.flush()
         message = f"完成，成功删除 {success_count} 个，失败 {failed_count} 个"
         if cabinet_deleted_count:
             message = f"{message}，同步删除图片 {cabinet_deleted_count} 个"
-        return {
+        result = {
             "deletedIds": deleted_ids,
             "failedIds": failed_ids,
             "products": failed_products,
@@ -7756,6 +7773,8 @@ def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, An
                 "warnings": warnings[:20],
             }
         }
+    cleanup_product_image_ids(deleted_ids)
+    return result
 
 
 def productCodeForError(row: ProductModel) -> str:
@@ -10059,7 +10078,10 @@ def persist_recovered_product_images(product: ProductModel, raw_payload: dict[st
         updated_payload = set_product_image_urls(raw_payload, image_urls)
         product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
         product.image_url = image_urls[0]
-        if product.last_error and "本地图片文件不存在" in product.last_error:
+        if product.last_error and any(
+            marker in product.last_error
+            for marker in ("本地图片文件不存在", "商品图片文件不存在")
+        ):
             product.last_error = None
     except Exception:
         return
@@ -10078,11 +10100,21 @@ def product_original_image_urls(raw_payload: dict[str, Any], *, shop_code: str =
 
 def is_missing_local_product_image_url(image_url: str) -> bool:
     local_path = local_product_image_path_from_url(image_url)
+    stored_image = parse_product_image_url(image_url)
+    if stored_image is not None and product_image_storage.enabled:
+        try:
+            if product_image_storage.exists(stored_image.object_key):
+                return False
+        except Exception:
+            if local_path and local_path.exists():
+                return False
+            return False
     return bool(local_path and not local_path.exists())
 
 
 def is_missing_local_product_image_error(exc: Exception) -> bool:
-    return "本地图片文件不存在" in str(exc)
+    message = str(exc)
+    return "本地图片文件不存在" in message or "商品图片文件不存在" in message
 
 
 def load_product_image_bytes(
@@ -10093,13 +10125,42 @@ def load_product_image_bytes(
 ) -> dict[str, Any]:
     normalized_max_bytes = max(1, int(max_bytes or MAX_PRODUCT_IMAGE_BYTES))
     local_path = local_product_image_path_from_url(image_url)
-    if local_path:
-        if not local_path.exists():
-            raise RuntimeError("本地图片文件不存在。")
-        content = local_path.read_bytes()
-        suffix = local_path.suffix.lower()
-        content_type = mimetypes.guess_type(str(local_path))[0] or "application/octet-stream"
+    stored_image = parse_product_image_url(image_url)
+    storage_error: Exception | None = None
+    if stored_image is not None and product_image_storage.enabled:
+        try:
+            if product_image_storage.exists(stored_image.object_key):
+                content = product_image_storage.read_bytes(
+                    stored_image.object_key,
+                    max_bytes=normalized_max_bytes,
+                )
+                suffix = Path(stored_image.filename).suffix.lower()
+                content_type = mimetypes.guess_type(stored_image.filename)[0] or "application/octet-stream"
+            else:
+                content = b""
+                suffix = ""
+                content_type = ""
+        except Exception as exc:
+            storage_error = exc
+            content = b""
+            suffix = ""
+            content_type = ""
     else:
+        content = b""
+        suffix = ""
+        content_type = ""
+    if not content and local_path:
+        if local_path.exists():
+            content = local_path.read_bytes()
+            suffix = local_path.suffix.lower()
+            content_type = mimetypes.guess_type(str(local_path))[0] or "application/octet-stream"
+        elif storage_error is not None:
+            raise RuntimeError("读取 OSS 商品图片失败。") from storage_error
+        elif stored_image is not None:
+            raise RuntimeError("商品图片文件不存在。")
+        else:
+            raise RuntimeError("本地图片文件不存在。")
+    if not content:
         response = requests.get(
             image_url,
             timeout=settings.crawler_timeout_seconds,
@@ -10779,6 +10840,7 @@ def truncate_text(value: Any, max_length: int) -> str:
 
 
 def update_product_local_detail(owner_username: str, product_id: int, payload: Any) -> dict[str, Any]:
+    cleanup_urls: list[str] = []
     with session_scope() as session:
         product = session.get(ProductModel, product_id)
         if product is None or product.owner_username != owner_username:
@@ -10796,7 +10858,7 @@ def update_product_local_detail(owner_username: str, product_id: int, payload: A
         )
         image_changes = getattr(payload, "imageChanges", None)
         if product.review_status == "pending":
-            updated_payload = apply_product_image_changes(product, updated_payload, image_changes)
+            updated_payload, cleanup_urls = apply_product_image_changes(product, updated_payload, image_changes)
         product.title = first_text_from_keys(updated_payload, ("itemName", "title", "name")) or product.title
         product.price = price_from_rakuten_item(updated_payload)
         if image_changes:
@@ -10805,32 +10867,49 @@ def update_product_local_detail(owner_username: str, product_id: int, payload: A
         product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
         product.last_error = None
         session.flush()
-        return product_detail_to_public(product)
+        result = product_detail_to_public(product)
+    cleanup_product_image_urls(product_id, cleanup_urls)
+    return result
 
 
-def apply_product_image_changes(product: ProductModel, raw_payload: dict[str, Any], image_changes: Any) -> dict[str, Any]:
+def apply_product_image_changes(
+    product: ProductModel,
+    raw_payload: dict[str, Any],
+    image_changes: Any,
+) -> tuple[dict[str, Any], list[str]]:
     if not image_changes:
-        return raw_payload
+        return raw_payload, []
     images = unique_texts([
         normalize_product_image_url(image, shop_code=product_shop_code(product, raw_payload))
         for image in list(getattr(image_changes, "images", []) or [])
     ])
+    for image_url in images:
+        validate_product_image_url_ownership(product.id, image_url)
     old_images = product_images_for_edit(product)
     replacements: dict[str, str] = {}
     for item in list(getattr(image_changes, "replacements", []) or []):
         old_url = normalize_product_image_url(getattr(item, "from_", ""), shop_code=product_shop_code(product, raw_payload))
         new_url = normalize_product_image_url(getattr(item, "to", ""), shop_code=product_shop_code(product, raw_payload))
         if old_url and new_url:
+            validate_product_image_url_ownership(product.id, old_url)
+            validate_product_image_url_ownership(product.id, new_url)
             replacements[old_url] = new_url
     remove_urls = unique_texts([
         normalize_product_image_url(image, shop_code=product_shop_code(product, raw_payload))
         for image in list(getattr(image_changes, "removeUrls", []) or [])
     ])
+    for image_url in remove_urls:
+        validate_product_image_url_ownership(product.id, image_url)
     finalized_urls: dict[str, str] = {}
+    cleanup_urls: list[str] = []
 
     def finalize_once(image_url: str) -> str:
         if image_url not in finalized_urls:
-            finalized_urls[image_url] = finalize_product_image_url(product.id, image_url)
+            finalized_urls[image_url] = finalize_product_image_url(
+                product.id,
+                image_url,
+                cleanup_urls=cleanup_urls,
+            )
         return finalized_urls[image_url]
 
     normalized_images = [finalize_once(image) for image in images]
@@ -10844,11 +10923,14 @@ def apply_product_image_changes(product: ProductModel, raw_payload: dict[str, An
         replace_map=finalized_replacements,
         remove_urls=remove_urls,
     )
-    current_images = set(normalized_images)
+    current_images = {
+        product_image_url_identity(image_url)
+        for image_url in normalized_images
+    }
     for old_url in old_images:
-        if old_url not in current_images:
-            remove_local_product_image_if_unused(old_url, normalized_images)
-    return updated_payload
+        if product_image_url_identity(old_url) not in current_images:
+            cleanup_urls.append(old_url)
+    return updated_payload, unique_texts(cleanup_urls)
 
 
 def product_images_for_edit(product: ProductModel) -> list[str]:
@@ -10868,6 +10950,11 @@ def product_image_download_info(owner_username: str, product_id: int, image_inde
         image_url = image_url_at_index(images, image_index)
     local_path = local_product_image_path_from_url(image_url)
     filename = product_image_download_name(product_id, image_index, image_url)
+    stored_image = parse_product_image_url(image_url)
+    if stored_image is not None and product_image_storage.enabled:
+        image_info = product_image_http_info(image_url, include_body=True)
+        image_info["filename"] = filename
+        return image_info
     if local_path and local_path.exists():
         return {
             "type": "local",
@@ -10880,6 +10967,59 @@ def product_image_download_info(owner_username: str, product_id: int, image_inde
         "url": image_url,
         "filename": filename,
         "mediaType": mimetypes.guess_type(filename)[0] or "application/octet-stream",
+    }
+
+
+def product_image_http_info(image_url: str, *, include_body: bool) -> dict[str, Any]:
+    local_path = local_product_image_path_from_url(image_url)
+    stored_image = parse_product_image_url(image_url)
+    storage_error: Exception | None = None
+    if stored_image is not None and product_image_storage.enabled:
+        try:
+            media_type = mimetypes.guess_type(stored_image.filename)[0] or "application/octet-stream"
+            if include_body:
+                stream = product_image_storage.open_stream(
+                    stored_image.object_key,
+                    max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+                )
+                if stream is not None:
+                    return {
+                        "type": "stream",
+                        "body": stream,
+                        "size": stream.size,
+                        "mediaType": media_type,
+                    }
+            else:
+                fingerprint = product_image_storage.object_fingerprint(stored_image.object_key)
+                if fingerprint is not None:
+                    return {
+                        "type": "metadata",
+                        "size": fingerprint.size,
+                        "mediaType": media_type,
+                    }
+        except Exception as exc:
+            storage_error = exc
+    if local_path and local_path.exists():
+        return {
+            "type": "local",
+            "path": local_path,
+            "size": local_path.stat().st_size,
+            "mediaType": mimetypes.guess_type(str(local_path))[0] or "application/octet-stream",
+        }
+    if storage_error is not None:
+        raise RuntimeError("读取 OSS 商品图片失败。") from storage_error
+    raise RuntimeError("商品图片文件不存在。")
+
+
+def product_image_content_info(image_url: str) -> dict[str, Any]:
+    image_data = load_product_image_bytes(
+        image_url,
+        max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+        size_error_message="图片下载大小不能超过 20MB。",
+    )
+    return {
+        "content": image_data["content"],
+        "mediaType": image_data["contentType"],
     }
 
 
@@ -10948,31 +11088,33 @@ def save_uploaded_product_image_file(upload_file: Any, image_dir: Path, url_buil
         raise RuntimeError("图片格式只支持 jpg、jpeg、png、gif。")
     if content_type and content_type not in ALLOWED_PRODUCT_IMAGE_MIME_TYPES:
         raise RuntimeError("图片文件类型不正确。")
-    image_dir.mkdir(parents=True, exist_ok=True)
     safe_name = f"{name_prefix}-{uuid.uuid4().hex[:12]}{suffix}"
-    target_path = image_dir / safe_name
     size = 0
+    chunks: list[bytes] = []
     try:
-        with target_path.open("wb") as target:
-            while True:
-                chunk = upload_file.file.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_PRODUCT_IMAGE_BYTES:
-                    target.close()
-                    target_path.unlink(missing_ok=True)
-                    raise RuntimeError("图片大小不能超过 2MB。")
-                target.write(chunk)
+        while True:
+            chunk = upload_file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_PRODUCT_IMAGE_BYTES:
+                raise RuntimeError("图片大小不能超过 2MB。")
+            chunks.append(chunk)
     finally:
         try:
             upload_file.file.seek(0)
         except Exception:
             pass
     if size <= 0:
-        target_path.unlink(missing_ok=True)
         raise RuntimeError("上传的图片为空。")
-    return url_builder(safe_name)
+    image_url = url_builder(safe_name)
+    store_product_image_content(
+        image_url,
+        b"".join(chunks),
+        content_type or product_image_content_type_from_suffix(suffix),
+        image_dir / safe_name,
+    )
+    return image_url
 
 
 def save_product_image_bytes(content: bytes, suffix: str, image_dir: Path, url_builder: Callable[[str], str], *, name_prefix: str) -> str:
@@ -10983,11 +11125,26 @@ def save_product_image_bytes(content: bytes, suffix: str, image_dir: Path, url_b
         raise RuntimeError("图片内容为空。")
     if len(content) > MAX_PRODUCT_IMAGE_BYTES:
         raise RuntimeError("图片大小不能超过 2MB。")
-    image_dir.mkdir(parents=True, exist_ok=True)
     safe_name = f"{name_prefix}-{uuid.uuid4().hex[:12]}{normalized_suffix}"
-    target_path = image_dir / safe_name
-    target_path.write_bytes(content)
-    return url_builder(safe_name)
+    image_url = url_builder(safe_name)
+    store_product_image_content(
+        image_url,
+        content,
+        product_image_content_type_from_suffix(normalized_suffix),
+        image_dir / safe_name,
+    )
+    return image_url
+
+
+def store_product_image_content(image_url: str, content: bytes, content_type: str, local_path: Path) -> None:
+    stored_image = parse_product_image_url(image_url)
+    if product_image_storage.enabled:
+        if stored_image is None:
+            raise RuntimeError("商品图片存储地址无效。")
+        product_image_storage.put_bytes(stored_image.object_key, content, content_type)
+        return
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(content)
 
 
 def decode_product_image_base64(image_base64: str, ext: str = "") -> dict[str, Any]:
@@ -11058,42 +11215,77 @@ def local_product_image_draft_url(product_id: int, filename: str) -> str:
     return f"{LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX}/{int(product_id)}/{quote(filename, safe='')}"
 
 
-def finalize_product_image_url(product_id: int, image_url: str) -> str:
+def validate_product_image_url_ownership(product_id: int, image_url: str) -> None:
+    stored_image = parse_product_image_url(image_url)
+    if stored_image is not None and stored_image.product_id != int(product_id):
+        raise RuntimeError("图片不属于当前商品，不能保存或删除。")
+
+
+def product_image_url_identity(image_url: str) -> str:
+    stored_image = parse_product_image_url(image_url)
+    return stored_image.object_key if stored_image is not None else normalize_text(image_url)
+
+
+def finalize_product_image_url(
+    product_id: int,
+    image_url: str,
+    *,
+    cleanup_urls: list[str] | None = None,
+) -> str:
     draft_path = local_product_image_path_from_url(image_url)
     if not draft_path or not is_product_image_draft_url(image_url):
         return image_url
+    draft_image = parse_product_image_url(image_url)
+    validate_product_image_url_ownership(product_id, image_url)
+    suffix = Path(draft_image.filename).suffix.lower() if draft_image is not None else draft_path.suffix.lower()
+    target_name = f"saved-{uuid.uuid4().hex[:12]}{suffix}"
+    target_url = local_product_image_url(product_id, target_name)
+    target_image = parse_product_image_url(target_url)
+    if (
+        product_image_storage.enabled
+        and draft_image is not None
+        and target_image is not None
+        and product_image_storage.exists(draft_image.object_key)
+    ):
+        product_image_storage.copy(draft_image.object_key, target_image.object_key)
+        if cleanup_urls is not None:
+            cleanup_urls.append(image_url)
+        return target_url
     target_dir = LOCAL_PRODUCT_IMAGE_DIR / str(product_id)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_name = f"saved-{uuid.uuid4().hex[:12]}{draft_path.suffix.lower()}"
     target_path = target_dir / target_name
-    shutil.move(str(draft_path), str(target_path))
-    return local_product_image_url(product_id, target_name)
+    if not draft_path.exists():
+        raise RuntimeError("商品草稿图片不存在。")
+    if product_image_storage.enabled:
+        store_product_image_content(
+            target_url,
+            draft_path.read_bytes(),
+            mimetypes.guess_type(str(draft_path))[0] or product_image_content_type_from_suffix(suffix),
+            target_path,
+        )
+    else:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(draft_path), str(target_path))
+    if cleanup_urls is not None:
+        cleanup_urls.append(image_url)
+    return target_url
 
 
 def is_product_image_draft_url(image_url: str) -> bool:
-    return normalize_text(image_url).startswith(LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX)
+    stored_image = parse_product_image_url(image_url)
+    return bool(stored_image and stored_image.kind == DRAFT_IMAGE_OBJECT_PREFIX)
 
 
 def local_product_image_path_from_url(image_url: str) -> Path | None:
-    text = normalize_text(image_url)
-    if text.startswith(LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX):
+    stored_image = parse_product_image_url(image_url)
+    if stored_image is None:
+        return None
+    if stored_image.kind == DRAFT_IMAGE_OBJECT_PREFIX:
         root_dir = LOCAL_PRODUCT_IMAGE_DRAFT_DIR
-        prefix = LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX
-    elif text.startswith(LOCAL_PRODUCT_IMAGE_URL_PREFIX):
+    elif stored_image.kind == PRODUCT_IMAGE_OBJECT_PREFIX:
         root_dir = LOCAL_PRODUCT_IMAGE_DIR
-        prefix = LOCAL_PRODUCT_IMAGE_URL_PREFIX
     else:
         return None
-    relative = text.removeprefix(prefix).lstrip("/")
-    parts = [unquote(part) for part in relative.split("/") if part]
-    if len(parts) != 2:
-        return None
-    product_id, filename = parts
-    if not re.fullmatch(r"\d+", product_id):
-        return None
-    if "/" in filename or "\\" in filename:
-        return None
-    candidate = (root_dir / product_id / filename).resolve()
+    candidate = (root_dir / str(stored_image.product_id) / stored_image.filename).resolve()
     root = root_dir.resolve()
     try:
         candidate.relative_to(root)
@@ -11102,15 +11294,59 @@ def local_product_image_path_from_url(image_url: str) -> Path | None:
     return candidate
 
 
-def remove_local_product_image_if_unused(image_url: str, current_images: list[str]) -> None:
+def remove_local_product_image_if_unused(
+    image_url: str,
+    current_images: list[str],
+    *,
+    expected_product_id: int | None = None,
+) -> None:
     if image_url in current_images:
         return
+    stored_image = parse_product_image_url(image_url)
+    current_keys = {
+        image.object_key
+        for image in (parse_product_image_url(url) for url in current_images)
+        if image is not None
+    }
+    if stored_image is not None and stored_image.object_key in current_keys:
+        return
+    if (
+        stored_image is not None
+        and expected_product_id is not None
+        and stored_image.product_id != int(expected_product_id)
+    ):
+        return
+    if stored_image is not None and product_image_storage.enabled:
+        product_image_storage.delete(stored_image.object_key)
     path = local_product_image_path_from_url(image_url)
     if path and path.exists():
         path.unlink(missing_ok=True)
 
 
+def cleanup_product_image_urls(product_id: int, image_urls: list[str]) -> None:
+    for image_url in unique_texts(image_urls):
+        try:
+            remove_local_product_image_if_unused(
+                image_url,
+                [],
+                expected_product_id=product_id,
+            )
+        except Exception:
+            logger.exception(
+                "Post-commit product image cleanup failed: product_id=%s image_url=%s",
+                product_id,
+                image_url,
+            )
+
+
 def clear_product_temp_image_files(product_id: int) -> None:
+    if product_image_storage.enabled:
+        product_image_storage.delete_prefix(f"{PRODUCT_IMAGE_OBJECT_PREFIX}/{int(product_id)}/")
+        product_image_storage.delete_prefix(f"{DRAFT_IMAGE_OBJECT_PREFIX}/{int(product_id)}/")
+    clear_local_product_image_files(product_id)
+
+
+def clear_local_product_image_files(product_id: int) -> None:
     for root_dir in (LOCAL_PRODUCT_IMAGE_DIR, LOCAL_PRODUCT_IMAGE_DRAFT_DIR):
         image_dir = (root_dir / str(int(product_id))).resolve()
         root = root_dir.resolve()
@@ -11122,8 +11358,19 @@ def clear_product_temp_image_files(product_id: int) -> None:
             shutil.rmtree(image_dir, ignore_errors=True)
 
 
+def cleanup_product_image_ids(product_ids: list[int]) -> None:
+    for product_id in dict.fromkeys(int(value) for value in product_ids):
+        try:
+            clear_product_temp_image_files(product_id)
+        except Exception:
+            logger.exception(
+                "Post-commit product image prefix cleanup failed: product_id=%s",
+                product_id,
+            )
+
+
 def cleanup_orphan_product_image_dirs() -> int:
-    product_ids = collect_product_image_dir_ids()
+    product_ids, oss_objects = collect_product_image_cleanup_state()
     if not product_ids:
         return 0
     existing_ids: set[int] = set()
@@ -11134,37 +11381,144 @@ def cleanup_orphan_product_image_dirs() -> int:
                 int(value)
                 for value in session.scalars(select(ProductModel.id).where(ProductModel.id.in_(batch))).all()
             )
-    orphan_ids = [product_id for product_id in product_ids if product_id not in existing_ids]
+    cutoff = time.time() - settings.product_image_orphan_retention_days * 24 * 60 * 60
+    oss_last_modified = {
+        product_id: max((item.last_modified for item in objects), default=0)
+        for product_id, objects in oss_objects.items()
+    }
+    orphan_ids = orphan_product_ids_ready_for_cleanup(
+        product_ids=product_ids,
+        existing_ids=existing_ids,
+        oss_last_modified=oss_last_modified,
+        cutoff=cutoff,
+    )
+    if not orphan_ids:
+        return 0
+    still_existing_ids: set[int] = set()
+    with session_scope() as session:
+        for offset in range(0, len(orphan_ids), 500):
+            batch = orphan_ids[offset:offset + 500]
+            still_existing_ids.update(
+                int(value)
+                for value in session.scalars(select(ProductModel.id).where(ProductModel.id.in_(batch))).all()
+            )
+    orphan_ids = [
+        product_id
+        for product_id in orphan_ids
+        if product_id not in still_existing_ids
+    ]
     for product_id in orphan_ids:
-        clear_product_temp_image_files(product_id)
+        cleanup_aged_orphan_oss_objects(
+            product_id,
+            oss_objects.get(product_id, []),
+            cutoff=cutoff,
+        )
+        clear_local_product_image_files(product_id)
     return len(orphan_ids)
 
 
 def collect_product_image_dir_ids() -> list[int]:
+    product_ids, _oss_objects = collect_product_image_cleanup_state()
+    return product_ids
+
+
+def collect_product_image_dir_state() -> tuple[list[int], dict[int, int]]:
+    product_ids, oss_objects = collect_product_image_cleanup_state()
+    return product_ids, {
+        product_id: max((item.last_modified for item in objects), default=0)
+        for product_id, objects in oss_objects.items()
+    }
+
+
+def collect_product_image_cleanup_state() -> tuple[list[int], dict[int, list[StoredObject]]]:
     ids: list[int] = []
     seen: set[int] = set()
+    oss_objects: dict[int, list[StoredObject]] = {}
+
+    def remember(value: Any, *, stored_object: StoredObject | None = None) -> None:
+        try:
+            product_id = int(value)
+        except (TypeError, ValueError):
+            return
+        if product_id not in seen:
+            seen.add(product_id)
+            ids.append(product_id)
+        if stored_object is not None:
+            oss_objects.setdefault(product_id, []).append(stored_object)
+
     for root_dir in (LOCAL_PRODUCT_IMAGE_DIR, LOCAL_PRODUCT_IMAGE_DRAFT_DIR):
         if not root_dir.exists() or not root_dir.is_dir():
             continue
         for path in root_dir.iterdir():
             if not path.is_dir():
                 continue
-            try:
-                product_id = int(path.name)
-            except ValueError:
+            remember(path.name)
+    if product_image_storage.enabled:
+        for prefix in (PRODUCT_IMAGE_OBJECT_PREFIX, DRAFT_IMAGE_OBJECT_PREFIX):
+            for item in product_image_storage.list_objects(f"{prefix}/"):
+                parts = item.key.split("/", 2)
+                if len(parts) >= 2:
+                    remember(parts[1], stored_object=item)
+    return ids, oss_objects
+
+
+def cleanup_aged_orphan_oss_objects(
+    product_id: int,
+    objects: list[StoredObject],
+    *,
+    cutoff: float,
+) -> None:
+    for item in objects:
+        if item.last_modified <= 0 or item.last_modified >= cutoff:
+            continue
+        try:
+            current = product_image_storage.object_fingerprint(item.key)
+            if (
+                current is None
+                or current.last_modified <= 0
+                or current.last_modified >= cutoff
+            ):
                 continue
-            if product_id not in seen:
-                seen.add(product_id)
-                ids.append(product_id)
-    return ids
+            product_image_storage.delete(item.key)
+        except Exception:
+            logger.exception(
+                "Orphan product image cleanup failed: product_id=%s key=%s",
+                product_id,
+                item.key,
+            )
+
+
+def orphan_product_ids_ready_for_cleanup(
+    *,
+    product_ids: list[int],
+    existing_ids: set[int],
+    oss_last_modified: dict[int, int],
+    cutoff: float,
+) -> list[int]:
+    return [
+        product_id
+        for product_id in product_ids
+        if product_id not in existing_ids
+        and (
+            product_id not in oss_last_modified
+            or oss_last_modified[product_id] < cutoff
+        )
+    ]
 
 
 def cleanup_expired_product_image_drafts() -> int:
-    root = LOCAL_PRODUCT_IMAGE_DRAFT_DIR
-    if not root.exists():
-        return 0
     cutoff = time.time() - settings.product_image_draft_retention_days * 24 * 60 * 60
     deleted_count = 0
+    if product_image_storage.enabled:
+        for item in product_image_storage.list_objects(f"{DRAFT_IMAGE_OBJECT_PREFIX}/"):
+            if item.last_modified >= cutoff:
+                continue
+            product_image_storage.delete(item.key)
+            deleted_count += 1
+
+    root = LOCAL_PRODUCT_IMAGE_DRAFT_DIR
+    if not root.exists():
+        return deleted_count
     for path in root.rglob("*"):
         if not path.is_file():
             continue

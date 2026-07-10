@@ -483,6 +483,12 @@ def download_product_image(
             raise HTTPException(status_code=403, detail="没有下载该商品图片的权限")
         info = crawler_service.product_image_download_info(user["username"], product_id, image_index)
         headers = {"Content-Disposition": f'attachment; filename="{info["filename"]}"'}
+        if info["type"] == "stream":
+            return StreamingResponse(
+                info["body"],
+                media_type=info["mediaType"],
+                headers=headers,
+            )
         if info["type"] == "local":
             return FileResponse(info["path"], media_type=info["mediaType"], filename=info["filename"])
         response = requests.get(

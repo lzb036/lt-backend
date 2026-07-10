@@ -5,6 +5,7 @@ SQLAlchemy==2.0.41
 PyMySQL==1.1.1
 cryptography==45.0.6
 requests==2.32.4
+oss2==2.19.1
 beautifulsoup4==4.13.4
 lxml==6.0.0
 python-multipart==0.0.20

@@ -85,6 +85,13 @@ class Settings(BaseModel):
     crawler_warmup_url: str = "https://www.rakuten.co.jp/"
     crawler_proxy_url: str = ""
     product_image_draft_retention_days: int = 7
+    product_image_orphan_retention_days: int = 7
+    product_image_storage: str = "local"
+    oss_bucket: str = ""
+    oss_endpoint: str = ""
+    oss_region: str = ""
+    oss_ecs_role_name: str = ""
+    oss_connect_timeout_seconds: int = 10
     task_queue_mode: str = "thread"
     redis_url: str = "redis://127.0.0.1:6379/0"
     task_queue_name: str = "lt-tasks"
@@ -130,6 +137,27 @@ def build_settings() -> Settings:
             "缺少 MySQL 配置 LT_DATABASE_URL，例如 "
             "mysql+pymysql://user:password@127.0.0.1:3306/lt_collector?charset=utf8mb4"
         )
+    product_image_storage = _env_text("LT_PRODUCT_IMAGE_STORAGE", "local").lower() or "local"
+    if product_image_storage not in {"local", "oss"}:
+        raise RuntimeError("LT_PRODUCT_IMAGE_STORAGE 只能配置为 local 或 oss。")
+    oss_bucket = _env_text("LT_OSS_BUCKET")
+    oss_endpoint = _env_text("LT_OSS_ENDPOINT")
+    if oss_endpoint and "://" not in oss_endpoint:
+        oss_endpoint = f"https://{oss_endpoint}"
+    oss_region = _env_text("LT_OSS_REGION")
+    oss_ecs_role_name = _env_text("LT_OSS_ECS_ROLE_NAME")
+    if product_image_storage == "oss":
+        required_oss_settings = {
+            "LT_OSS_BUCKET": oss_bucket,
+            "LT_OSS_ENDPOINT": oss_endpoint,
+            "LT_OSS_REGION": oss_region,
+            "LT_OSS_ECS_ROLE_NAME": oss_ecs_role_name,
+        }
+        missing = [name for name, value in required_oss_settings.items() if not value]
+        if missing:
+            raise RuntimeError(f"OSS 图片存储缺少配置：{', '.join(missing)}。")
+        if not oss_endpoint.lower().startswith("https://"):
+            raise RuntimeError("LT_OSS_ENDPOINT 在 OSS 模式下必须使用 HTTPS。")
     return Settings(
         database_url=database_url,
         database_echo=_env_bool("LT_DATABASE_ECHO", False),
@@ -162,6 +190,13 @@ def build_settings() -> Settings:
         crawler_warmup_url=_env_text("LT_CRAWLER_WARMUP_URL", "https://www.rakuten.co.jp/"),
         crawler_proxy_url=_env_text("LT_CRAWLER_PROXY_URL", ""),
         product_image_draft_retention_days=max(1, _env_int("LT_PRODUCT_IMAGE_DRAFT_RETENTION_DAYS", 7)),
+        product_image_orphan_retention_days=max(1, _env_int("LT_PRODUCT_IMAGE_ORPHAN_RETENTION_DAYS", 7)),
+        product_image_storage=product_image_storage,
+        oss_bucket=oss_bucket,
+        oss_endpoint=oss_endpoint,
+        oss_region=oss_region,
+        oss_ecs_role_name=oss_ecs_role_name,
+        oss_connect_timeout_seconds=max(1, _env_int("LT_OSS_CONNECT_TIMEOUT_SECONDS", 10)),
         task_queue_mode=_env_text("LT_TASK_QUEUE_MODE", "thread").lower() or "thread",
         redis_url=_env_text("LT_REDIS_URL", "redis://127.0.0.1:6379/0"),
         task_queue_name=(base_task_queue_name := _env_text("LT_TASK_QUEUE_NAME", "lt-tasks")),

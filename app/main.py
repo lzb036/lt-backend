@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy import text
 
 from app.api.auth import router as auth_router
@@ -11,7 +11,9 @@ from app.api.profile import router as profile_router
 from app.api.users import router as users_router
 from app.core.config import settings
 from app.db.database import SessionLocal, init_database
+from app.services import crawler_service
 from app.services.crawler_service import LOCAL_PRODUCT_IMAGE_DIR, LOCAL_PRODUCT_IMAGE_DRAFT_DIR, start_schedule_runner
+from app.services.product_image_storage import product_image_storage
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
 LOCAL_PRODUCT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,8 +54,60 @@ async def add_product_image_cors_headers(request, call_next):
     return response
 
 
-app.mount("/api/static/product-images", StaticFiles(directory=LOCAL_PRODUCT_IMAGE_DIR), name="product-images")
-app.mount("/api/static/product-image-drafts", StaticFiles(directory=LOCAL_PRODUCT_IMAGE_DRAFT_DIR), name="product-image-drafts")
+@app.api_route(
+    "/api/static/product-images/{product_id}/{filename}",
+    methods=["GET", "HEAD", "OPTIONS"],
+    include_in_schema=False,
+)
+def product_image_file(product_id: int, filename: str, request: Request):
+    if request.method == "OPTIONS":
+        return Response(status_code=204)
+    return build_product_image_response(
+        crawler_service.local_product_image_url(product_id, filename),
+        method=request.method,
+    )
+
+
+@app.api_route(
+    "/api/static/product-image-drafts/{product_id}/{filename}",
+    methods=["GET", "HEAD", "OPTIONS"],
+    include_in_schema=False,
+)
+def product_image_draft_file(product_id: int, filename: str, request: Request):
+    if request.method == "OPTIONS":
+        return Response(status_code=204)
+    return build_product_image_response(
+        crawler_service.local_product_image_draft_url(product_id, filename),
+        method=request.method,
+    )
+
+
+def build_product_image_response(image_url: str, *, method: str) -> Response:
+    try:
+        info = crawler_service.product_image_http_info(
+            image_url,
+            include_body=method.upper() != "HEAD",
+        )
+    except RuntimeError as exc:
+        status_code = 404 if "不存在" in str(exc) else 503
+        return Response(status_code=status_code)
+    headers = {
+        "Cache-Control": "public, max-age=3600",
+        "Content-Length": str(info["size"]),
+    }
+    if method.upper() == "HEAD":
+        return Response(media_type=info["mediaType"], headers=headers)
+    if info["type"] == "local":
+        return FileResponse(
+            info["path"],
+            media_type=info["mediaType"],
+            headers=headers,
+        )
+    return StreamingResponse(
+        info["body"],
+        media_type=info["mediaType"],
+        headers=headers,
+    )
 
 
 @app.on_event("startup")
@@ -69,10 +123,12 @@ def root() -> dict[str, str]:
 
 @app.get("/api/health")
 def health() -> dict[str, object]:
+    product_image_storage_ok = product_image_storage.health_check()
     checks = {
         "database": check_database(),
-        "productImagesWritable": check_directory_writable(LOCAL_PRODUCT_IMAGE_DIR),
-        "productImageDraftsWritable": check_directory_writable(LOCAL_PRODUCT_IMAGE_DRAFT_DIR),
+        "productImagesWritable": product_image_storage_ok if product_image_storage.enabled else check_directory_writable(LOCAL_PRODUCT_IMAGE_DIR),
+        "productImageDraftsWritable": product_image_storage_ok if product_image_storage.enabled else check_directory_writable(LOCAL_PRODUCT_IMAGE_DRAFT_DIR),
+        "productImageStorage": product_image_storage_ok,
     }
     return {
         "status": "ok" if all(checks.values()) else "degraded",
@@ -81,6 +137,9 @@ def health() -> dict[str, object]:
         "checks": checks,
         "settings": {
             "productImageDraftRetentionDays": settings.product_image_draft_retention_days,
+            "productImageOrphanRetentionDays": settings.product_image_orphan_retention_days,
+            "productImageStorage": settings.product_image_storage,
+            "ossBucket": settings.oss_bucket if product_image_storage.enabled else "",
             "taskQueueMode": settings.task_queue_mode,
             "taskQueueName": settings.task_queue_name,
             "taskQueueNames": {
