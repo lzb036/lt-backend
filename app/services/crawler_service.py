@@ -404,7 +404,6 @@ ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 TASK_CANCEL_REQUESTED_MARKER = "__LT_CANCEL_REQUESTED__"
 TASK_CANCEL_REQUESTED_MESSAGE = "已请求终止，等待任务停止"
 TASK_CANCELLED_MESSAGE = "任务已终止"
-TASK_START_RETRY_DELAY_SECONDS = 5.0
 TASK_STALE_CANCEL_REQUEST_SECONDS = 10 * 60
 TASK_REDIS_MISSING_JOB_GRACE_SECONDS = 60
 TASK_QUEUED_REDIS_MISSING_JOB_GRACE_SECONDS = 2 * 60
@@ -3112,7 +3111,6 @@ def task_start_wait_reason(
 ) -> str:
     finalize_stale_cancel_requested_tasks(session, model, action_label=label, owner_username=owner_username)
     finalize_stale_store_cancel_requested_tasks(session, store_id)
-    reconcile_interrupted_running_tasks(session, model, owner_username=owner_username)
     running_count = running_user_task_count(session, model, owner_username, exclude_task_id=task_id)
     if running_count >= limit:
         return f"排队中，等待当前{label}任务完成"
@@ -12556,6 +12554,10 @@ def summarize_task_errors(errors: list[str], limit: int = 20, *, item_label: str
 
 def run_task(task_id: str) -> None:
     owner_username = ""
+    source_type = ""
+    target = ""
+    should_run = False
+    should_refill = False
     success_count = 0
     failed_count = 0
     warning_count = 0
@@ -12575,40 +12577,46 @@ def run_task(task_id: str) -> None:
         task = session.get(CrawlTaskModel, task_id)
         if task is None:
             return
+        owner_username = task.owner_username
+        should_refill = should_use_redis_task_queue()
+        task.queue_job_id = None
         if task.status == "cancelled":
-            return
-        if task.status != "queued":
-            return
-        if task_cancel_requested(task):
+            pass
+        elif task.status != "queued":
+            pass
+        elif task_cancel_requested(task):
             task.status = "cancelled"
             task.message = TASK_CANCELLED_MESSAGE
             task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
             task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=task.warning_detail)
             task.finished_at = datetime.now()
-            return
-        wait_reason = task_start_wait_reason(
-            session,
-            CrawlTaskModel,
-            task.owner_username,
-            task_id,
-            limit=settings.max_running_crawl_tasks_per_user,
-            label="采集",
-        )
-        if wait_reason:
-            task.message = wait_reason
-            session.flush()
-            dispatch_crawl_task(task_id, delay_seconds=TASK_START_RETRY_DELAY_SECONDS)
-            return
-        task.status = "running"
-        task.started_at = datetime.now()
-        task.message = "采集中"
-        task.error_detail = None
-        task.warning_detail = None
-        if task.total_count <= 0:
-            task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
-        owner_username = task.owner_username
-        source_type = task.source_type
-        target = task.target
+        else:
+            wait_reason = task_start_wait_reason(
+                session,
+                CrawlTaskModel,
+                task.owner_username,
+                task_id,
+                limit=settings.max_running_crawl_tasks_per_user,
+                label="采集",
+            )
+            if wait_reason:
+                task.message = wait_reason
+            else:
+                task.status = "running"
+                task.started_at = datetime.now()
+                task.message = "采集中"
+                task.error_detail = None
+                task.warning_detail = None
+                if task.total_count <= 0:
+                    task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
+                source_type = task.source_type
+                target = task.target
+                should_run = True
+
+    if not should_run:
+        if should_refill:
+            dispatch_queued_crawl_tasks_safely(owner_username)
+        return
 
     try:
         raise_if_task_cancelled(CrawlTaskModel, task_id)
@@ -12715,6 +12723,9 @@ def run_task(task_id: str) -> None:
             task.error_detail = current_error_detail()
             task.warning_detail = current_warning_detail()
         log_event(owner_username, task_id, "error", error_text)
+    finally:
+        if should_refill:
+            dispatch_queued_crawl_tasks_safely(owner_username)
 
 
 def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any]) -> dict[str, Any]:

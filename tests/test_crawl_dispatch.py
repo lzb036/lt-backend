@@ -46,7 +46,7 @@ class FakeRedisConnection:
         return self.lock_instance
 
 
-class CrawlDispatcherTests(unittest.TestCase):
+class CrawlDispatchDatabaseTestCase(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
         Base.metadata.create_all(self.engine)
@@ -104,6 +104,8 @@ class CrawlDispatcherTests(unittest.TestCase):
                 select(CrawlTaskModel).where(CrawlTaskModel.id == task_id)
             )
 
+
+class CrawlDispatcherTests(CrawlDispatchDatabaseTestCase):
     @contextmanager
     def dispatcher_context(
         self,
@@ -246,6 +248,95 @@ class CrawlDispatcherTests(unittest.TestCase):
         direct_dispatch.assert_not_called()
         task = self.get_task("retry")
         self.assertEqual(task.status, "queued")
+        self.assertIsNone(task.queue_job_id)
+
+
+class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
+    def test_concurrency_rejected_task_is_not_requeued(self):
+        now = datetime.now()
+        self.add_task(
+            "running",
+            status="running",
+            created_at=now - timedelta(minutes=2),
+        )
+        self.add_task(
+            "waiting",
+            queue_job_id="crawl-waiting-reserved",
+            created_at=now - timedelta(minutes=1),
+        )
+        direct_dispatch = Mock()
+        refill = Mock(return_value=0)
+        reconcile = Mock(return_value=0)
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(
+                crawler_service.settings,
+                "max_running_crawl_tasks_per_user",
+                1,
+            ),
+            patch.object(
+                crawler_service,
+                "dispatch_crawl_task",
+                direct_dispatch,
+            ),
+            patch.object(
+                crawler_service,
+                "dispatch_queued_crawl_tasks_safely",
+                refill,
+            ),
+            patch.object(
+                crawler_service,
+                "reconcile_interrupted_running_tasks",
+                reconcile,
+            ),
+        ):
+            crawler_service.run_task("waiting")
+
+        direct_dispatch.assert_not_called()
+        reconcile.assert_not_called()
+        refill.assert_called_once_with("owner")
+        task = self.get_task("waiting")
+        self.assertEqual(task.status, "queued")
+        self.assertIsNone(task.queue_job_id)
+        self.assertIn("排队中", task.message)
+
+    def test_completed_task_refills_crawl_capacity(self):
+        self.add_task(
+            "complete",
+            queue_job_id="crawl-complete-reserved",
+        )
+        refill = Mock(return_value=1)
+        reconcile = Mock(return_value=0)
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(
+                crawler_service.settings,
+                "max_running_crawl_tasks_per_user",
+                3,
+            ),
+            patch.object(crawler_service, "collect_items", return_value=[]),
+            patch.object(crawler_service, "log_event"),
+            patch.object(
+                crawler_service,
+                "dispatch_queued_crawl_tasks_safely",
+                refill,
+            ),
+            patch.object(
+                crawler_service,
+                "reconcile_interrupted_running_tasks",
+                reconcile,
+            ),
+        ):
+            crawler_service.run_task("complete")
+
+        reconcile.assert_not_called()
+        refill.assert_called_once_with("owner")
+        task = self.get_task("complete")
+        self.assertEqual(task.status, "success")
         self.assertIsNone(task.queue_job_id)
 
 
