@@ -6396,6 +6396,7 @@ def list_store_empty_cabinet_folders(owner_username: str, store_id: int) -> dict
         if not service_secret or not license_key:
             raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
         folders = fetch_rakuten_cabinet_folders(service_secret, license_key)
+        folder_prefix = listing_cabinet_directory_prefix(row)
         empty_folders = [
             {
                 "folderId": int(folder.get("folderId") or 0),
@@ -6406,6 +6407,7 @@ def list_store_empty_cabinet_folders(owner_username: str, store_id: int) -> dict
             for folder in folders
             if int(folder.get("folderId") or 0) > 0
             and int(folder.get("fileCount") or 0) == 0
+            and listing_cabinet_folder_matches_directory_prefix(folder, folder_prefix)
         ]
         empty_folders.sort(
             key=lambda folder: (
@@ -6423,6 +6425,7 @@ def list_store_empty_cabinet_folders(owner_username: str, store_id: int) -> dict
             },
             "folders": empty_folders,
             "total": len(empty_folders),
+            "folderPrefix": folder_prefix,
             "manualCleanupRequired": True,
         }
 
