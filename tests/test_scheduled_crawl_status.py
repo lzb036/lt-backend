@@ -162,7 +162,7 @@ class ScheduledCrawlStatusTests(unittest.TestCase):
         with patch.object(crawler_service, "session_scope", self.session_scope):
             result = crawler_service.update_scheduled_crawl_statuses(
                 "owner",
-                [owned_id, owned_id, other_id, 999999, 0, -1],
+                [owned_id, owned_id, other_id, 999999, 0, -1, "invalid"],
                 False,
             )
 

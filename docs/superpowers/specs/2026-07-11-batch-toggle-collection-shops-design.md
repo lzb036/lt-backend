@@ -65,4 +65,3 @@ No new Vue component or composable is needed because this is a small extension o
 - Service test: duplicate, invalid, missing, and other-owner IDs are normalized or returned as failures.
 - Frontend verification: TypeScript compilation and production build pass.
 - Backend verification: focused tests, compile check, and diff check pass.
-
