@@ -7623,6 +7623,49 @@ def delete_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
         session.delete(row)
 
 
+def update_scheduled_crawl_statuses(
+    owner_username: str,
+    schedule_ids: list[int],
+    enabled: bool,
+) -> dict[str, Any]:
+    normalized_ids: list[int] = []
+    seen: set[int] = set()
+    for value in schedule_ids or []:
+        try:
+            schedule_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if schedule_id <= 0 or schedule_id in seen:
+            continue
+        seen.add(schedule_id)
+        normalized_ids.append(schedule_id)
+    if not normalized_ids:
+        raise RuntimeError("请选择要启用或停用的采集店铺。")
+
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ScheduledCrawlModel).where(
+                ScheduledCrawlModel.owner_username == owner_username,
+                ScheduledCrawlModel.id.in_(normalized_ids),
+            )
+        ).all()
+        found_ids = {int(row.id) for row in rows}
+        for row in rows:
+            row.enabled = bool(enabled)
+            row.status = "idle" if enabled else "disabled"
+            row.next_run_at = next_daily_run_at(row.schedule_time) if enabled else None
+        return {
+            "updatedIds": sorted(found_ids),
+            "failedIds": [
+                schedule_id
+                for schedule_id in normalized_ids
+                if schedule_id not in found_ids
+            ],
+            "updatedCount": len(found_ids),
+            "enabled": bool(enabled),
+        }
+
+
 def delete_scheduled_crawls(owner_username: str, schedule_ids: list[int]) -> dict[str, Any]:
     normalized_ids: list[int] = []
     seen: set[int] = set()
