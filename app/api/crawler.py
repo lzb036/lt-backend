@@ -49,6 +49,11 @@ class ScheduleDeletePayload(BaseModel):
     scheduleIds: list[int] = Field(default_factory=list)
 
 
+class ScheduleStatusBatchPayload(BaseModel):
+    scheduleIds: list[int] = Field(default_factory=list)
+    enabled: bool
+
+
 class ScheduleRunAllPayload(BaseModel):
     keyword: str | None = None
     enabledStatus: str | None = None
@@ -819,6 +824,21 @@ def create_schedule(payload: ScheduledCrawlPayload, user: dict = Depends(require
 def delete_schedules(payload: ScheduleDeletePayload, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
         return crawler_service.delete_scheduled_crawls(user["username"], payload.scheduleIds)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/schedules/status")
+def update_schedule_statuses(
+    payload: ScheduleStatusBatchPayload,
+    user: dict = Depends(require_crawler_permission),
+) -> dict:
+    try:
+        return crawler_service.update_scheduled_crawl_statuses(
+            user["username"],
+            payload.scheduleIds,
+            payload.enabled,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
