@@ -293,6 +293,32 @@ def create_task(payload: CreateTaskPayload, user: dict = Depends(require_crawler
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/tasks/import-template")
+def download_manual_task_import_template(user: dict = Depends(require_crawler_permission)) -> StreamingResponse:
+    try:
+        content = crawler_service.manual_crawl_import_template_bytes()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    filename = crawler_service.MANUAL_CRAWL_IMPORT_TEMPLATE_FILENAME
+    encoded_filename = quote(filename)
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}; filename*=UTF-8''{encoded_filename}",
+        },
+    )
+
+
+@router.post("/tasks/import")
+async def import_manual_tasks(file: UploadFile = File(...), user: dict = Depends(require_crawler_permission)) -> dict:
+    try:
+        content = await file.read()
+        return crawler_service.import_manual_crawl_tasks(user["username"], file.filename or "", content)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/tasks/{task_id}/restart")
 def restart_task(task_id: str, user: dict = Depends(require_crawler_permission)) -> dict:
     try:

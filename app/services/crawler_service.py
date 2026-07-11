@@ -19,6 +19,7 @@ from decimal import Decimal
 from html import unescape
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -413,6 +414,7 @@ CRAWL_DISPATCH_LOCK_TIMEOUT_SECONDS = 30
 CRAWL_DISPATCH_LOCK_BLOCKING_TIMEOUT_SECONDS = 3
 SCHEDULE_IMPORT_TEMPLATE_FILENAME = "scheduled-crawl-template.xlsx"
 SCHEDULE_EXPORT_FILENAME = "scheduled-crawl-shops.xlsx"
+MANUAL_CRAWL_IMPORT_TEMPLATE_FILENAME = "manual-crawl-import-template.xlsx"
 SCHEDULE_FALLBACK_SHOP_URL_KEY = "fallbackShopUrl"
 SCHEDULE_IMPORTED_NOTE_KEY = "importedSchedule"
 SCHEDULE_FALLBACK_TARGET_PREFIX = "__LT_FALLBACK_SHOP_URL__:"
@@ -3287,6 +3289,20 @@ def parse_rakuten_product_target(target: str) -> tuple[str, str] | None:
     if any(part.startswith(("http:", "https:")) for part in (shop_code, item_number)):
         return None
     return shop_code, item_number
+
+
+def normalize_rakuten_product_targets(target: Any) -> list[str]:
+    normalized: list[str] = []
+    for value in re.split(r"[\r\n]+", str(target or "")):
+        item = normalize_text(value)
+        if not item:
+            continue
+        url = normalize_rakuten_product_target(item)
+        if url not in normalized:
+            normalized.append(url)
+    if not normalized:
+        raise RuntimeError(RAKUTEN_PRODUCT_TARGET_ERROR)
+    return normalized
 
 
 def normalize_rakuten_product_target(target: str) -> str:
@@ -7282,6 +7298,228 @@ def refresh_store_product_counts(owner_username: str, store_id: int) -> dict[str
             row.last_error = str(exc)
         session.flush()
         return store_to_public(row)
+
+
+def manual_crawl_import_template_bytes() -> bytes:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.formatting.rule import FormulaRule
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.worksheet.datavalidation import DataValidation
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 openpyxl，无法生成导入模板。") from exc
+
+    workbook = Workbook()
+    product_sheet = workbook.active
+    product_sheet.title = "单个商品采集"
+    product_sheet.append(["商品URL", "备注"])
+    product_sheet.append(["https://item.rakuten.co.jp/example-shop/example-item/", "示例行，导入前可删除"])
+    product_sheet.column_dimensions["A"].width = 72
+    product_sheet.column_dimensions["B"].width = 32
+
+    shop_sheet = workbook.create_sheet("店铺采集")
+    shop_sheet.append(["店铺名称或URL", "榜单时间", "采集数量", "备注"])
+    shop_sheet.append(["https://www.rakuten.co.jp/example-shop/", "日榜", "全部", "示例行，导入前可删除"])
+    shop_sheet.column_dimensions["A"].width = 52
+    shop_sheet.column_dimensions["B"].width = 18
+    shop_sheet.column_dimensions["C"].width = 18
+    shop_sheet.column_dimensions["D"].width = 32
+
+    period_validation = DataValidation(type="list", formula1='"日榜,周榜,月榜"', allow_blank=False)
+    shop_sheet.add_data_validation(period_validation)
+    period_validation.add("B2:B1000")
+    count_validation = DataValidation(type="list", formula1='"全部,30,50,100"', allow_blank=False)
+    shop_sheet.add_data_validation(count_validation)
+    count_validation.add("C2:C1000")
+
+    header_fill = PatternFill("solid", fgColor="E9EEF5")
+    example_fill = PatternFill("solid", fgColor="FFF7D6")
+    input_font = Font(name="Arial", color="0000FF")
+    header_font = Font(name="Arial", bold=True, color="1F2937")
+    warning_fill = PatternFill("solid", fgColor="FDECEC")
+    for sheet in (product_sheet, shop_sheet):
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        sheet.row_dimensions[1].height = 24
+        for cell in sheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for cell in sheet[2]:
+            cell.fill = example_fill
+            cell.font = input_font
+        sheet.conditional_formatting.add(
+            f"A2:A1000",
+            FormulaRule(formula=["LEN(TRIM(A2))=0"], fill=warning_fill),
+        )
+
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def import_manual_crawl_tasks(owner_username: str, filename: str, content: bytes) -> dict[str, Any]:
+    normalized_filename = normalize_text(filename).lower()
+    if not content:
+        raise RuntimeError("导入文件为空。")
+    if not normalized_filename.endswith((".xlsx", ".xlsm")):
+        raise RuntimeError("手动采集导入只支持 .xlsx 文件。")
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 openpyxl，无法读取 xlsx 文件。") from exc
+
+    workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+    product_rows = manual_product_import_rows(workbook)
+    shop_rows = manual_shop_import_rows(workbook)
+    if not product_rows and not shop_rows:
+        raise RuntimeError("导入文件没有可创建的手动采集数据。")
+
+    failed_rows: list[dict[str, Any]] = []
+    normalized_product_urls: list[str] = []
+    seen_product_urls: set[str] = set()
+    for row in product_rows:
+        row_number = int(row["rowNumber"])
+        raw_url = normalize_text(row["target"])
+        try:
+            url = normalize_rakuten_product_target(raw_url)
+        except RuntimeError as exc:
+            failed_rows.append({"sheet": "单个商品采集", "rowNumber": row_number, "message": str(exc)})
+            continue
+        if url in seen_product_urls:
+            continue
+        seen_product_urls.add(url)
+        normalized_product_urls.append(url)
+
+    product_task: dict[str, Any] | None = None
+    if normalized_product_urls:
+        product_task = create_task(
+            owner_username,
+            SimpleNamespace(
+                sourceId=None,
+                sourceType="product_url",
+                target="\n".join(normalized_product_urls),
+                mode="manual",
+                rankingPeriod=None,
+                crawlLimit=None,
+            ),
+        )
+
+    shop_tasks: list[dict[str, Any]] = []
+    for row in shop_rows:
+        row_number = int(row["rowNumber"])
+        raw_target = normalize_text(row["target"])
+        try:
+            normalized_target = normalize_rakuten_shop_target(raw_target)
+            if not normalized_target:
+                raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR)
+            task = create_task(
+                owner_username,
+                SimpleNamespace(
+                    sourceId=None,
+                    sourceType="shop",
+                    target=normalized_target,
+                    mode="manual",
+                    rankingPeriod=manual_import_ranking_period(row.get("rankingPeriod")),
+                    crawlLimit=manual_import_crawl_limit(row.get("crawlLimit")),
+                ),
+            )
+            shop_tasks.append(task)
+        except RuntimeError as exc:
+            failed_rows.append({"sheet": "店铺采集", "rowNumber": row_number, "message": str(exc)})
+
+    return {
+        "productUrlCount": len(normalized_product_urls),
+        "productTaskCreated": product_task is not None,
+        "shopTaskCount": len(shop_tasks),
+        "createdTaskCount": (1 if product_task else 0) + len(shop_tasks),
+        "failedCount": len(failed_rows),
+        "failedRows": failed_rows,
+    }
+
+
+def manual_product_import_rows(workbook: Any) -> list[dict[str, Any]]:
+    if "单个商品采集" not in workbook.sheetnames:
+        return []
+    values = list(workbook["单个商品采集"].iter_rows(values_only=True))
+    return manual_import_rows_from_table(
+        values,
+        sheet_name="单个商品采集",
+        required_headers={"target": {"商品url", "商品链接", "url"}},
+    )
+
+
+def manual_shop_import_rows(workbook: Any) -> list[dict[str, Any]]:
+    if "店铺采集" not in workbook.sheetnames:
+        return []
+    values = list(workbook["店铺采集"].iter_rows(values_only=True))
+    return manual_import_rows_from_table(
+        values,
+        sheet_name="店铺采集",
+        required_headers={
+            "target": {"店铺名称或url", "店铺", "店铺url", "店铺链接"},
+            "rankingPeriod": {"榜单时间", "榜单", "排行时间"},
+            "crawlLimit": {"采集数量", "数量"},
+        },
+    )
+
+
+def manual_import_rows_from_table(
+    values: list[Any],
+    *,
+    sheet_name: str,
+    required_headers: dict[str, set[str]],
+) -> list[dict[str, Any]]:
+    if not values:
+        return []
+    normalized_header = [re.sub(r"\s+", "", normalize_text(value)).lower() for value in values[0]]
+    indexes: dict[str, int] = {}
+    for key, aliases in required_headers.items():
+        index = next((position for position, value in enumerate(normalized_header) if value in aliases), None)
+        if index is None:
+            required = "、".join(next(iter(aliases)) for aliases in required_headers.values())
+            raise RuntimeError(f"工作表“{sheet_name}”表头必须包含：{required}。")
+        indexes[key] = index
+    rows: list[dict[str, Any]] = []
+    for row_number, row in enumerate(values[1:], start=2):
+        row_values = list(row or [])
+        parsed = {
+            key: import_cell_text(row_values[index] if index < len(row_values) else "")
+            for key, index in indexes.items()
+        }
+        if not any(parsed.values()):
+            continue
+        parsed["rowNumber"] = row_number
+        rows.append(parsed)
+    return rows
+
+
+def manual_import_ranking_period(value: Any) -> str:
+    normalized = normalize_text(value).lower()
+    mapping = {
+        "日榜": "daily",
+        "daily": "daily",
+        "周榜": "weekly",
+        "weekly": "weekly",
+        "月榜": "monthly",
+        "monthly": "monthly",
+    }
+    if normalized not in mapping:
+        raise RuntimeError("榜单时间只能填写：日榜、周榜、月榜。")
+    return mapping[normalized]
+
+
+def manual_import_crawl_limit(value: Any) -> str | int:
+    normalized = normalize_text(value)
+    if normalized in {"全部", "all"}:
+        return "all"
+    try:
+        count = int(float(normalized))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("采集数量必须填写“全部”或大于 0 的整数。") from exc
+    if count <= 0:
+        raise RuntimeError("采集数量必须填写“全部”或大于 0 的整数。")
+    return count
 
 
 def scheduled_crawl_import_template_bytes() -> bytes:
@@ -12609,7 +12847,7 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
         if not source_type or not target:
             raise RuntimeError("采集类型和目标不能为空。")
         if source_type == "product_url":
-            target = normalize_rakuten_product_target(target)
+            target = "\n".join(normalize_rakuten_product_targets(target))
         elif source_type == "shop":
             primary_target, fallback_target = split_shop_fallback_target(target)
             parsed_target, existing_limit, existing_period = parse_ranking_target(strip_shop_ranking_prefix(primary_target))
@@ -12950,7 +13188,7 @@ def initial_crawl_task_total_count(source_type: str, target: str) -> int:
     if not normalized_source_type or not normalized_target:
         return 0
     if normalized_source_type == "product_url":
-        return 1
+        return len(normalize_rakuten_product_targets(target))
     if normalized_source_type in {"shop", "ranking"}:
         _, limit, _ = parse_ranking_target(
             strip_shop_ranking_prefix(normalized_target) if normalized_source_type == "shop" else normalized_target
@@ -12977,7 +13215,23 @@ def collect_items(source_type: str, target: str, *, task_id: str | None = None) 
 def collect_items_for_target(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
     raise_if_task_cancelled(CrawlTaskModel, task_id)
     if source_type == "product_url":
-        return [collect_product_detail(normalize_rakuten_product_target(target))]
+        items: list[dict[str, Any]] = []
+        for product_url in normalize_rakuten_product_targets(target):
+            raise_if_task_cancelled(CrawlTaskModel, task_id)
+            try:
+                items.append(collect_product_detail(product_url))
+            except Exception as exc:
+                items.append(
+                    {
+                        "title": product_url,
+                        "source_url": product_url,
+                        "raw": {
+                            "detailCollected": False,
+                            "detailError": str(exc) or "商品详情采集失败。",
+                        },
+                    }
+                )
+        return items
     limit: int | None = 30
     shop_code_filter = ""
     if source_type == "shop":
