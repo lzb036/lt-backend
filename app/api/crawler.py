@@ -686,6 +686,19 @@ def sync_store(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/stores/{store_id}/cabinet/empty-folders")
+def list_store_empty_cabinet_folders(
+    store_id: int,
+    ownerUsername: str | None = Query(default=None),
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        target_username = resolve_target_username(user, ownerUsername)
+        return crawler_service.list_store_empty_cabinet_folders(target_username, store_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/sync-tasks")
 def list_sync_tasks(
     page: int | None = Query(default=None, ge=1),

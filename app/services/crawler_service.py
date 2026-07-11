@@ -6384,6 +6384,49 @@ def sync_store(owner_username: str, store_id: int) -> dict[str, Any]:
     }
 
 
+def list_store_empty_cabinet_folders(owner_username: str, store_id: int) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(StoreModel, store_id)
+        if row is None:
+            raise RuntimeError("店铺不存在。")
+        if row.owner_username != owner_username:
+            raise RuntimeError("不能查看其他用户店铺的 R-Cabinet 文件夹。")
+        service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
+        license_key = decrypt_text(row.rakuten_license_key_encrypted)
+        if not service_secret or not license_key:
+            raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
+        folders = fetch_rakuten_cabinet_folders(service_secret, license_key)
+        empty_folders = [
+            {
+                "folderId": int(folder.get("folderId") or 0),
+                "folderName": normalize_text(folder.get("folderName")),
+                "folderPath": normalize_text(folder.get("folderPath")),
+                "fileCount": 0,
+            }
+            for folder in folders
+            if int(folder.get("folderId") or 0) > 0
+            and int(folder.get("fileCount") or 0) == 0
+        ]
+        empty_folders.sort(
+            key=lambda folder: (
+                normalize_text(folder.get("folderPath")).lower(),
+                normalize_text(folder.get("folderName")).lower(),
+                int(folder.get("folderId") or 0),
+            )
+        )
+        return {
+            "store": {
+                "id": int(row.id),
+                "storeCode": row.store_code,
+                "storeName": row.store_name,
+                "aliasName": row.alias_name,
+            },
+            "folders": empty_folders,
+            "total": len(empty_folders),
+            "manualCleanupRequired": True,
+        }
+
+
 def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | None = None) -> dict[str, Any]:
     raise_if_task_cancelled(SyncTaskModel, task_id)
     deleted_product_ids: list[int] = []
