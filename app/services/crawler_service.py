@@ -10690,39 +10690,14 @@ def load_product_image_bytes(
         else:
             raise RuntimeError("本地图片文件不存在。")
     if not content:
-        response = requests.get(
+        remote_image = download_remote_product_image(
             image_url,
-            timeout=settings.crawler_timeout_seconds,
-            headers={"User-Agent": settings.crawler_user_agent},
-            proxies=crawler_request_proxies(),
-            stream=True,
+            max_bytes=normalized_max_bytes,
+            size_error_message=size_error_message,
         )
-        try:
-            try:
-                response.raise_for_status()
-            except requests.HTTPError as exc:
-                status_code = int(response.status_code or 0)
-                if status_code in {404, 410}:
-                    raise ProductImageUnavailableError(status_code) from exc
-                raise RuntimeError(f"读取商品图片失败（HTTP {status_code}）。") from exc
-            chunks: list[bytes] = []
-            size = 0
-            for chunk in response.iter_content(chunk_size=1024 * 256):
-                if not chunk:
-                    continue
-                size += len(chunk)
-                if size > normalized_max_bytes:
-                    raise RuntimeError(size_error_message)
-                chunks.append(chunk)
-            content = b"".join(chunks)
-            suffix = Path(urlsplit(image_url).path).suffix.lower()
-            content_type = normalize_text(response.headers.get("Content-Type")).split(";", 1)[0].lower()
-            if not suffix:
-                suffix = product_image_suffix_from_content_type(content_type)
-        except requests.RequestException as exc:
-            raise RuntimeError("读取商品图片失败。") from exc
-        finally:
-            response.close()
+        content = remote_image["content"]
+        suffix = remote_image["suffix"]
+        content_type = remote_image["contentType"]
     if suffix == ".jpeg":
         suffix = ".jpg"
     if suffix not in ALLOWED_PRODUCT_IMAGE_EXTENSIONS:
@@ -10740,6 +10715,70 @@ def load_product_image_bytes(
     if len(content) > normalized_max_bytes:
         raise RuntimeError(size_error_message)
     return {"content": content, "suffix": suffix, "contentType": content_type}
+
+
+def download_remote_product_image(
+    image_url: str,
+    *,
+    max_bytes: int,
+    size_error_message: str,
+) -> dict[str, Any]:
+    proxy_config = crawler_request_proxies()
+    attempts: list[dict[str, str] | None] = [None]
+    if proxy_config:
+        attempts.append(proxy_config)
+    last_error: Exception | None = None
+    for attempt_index, proxies in enumerate(attempts):
+        response: requests.Response | None = None
+        try:
+            response = requests.get(
+                image_url,
+                timeout=settings.crawler_timeout_seconds,
+                headers={"User-Agent": settings.crawler_user_agent},
+                proxies=proxies,
+                stream=True,
+            )
+            status_code = int(response.status_code or 0)
+            if status_code in {404, 410}:
+                raise ProductImageUnavailableError(status_code)
+            if (
+                proxies is None
+                and proxy_config
+                and (status_code in {403, 429} or status_code >= 500)
+            ):
+                last_error = RuntimeError(f"读取商品图片失败（HTTP {status_code}）。")
+                continue
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            size = 0
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > max_bytes:
+                    raise RuntimeError(size_error_message)
+                chunks.append(chunk)
+            content = b"".join(chunks)
+            suffix = Path(urlsplit(image_url).path).suffix.lower()
+            content_type = normalize_text(response.headers.get("Content-Type")).split(";", 1)[0].lower()
+            if not suffix:
+                suffix = product_image_suffix_from_content_type(content_type)
+            return {
+                "content": content,
+                "suffix": suffix,
+                "contentType": content_type,
+            }
+        except ProductImageUnavailableError:
+            raise
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt_index + 1 < len(attempts):
+                continue
+            break
+        finally:
+            if response is not None:
+                response.close()
+    raise RuntimeError("读取商品图片失败。") from last_error
 
 
 def prepare_rakuten_cabinet_image(image_data: dict[str, Any]) -> dict[str, Any]:
