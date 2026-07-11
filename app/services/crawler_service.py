@@ -7303,6 +7303,7 @@ def refresh_store_product_counts(owner_username: str, store_id: int) -> dict[str
 def manual_crawl_import_template_bytes() -> bytes:
     try:
         from openpyxl import Workbook
+        from openpyxl.comments import Comment
         from openpyxl.formatting.rule import FormulaRule
         from openpyxl.styles import Alignment, Font, PatternFill
         from openpyxl.worksheet.datavalidation import DataValidation
@@ -7313,13 +7314,21 @@ def manual_crawl_import_template_bytes() -> bytes:
     product_sheet = workbook.active
     product_sheet.title = "单个商品采集"
     product_sheet.append(["商品URL", "备注"])
-    product_sheet.append(["https://item.rakuten.co.jp/example-shop/example-item/", "示例行，导入前可删除"])
+    product_sheet.append(["", ""])
+    product_sheet["A1"].comment = Comment(
+        "每行填写一个乐天商品 URL。所有有效 URL 会合并创建为一个手动采集任务。",
+        "商品采集系统",
+    )
     product_sheet.column_dimensions["A"].width = 72
     product_sheet.column_dimensions["B"].width = 32
 
     shop_sheet = workbook.create_sheet("店铺采集")
     shop_sheet.append(["店铺名称或URL", "榜单时间", "采集数量", "备注"])
-    shop_sheet.append(["https://www.rakuten.co.jp/example-shop/", "日榜", "全部", "示例行，导入前可删除"])
+    shop_sheet.append(["", "日榜", "全部", ""])
+    shop_sheet["A1"].comment = Comment(
+        "每行填写一个店铺展示名称、URL 代码、完整 URL 或 SID。每个有效店铺创建一个任务。",
+        "商品采集系统",
+    )
     shop_sheet.column_dimensions["A"].width = 52
     shop_sheet.column_dimensions["B"].width = 18
     shop_sheet.column_dimensions["C"].width = 18
@@ -7487,7 +7496,7 @@ def manual_import_rows_from_table(
             key: import_cell_text(row_values[index] if index < len(row_values) else "")
             for key, index in indexes.items()
         }
-        if not any(parsed.values()):
+        if not normalize_text(parsed.get("target")):
             continue
         parsed["rowNumber"] = row_number
         rows.append(parsed)
