@@ -6066,7 +6066,10 @@ def list_products(
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
         if normalize_text(task_id):
-            query = query.where(ProductModel.task_id == normalize_text(task_id))
+            query = query.where(
+                ProductModel.task_id == normalize_text(task_id),
+                ProductModel.parent_product_id.is_(None),
+            )
         if store_id is not None:
             query = query.where(ProductModel.store_id == store_id)
         if listing_status in {"listed", "unlisted"}:
