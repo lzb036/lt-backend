@@ -323,6 +323,7 @@ def delete_tasks(payload: TaskDeletePayload, user: dict = Depends(require_crawle
 def list_products(
     status: str | None = Query(default=None),
     keyword: str | None = Query(default=None),
+    taskId: str | None = Query(default=None),
     storeId: int | None = Query(default=None),
     listedStoreId: str | None = Query(default=None),
     listingStatus: str | None = Query(default=None),
@@ -342,6 +343,7 @@ def list_products(
         user["username"],
         status=status,
         keyword=keyword,
+        task_id=taskId,
         store_id=storeId,
         listed_store_id=listedStoreId,
         listing_status=listingStatus,

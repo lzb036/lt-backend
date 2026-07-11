@@ -6040,6 +6040,7 @@ def list_products(
     *,
     status: str | None = None,
     keyword: str | None = None,
+    task_id: str | None = None,
     store_id: int | None = None,
     listed_store_id: str | None = None,
     listing_status: str | None = None,
@@ -6064,6 +6065,8 @@ def list_products(
         listed_store_filter = normalize_listed_store_filter(listed_store_id)
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
+        if normalize_text(task_id):
+            query = query.where(ProductModel.task_id == normalize_text(task_id))
         if store_id is not None:
             query = query.where(ProductModel.store_id == store_id)
         if listing_status in {"listed", "unlisted"}:
