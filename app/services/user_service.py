@@ -116,6 +116,16 @@ def permissions_to_flags(permissions: list[str], *, role: str) -> dict[str, bool
     }
 
 
+def normalize_crawl_min_price(value: Any) -> int:
+    try:
+        normalized = int(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("采集价格设置无效。") from exc
+    if normalized not in {0, 2500, 3800}:
+        raise RuntimeError("采集价格只能选择：全部、2500 日元以上、3800 日元以上。")
+    return normalized
+
+
 def account_to_public(row: UserAccountModel) -> dict[str, Any]:
     permissions = parse_permissions_json(row.permissions_json, role=row.role)
     return {
@@ -123,6 +133,7 @@ def account_to_public(row: UserAccountModel) -> dict[str, Any]:
         "displayName": row.display_name or row.username,
         "role": row.role,
         "enabled": bool(row.enabled),
+        "crawlMinPrice": normalize_crawl_min_price(row.crawl_min_price),
         "permissionCodes": permissions,
         "permissions": permissions_to_flags(permissions, role=row.role),
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -218,6 +229,7 @@ def update_user(
     display_name: str | None = None,
     enabled: bool | None = None,
     permissions: Any = None,
+    crawl_min_price: int | None = None,
 ) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(UserAccountModel, normalize_username(username))
@@ -231,6 +243,8 @@ def update_user(
             row.enabled = bool(enabled)
         if permissions is not None and row.role != "superadmin":
             row.permissions_json = json.dumps(normalize_permissions(permissions, role=row.role), ensure_ascii=False)
+        if crawl_min_price is not None:
+            row.crawl_min_price = normalize_crawl_min_price(crawl_min_price)
         session.flush()
         return account_to_public(row)
 

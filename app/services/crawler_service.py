@@ -43,6 +43,7 @@ from app.db.models import (
     StoreModel,
     SyncTaskModel,
     SystemSettingModel,
+    UserAccountModel,
     make_source_url_hash,
 )
 from app.services.product_image_storage import (
@@ -13177,6 +13178,13 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
 
 def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any]) -> dict[str, Any]:
     product_id: int | None = None
+    if item.get("_crawlPriceFiltered"):
+        price = item.get("price")
+        return {
+            "saved": False,
+            "skipped": True,
+            "error": f"商品价格 {price} 日元低于用户设置的采集门槛，已跳过。",
+        }
     with session_scope() as session:
         duplicated_product = find_existing_collected_product(session, owner_username, item)
         if duplicated_product is not None:
@@ -13262,12 +13270,15 @@ def collect_items(source_type: str, target: str, *, task_id: str | None = None) 
 
 def collect_items_for_target(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
     raise_if_task_cancelled(CrawlTaskModel, task_id)
+    min_price = crawl_min_price_for_task(task_id)
     if source_type == "product_url":
         items: list[dict[str, Any]] = []
         for product_url in normalize_rakuten_product_targets(target):
             raise_if_task_cancelled(CrawlTaskModel, task_id)
             try:
-                items.append(collect_product_detail(product_url))
+                detail = collect_product_detail(product_url)
+                mark_collected_item_price_filter(detail, min_price)
+                items.append(detail)
             except Exception as exc:
                 items.append(
                     {
@@ -13309,6 +13320,8 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
     if source_type == "shop" and shop_code_filter:
         items = [item for item in items if product_url_shop_code(item.get("source_url")) == shop_code_filter]
     limited_items = items if limit is None else items[:limit]
+    for item in limited_items:
+        mark_collected_item_price_filter(item, min_price)
     if task_id:
         update_task_progress(
             CrawlTaskModel,
@@ -13321,6 +13334,7 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
         limited_items,
         task_id=task_id,
         existing_source_hashes=existing_source_hashes,
+        min_price=min_price,
     )
 
 
@@ -13443,11 +13457,42 @@ def existing_collected_source_hashes_for_task(
         return existing_hashes
 
 
+def crawl_min_price_for_task(task_id: str | None) -> int:
+    if not task_id:
+        return 0
+    with session_scope() as session:
+        task = session.get(CrawlTaskModel, task_id)
+        if task is None:
+            return 0
+        account = session.get(UserAccountModel, task.owner_username)
+        value = int(account.crawl_min_price or 0) if account is not None else 0
+        return value if value in {2500, 3800} else 0
+
+
+def should_filter_collected_item_by_price(item: dict[str, Any], min_price: int) -> bool:
+    if min_price not in {2500, 3800}:
+        return False
+    raw_price = item.get("price")
+    if raw_price is None or normalize_text(raw_price) == "":
+        return False
+    try:
+        price = float(raw_price)
+    except (TypeError, ValueError):
+        return False
+    return price < min_price
+
+
+def mark_collected_item_price_filter(item: dict[str, Any], min_price: int) -> None:
+    if should_filter_collected_item_by_price(item, min_price):
+        item["_crawlPriceFiltered"] = True
+
+
 def enrich_collected_items_with_detail(
     items: list[dict[str, Any]],
     *,
     task_id: str | None = None,
     existing_source_hashes: set[str] | None = None,
+    min_price: int = 0,
 ) -> list[dict[str, Any]]:
     known_hashes = existing_source_hashes or set()
     enriched_items: list[dict[str, Any]] = []
@@ -13455,6 +13500,9 @@ def enrich_collected_items_with_detail(
         raise_if_task_cancelled(CrawlTaskModel, task_id)
         source_url = normalize_text(item.get("source_url"))
         if not source_url:
+            enriched_items.append(item)
+            continue
+        if item.get("_crawlPriceFiltered"):
             enriched_items.append(item)
             continue
         source_hash_key = normalize_text(item.get("source_url_hash_key") or source_url)
@@ -13479,6 +13527,7 @@ def enrich_collected_items_with_detail(
             detail["price"] = item.get("price")
         if not detail.get("image_url"):
             detail["image_url"] = item.get("image_url")
+        mark_collected_item_price_filter(detail, min_price)
         enriched_items.append(detail)
     return enriched_items
 

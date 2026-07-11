@@ -70,6 +70,8 @@ def ensure_schema_compatibility() -> None:
                 )
             )
             connection.execute(text("ALTER TABLE lt_user_accounts MODIFY COLUMN permissions_json TEXT NOT NULL"))
+        if user_columns and "crawl_min_price" not in user_columns:
+            connection.execute(text("ALTER TABLE lt_user_accounts ADD COLUMN crawl_min_price INT NOT NULL DEFAULT 0"))
 
         store_columns = set(
             connection.execute(
