@@ -13277,7 +13277,12 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
             total_count=len(limited_items),
             message=f"已发现 {len(limited_items)} 个商品，开始采集详情",
         )
-    return enrich_collected_items_with_detail(limited_items, task_id=task_id)
+    existing_source_hashes = existing_collected_source_hashes_for_task(limited_items, task_id)
+    return enrich_collected_items_with_detail(
+        limited_items,
+        task_id=task_id,
+        existing_source_hashes=existing_source_hashes,
+    )
 
 
 def collect_listing_items(url: str, requested_limit: int | None, *, task_id: str | None = None) -> list[dict[str, Any]]:
@@ -13366,12 +13371,55 @@ def product_url_shop_code(source_url: Any) -> str:
     return normalize_shop_code(parsed[0]) if parsed else ""
 
 
-def enrich_collected_items_with_detail(items: list[dict[str, Any]], *, task_id: str | None = None) -> list[dict[str, Any]]:
+def existing_collected_source_hashes_for_task(
+    items: list[dict[str, Any]],
+    task_id: str | None,
+) -> set[str]:
+    if not task_id or not items:
+        return set()
+    source_hashes = {
+        make_source_url_hash(
+            normalize_text(item.get("source_url_hash_key") or item.get("source_url"))
+        )
+        for item in items
+        if normalize_text(item.get("source_url_hash_key") or item.get("source_url"))
+    }
+    if not source_hashes:
+        return set()
+    with session_scope() as session:
+        task = session.get(CrawlTaskModel, task_id)
+        if task is None:
+            return set()
+        existing_hashes: set[str] = set()
+        for hash_batch in chunk_items(list(source_hashes), 1000):
+            existing_hashes.update(
+                session.scalars(
+                    select(ProductModel.source_url_hash).where(
+                        ProductModel.owner_username == task.owner_username,
+                        ProductModel.store_id.is_(None),
+                        ProductModel.source_url_hash.in_(hash_batch),
+                    )
+                ).all()
+            )
+        return existing_hashes
+
+
+def enrich_collected_items_with_detail(
+    items: list[dict[str, Any]],
+    *,
+    task_id: str | None = None,
+    existing_source_hashes: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    known_hashes = existing_source_hashes or set()
     enriched_items: list[dict[str, Any]] = []
     for item in items:
         raise_if_task_cancelled(CrawlTaskModel, task_id)
         source_url = normalize_text(item.get("source_url"))
         if not source_url:
+            enriched_items.append(item)
+            continue
+        source_hash_key = normalize_text(item.get("source_url_hash_key") or source_url)
+        if make_source_url_hash(source_hash_key) in known_hashes:
             enriched_items.append(item)
             continue
         try:
