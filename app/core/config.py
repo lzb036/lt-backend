@@ -84,6 +84,11 @@ class Settings(BaseModel):
     crawler_batch_pause_seconds: float = 3.0
     crawler_warmup_url: str = "https://www.rakuten.co.jp/"
     crawler_proxy_url: str = ""
+    proxy_subscription_url: str = ""
+    proxy_traffic_total_gib: float = 168.0
+    proxy_traffic_reset_day: int = 2
+    proxy_usage_cache_seconds: int = 300
+    mihomo_config_path: str = "/etc/mihomo/config.yaml"
     product_image_draft_retention_days: int = 7
     product_image_orphan_retention_days: int = 7
     product_image_storage: str = "local"
@@ -189,6 +194,11 @@ def build_settings() -> Settings:
         crawler_batch_pause_seconds=max(0, float(_env_text("LT_CRAWLER_BATCH_PAUSE_SECONDS", "3") or "0")),
         crawler_warmup_url=_env_text("LT_CRAWLER_WARMUP_URL", "https://www.rakuten.co.jp/"),
         crawler_proxy_url=_env_text("LT_CRAWLER_PROXY_URL", ""),
+        proxy_subscription_url=_env_text("LT_PROXY_SUBSCRIPTION_URL", ""),
+        proxy_traffic_total_gib=max(0.0, float(_env_text("LT_PROXY_TRAFFIC_TOTAL_GIB", "168") or "0")),
+        proxy_traffic_reset_day=min(28, max(1, _env_int("LT_PROXY_TRAFFIC_RESET_DAY", 2))),
+        proxy_usage_cache_seconds=max(60, _env_int("LT_PROXY_USAGE_CACHE_SECONDS", 300)),
+        mihomo_config_path=_env_text("LT_MIHOMO_CONFIG_PATH", "/etc/mihomo/config.yaml"),
         product_image_draft_retention_days=max(1, _env_int("LT_PRODUCT_IMAGE_DRAFT_RETENTION_DAYS", 7)),
         product_image_orphan_retention_days=max(1, _env_int("LT_PRODUCT_IMAGE_ORPHAN_RETENTION_DAYS", 7)),
         product_image_storage=product_image_storage,

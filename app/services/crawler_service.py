@@ -58,6 +58,10 @@ from app.services.product_image_storage import (
 
 logger = logging.getLogger(__name__)
 
+PROXY_USAGE_CACHE_LOCK = threading.Lock()
+PROXY_USAGE_REFRESH_LOCK = threading.Lock()
+PROXY_USAGE_CACHE: dict[str, Any] = {}
+
 RAKUTEN_SEARCH_BASE = "https://search.rakuten.co.jp/search/mall/"
 RAKUTEN_RANKING_BASE = "https://ranking.rakuten.co.jp/search"
 RAKUTEN_REALTIME_RANKING_URL = "https://ranking.rakuten.co.jp/realtime/"
@@ -5246,6 +5250,188 @@ def delete_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
             "failedIds": [task_id for task_id in normalized_ids if task_id not in found_ids],
             "deletedCount": len(deleted_ids),
         }
+
+
+def parse_subscription_userinfo(value: Any) -> dict[str, int]:
+    parsed: dict[str, int] = {}
+    key_map = {
+        "upload": "uploadBytes",
+        "download": "downloadBytes",
+        "total": "totalBytes",
+    }
+    for part in str(value or "").split(";"):
+        if "=" not in part:
+            continue
+        key, raw_value = part.strip().split("=", 1)
+        public_key = key_map.get(key.strip().lower())
+        if not public_key:
+            continue
+        try:
+            parsed[public_key] = max(0, int(raw_value.strip()))
+        except ValueError:
+            continue
+    return parsed
+
+
+def next_proxy_traffic_reset_at(reset_day: int, *, now: datetime | None = None) -> datetime:
+    reference = now or datetime.now()
+    normalized_day = min(28, max(1, int(reset_day or 1)))
+    candidate = reference.replace(day=normalized_day, hour=0, minute=0, second=0, microsecond=0)
+    if candidate > reference:
+        return candidate
+    if reference.month == 12:
+        return candidate.replace(year=reference.year + 1, month=1)
+    return candidate.replace(month=reference.month + 1)
+
+
+def proxy_usage_public_payload(
+    *,
+    upload_bytes: int,
+    download_bytes: int,
+    total_bytes: int,
+    source: str,
+    stale: bool,
+    checked_at: datetime,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    used_bytes = max(0, int(upload_bytes or 0)) + max(0, int(download_bytes or 0))
+    normalized_total = max(0, int(total_bytes or 0))
+    remaining_bytes = max(0, normalized_total - used_bytes)
+    usage_percent = round((used_bytes / normalized_total) * 100, 2) if normalized_total else 0.0
+    reference = now or datetime.now()
+    reset_at = next_proxy_traffic_reset_at(settings.proxy_traffic_reset_day, now=reference)
+    return {
+        "uploadBytes": max(0, int(upload_bytes or 0)),
+        "downloadBytes": max(0, int(download_bytes or 0)),
+        "usedBytes": used_bytes,
+        "totalBytes": normalized_total,
+        "remainingBytes": remaining_bytes,
+        "usagePercent": min(100.0, usage_percent),
+        "resetDay": settings.proxy_traffic_reset_day,
+        "resetAt": datetime_to_public(reset_at),
+        "resetRemainingSeconds": max(0, int((reset_at - reference).total_seconds())),
+        "checkedAt": datetime_to_public(checked_at),
+        "source": source,
+        "stale": stale,
+    }
+
+
+def fetch_proxy_subscription_usage() -> dict[str, Any]:
+    subscription_url = normalize_text(settings.proxy_subscription_url)
+    if not subscription_url:
+        raise RuntimeError("代理订阅地址未配置。")
+    response = requests.get(
+        subscription_url,
+        headers={"User-Agent": "clash.meta"},
+        timeout=settings.crawler_timeout_seconds,
+        stream=True,
+    )
+    try:
+        response.raise_for_status()
+        parsed = parse_subscription_userinfo(response.headers.get("subscription-userinfo"))
+        if not all(key in parsed for key in ("uploadBytes", "downloadBytes", "totalBytes")):
+            raise RuntimeError("订阅响应未提供完整流量信息。")
+        return proxy_usage_public_payload(
+            upload_bytes=parsed["uploadBytes"],
+            download_bytes=parsed["downloadBytes"],
+            total_bytes=parsed["totalBytes"],
+            source="subscription",
+            stale=False,
+            checked_at=datetime.now(),
+        )
+    finally:
+        response.close()
+
+
+def proxy_usage_from_mihomo_config() -> dict[str, Any]:
+    config_path = Path(settings.mihomo_config_path)
+    if not config_path.exists():
+        raise RuntimeError("Mihomo 配置文件不存在。")
+    text = config_path.read_text(encoding="utf-8", errors="ignore")
+    remaining_match = re.search(r"剩余流量[：:]\s*([0-9.]+)\s*(GB|MB|TB)", text, re.IGNORECASE)
+    if not remaining_match:
+        raise RuntimeError("Mihomo 配置中没有剩余流量信息。")
+    amount = float(remaining_match.group(1))
+    unit = remaining_match.group(2).upper()
+    unit_bytes = {"MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}[unit]
+    remaining_bytes = int(amount * unit_bytes)
+    total_bytes = int(settings.proxy_traffic_total_gib * 1024 ** 3)
+    used_bytes = max(0, total_bytes - remaining_bytes)
+    checked_at = datetime.fromtimestamp(config_path.stat().st_mtime)
+    return proxy_usage_public_payload(
+        upload_bytes=0,
+        download_bytes=used_bytes,
+        total_bytes=total_bytes,
+        source="mihomo_config",
+        stale=True,
+        checked_at=checked_at,
+    )
+
+
+def stale_proxy_usage_payload(payload: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    stale_payload = dict(payload)
+    reset_at = next_proxy_traffic_reset_at(settings.proxy_traffic_reset_day, now=now)
+    stale_payload.update({
+        "stale": True,
+        "resetDay": settings.proxy_traffic_reset_day,
+        "resetAt": datetime_to_public(reset_at),
+        "resetRemainingSeconds": max(0, int((reset_at - now).total_seconds())),
+    })
+    return stale_payload
+
+
+def get_proxy_resource_usage(*, force: bool = False) -> dict[str, Any]:
+    requested_monotonic = time.monotonic()
+    with PROXY_USAGE_CACHE_LOCK:
+        cached = PROXY_USAGE_CACHE.get("payload")
+        cached_monotonic = PROXY_USAGE_CACHE.get("cachedMonotonic")
+        requested_generation = int(PROXY_USAGE_CACHE.get("generation") or 0)
+        if (
+            not force
+            and isinstance(cached, dict)
+            and isinstance(cached_monotonic, (int, float))
+            and requested_monotonic - cached_monotonic < settings.proxy_usage_cache_seconds
+        ):
+            return dict(cached)
+
+    with PROXY_USAGE_REFRESH_LOCK:
+        now = datetime.now()
+        current_monotonic = time.monotonic()
+        with PROXY_USAGE_CACHE_LOCK:
+            cached = PROXY_USAGE_CACHE.get("payload")
+            cached_monotonic = PROXY_USAGE_CACHE.get("cachedMonotonic")
+            current_generation = int(PROXY_USAGE_CACHE.get("generation") or 0)
+            if (
+                isinstance(cached, dict)
+                and (
+                    current_generation > requested_generation
+                    or (
+                        not force
+                        and isinstance(cached_monotonic, (int, float))
+                        and current_monotonic - cached_monotonic < settings.proxy_usage_cache_seconds
+                    )
+                )
+            ):
+                return dict(cached)
+
+        try:
+            payload = fetch_proxy_subscription_usage()
+        except Exception:
+            try:
+                payload = proxy_usage_from_mihomo_config()
+            except Exception:
+                with PROXY_USAGE_CACHE_LOCK:
+                    cached = PROXY_USAGE_CACHE.get("payload")
+                if not isinstance(cached, dict):
+                    raise
+                payload = stale_proxy_usage_payload(cached, now=now)
+
+        with PROXY_USAGE_CACHE_LOCK:
+            PROXY_USAGE_CACHE["payload"] = dict(payload)
+            PROXY_USAGE_CACHE["cachedAt"] = datetime.now()
+            PROXY_USAGE_CACHE["cachedMonotonic"] = time.monotonic()
+            PROXY_USAGE_CACHE["generation"] = int(PROXY_USAGE_CACHE.get("generation") or 0) + 1
+        return payload
 
 
 def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any]:

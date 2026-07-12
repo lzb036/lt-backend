@@ -217,6 +217,17 @@ def run_unlisted_product_cleanup(user: dict = Depends(require_settings_permissio
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/settings/resources/proxy-usage")
+def get_proxy_resource_usage(
+    refresh: bool = Query(default=False),
+    user: dict = Depends(require_settings_permission),
+) -> dict:
+    try:
+        return {"proxyUsage": crawler_service.get_proxy_resource_usage(force=refresh)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/sources")
 def list_sources(
     page: int | None = Query(default=None, ge=1),
