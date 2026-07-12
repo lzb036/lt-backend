@@ -5523,13 +5523,20 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
     }
 
 
-def time_settings_to_public(row: SystemSettingModel | None, payload: dict[str, Any]) -> dict[str, Any]:
-    return {
+def time_settings_to_public(
+    row: SystemSettingModel | None,
+    payload: dict[str, Any],
+    *,
+    include_queue_health: bool = True,
+) -> dict[str, Any]:
+    result = {
         **payload,
         "serverNow": datetime_to_public(datetime.now()),
         "updatedAt": datetime_to_public(row.updated_at if row is not None else None),
-        "queueHealth": task_queue_health(),
     }
+    if include_queue_health:
+        result["queueHealth"] = task_queue_health()
+    return result
 
 
 def upsert_time_settings_row(session: Any, payload: dict[str, Any]) -> SystemSettingModel:
@@ -5541,17 +5548,17 @@ def upsert_time_settings_row(session: Any, payload: dict[str, Any]) -> SystemSet
     return row
 
 
-def get_time_settings() -> dict[str, Any]:
+def get_time_settings(*, include_queue_health: bool = True) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
         payload = load_time_settings_payload(row)
         if row is None or (row.value_json or "") != json.dumps(payload, ensure_ascii=False):
             row = upsert_time_settings_row(session, payload)
             session.flush()
-        return time_settings_to_public(row, payload)
+        return time_settings_to_public(row, payload, include_queue_health=include_queue_health)
 
 
-def save_time_settings(payload: Any) -> dict[str, Any]:
+def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> dict[str, Any]:
     cleanup_weekday = normalize_cleanup_weekday(getattr(payload, "cleanupWeekday", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY))
     cleanup_time = normalize_schedule_time(getattr(payload, "cleanupTime", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME))
     now = datetime.now()
@@ -5567,7 +5574,7 @@ def save_time_settings(payload: Any) -> dict[str, Any]:
         }
         row = upsert_time_settings_row(session, updated_payload)
         session.flush()
-        return time_settings_to_public(row, updated_payload)
+        return time_settings_to_public(row, updated_payload, include_queue_health=include_queue_health)
 
 
 def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:
@@ -5672,9 +5679,9 @@ def cleanup_completed_scheduled_crawl_tasks_if_due() -> int:
     return cleanup_completed_scheduled_crawl_tasks(force=False)
 
 
-def run_completed_scheduled_crawl_tasks_cleanup_now() -> dict[str, Any]:
+def run_completed_scheduled_crawl_tasks_cleanup_now(*, include_queue_health: bool = True) -> dict[str, Any]:
     cleanup_completed_scheduled_crawl_tasks(force=True)
-    return get_time_settings()
+    return get_time_settings(include_queue_health=include_queue_health)
 
 
 def create_store_unlisted_product_delete_tasks(session: Any, now: datetime) -> tuple[list[tuple[str, str]], int]:
@@ -5776,10 +5783,10 @@ def cleanup_store_unlisted_products_if_due() -> dict[str, int]:
     return cleanup_store_unlisted_products(force=False)
 
 
-def run_store_unlisted_product_cleanup_now() -> dict[str, Any]:
+def run_store_unlisted_product_cleanup_now(*, include_queue_health: bool = True) -> dict[str, Any]:
     summary = cleanup_store_unlisted_products(force=True)
     return {
-        "settings": get_time_settings(),
+        "settings": get_time_settings(include_queue_health=include_queue_health),
         "summary": {
             "taskCount": summary["taskCount"],
             "productCount": summary["productCount"],

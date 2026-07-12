@@ -162,6 +162,13 @@ class TimeSettingsPayload(BaseModel):
     cleanupTime: str = Field(pattern=r"^\d{2}:\d{2}$")
 
 
+def visible_time_settings(user: dict, settings_payload: dict) -> dict:
+    result = dict(settings_payload)
+    if user.get("role") != "superadmin":
+        result.pop("queueHealth", None)
+    return result
+
+
 def resolve_target_username(user: dict, owner_username: str | None = None, *, require_child_owner: bool = False) -> str:
     if owner_username and not has_permission(user, "stores.manage"):
         raise HTTPException(status_code=403, detail="没有管理店铺所属用户的权限")
@@ -190,13 +197,28 @@ def get_dashboard_summary(user: dict = Depends(require_any_permission("crawler.m
 
 @router.get("/settings/time")
 def get_time_settings(user: dict = Depends(require_any_permission("crawler.manage", "settings.manage"))) -> dict:
-    return {"settings": crawler_service.get_time_settings()}
+    include_queue_health = user.get("role") == "superadmin"
+    return {
+        "settings": visible_time_settings(
+            user,
+            crawler_service.get_time_settings(include_queue_health=include_queue_health),
+        )
+    }
 
 
 @router.put("/settings/time")
 def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(require_settings_permission)) -> dict:
     try:
-        return {"settings": crawler_service.save_time_settings(payload)}
+        include_queue_health = user.get("role") == "superadmin"
+        return {
+            "settings": visible_time_settings(
+                user,
+                crawler_service.save_time_settings(
+                    payload,
+                    include_queue_health=include_queue_health,
+                ),
+            )
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -204,7 +226,15 @@ def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(requ
 @router.post("/settings/time/scheduled-task-cleanup/run")
 def run_scheduled_task_cleanup(user: dict = Depends(require_settings_permission)) -> dict:
     try:
-        return {"settings": crawler_service.run_completed_scheduled_crawl_tasks_cleanup_now()}
+        include_queue_health = user.get("role") == "superadmin"
+        return {
+            "settings": visible_time_settings(
+                user,
+                crawler_service.run_completed_scheduled_crawl_tasks_cleanup_now(
+                    include_queue_health=include_queue_health,
+                ),
+            )
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -212,7 +242,14 @@ def run_scheduled_task_cleanup(user: dict = Depends(require_settings_permission)
 @router.post("/settings/time/unlisted-products/run")
 def run_unlisted_product_cleanup(user: dict = Depends(require_settings_permission)) -> dict:
     try:
-        return crawler_service.run_store_unlisted_product_cleanup_now()
+        include_queue_health = user.get("role") == "superadmin"
+        result = crawler_service.run_store_unlisted_product_cleanup_now(
+            include_queue_health=include_queue_health,
+        )
+        return {
+            **result,
+            "settings": visible_time_settings(user, result["settings"]),
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -220,7 +257,7 @@ def run_unlisted_product_cleanup(user: dict = Depends(require_settings_permissio
 @router.get("/settings/resources/proxy-usage")
 def get_proxy_resource_usage(
     refresh: bool = Query(default=False),
-    user: dict = Depends(require_settings_permission),
+    user: dict = Depends(require_superadmin),
 ) -> dict:
     try:
         return {"proxyUsage": crawler_service.get_proxy_resource_usage(force=refresh)}
