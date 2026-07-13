@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from decimal import Decimal
 
 from app.core.auth import has_permission, require_any_permission, require_permission, require_superadmin
-from app.services import crawler_service
+from app.services import crawler_service, sensitive_word_service
 from app.services.user_service import require_existing_account
 
 router = APIRouter(prefix="/crawler", tags=["crawler"])
@@ -20,6 +20,8 @@ require_products_permission = require_permission("products.manage")
 require_stores_permission = require_permission("stores.manage")
 require_settings_permission = require_permission("settings.manage")
 require_products_or_stores_permission = require_any_permission("products.manage", "stores.manage")
+SENSITIVE_WORD_TEMPLATE_FILENAME = "敏感词导入模板.xlsx"
+SENSITIVE_WORD_TEMPLATE_FALLBACK_FILENAME = "sensitive-word-template.xlsx"
 
 
 class CrawlSourcePayload(BaseModel):
@@ -86,6 +88,11 @@ class ScheduledCrawlPayload(BaseModel):
     intervalMinutes: int = Field(default=60, ge=5, le=1440)
     scheduleTime: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
     notes: str = ""
+
+
+class SensitiveWordPayload(BaseModel):
+    word: str = Field(min_length=1, max_length=500)
+    enabled: bool = True
 
 
 class ProductStatusPayload(BaseModel):
@@ -263,6 +270,68 @@ def get_proxy_resource_usage(
         return {"proxyUsage": crawler_service.get_proxy_resource_usage(force=refresh)}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/settings/sensitive-words")
+def list_sensitive_words(
+    page: int | None = Query(default=None, ge=1),
+    pageSize: int | None = Query(default=None, ge=1, le=500),
+    keyword: str | None = Query(default=None),
+    _: dict = Depends(require_superadmin),
+) -> dict:
+    return sensitive_word_service.list_sensitive_words(page=page, page_size=pageSize, keyword=keyword or "")
+
+
+@router.post("/settings/sensitive-words")
+def create_sensitive_word(payload: SensitiveWordPayload, _: dict = Depends(require_superadmin)) -> dict:
+    try:
+        return {"sensitiveWord": sensitive_word_service.create_sensitive_word(payload.word, payload.enabled)}
+    except RuntimeError as exc:
+        raise _sensitive_word_http_exception(exc) from exc
+
+
+@router.put("/settings/sensitive-words/{word_id}")
+def update_sensitive_word(word_id: int, payload: SensitiveWordPayload, _: dict = Depends(require_superadmin)) -> dict:
+    try:
+        return {"sensitiveWord": sensitive_word_service.update_sensitive_word(word_id, payload.word, payload.enabled)}
+    except RuntimeError as exc:
+        raise _sensitive_word_http_exception(exc) from exc
+
+
+@router.delete("/settings/sensitive-words/{word_id}")
+def delete_sensitive_word(word_id: int, _: dict = Depends(require_superadmin)) -> dict:
+    if sensitive_word_service.delete_sensitive_word(word_id):
+        return {"deleted": True}
+    raise HTTPException(status_code=404, detail="敏感词不存在。")
+
+
+@router.get("/settings/sensitive-words/template")
+def download_sensitive_word_template(_: dict = Depends(require_superadmin)) -> StreamingResponse:
+    try:
+        content = sensitive_word_service.build_sensitive_word_template()
+    except RuntimeError as exc:
+        raise _sensitive_word_http_exception(exc) from exc
+    encoded_filename = quote(SENSITIVE_WORD_TEMPLATE_FILENAME)
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": (
+                "attachment; "
+                f"filename={SENSITIVE_WORD_TEMPLATE_FALLBACK_FILENAME}; "
+                f"filename*=UTF-8''{encoded_filename}"
+            ),
+        },
+    )
+
+
+@router.post("/settings/sensitive-words/import")
+async def import_sensitive_words(file: UploadFile = File(...), _: dict = Depends(require_superadmin)) -> dict:
+    try:
+        content = await file.read()
+        return sensitive_word_service.import_sensitive_words(content, file.filename or "")
+    except RuntimeError as exc:
+        raise _sensitive_word_http_exception(exc) from exc
 
 
 @router.get("/sources")
@@ -1073,3 +1142,12 @@ def delete_role(role_id: int, _: dict = Depends(require_superadmin)) -> dict:
         return {"deleted": True}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _sensitive_word_http_exception(exc: RuntimeError) -> HTTPException:
+    detail = str(exc)
+    if "已存在" in detail:
+        return HTTPException(status_code=409, detail=detail)
+    if "不存在" in detail:
+        return HTTPException(status_code=404, detail=detail)
+    return HTTPException(status_code=400, detail=detail)
