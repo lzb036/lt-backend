@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from io import BytesIO
 from zipfile import BadZipFile
@@ -11,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.db.database import SessionLocal
-from app.db.models import SensitiveWordModel
+from app.db.models import ProductModel, SensitiveWordModel
 
 BRACKET_RULE = "【】"
 BRACKET_SEGMENT_RE = re.compile(r"【[^】]*】")
@@ -94,18 +95,7 @@ def sanitize_sensitive_text(value: Any, words: Iterable[str]) -> str:
 
 def sanitize_product_payload(payload: dict[str, Any], words: Iterable[str]) -> tuple[dict[str, Any], bool]:
     bracket_rule_enabled, normalized_words = _prepare_sensitive_words(words)
-    cleaned, changed = _sanitize_payload_node(payload, normalized_words, bracket_rule_enabled)
-
-    for key in ROOT_ONLY_SANITIZE_FIELD_NAMES:
-        value = cleaned.get(key)
-        if isinstance(value, (dict, list)):
-            continue
-        sanitized = _sanitize_text_with_prepared_words(value, normalized_words, bracket_rule_enabled)
-        if sanitized != value:
-            cleaned[key] = sanitized
-            changed = True
-
-    return cleaned, changed
+    return _sanitize_product_payload_with_prepared_words(payload, normalized_words, bracket_rule_enabled)
 
 
 def seed_default_sensitive_words(session: Any) -> int:
@@ -287,6 +277,58 @@ def import_sensitive_words(content: bytes, filename: str) -> dict[str, int]:
     }
 
 
+def cleanup_pending_products(session: Any, *, apply: bool = False) -> dict[str, int]:
+    active_words = active_sensitive_words(session)
+    bracket_rule_enabled, literal_words = _prepare_sensitive_words(active_words)
+    scanned_count = 0
+    matched_count = 0
+    updated_count = 0
+    empty_title_count = 0
+
+    pending_products = session.scalars(
+        select(ProductModel)
+        .where(ProductModel.review_status == "pending")
+        .order_by(ProductModel.id.asc())
+    ).all()
+
+    for product in pending_products:
+        scanned_count += 1
+
+        cleaned_title = _sanitize_text_with_prepared_words(product.title, literal_words, bracket_rule_enabled)
+        title_changed = cleaned_title != product.title
+
+        cleaned_payload = None
+        payload_changed = False
+        raw_payload = _load_cleanup_payload(product.raw_payload_json)
+        if raw_payload is not None:
+            cleaned_payload, payload_changed = _sanitize_product_payload_with_prepared_words(
+                raw_payload,
+                literal_words,
+                bracket_rule_enabled,
+            )
+
+        if not title_changed and not payload_changed:
+            continue
+
+        matched_count += 1
+        if not cleaned_title:
+            empty_title_count += 1
+            continue
+
+        updated_count += 1
+        if apply:
+            product.title = cleaned_title
+            if payload_changed and cleaned_payload is not None:
+                product.raw_payload_json = json.dumps(cleaned_payload, ensure_ascii=False)
+
+    return {
+        "scannedCount": scanned_count,
+        "matchedCount": matched_count,
+        "updatedCount": updated_count,
+        "emptyTitleCount": empty_title_count,
+    }
+
+
 def _prepare_sensitive_words(words: Iterable[str]) -> tuple[bool, list[str]]:
     bracket_rule_enabled = False
     literal_words: set[str] = set()
@@ -336,6 +378,38 @@ def _sanitize_text_with_prepared_words(value: Any, literal_words: list[str], bra
         text = text.replace(word, "")
 
     return WHITESPACE_RE.sub(" ", text).strip()
+
+
+def _sanitize_product_payload_with_prepared_words(
+    payload: dict[str, Any],
+    literal_words: list[str],
+    bracket_rule_enabled: bool,
+) -> tuple[dict[str, Any], bool]:
+    cleaned, changed = _sanitize_payload_node(payload, literal_words, bracket_rule_enabled)
+
+    for key in ROOT_ONLY_SANITIZE_FIELD_NAMES:
+        if key not in cleaned:
+            continue
+        value = cleaned.get(key)
+        if isinstance(value, (dict, list)):
+            continue
+        sanitized = _sanitize_text_with_prepared_words(value, literal_words, bracket_rule_enabled)
+        if sanitized != value:
+            cleaned[key] = sanitized
+            changed = True
+
+    return cleaned, changed
+
+
+def _load_cleanup_payload(raw_payload_json: str) -> dict[str, Any] | None:
+    normalized_payload_json = normalize_sensitive_word(raw_payload_json)
+    if not normalized_payload_json:
+        return {}
+    try:
+        payload = json.loads(normalized_payload_json)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _load_sensitive_word_workbook(content: bytes) -> Any:

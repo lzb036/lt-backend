@@ -773,5 +773,227 @@ class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
         self.assertEqual(products[0].title, "春物")
 
 
+class SensitiveWordCleanupTests(SensitiveWordDatabaseTestCase):
+    def seed_pending_cleanup_rows(self) -> dict[str, int]:
+        from app.db.models import ProductModel, SensitiveWordModel
+
+        with self.session_scope() as session:
+            session.add_all(
+                [
+                    SensitiveWordModel(word="【】", enabled=True),
+                    SensitiveWordModel(word="即納", enabled=True),
+                ]
+            )
+            session.flush()
+
+            rows = [
+                ProductModel(
+                    owner_username="alice",
+                    title="【楽天1位】 即納 春物",
+                    source_url="https://example.test/pending-updatable",
+                    source_url_hash="cleanup-pending-updatable",
+                    review_status="pending",
+                    raw_payload_json=json.dumps(
+                        {
+                            "title": "【楽天1位】 即納 春物",
+                            "itemName": "【楽天1位】 即納 春物",
+                            "tagline": "即納 おすすめ",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+                ProductModel(
+                    owner_username="alice",
+                    title="【楽天1位】 即納",
+                    source_url="https://example.test/pending-empty-title",
+                    source_url_hash="cleanup-pending-empty",
+                    review_status="pending",
+                    raw_payload_json=json.dumps(
+                        {
+                            "title": "【楽天1位】 即納",
+                            "itemName": "【楽天1位】 即納",
+                            "tagline": "即納",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+                ProductModel(
+                    owner_username="alice",
+                    title="常规商品",
+                    source_url="https://example.test/pending-clean",
+                    source_url_hash="cleanup-pending-clean",
+                    review_status="pending",
+                    raw_payload_json=json.dumps(
+                        {
+                            "title": "常规商品",
+                            "itemName": "常规商品",
+                            "tagline": "普通推荐",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+                ProductModel(
+                    owner_username="alice",
+                    title="【楽天1位】 即納 已审核商品",
+                    source_url="https://example.test/approved",
+                    source_url_hash="cleanup-approved",
+                    review_status="approved",
+                    raw_payload_json=json.dumps(
+                        {
+                            "title": "【楽天1位】 即納 已审核商品",
+                            "itemName": "【楽天1位】 即納 已审核商品",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+                ProductModel(
+                    owner_username="alice",
+                    title="【楽天1位】 即納 已上架商品",
+                    source_url="https://example.test/listed",
+                    source_url_hash="cleanup-listed",
+                    review_status="listed",
+                    raw_payload_json=json.dumps(
+                        {
+                            "title": "【楽天1位】 即納 已上架商品",
+                            "itemName": "【楽天1位】 即納 已上架商品",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+                ProductModel(
+                    owner_username="alice",
+                    title="【楽天1位】 即納 异常商品",
+                    source_url="https://example.test/error",
+                    source_url_hash="cleanup-error",
+                    review_status="error",
+                    raw_payload_json=json.dumps(
+                        {
+                            "title": "【楽天1位】 即納 异常商品",
+                            "itemName": "【楽天1位】 即納 异常商品",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ]
+            session.add_all(rows)
+            session.flush()
+            return {
+                "pending_updatable": rows[0].id,
+                "pending_empty": rows[1].id,
+                "pending_clean": rows[2].id,
+                "approved": rows[3].id,
+                "listed": rows[4].id,
+                "error": rows[5].id,
+            }
+
+    def test_cleanup_pending_products_dry_run_reports_without_persisting(self) -> None:
+        from app.db.models import ProductModel
+        from app.services.sensitive_word_service import cleanup_pending_products
+
+        row_ids = self.seed_pending_cleanup_rows()
+
+        with self.session_scope() as session:
+            summary = cleanup_pending_products(session, apply=False)
+
+        self.assertEqual(
+            summary,
+            {
+                "scannedCount": 3,
+                "matchedCount": 2,
+                "updatedCount": 1,
+                "emptyTitleCount": 1,
+            },
+        )
+
+        with Session(self.engine, future=True) as session:
+            pending_updatable = session.get(ProductModel, row_ids["pending_updatable"])
+            pending_empty = session.get(ProductModel, row_ids["pending_empty"])
+            approved = session.get(ProductModel, row_ids["approved"])
+            listed = session.get(ProductModel, row_ids["listed"])
+            error = session.get(ProductModel, row_ids["error"])
+
+        self.assertIsNotNone(pending_updatable)
+        self.assertIsNotNone(pending_empty)
+        self.assertIsNotNone(approved)
+        self.assertIsNotNone(listed)
+        self.assertIsNotNone(error)
+        assert pending_updatable is not None
+        assert pending_empty is not None
+        assert approved is not None
+        assert listed is not None
+        assert error is not None
+        self.assertEqual(pending_updatable.title, "【楽天1位】 即納 春物")
+        self.assertEqual(json.loads(pending_updatable.raw_payload_json)["title"], "【楽天1位】 即納 春物")
+        self.assertEqual(pending_empty.title, "【楽天1位】 即納")
+        self.assertEqual(json.loads(pending_empty.raw_payload_json)["title"], "【楽天1位】 即納")
+        self.assertEqual(approved.title, "【楽天1位】 即納 已审核商品")
+        self.assertEqual(listed.title, "【楽天1位】 即納 已上架商品")
+        self.assertEqual(error.title, "【楽天1位】 即納 异常商品")
+
+    def test_cleanup_pending_products_apply_updates_only_pending_nonempty_titles(self) -> None:
+        from app.db.models import ProductModel
+        from app.services.sensitive_word_service import cleanup_pending_products
+
+        row_ids = self.seed_pending_cleanup_rows()
+
+        with self.session_scope() as session:
+            summary = cleanup_pending_products(session, apply=True)
+            session.flush()
+
+        self.assertEqual(
+            summary,
+            {
+                "scannedCount": 3,
+                "matchedCount": 2,
+                "updatedCount": 1,
+                "emptyTitleCount": 1,
+            },
+        )
+
+        with Session(self.engine, future=True) as session:
+            pending_updatable = session.get(ProductModel, row_ids["pending_updatable"])
+            pending_empty = session.get(ProductModel, row_ids["pending_empty"])
+            pending_clean = session.get(ProductModel, row_ids["pending_clean"])
+            approved = session.get(ProductModel, row_ids["approved"])
+            listed = session.get(ProductModel, row_ids["listed"])
+            error = session.get(ProductModel, row_ids["error"])
+
+        self.assertIsNotNone(pending_updatable)
+        self.assertIsNotNone(pending_empty)
+        self.assertIsNotNone(pending_clean)
+        self.assertIsNotNone(approved)
+        self.assertIsNotNone(listed)
+        self.assertIsNotNone(error)
+        assert pending_updatable is not None
+        assert pending_empty is not None
+        assert pending_clean is not None
+        assert approved is not None
+        assert listed is not None
+        assert error is not None
+        self.assertEqual(pending_updatable.title, "春物")
+        self.assertEqual(
+            json.loads(pending_updatable.raw_payload_json),
+            {
+                "title": "春物",
+                "itemName": "春物",
+                "tagline": "おすすめ",
+            },
+        )
+        self.assertEqual(pending_empty.title, "【楽天1位】 即納")
+        self.assertEqual(
+            json.loads(pending_empty.raw_payload_json),
+            {
+                "title": "【楽天1位】 即納",
+                "itemName": "【楽天1位】 即納",
+                "tagline": "即納",
+            },
+        )
+        self.assertEqual(pending_clean.title, "常规商品")
+        self.assertEqual(json.loads(pending_clean.raw_payload_json)["title"], "常规商品")
+        self.assertEqual(approved.title, "【楽天1位】 即納 已审核商品")
+        self.assertEqual(listed.title, "【楽天1位】 即納 已上架商品")
+        self.assertEqual(error.title, "【楽天1位】 即納 异常商品")
+
+
 if __name__ == "__main__":
     unittest.main()
