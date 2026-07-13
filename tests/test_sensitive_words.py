@@ -170,6 +170,43 @@ class SensitiveWordPersistenceTests(SensitiveWordDatabaseTestCase):
         from app.db.models import SensitiveWordModel
         from app.services.sensitive_word_service import DEFAULT_SENSITIVE_WORDS, seed_default_sensitive_words
 
+        expected_default_words = (
+            "500円OFFクーポン",
+            "【全店2点購入で10％OFF】",
+            "300円OFFクーポン",
+            "【お買い物マラソン 当店ポイント5倍】",
+            "翌日出荷",
+            "翌日配達",
+            "楽天1位",
+            "楽天2位",
+            "楽天3位",
+            "【】",
+            "【P10&最大600円OFF】",
+            "【楽天倉庫出荷】",
+            "【日本国内発送】",
+            "【楽天1位】",
+            "【楽天2位】",
+            "【楽天3位】",
+            "新生活",
+            "即納",
+            "【10%OFFクーポン】",
+            "【8%OFFクーポン】",
+            "【期間限定5％OFF】",
+            "一部即納",
+            "【P5倍期間限定】",
+            "【P10倍期間限定】",
+            "お買い物マラソン",
+            "【P5倍】",
+            "【LINE追加で5%OFF】",
+            "【限定10%OFF】",
+            "【スーパーDEAL&お買い物マラソンP10】",
+            "【お買い物マラソン最大2000円OFF】",
+            "＼7%OFFクーポン利用可2.18まで／",
+            "【短納期】",
+        )
+
+        self.assertEqual(DEFAULT_SENSITIVE_WORDS, expected_default_words)
+
         with self.session_scope() as session:
             created_count = seed_default_sensitive_words(session)
             self.assertGreater(created_count, 0)
@@ -180,6 +217,7 @@ class SensitiveWordPersistenceTests(SensitiveWordDatabaseTestCase):
 
         self.assertEqual(total, len(set(DEFAULT_SENSITIVE_WORDS)))
         self.assertEqual(len(DEFAULT_SENSITIVE_WORDS), len(set(DEFAULT_SENSITIVE_WORDS)))
+        self.assertEqual(list(self.list_words()), list(expected_default_words))
         self.assertIn("【】", DEFAULT_SENSITIVE_WORDS)
         self.assertIn("即納", DEFAULT_SENSITIVE_WORDS)
         self.assertIn("楽天1位", DEFAULT_SENSITIVE_WORDS)
