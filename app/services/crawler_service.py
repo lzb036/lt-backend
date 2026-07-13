@@ -5,7 +5,6 @@ import re
 import uuid
 import base64
 import binascii
-import copy
 import hashlib
 import logging
 import mimetypes
@@ -15,6 +14,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 import time
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from html import unescape
@@ -59,6 +59,19 @@ from app.services.product_image_storage import (
 from app.services.sensitive_word_service import active_sensitive_words, sanitize_product_payload
 
 logger = logging.getLogger(__name__)
+
+
+EMPTY_SENSITIVE_TITLE_SAVE_ERROR = "商品标题命中敏感词后为空，商品未保存。"
+
+
+@dataclass(frozen=True)
+class PreparedProductUpsertItem:
+    item: dict[str, Any]
+    source_url: str
+    title: str
+    source_url_hash_key: str
+    rakuten_manage_number: str | None
+    error: str = ""
 
 PROXY_USAGE_CACHE_LOCK = threading.Lock()
 PROXY_USAGE_REFRESH_LOCK = threading.Lock()
@@ -6676,10 +6689,18 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
                 message=f"同步中，已处理 0 / {len(items)} 条",
             )
         raise_if_task_cancelled(SyncTaskModel, task_id)
+        active_words = active_sensitive_words(session)
         previous_store_links, deleted_product_ids = clear_store_products_for_reimport(session, owner_username, row)
         for index, item in enumerate(items, start=1):
             raise_if_task_cancelled(SyncTaskModel, task_id)
-            if upsert_store_product(session, owner_username, row, item, previous_store_links=previous_store_links):
+            if upsert_store_product(
+                session,
+                owner_username,
+                row,
+                item,
+                previous_store_links=previous_store_links,
+                active_words=active_words,
+            ):
                 synced_count += 1
             else:
                 failed_count += 1
@@ -13280,13 +13301,17 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
         batch_size = max(1, int(settings.crawler_batch_size))
         processed_count = 0
         batches = list(chunk_items(items, batch_size))
+        active_words = []
+        if batches:
+            with session_scope() as session:
+                active_words = active_sensitive_words(session)
         for batch_index, batch_items in enumerate(batches, start=1):
             raise_if_task_cancelled(CrawlTaskModel, task_id)
             for item in batch_items:
                 raise_if_task_cancelled(CrawlTaskModel, task_id)
                 processed_count += 1
                 item_error = collected_item_error(item)
-                save_result = save_collected_item(owner_username, task_id, item)
+                save_result = save_collected_item(owner_username, task_id, item, active_words=active_words)
                 saved = bool(save_result.get("saved"))
                 skipped = bool(save_result.get("skipped"))
                 save_error = normalize_text(save_result.get("error"))
@@ -13371,7 +13396,13 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
             dispatch_queued_crawl_tasks_safely(owner_username)
 
 
-def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any]) -> dict[str, Any]:
+def save_collected_item(
+    owner_username: str,
+    task_id: str,
+    item: dict[str, Any],
+    *,
+    active_words: list[str] | None = None,
+) -> dict[str, Any]:
     product_id: int | None = None
     if item.get("_crawlPriceFiltered"):
         price = item.get("price")
@@ -13389,10 +13420,18 @@ def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any])
                 "skipped": True,
                 "error": f"{display_name}: 商品已存在于商品管理，已跳过。",
             }
-        saved = upsert_product(session, owner_username, task_id, item)
+        prepared_item = prepare_product_upsert_item(session, item, active_words=active_words)
+        saved = upsert_product(
+            session,
+            owner_username,
+            task_id,
+            item,
+            active_words=active_words,
+            prepared_item=prepared_item,
+        )
         if saved:
             session.flush()
-            source_url = str(item.get("source_url") or "").strip()
+            source_url = prepared_item.source_url
             if source_url:
                 product = session.scalar(
                     select(ProductModel).where(
@@ -13402,7 +13441,7 @@ def save_collected_item(owner_username: str, task_id: str, item: dict[str, Any])
                 )
                 product_id = product.id if product is not None else None
         else:
-            return {"saved": False, "error": ""}
+            return {"saved": False, "error": prepared_item.error}
     image_error = ""
     if product_id is not None:
         try:
@@ -15226,6 +15265,7 @@ def upsert_store_product(
     item: dict[str, Any],
     *,
     previous_store_links: dict[str, dict[str, Any]] | None = None,
+    active_words: list[str] | None = None,
 ) -> bool:
     item_number = first_text_from_keys(item, ("itemNumber", "manageNumber"))
     manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
@@ -15248,7 +15288,15 @@ def upsert_store_product(
         "genre_id": first_text_from_keys(item, ("genreId", "genre_id", "genre")),
         "raw": item,
     }
-    saved = upsert_product(session, owner_username, None, normalized, review_status="listed", store_id=store.id)
+    saved = upsert_product(
+        session,
+        owner_username,
+        None,
+        normalized,
+        review_status="listed",
+        store_id=store.id,
+        active_words=active_words,
+    )
     if saved and manage_number:
         row = session.scalar(
             select(ProductModel).where(
@@ -15297,25 +15345,19 @@ def upsert_product(
     *,
     review_status: str = "pending",
     store_id: int | None = None,
+    active_words: list[str] | None = None,
+    prepared_item: PreparedProductUpsertItem | None = None,
 ) -> bool:
-    cleaned_item = copy.deepcopy(item)
-    words = active_sensitive_words(session)
-    if words:
-        cleaned_item, _ = sanitize_product_payload(cleaned_item, words)
-
-    source_url = str(cleaned_item.get("source_url") or "").strip()
-    title = str(cleaned_item.get("title") or "").strip()
-    if not source_url or not title:
+    prepared = prepared_item or prepare_product_upsert_item(session, item, active_words=active_words)
+    if prepared.error or not prepared.source_url or not prepared.title:
         return False
-    source_url_hash_key = str(cleaned_item.get("source_url_hash_key") or source_url).strip()
-    source_url_hash = make_source_url_hash(source_url_hash_key)
-    rakuten_manage_number = str(cleaned_item.get("rakuten_manage_number") or "").strip() or None
+    source_url_hash = make_source_url_hash(prepared.source_url_hash_key)
     row = None
-    if store_id is not None and rakuten_manage_number:
+    if store_id is not None and prepared.rakuten_manage_number:
         row = session.scalar(
             select(ProductModel).where(
                 ProductModel.store_id == store_id,
-                ProductModel.rakuten_manage_number == rakuten_manage_number,
+                ProductModel.rakuten_manage_number == prepared.rakuten_manage_number,
             )
         )
     if row is None and store_id is None:
@@ -15326,30 +15368,56 @@ def upsert_product(
             )
         )
     if row is None:
-        row = ProductModel(owner_username=owner_username, source_url=source_url, source_url_hash=source_url_hash)
+        row = ProductModel(owner_username=owner_username, source_url=prepared.source_url, source_url_hash=source_url_hash)
         session.add(row)
     elif store_id is None and row.store_id is not None and row.review_status == "listed":
         return False
-    row.source_url = source_url
+    row.source_url = prepared.source_url
     row.source_url_hash = source_url_hash
     row.task_id = task_id
     row.store_id = store_id
-    row.rakuten_manage_number = rakuten_manage_number
-    row.rakuten_listing_status = str(cleaned_item.get("rakuten_listing_status") or row.rakuten_listing_status or "")
-    row.title = title[:500]
-    row.image_url = str(cleaned_item.get("image_url") or "")
-    row.item_number = str(cleaned_item.get("item_number") or "")
-    row.shop_name = str(cleaned_item.get("shop_name") or "")
-    row.genre_id = str(cleaned_item.get("genre_id") or "")
-    price = cleaned_item.get("price")
+    row.rakuten_manage_number = prepared.rakuten_manage_number
+    row.rakuten_listing_status = str(prepared.item.get("rakuten_listing_status") or row.rakuten_listing_status or "")
+    row.title = prepared.title[:500]
+    row.image_url = str(prepared.item.get("image_url") or "")
+    row.item_number = str(prepared.item.get("item_number") or "")
+    row.shop_name = str(prepared.item.get("shop_name") or "")
+    row.genre_id = str(prepared.item.get("genre_id") or "")
+    price = prepared.item.get("price")
     row.price = Decimal(str(price)) if price is not None else None
     row.currency = "JPY"
     row.review_status = review_status
     if store_id is not None and review_status == "listed":
         row.store_product_status = "active"
         row.store_last_seen_at = datetime.now()
-    raw_payload = cleaned_item.get("raw") or cleaned_item
+    raw_payload = prepared.item.get("raw") or prepared.item
     row.listed_at = parse_rakuten_datetime_value(raw_payload.get("created") if isinstance(raw_payload, dict) else None) or row.listed_at
     row.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
     row.last_error = None
     return True
+
+
+def prepare_product_upsert_item(
+    session: Any,
+    item: dict[str, Any],
+    *,
+    active_words: list[str] | None = None,
+) -> PreparedProductUpsertItem:
+    original_title = str(item.get("title") or "").strip()
+    words = active_words if active_words is not None else active_sensitive_words(session)
+    cleaned_item = item
+    if words:
+        cleaned_item, _ = sanitize_product_payload(item, words)
+    source_url = str(cleaned_item.get("source_url") or "").strip()
+    title = str(cleaned_item.get("title") or "").strip()
+    source_url_hash_key = str(cleaned_item.get("source_url_hash_key") or source_url).strip()
+    rakuten_manage_number = str(cleaned_item.get("rakuten_manage_number") or "").strip() or None
+    error = EMPTY_SENSITIVE_TITLE_SAVE_ERROR if original_title and not title else ""
+    return PreparedProductUpsertItem(
+        item=cleaned_item,
+        source_url=source_url,
+        title=title,
+        source_url_hash_key=source_url_hash_key,
+        rakuten_manage_number=rakuten_manage_number,
+        error=error,
+    )

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import BytesIO
 import tempfile
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zipfile import ZipFile
 import json
 
@@ -574,6 +575,202 @@ class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
 
             self.assertFalse(saved)
             self.assertEqual(session.scalar(select(func.count()).select_from(ProductModel)), 0)
+
+    def test_save_collected_item_returns_specific_error_when_sensitive_words_clear_title(self) -> None:
+        from app.db.models import ProductModel
+        from app.services import crawler_service
+
+        item = {
+            "source_url": "https://example.test/item/3",
+            "title": "【楽天1位】 即納",
+            "raw": {
+                "title": "【楽天1位】 即納",
+                "itemName": "【楽天1位】 即納",
+            },
+        }
+
+        with patch.object(crawler_service, "session_scope", self.session_scope):
+            result = crawler_service.save_collected_item(
+                "alice",
+                "task-3",
+                item,
+                active_words=["【】", "即納"],
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "saved": False,
+                "error": "商品标题命中敏感词后为空，商品未保存。",
+            },
+        )
+        with Session(self.engine, future=True) as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(ProductModel)), 0)
+
+    def test_save_collected_item_propagates_active_word_loading_failure(self) -> None:
+        from app.services import crawler_service
+
+        item = {
+            "source_url": "https://example.test/item/4",
+            "title": "春物",
+            "raw": {
+                "title": "春物",
+                "itemName": "春物",
+            },
+        }
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(crawler_service, "active_sensitive_words", side_effect=RuntimeError("敏感词加载失败")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "敏感词加载失败"):
+                crawler_service.save_collected_item("alice", "task-4", item)
+
+    def test_upsert_store_product_preserves_dedupe_and_listed_store_mark_with_preloaded_words(self) -> None:
+        from app.db.models import ProductModel, StoreModel
+        from app.services import crawler_service
+
+        linked_at = datetime(2026, 7, 13, 12, 0, 0)
+
+        with self.session_scope() as session:
+            store = StoreModel(owner_username="alice", store_code="demo", store_name="Demo Store")
+            parent = ProductModel(
+                owner_username="alice",
+                title="原商品",
+                source_url="https://source.example/item/1",
+                source_url_hash="parent-hash-1",
+                review_status="approved",
+                raw_payload_json="{}",
+            )
+            session.add_all([store, parent])
+            session.flush()
+
+            previous_store_links = {
+                "MN-1": {
+                    "parentProductId": parent.id,
+                    "listedAt": linked_at,
+                }
+            }
+            first_item = {
+                "manageNumber": "MN-1",
+                "itemNumber": "IT-1",
+                "itemUrl": "https://item.rakuten.co.jp/demo/it-1/",
+                "itemName": "【楽天1位】 即納 春物",
+            }
+            second_item = {
+                **first_item,
+                "itemName": "【楽天1位】 即納 夏物",
+            }
+
+            with patch.object(crawler_service, "active_sensitive_words", side_effect=AssertionError("should not load")):
+                first_saved = crawler_service.upsert_store_product(
+                    session,
+                    "alice",
+                    store,
+                    first_item,
+                    previous_store_links=previous_store_links,
+                    active_words=["【】", "即納"],
+                )
+                second_saved = crawler_service.upsert_store_product(
+                    session,
+                    "alice",
+                    store,
+                    second_item,
+                    previous_store_links=previous_store_links,
+                    active_words=["【】", "即納"],
+                )
+            session.flush()
+
+            store_products = session.scalars(
+                select(ProductModel).where(ProductModel.store_id == store.id).order_by(ProductModel.id.asc())
+            ).all()
+            parent_row = session.get(ProductModel, parent.id)
+
+        self.assertTrue(first_saved)
+        self.assertTrue(second_saved)
+        self.assertEqual(len(store_products), 1)
+        self.assertEqual(store_products[0].title, "夏物")
+        self.assertEqual(store_products[0].rakuten_manage_number, "MN-1")
+        self.assertEqual(store_products[0].parent_product_id, parent.id)
+        self.assertEqual(store_products[0].listed_at, linked_at)
+        self.assertIsNotNone(parent_row)
+        assert parent_row is not None
+        self.assertEqual(parent_row.review_status, "listed_master")
+        parent_payload = json.loads(parent_row.raw_payload_json)
+        self.assertEqual(len(parent_payload["listedStores"]), 1)
+        self.assertEqual(parent_payload["listedStores"][0]["storeId"], store.id)
+
+    def test_run_task_loads_active_words_once_and_records_specific_empty_title_error(self) -> None:
+        from app.db.models import CrawlTaskModel, ProductModel, SensitiveWordModel
+        from app.services import crawler_service
+
+        with self.session_scope() as session:
+            session.add(
+                CrawlTaskModel(
+                    id="task-sensitive-empty-title",
+                    owner_username="alice",
+                    source_type="shop",
+                    target="店铺:https://www.rakuten.co.jp/demo/ 全部",
+                    mode="manual",
+                    status="queued",
+                    total_count=0,
+                    success_count=0,
+                    failed_count=0,
+                    warning_count=0,
+                    message="等待执行",
+                )
+            )
+            session.add_all(
+                [
+                    SensitiveWordModel(word="【】", enabled=True),
+                    SensitiveWordModel(word="即納", enabled=True),
+                ]
+            )
+
+        collected_items = [
+            {
+                "source_url": "https://example.test/item/ok",
+                "title": "春物",
+                "raw": {
+                    "title": "春物",
+                    "itemName": "春物",
+                },
+            },
+            {
+                "source_url": "https://example.test/item/empty",
+                "title": "【楽天1位】 即納",
+                "raw": {
+                    "title": "【楽天1位】 即納",
+                    "itemName": "【楽天1位】 即納",
+                },
+            },
+        ]
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(crawler_service.settings, "task_queue_mode", "thread"),
+            patch.object(crawler_service, "collect_items", return_value=collected_items),
+            patch.object(crawler_service, "localize_collected_product_images", return_value=""),
+            patch.object(crawler_service, "log_event", Mock()),
+            patch.object(crawler_service, "dispatch_queued_crawl_tasks_safely", Mock()),
+            patch.object(crawler_service, "reconcile_interrupted_running_tasks", return_value=0),
+            patch.object(crawler_service, "active_sensitive_words", wraps=crawler_service.active_sensitive_words) as mock_active_words,
+        ):
+            crawler_service.run_task("task-sensitive-empty-title")
+
+        with Session(self.engine, future=True) as session:
+            task = session.get(CrawlTaskModel, "task-sensitive-empty-title")
+            products = session.scalars(select(ProductModel).order_by(ProductModel.id.asc())).all()
+
+        self.assertEqual(mock_active_words.call_count, 1)
+        self.assertIsNotNone(task)
+        assert task is not None
+        self.assertEqual(task.status, "partial")
+        self.assertEqual(task.success_count, 1)
+        self.assertEqual(task.failed_count, 1)
+        self.assertIn("商品标题命中敏感词后为空，商品未保存。", task.error_detail or "")
+        self.assertEqual(len(products), 1)
+        self.assertEqual(products[0].title, "春物")
 
 
 if __name__ == "__main__":
