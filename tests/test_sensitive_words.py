@@ -6,6 +6,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 from zipfile import ZipFile
+import json
 
 from sqlalchemy import event
 from sqlalchemy import create_engine, func, select
@@ -498,6 +499,81 @@ class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
                     event.remove(race_session_factory.class_, "before_flush", inject_competing_insert)
                 if race_engine is not None:
                     race_engine.dispose()
+
+
+class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
+    def test_upsert_product_sanitizes_stored_title_and_payload_with_active_words(self) -> None:
+        from app.db.models import ProductModel, SensitiveWordModel
+        from app.services import crawler_service
+
+        item = {
+            "source_url": "https://example.test/item/1",
+            "title": "【楽天1位】 即納 春物",
+            "raw": {
+                "title": "【楽天1位】 即納 春物",
+                "itemName": "【楽天1位】 即納 春物",
+                "tagline": "翌日配達 おすすめ",
+            },
+        }
+
+        with self.session_scope() as session:
+            session.add_all(
+                [
+                    SensitiveWordModel(word="【】", enabled=True),
+                    SensitiveWordModel(word="即納", enabled=True),
+                    SensitiveWordModel(word="翌日配達", enabled=True),
+                ]
+            )
+            session.flush()
+
+            saved = crawler_service.upsert_product(session, "alice", "task-1", item)
+            self.assertTrue(saved)
+            session.flush()
+
+            row = session.scalar(select(ProductModel))
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row.title, "春物")
+            self.assertEqual(
+                json.loads(row.raw_payload_json),
+                {
+                    "title": "春物",
+                    "itemName": "春物",
+                    "tagline": "おすすめ",
+                },
+            )
+
+        self.assertEqual(item["title"], "【楽天1位】 即納 春物")
+        self.assertEqual(item["raw"]["title"], "【楽天1位】 即納 春物")
+        self.assertEqual(item["raw"]["itemName"], "【楽天1位】 即納 春物")
+        self.assertEqual(item["raw"]["tagline"], "翌日配達 おすすめ")
+
+    def test_upsert_product_returns_false_when_sanitized_title_becomes_empty(self) -> None:
+        from app.db.models import ProductModel, SensitiveWordModel
+        from app.services import crawler_service
+
+        item = {
+            "source_url": "https://example.test/item/2",
+            "title": "【楽天1位】 即納",
+            "raw": {
+                "title": "【楽天1位】 即納",
+                "itemName": "【楽天1位】 即納",
+            },
+        }
+
+        with self.session_scope() as session:
+            session.add_all(
+                [
+                    SensitiveWordModel(word="【】", enabled=True),
+                    SensitiveWordModel(word="即納", enabled=True),
+                ]
+            )
+            session.flush()
+
+            saved = crawler_service.upsert_product(session, "alice", "task-2", item)
+
+            self.assertFalse(saved)
+            self.assertEqual(session.scalar(select(func.count()).select_from(ProductModel)), 0)
 
 
 if __name__ == "__main__":

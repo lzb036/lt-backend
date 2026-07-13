@@ -5,6 +5,7 @@ import re
 import uuid
 import base64
 import binascii
+import copy
 import hashlib
 import logging
 import mimetypes
@@ -55,6 +56,7 @@ from app.services.product_image_storage import (
     parse_product_image_url,
     product_image_storage,
 )
+from app.services.sensitive_word_service import active_sensitive_words, sanitize_product_payload
 
 logger = logging.getLogger(__name__)
 
@@ -15296,13 +15298,18 @@ def upsert_product(
     review_status: str = "pending",
     store_id: int | None = None,
 ) -> bool:
-    source_url = str(item.get("source_url") or "").strip()
-    title = str(item.get("title") or "").strip()
+    cleaned_item = copy.deepcopy(item)
+    words = active_sensitive_words(session)
+    if words:
+        cleaned_item, _ = sanitize_product_payload(cleaned_item, words)
+
+    source_url = str(cleaned_item.get("source_url") or "").strip()
+    title = str(cleaned_item.get("title") or "").strip()
     if not source_url or not title:
         return False
-    source_url_hash_key = str(item.get("source_url_hash_key") or source_url).strip()
+    source_url_hash_key = str(cleaned_item.get("source_url_hash_key") or source_url).strip()
     source_url_hash = make_source_url_hash(source_url_hash_key)
-    rakuten_manage_number = str(item.get("rakuten_manage_number") or "").strip() or None
+    rakuten_manage_number = str(cleaned_item.get("rakuten_manage_number") or "").strip() or None
     row = None
     if store_id is not None and rakuten_manage_number:
         row = session.scalar(
@@ -15328,20 +15335,20 @@ def upsert_product(
     row.task_id = task_id
     row.store_id = store_id
     row.rakuten_manage_number = rakuten_manage_number
-    row.rakuten_listing_status = str(item.get("rakuten_listing_status") or row.rakuten_listing_status or "")
+    row.rakuten_listing_status = str(cleaned_item.get("rakuten_listing_status") or row.rakuten_listing_status or "")
     row.title = title[:500]
-    row.image_url = str(item.get("image_url") or "")
-    row.item_number = str(item.get("item_number") or "")
-    row.shop_name = str(item.get("shop_name") or "")
-    row.genre_id = str(item.get("genre_id") or "")
-    price = item.get("price")
+    row.image_url = str(cleaned_item.get("image_url") or "")
+    row.item_number = str(cleaned_item.get("item_number") or "")
+    row.shop_name = str(cleaned_item.get("shop_name") or "")
+    row.genre_id = str(cleaned_item.get("genre_id") or "")
+    price = cleaned_item.get("price")
     row.price = Decimal(str(price)) if price is not None else None
     row.currency = "JPY"
     row.review_status = review_status
     if store_id is not None and review_status == "listed":
         row.store_product_status = "active"
         row.store_last_seen_at = datetime.now()
-    raw_payload = item.get("raw") or item
+    raw_payload = cleaned_item.get("raw") or cleaned_item
     row.listed_at = parse_rakuten_datetime_value(raw_payload.get("created") if isinstance(raw_payload, dict) else None) or row.listed_at
     row.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
     row.last_error = None
