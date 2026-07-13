@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from io import BytesIO
+from zipfile import BadZipFile
 from collections.abc import Iterable
 from typing import Any
 
@@ -14,6 +16,8 @@ BRACKET_RULE = "【】"
 BRACKET_SEGMENT_RE = re.compile(r"【[^】]*】")
 WHITESPACE_RE = re.compile(r"\s+")
 MAX_PAGE_SIZE = 500
+SENSITIVE_WORD_TEMPLATE_SHEET_NAME = "敏感词导入"
+SENSITIVE_WORD_TEMPLATE_HEADER = "敏感词"
 DEFAULT_SENSITIVE_WORDS: tuple[str, ...] = (
     "500円OFFクーポン",
     "【全店2点購入で10％OFF】",
@@ -206,6 +210,78 @@ def active_sensitive_words(session: Any) -> list[str]:
     ]
 
 
+def build_sensitive_word_template() -> bytes:
+    try:
+        from openpyxl import Workbook
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 openpyxl，无法生成敏感词导入模板。") from exc
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = SENSITIVE_WORD_TEMPLATE_SHEET_NAME
+    sheet.append([SENSITIVE_WORD_TEMPLATE_HEADER])
+
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def import_sensitive_words(content: bytes, filename: str) -> dict[str, int]:
+    normalized_filename = normalize_sensitive_word(filename).lower()
+    if not content:
+        raise RuntimeError("导入文件为空。")
+    if not normalized_filename.endswith(".xlsx"):
+        raise RuntimeError("敏感词导入只支持 .xlsx 文件。")
+
+    workbook = _load_sensitive_word_workbook(content)
+    sheet = workbook.active
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows:
+        raise RuntimeError("导入文件没有内容。")
+
+    header = _sensitive_word_import_header_key(rows[0][0] if rows[0] else "")
+    if header != SENSITIVE_WORD_TEMPLATE_HEADER:
+        raise RuntimeError("导入文件表头必须包含：敏感词。")
+
+    created_count = 0
+    duplicate_count = 0
+    invalid_count = 0
+
+    with SessionLocal() as session:
+        existing_words = {
+            normalize_sensitive_word(word)
+            for word in session.scalars(select(SensitiveWordModel.word)).all()
+            if normalize_sensitive_word(word)
+        }
+        pending_words: set[str] = set()
+
+        for row in rows[1:]:
+            raw_value = row[0] if row else ""
+            normalized_word = normalize_sensitive_word(raw_value)
+            if not normalized_word:
+                invalid_count += 1
+                continue
+            if normalized_word in existing_words or normalized_word in pending_words:
+                duplicate_count += 1
+                continue
+            session.add(SensitiveWordModel(word=normalized_word, enabled=True))
+            pending_words.add(normalized_word)
+            created_count += 1
+
+        if created_count:
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                raise RuntimeError("敏感词导入失败，检测到重复数据。") from exc
+
+    return {
+        "createdCount": created_count,
+        "duplicateCount": duplicate_count,
+        "invalidCount": invalid_count,
+    }
+
+
 def _prepare_sensitive_words(words: Iterable[str]) -> tuple[bool, list[str]]:
     bracket_rule_enabled = False
     literal_words: set[str] = set()
@@ -255,6 +331,22 @@ def _sanitize_text_with_prepared_words(value: Any, literal_words: list[str], bra
         text = text.replace(word, "")
 
     return WHITESPACE_RE.sub(" ", text).strip()
+
+
+def _load_sensitive_word_workbook(content: bytes) -> Any:
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("服务器缺少 openpyxl，无法读取 xlsx 文件。") from exc
+
+    try:
+        return load_workbook(BytesIO(content), read_only=True, data_only=True)
+    except BadZipFile as exc:
+        raise RuntimeError("无法读取敏感词导入文件，请确认文件是有效的 .xlsx 格式。") from exc
+
+
+def _sensitive_word_import_header_key(value: Any) -> str:
+    return re.sub(r"\s+", "", normalize_sensitive_word(value))
 
 
 def _sanitize_payload_node(value: Any, words: list[str], bracket_rule_enabled: bool) -> tuple[Any, bool]:

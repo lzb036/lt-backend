@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
@@ -133,6 +134,8 @@ class SensitiveWordSanitizerTests(unittest.TestCase):
 
 class SensitiveWordDatabaseTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        import app.db.models  # noqa: F401
+
         self.engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
         Base.metadata.create_all(self.engine)
         self.session_factory = sessionmaker(
@@ -327,6 +330,76 @@ class SensitiveWordPersistenceTests(SensitiveWordDatabaseTestCase):
         self.assertEqual([row.word for row in rows], ["翌日配達", "期間限定"])
         self.assertFalse(rows[0].enabled)
         self.assertTrue(rows[1].enabled)
+
+
+class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
+    def test_template_contains_expected_sheet_and_header(self) -> None:
+        from openpyxl import load_workbook
+
+        from app.services.sensitive_word_service import build_sensitive_word_template
+
+        content = build_sensitive_word_template()
+        workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+
+        self.assertEqual(workbook.sheetnames, ["敏感词导入"])
+        sheet = workbook["敏感词导入"]
+        self.assertEqual(sheet["A1"].value, "敏感词")
+
+    def test_import_counts_created_duplicate_and_invalid_rows(self) -> None:
+        from openpyxl import Workbook
+
+        from app.services import sensitive_word_service
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "敏感词导入"
+        sheet.append(["敏感词"])
+        sheet.append(["春物"])
+        sheet.append(["即納"])
+        sheet.append(["春物"])
+        sheet.append(["   "])
+        sheet.append(["翌日配達"])
+        buffer = BytesIO()
+        workbook.save(buffer)
+
+        with patch.object(sensitive_word_service, "SessionLocal", self.session_factory):
+            sensitive_word_service.create_sensitive_word("即納")
+            result = sensitive_word_service.import_sensitive_words(
+                content=buffer.getvalue(),
+                filename="sensitive-words.xlsx",
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "createdCount": 2,
+                "duplicateCount": 2,
+                "invalidCount": 1,
+            },
+        )
+        self.assertEqual(self.list_words(), ["即納", "春物", "翌日配達"])
+
+    def test_import_rejects_non_xlsx_files(self) -> None:
+        from app.services.sensitive_word_service import import_sensitive_words
+
+        with self.assertRaisesRegex(RuntimeError, r"\.xlsx"):
+            import_sensitive_words(content=b"not-an-excel-file", filename="sensitive-words.csv")
+
+    def test_import_requires_sensitive_word_header(self) -> None:
+        from openpyxl import Workbook
+
+        from app.services.sensitive_word_service import import_sensitive_words
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "敏感词导入"
+        sheet.append(["词汇"])
+        sheet.append(["春物"])
+        buffer = BytesIO()
+        workbook.save(buffer)
+
+        with self.assertRaisesRegex(RuntimeError, "表头"):
+            import_sensitive_words(content=buffer.getvalue(), filename="sensitive-words.xlsx")
 
 
 if __name__ == "__main__":
