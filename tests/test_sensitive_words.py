@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from io import BytesIO
+import tempfile
 import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
+from zipfile import ZipFile
 
+from sqlalchemy import event
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -385,6 +388,16 @@ class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
         with self.assertRaisesRegex(RuntimeError, r"\.xlsx"):
             import_sensitive_words(content=b"not-an-excel-file", filename="sensitive-words.csv")
 
+    def test_import_rejects_valid_zip_that_is_not_a_real_xlsx_workbook(self) -> None:
+        from app.services.sensitive_word_service import import_sensitive_words
+
+        buffer = BytesIO()
+        with ZipFile(buffer, "w") as archive:
+            archive.writestr("not-a-workbook.txt", "plain text")
+
+        with self.assertRaisesRegex(RuntimeError, r"有效的 \.xlsx"):
+            import_sensitive_words(content=buffer.getvalue(), filename="sensitive-words.xlsx")
+
     def test_import_requires_sensitive_word_header(self) -> None:
         from openpyxl import Workbook
 
@@ -400,6 +413,91 @@ class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "表头"):
             import_sensitive_words(content=buffer.getvalue(), filename="sensitive-words.xlsx")
+
+    def test_import_counts_flush_time_uniqueness_race_as_duplicate_and_keeps_valid_rows(self) -> None:
+        from openpyxl import Workbook
+
+        from app.db.models import SensitiveWordModel
+        from app.services import sensitive_word_service
+
+        race_engine = None
+        race_session_factory = None
+        inject_competing_insert = None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = f"{temp_dir}\\sensitive-word-race.sqlite3"
+            race_engine = create_engine(f"sqlite+pysqlite:///{database_path}", future=True)
+            try:
+                Base.metadata.create_all(race_engine)
+                race_session_factory = sessionmaker(
+                    bind=race_engine,
+                    expire_on_commit=False,
+                    future=True,
+                )
+
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.title = "敏感词导入"
+                sheet.append(["敏感词"])
+                sheet.append(["春物"])
+                sheet.append(["競合語"])
+                sheet.append(["翌日配達"])
+                buffer = BytesIO()
+                workbook.save(buffer)
+
+                injected_words: list[str] = []
+
+                @event.listens_for(race_session_factory.class_, "before_flush")
+                def inject_competing_insert(session, flush_context, instances) -> None:
+                    if not session.info.get("inject_race_once") or session.info.get("race_injected"):
+                        return
+
+                    pending_words = {
+                        row.word
+                        for row in session.new
+                        if isinstance(row, SensitiveWordModel)
+                    }
+                    if "競合語" not in pending_words:
+                        return
+
+                    session.info["race_injected"] = True
+                    with race_session_factory() as competing_session:
+                        competing_session.add(SensitiveWordModel(word="競合語", enabled=True))
+                        competing_session.commit()
+                    injected_words.append("競合語")
+
+                def flagged_session_local():
+                    session = race_session_factory()
+                    session.info["inject_race_once"] = True
+                    return session
+
+                with patch.object(sensitive_word_service, "SessionLocal", flagged_session_local):
+                    result = sensitive_word_service.import_sensitive_words(
+                        content=buffer.getvalue(),
+                        filename="sensitive-words.xlsx",
+                    )
+
+                self.assertEqual(injected_words, ["競合語"])
+                self.assertEqual(
+                    result,
+                    {
+                        "createdCount": 2,
+                        "duplicateCount": 1,
+                        "invalidCount": 0,
+                    },
+                )
+
+                with Session(race_engine, future=True) as session:
+                    words = session.scalars(
+                        select(SensitiveWordModel.word).order_by(SensitiveWordModel.id.asc())
+                    ).all()
+
+                self.assertEqual(words, ["春物", "競合語", "翌日配達"])
+            finally:
+                if race_session_factory is not None and inject_competing_insert is not None:
+                    event.remove(race_session_factory.class_, "before_flush", inject_competing_insert)
+                if race_engine is not None:
+                    race_engine.dispose()
 
 
 if __name__ == "__main__":

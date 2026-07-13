@@ -5,6 +5,7 @@ from io import BytesIO
 from zipfile import BadZipFile
 from collections.abc import Iterable
 from typing import Any
+from xml.etree.ElementTree import ParseError
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -253,7 +254,6 @@ def import_sensitive_words(content: bytes, filename: str) -> dict[str, int]:
             for word in session.scalars(select(SensitiveWordModel.word)).all()
             if normalize_sensitive_word(word)
         }
-        pending_words: set[str] = set()
 
         for row in rows[1:]:
             raw_value = row[0] if row else ""
@@ -261,19 +261,24 @@ def import_sensitive_words(content: bytes, filename: str) -> dict[str, int]:
             if not normalized_word:
                 invalid_count += 1
                 continue
-            if normalized_word in existing_words or normalized_word in pending_words:
+            if normalized_word in existing_words:
                 duplicate_count += 1
                 continue
-            session.add(SensitiveWordModel(word=normalized_word, enabled=True))
-            pending_words.add(normalized_word)
+            try:
+                with session.begin_nested():
+                    session.add(SensitiveWordModel(word=normalized_word, enabled=True))
+                    session.flush()
+            except IntegrityError as exc:
+                if _is_sensitive_word_unique_conflict(exc):
+                    duplicate_count += 1
+                    existing_words.add(normalized_word)
+                    continue
+                raise
+            existing_words.add(normalized_word)
             created_count += 1
 
         if created_count:
-            try:
-                session.commit()
-            except IntegrityError as exc:
-                session.rollback()
-                raise RuntimeError("敏感词导入失败，检测到重复数据。") from exc
+            session.commit()
 
     return {
         "createdCount": created_count,
@@ -336,17 +341,44 @@ def _sanitize_text_with_prepared_words(value: Any, literal_words: list[str], bra
 def _load_sensitive_word_workbook(content: bytes) -> Any:
     try:
         from openpyxl import load_workbook
+        from openpyxl.utils.exceptions import InvalidFileException
     except ImportError as exc:
         raise RuntimeError("服务器缺少 openpyxl，无法读取 xlsx 文件。") from exc
 
     try:
         return load_workbook(BytesIO(content), read_only=True, data_only=True)
-    except BadZipFile as exc:
+    except (BadZipFile, KeyError, OSError, ParseError, ValueError, InvalidFileException) as exc:
         raise RuntimeError("无法读取敏感词导入文件，请确认文件是有效的 .xlsx 格式。") from exc
 
 
 def _sensitive_word_import_header_key(value: Any) -> str:
     return re.sub(r"\s+", "", normalize_sensitive_word(value))
+
+
+def _is_sensitive_word_unique_conflict(exc: IntegrityError) -> bool:
+    orig = getattr(exc, "orig", None)
+    if getattr(orig, "pgcode", None) == "23505":
+        return True
+
+    orig_args = getattr(orig, "args", ())
+    if orig_args and orig_args[0] == 1062:
+        return True
+
+    message = " ".join(
+        part for part in (
+            str(orig).lower() if orig is not None else "",
+            str(exc).lower(),
+        ) if part
+    )
+    return any(
+        token in message
+        for token in (
+            "unique constraint",
+            "duplicate entry",
+            "uq_lt_sensitive_word",
+            "lt_sensitive_words.word",
+        )
+    )
 
 
 def _sanitize_payload_node(value: Any, words: list[str], bracket_rule_enabled: bool) -> tuple[Any, bool]:
