@@ -4,9 +4,24 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+
+from app.db.database import SessionLocal
+from app.db.models import SensitiveWordModel
+
 BRACKET_RULE = "【】"
 BRACKET_SEGMENT_RE = re.compile(r"【[^】]*】")
 WHITESPACE_RE = re.compile(r"\s+")
+MAX_PAGE_SIZE = 500
+DEFAULT_SENSITIVE_WORDS: tuple[str, ...] = (
+    "【】",
+    "楽天1位",
+    "日本国内発送",
+    "即納",
+    "期間限定",
+    "翌日配達",
+)
 RECURSIVE_SANITIZE_FIELD_NAMES = {
     "title",
     "itemName",
@@ -62,6 +77,109 @@ def sanitize_product_payload(payload: dict[str, Any], words: Iterable[str]) -> t
     return cleaned, changed
 
 
+def seed_default_sensitive_words(session: Any) -> int:
+    existing_words = {
+        normalize_sensitive_word(word)
+        for word in session.scalars(select(SensitiveWordModel.word)).all()
+        if normalize_sensitive_word(word)
+    }
+    created_count = 0
+    for word in DEFAULT_SENSITIVE_WORDS:
+        normalized = normalize_sensitive_word(word)
+        if not normalized or normalized in existing_words:
+            continue
+        session.add(SensitiveWordModel(word=normalized, enabled=True))
+        existing_words.add(normalized)
+        created_count += 1
+    if created_count:
+        session.flush()
+    return created_count
+
+
+def list_sensitive_words(page: int, page_size: int, keyword: str = "") -> dict[str, Any]:
+    normalized_page, normalized_page_size = _normalize_page_params(page, page_size)
+    normalized_keyword = normalize_sensitive_word(keyword)
+
+    with SessionLocal() as session:
+        query = select(SensitiveWordModel)
+        if normalized_keyword:
+            query = query.where(SensitiveWordModel.word.like(f"%{normalized_keyword}%"))
+        total = int(session.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0)
+        if total:
+            max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+            normalized_page = min(normalized_page, max_page)
+        rows = session.scalars(
+            query.order_by(SensitiveWordModel.created_at.asc(), SensitiveWordModel.id.asc())
+            .offset((normalized_page - 1) * normalized_page_size)
+            .limit(normalized_page_size)
+        ).all()
+        return {
+            "items": [_sensitive_word_to_public(row) for row in rows],
+            "total": total,
+            "page": normalized_page,
+            "pageSize": normalized_page_size,
+        }
+
+
+def create_sensitive_word(word: str, enabled: bool = True) -> dict[str, Any]:
+    normalized_word = normalize_sensitive_word(word)
+    if not normalized_word:
+        raise RuntimeError("敏感词不能为空。")
+
+    with SessionLocal() as session:
+        row = SensitiveWordModel(word=normalized_word, enabled=bool(enabled))
+        session.add(row)
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise RuntimeError("敏感词已存在。") from exc
+        session.refresh(row)
+        return _sensitive_word_to_public(row)
+
+
+def update_sensitive_word(word_id: int, word: str, enabled: bool) -> dict[str, Any]:
+    normalized_word = normalize_sensitive_word(word)
+    if not normalized_word:
+        raise RuntimeError("敏感词不能为空。")
+
+    with SessionLocal() as session:
+        row = session.get(SensitiveWordModel, int(word_id))
+        if row is None:
+            raise RuntimeError("敏感词不存在。")
+        row.word = normalized_word
+        row.enabled = bool(enabled)
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise RuntimeError("敏感词已存在。") from exc
+        session.refresh(row)
+        return _sensitive_word_to_public(row)
+
+
+def delete_sensitive_word(word_id: int) -> bool:
+    with SessionLocal() as session:
+        row = session.get(SensitiveWordModel, int(word_id))
+        if row is None:
+            return False
+        session.delete(row)
+        session.commit()
+        return True
+
+
+def active_sensitive_words(session: Any) -> list[str]:
+    return [
+        normalize_sensitive_word(word)
+        for word in session.scalars(
+            select(SensitiveWordModel.word)
+            .where(SensitiveWordModel.enabled.is_(True))
+            .order_by(func.length(SensitiveWordModel.word).desc(), SensitiveWordModel.word.asc(), SensitiveWordModel.id.asc())
+        ).all()
+        if normalize_sensitive_word(word)
+    ]
+
+
 def _prepare_sensitive_words(words: Iterable[str]) -> tuple[bool, list[str]]:
     bracket_rule_enabled = False
     literal_words: set[str] = set()
@@ -76,6 +194,27 @@ def _prepare_sensitive_words(words: Iterable[str]) -> tuple[bool, list[str]]:
         literal_words.add(normalized)
 
     return bracket_rule_enabled, sorted(literal_words, key=lambda item: (-len(item), item))
+
+
+def _normalize_page_params(page: int | None, page_size: int | None) -> tuple[int, int]:
+    normalized_page = max(1, int(page or 1))
+    normalized_page_size = min(MAX_PAGE_SIZE, max(1, int(page_size or 1)))
+    return normalized_page, normalized_page_size
+
+
+def _rule_type_for_word(word: str) -> str:
+    return "bracket" if word == BRACKET_RULE else "literal"
+
+
+def _sensitive_word_to_public(row: SensitiveWordModel) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "word": row.word,
+        "ruleType": _rule_type_for_word(row.word),
+        "enabled": bool(row.enabled),
+        "createdAt": row.created_at.isoformat() if row.created_at else "",
+        "updatedAt": row.updated_at.isoformat() if row.updated_at else "",
+    }
 
 
 def _sanitize_text_with_prepared_words(value: Any, literal_words: list[str], bracket_rule_enabled: bool) -> str:

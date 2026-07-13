@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import contextmanager
+from unittest.mock import patch
+
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.db.database import Base
 
 
 class SensitiveWordModelTests(unittest.TestCase):
@@ -122,6 +129,166 @@ class SensitiveWordSanitizerTests(unittest.TestCase):
         self.assertEqual(cleaned["metadata"]["tagline"], "おすすめ")
         self.assertEqual(cleaned["item"]["itemName"], "ワンピース")
         self.assertEqual(cleaned["item"]["subtitle"], "人気")
+
+
+class SensitiveWordDatabaseTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        Base.metadata.create_all(self.engine)
+        self.session_factory = sessionmaker(
+            bind=self.engine,
+            expire_on_commit=False,
+            future=True,
+        )
+
+    def tearDown(self) -> None:
+        self.engine.dispose()
+
+    @contextmanager
+    def session_scope(self):
+        session = self.session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def list_words(self) -> list[str]:
+        from app.db.models import SensitiveWordModel
+
+        with Session(self.engine, future=True) as session:
+            return session.scalars(
+                select(SensitiveWordModel.word).order_by(SensitiveWordModel.id.asc())
+            ).all()
+
+
+class SensitiveWordPersistenceTests(SensitiveWordDatabaseTestCase):
+    def test_seed_is_idempotent_and_deduplicates_default_words(self) -> None:
+        from app.db.models import SensitiveWordModel
+        from app.services.sensitive_word_service import DEFAULT_SENSITIVE_WORDS, seed_default_sensitive_words
+
+        with self.session_scope() as session:
+            created_count = seed_default_sensitive_words(session)
+            self.assertGreater(created_count, 0)
+
+        with self.session_scope() as session:
+            self.assertEqual(seed_default_sensitive_words(session), 0)
+            total = session.scalar(select(func.count()).select_from(SensitiveWordModel))
+
+        self.assertEqual(total, len(set(DEFAULT_SENSITIVE_WORDS)))
+        self.assertEqual(len(DEFAULT_SENSITIVE_WORDS), len(set(DEFAULT_SENSITIVE_WORDS)))
+        self.assertIn("【】", DEFAULT_SENSITIVE_WORDS)
+        self.assertIn("即納", DEFAULT_SENSITIVE_WORDS)
+        self.assertIn("楽天1位", DEFAULT_SENSITIVE_WORDS)
+        self.assertIn("翌日配達", DEFAULT_SENSITIVE_WORDS)
+
+    def test_init_database_seeds_defaults_without_breaking_existing_bootstrap_steps(self) -> None:
+        import app.db.database as database_module
+        from app.db.models import SensitiveWordModel
+
+        with (
+            patch.object(database_module, "engine", self.engine),
+            patch.object(database_module, "SessionLocal", self.session_factory),
+            patch.object(database_module, "ensure_mysql_database_exists") as ensure_database_exists,
+            patch.object(database_module, "ensure_schema_compatibility") as ensure_schema_compatibility,
+            patch.object(database_module.settings, "database_auto_create", False),
+            patch("app.services.user_service.ensure_initial_superadmin") as ensure_initial_superadmin,
+            patch("app.services.crawler_service.ensure_default_roles") as ensure_default_roles,
+        ):
+            database_module.init_database()
+
+        ensure_database_exists.assert_not_called()
+        ensure_schema_compatibility.assert_called_once_with()
+        ensure_initial_superadmin.assert_called_once_with()
+        ensure_default_roles.assert_called_once_with()
+
+        with Session(self.engine, future=True) as session:
+            total = session.scalar(select(func.count()).select_from(SensitiveWordModel))
+            self.assertEqual(total, session.scalar(select(func.count()).select_from(SensitiveWordModel)))
+            self.assertGreater(total or 0, 0)
+
+        with (
+            patch.object(database_module, "engine", self.engine),
+            patch.object(database_module, "SessionLocal", self.session_factory),
+            patch.object(database_module, "ensure_mysql_database_exists"),
+            patch.object(database_module, "ensure_schema_compatibility"),
+            patch.object(database_module.settings, "database_auto_create", False),
+            patch("app.services.user_service.ensure_initial_superadmin"),
+            patch("app.services.crawler_service.ensure_default_roles"),
+        ):
+            database_module.init_database()
+
+        with Session(self.engine, future=True) as session:
+            second_total = session.scalar(select(func.count()).select_from(SensitiveWordModel))
+
+        self.assertEqual(second_total, total)
+
+    def test_crud_normalizes_words_and_rejects_duplicates(self) -> None:
+        from app.services import sensitive_word_service
+
+        with patch.object(sensitive_word_service, "SessionLocal", self.session_factory):
+            created = sensitive_word_service.create_sensitive_word("  即納  ")
+
+            self.assertEqual(created["word"], "即納")
+            self.assertEqual(created["ruleType"], "literal")
+            self.assertTrue(created["enabled"])
+
+            with self.assertRaisesRegex(RuntimeError, "已存在"):
+                sensitive_word_service.create_sensitive_word("即納")
+
+            with self.assertRaisesRegex(RuntimeError, "不能为空"):
+                sensitive_word_service.create_sensitive_word("   ")
+
+    def test_list_filters_and_paginates_sensitive_words(self) -> None:
+        from app.services import sensitive_word_service
+
+        with patch.object(sensitive_word_service, "SessionLocal", self.session_factory):
+            sensitive_word_service.create_sensitive_word("翌日配達")
+            sensitive_word_service.create_sensitive_word("即納")
+            sensitive_word_service.create_sensitive_word("【】")
+
+            page_one = sensitive_word_service.list_sensitive_words(page=1, page_size=2)
+            filtered = sensitive_word_service.list_sensitive_words(page=1, page_size=10, keyword="即")
+
+        self.assertEqual(page_one["total"], 3)
+        self.assertEqual(page_one["page"], 1)
+        self.assertEqual(page_one["pageSize"], 2)
+        self.assertEqual(len(page_one["items"]), 2)
+        self.assertEqual([item["word"] for item in page_one["items"]], ["翌日配達", "即納"])
+        self.assertEqual(filtered["total"], 1)
+        self.assertEqual(filtered["items"][0]["word"], "即納")
+        self.assertEqual(filtered["items"][0]["ruleType"], "literal")
+
+    def test_update_delete_and_active_word_ordering_respect_enabled_state(self) -> None:
+        from app.db.models import SensitiveWordModel
+        from app.services import sensitive_word_service
+
+        with patch.object(sensitive_word_service, "SessionLocal", self.session_factory):
+            created_bracket = sensitive_word_service.create_sensitive_word("【】")
+            created_short = sensitive_word_service.create_sensitive_word("即納")
+            created_long = sensitive_word_service.create_sensitive_word("期間限定")
+
+            updated = sensitive_word_service.update_sensitive_word(created_short["id"], "  翌日配達  ", False)
+            self.assertEqual(updated["word"], "翌日配達")
+            self.assertFalse(updated["enabled"])
+
+            with self.assertRaisesRegex(RuntimeError, "已存在"):
+                sensitive_word_service.update_sensitive_word(created_long["id"], "【】", True)
+
+            self.assertTrue(sensitive_word_service.delete_sensitive_word(created_bracket["id"]))
+            self.assertFalse(sensitive_word_service.delete_sensitive_word(created_bracket["id"]))
+
+        with Session(self.engine, future=True) as session:
+            active_words = sensitive_word_service.active_sensitive_words(session)
+            rows = session.scalars(select(SensitiveWordModel).order_by(SensitiveWordModel.id.asc())).all()
+
+        self.assertEqual(active_words, ["期間限定"])
+        self.assertEqual([row.word for row in rows], ["翌日配達", "期間限定"])
+        self.assertFalse(rows[0].enabled)
+        self.assertTrue(rows[1].enabled)
 
 
 if __name__ == "__main__":

@@ -448,12 +448,22 @@ def init_database() -> None:
         ensure_mysql_database_exists()
     from app.db import models  # noqa: F401
     from app.services.crawler_service import ensure_default_roles
+    from app.services.sensitive_word_service import seed_default_sensitive_words
     from app.services.user_service import ensure_initial_superadmin
 
     Base.metadata.create_all(bind=engine)
     ensure_schema_compatibility()
     ensure_initial_superadmin()
     ensure_default_roles()
+    session = SessionLocal()
+    try:
+        seed_default_sensitive_words(session)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 @contextmanager
