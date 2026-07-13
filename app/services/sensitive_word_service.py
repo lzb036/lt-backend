@@ -299,13 +299,18 @@ def cleanup_pending_products(session: Any, *, apply: bool = False) -> dict[str, 
 
         cleaned_payload = None
         payload_changed = False
-        raw_payload = _load_cleanup_payload(product.raw_payload_json)
-        if raw_payload is not None:
+        raw_payload, payload_supported = _load_cleanup_payload(product.raw_payload_json)
+        if payload_supported:
             cleaned_payload, payload_changed = _sanitize_product_payload_with_prepared_words(
                 raw_payload,
                 literal_words,
                 bracket_rule_enabled,
             )
+        elif title_changed:
+            matched_count += 1
+            if not cleaned_title:
+                empty_title_count += 1
+            continue
 
         if not title_changed and not payload_changed:
             continue
@@ -401,15 +406,17 @@ def _sanitize_product_payload_with_prepared_words(
     return cleaned, changed
 
 
-def _load_cleanup_payload(raw_payload_json: str) -> dict[str, Any] | None:
+def _load_cleanup_payload(raw_payload_json: str) -> tuple[dict[str, Any], bool]:
     normalized_payload_json = normalize_sensitive_word(raw_payload_json)
     if not normalized_payload_json:
-        return {}
+        return {}, True
     try:
         payload = json.loads(normalized_payload_json)
     except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
+        return {}, False
+    if not isinstance(payload, dict):
+        return {}, False
+    return payload, True
 
 
 def _load_sensitive_word_workbook(content: bytes) -> Any:

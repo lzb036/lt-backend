@@ -994,6 +994,70 @@ class SensitiveWordCleanupTests(SensitiveWordDatabaseTestCase):
         self.assertEqual(listed.title, "【楽天1位】 即納 已上架商品")
         self.assertEqual(error.title, "【楽天1位】 即納 异常商品")
 
+    def test_cleanup_pending_products_apply_skips_malformed_and_non_object_payloads_without_partial_title_updates(self) -> None:
+        from app.db.models import ProductModel, SensitiveWordModel
+        from app.services.sensitive_word_service import cleanup_pending_products
+
+        malformed_payload = '{"title":"【楽天1位】 即納 春物"'
+        non_object_payload = '["【楽天1位】 即納 夏物"]'
+
+        with self.session_scope() as session:
+            session.add_all(
+                [
+                    SensitiveWordModel(word="【】", enabled=True),
+                    SensitiveWordModel(word="即納", enabled=True),
+                ]
+            )
+            session.flush()
+
+            malformed_row = ProductModel(
+                owner_username="alice",
+                title="【楽天1位】 即納 春物",
+                source_url="https://example.test/pending-malformed-payload",
+                source_url_hash="cleanup-pending-malformed-payload",
+                review_status="pending",
+                raw_payload_json=malformed_payload,
+            )
+            non_object_row = ProductModel(
+                owner_username="alice",
+                title="【楽天1位】 即納 夏物",
+                source_url="https://example.test/pending-non-object-payload",
+                source_url_hash="cleanup-pending-non-object-payload",
+                review_status="pending",
+                raw_payload_json=non_object_payload,
+            )
+            session.add_all([malformed_row, non_object_row])
+            session.flush()
+
+            malformed_id = malformed_row.id
+            non_object_id = non_object_row.id
+
+            summary = cleanup_pending_products(session, apply=True)
+            session.flush()
+
+        self.assertEqual(
+            summary,
+            {
+                "scannedCount": 2,
+                "matchedCount": 2,
+                "updatedCount": 0,
+                "emptyTitleCount": 0,
+            },
+        )
+
+        with Session(self.engine, future=True) as session:
+            malformed_row = session.get(ProductModel, malformed_id)
+            non_object_row = session.get(ProductModel, non_object_id)
+
+        self.assertIsNotNone(malformed_row)
+        self.assertIsNotNone(non_object_row)
+        assert malformed_row is not None
+        assert non_object_row is not None
+        self.assertEqual(malformed_row.title, "【楽天1位】 即納 春物")
+        self.assertEqual(malformed_row.raw_payload_json, malformed_payload)
+        self.assertEqual(non_object_row.title, "【楽天1位】 即納 夏物")
+        self.assertEqual(non_object_row.raw_payload_json, non_object_payload)
+
 
 if __name__ == "__main__":
     unittest.main()
