@@ -87,6 +87,15 @@ class SystemSettingModel(TimestampMixin, Base):
     value_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 
 
+class SensitiveWordModel(TimestampMixin, Base):
+    __tablename__ = "lt_sensitive_words"
+    __table_args__ = (UniqueConstraint("word", name="uq_lt_sensitive_word"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    word: Mapped[str] = mapped_column(String(500), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+
+
 class StoreModel(TimestampMixin, Base):
     __tablename__ = "lt_stores"
     __table_args__ = (
