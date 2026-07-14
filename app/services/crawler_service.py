@@ -62,6 +62,14 @@ logger = logging.getLogger(__name__)
 
 
 EMPTY_SENSITIVE_TITLE_SAVE_ERROR = "商品标题命中敏感词后为空，商品未保存。"
+RAKUTEN_IMAGE_CDN_HOSTS = {
+    "image.rakuten.co.jp",
+    "shop.r10s.jp",
+    "tshop.r10s.jp",
+}
+PRODUCT_IMAGE_VISUAL_SIZE = (32, 32)
+PRODUCT_IMAGE_VISUAL_MAX_MEAN_DIFFERENCE = 2.0
+PRODUCT_IMAGE_VISUAL_MAX_ASPECT_RATIO_DIFFERENCE = 0.03
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,14 @@ class PreparedProductUpsertItem:
     source_url_hash_key: str
     rakuten_manage_number: str | None
     error: str = ""
+
+
+@dataclass(frozen=True)
+class ProductImageVisualSignature:
+    width: int
+    height: int
+    pixels: bytes
+
 
 PROXY_USAGE_CACHE_LOCK = threading.Lock()
 PROXY_USAGE_REFRESH_LOCK = threading.Lock()
@@ -1258,6 +1274,94 @@ def set_product_image_urls_with_description_updates(
     return updated_payload
 
 
+def rakuten_image_identity_key(image_url: str) -> str:
+    normalized_url = normalize_product_image_url(image_url)
+    if not normalized_url:
+        return ""
+    parsed = urlsplit(normalized_url)
+    if parsed.hostname not in RAKUTEN_IMAGE_CDN_HOSTS:
+        return ""
+    path = unquote(parsed.path or "").replace("\\", "/")
+    return path.lower().rstrip("/")
+
+
+def rakuten_image_quality_score(image_url: str) -> tuple[int, int]:
+    parsed = urlsplit(image_url)
+    query = parse_qs(parsed.query)
+    resized = any(key.lower() in {"_ex", "fitin", "resize", "width", "height"} for key in query)
+    preferred_host = 1 if parsed.hostname == "image.rakuten.co.jp" else 0
+    return (0 if resized else 1, preferred_host)
+
+
+def preferred_rakuten_image_urls(image_urls: list[str]) -> tuple[list[str], dict[str, str]]:
+    source_urls = unique_texts(image_urls)
+    best_by_identity: dict[str, str] = {}
+    for image_url in source_urls:
+        identity = rakuten_image_identity_key(image_url)
+        if not identity:
+            continue
+        current = best_by_identity.get(identity)
+        if current is None or rakuten_image_quality_score(image_url) > rakuten_image_quality_score(current):
+            best_by_identity[identity] = image_url
+
+    selected_urls: list[str] = []
+    aliases: dict[str, str] = {}
+    emitted_identities: set[str] = set()
+    for image_url in source_urls:
+        identity = rakuten_image_identity_key(image_url)
+        if not identity:
+            selected_urls.append(image_url)
+            continue
+        preferred_url = best_by_identity[identity]
+        aliases[image_url] = preferred_url
+        if identity not in emitted_identities:
+            selected_urls.append(preferred_url)
+            emitted_identities.add(identity)
+    return unique_texts(selected_urls), aliases
+
+
+def product_image_visual_signature(content: bytes) -> ProductImageVisualSignature | None:
+    try:
+        from PIL import Image, ImageOps, UnidentifiedImageError
+
+        with Image.open(BytesIO(content)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            width, height = image.size
+            if width < 1 or height < 1:
+                return None
+            pixels = image.resize(PRODUCT_IMAGE_VISUAL_SIZE, Image.Resampling.LANCZOS).tobytes()
+            return ProductImageVisualSignature(width=width, height=height, pixels=pixels)
+    except (OSError, UnidentifiedImageError):
+        return None
+
+
+def product_images_visually_equal(
+    first: ProductImageVisualSignature,
+    second: ProductImageVisualSignature,
+) -> bool:
+    first_ratio = first.width / first.height
+    second_ratio = second.width / second.height
+    if abs(first_ratio - second_ratio) / max(first_ratio, second_ratio) > PRODUCT_IMAGE_VISUAL_MAX_ASPECT_RATIO_DIFFERENCE:
+        return False
+    if len(first.pixels) != len(second.pixels) or not first.pixels:
+        return False
+    difference = sum(abs(a - b) for a, b in zip(first.pixels, second.pixels)) / len(first.pixels)
+    return difference <= PRODUCT_IMAGE_VISUAL_MAX_MEAN_DIFFERENCE
+
+
+def canonical_product_image_url_by_visual_content(
+    content: bytes,
+    visual_content_urls: list[tuple[ProductImageVisualSignature, str]],
+) -> tuple[str, ProductImageVisualSignature | None]:
+    signature = product_image_visual_signature(content)
+    if signature is None:
+        return "", None
+    for known_signature, known_url in visual_content_urls:
+        if product_images_visually_equal(signature, known_signature):
+            return known_url, signature
+    return "", signature
+
+
 def localize_collected_product_images(owner_username: str, product_id: int) -> str:
     referenced_local_urls: list[str] = []
     with session_scope() as session:
@@ -1274,17 +1378,20 @@ def localize_collected_product_images(owner_username: str, product_id: int) -> s
             source_images.insert(0, product.image_url)
 
     content_hash_urls: dict[str, str] = {}
+    visual_content_urls: list[tuple[ProductImageVisualSignature, str]] = []
     image_result = localize_product_image_urls(
         product_id,
         source_images,
         prefix="p",
         content_hash_urls=content_hash_urls,
+        visual_content_urls=visual_content_urls,
     )
     description_result = localize_product_description_images(
         product_id,
         raw_payload,
         existing_replacements=image_result["replacementMap"],
         content_hash_urls=content_hash_urls,
+        visual_content_urls=visual_content_urls,
     )
     replacement_map = {**image_result["replacementMap"], **description_result["replacementMap"]}
 
@@ -1343,12 +1450,14 @@ def localize_product_image_urls(
     *,
     prefix: str,
     content_hash_urls: dict[str, str] | None = None,
+    visual_content_urls: list[tuple[ProductImageVisualSignature, str]] | None = None,
 ) -> dict[str, Any]:
     local_urls: list[str] = []
     replacement_map: dict[str, str] = {}
     errors: list[str] = []
     known_content_hash_urls = content_hash_urls if content_hash_urls is not None else {}
-    source_urls = unique_texts(image_urls)
+    known_visual_content_urls = visual_content_urls if visual_content_urls is not None else []
+    source_urls, source_aliases = preferred_rakuten_image_urls(image_urls)
     if not source_urls:
         errors.append("未采集到商品主图。")
     for index, image_url in enumerate(source_urls, start=1):
@@ -1360,6 +1469,7 @@ def localize_product_image_urls(
             canonical_url = localized_product_image_url_by_content(
                 image_url,
                 known_content_hash_urls,
+                known_visual_content_urls,
             )
             replacement_map[image_url] = canonical_url
             if canonical_url not in local_urls:
@@ -1371,12 +1481,17 @@ def localize_product_image_urls(
                 image_url,
                 f"{prefix}{index:02d}",
                 content_hash_urls=known_content_hash_urls,
+                visual_content_urls=known_visual_content_urls,
             )
         except Exception as exc:
             errors.append(f"{image_url}: {exc}")
             continue
         replacement_map[image_url] = local_url
         local_urls.append(local_url)
+    for alias_url, preferred_url in source_aliases.items():
+        canonical_url = replacement_map.get(preferred_url)
+        if canonical_url:
+            replacement_map[alias_url] = canonical_url
     return {"urls": unique_texts(local_urls), "replacementMap": replacement_map, "errors": errors}
 
 
@@ -1386,6 +1501,7 @@ def localize_product_description_images(
     *,
     existing_replacements: dict[str, str] | None = None,
     content_hash_urls: dict[str, str] | None = None,
+    visual_content_urls: list[tuple[ProductImageVisualSignature, str]] | None = None,
 ) -> dict[str, Any]:
     description_urls = unique_texts(
         [
@@ -1401,6 +1517,7 @@ def localize_product_description_images(
     removed_urls: list[str] = []
     known_replacements = existing_replacements or {}
     known_content_hash_urls = content_hash_urls if content_hash_urls is not None else {}
+    known_visual_content_urls = visual_content_urls if visual_content_urls is not None else []
     for index, image_url in enumerate(description_urls, start=1):
         if is_gif_image_url(image_url):
             removed_urls.append(image_url)
@@ -1410,6 +1527,7 @@ def localize_product_description_images(
             replacement_map[image_url] = localized_product_image_url_by_content(
                 image_url,
                 known_content_hash_urls,
+                known_visual_content_urls,
             )
             continue
         if image_url in known_replacements:
@@ -1421,6 +1539,7 @@ def localize_product_description_images(
                 image_url,
                 f"d{index:02d}",
                 content_hash_urls=known_content_hash_urls,
+                visual_content_urls=known_visual_content_urls,
             )
         except ProductImageUnavailableError as exc:
             removed_urls.append(image_url)
@@ -1433,6 +1552,7 @@ def localize_product_description_images(
 def localized_product_image_url_by_content(
     image_url: str,
     content_hash_urls: dict[str, str],
+    visual_content_urls: list[tuple[ProductImageVisualSignature, str]],
 ) -> str:
     try:
         image_data = load_product_image_bytes(
@@ -1446,7 +1566,16 @@ def localized_product_image_url_by_content(
     canonical_url = content_hash_urls.get(digest)
     if canonical_url:
         return canonical_url
+    canonical_url, visual_signature = canonical_product_image_url_by_visual_content(
+        image_data["content"],
+        visual_content_urls,
+    )
+    if canonical_url:
+        content_hash_urls[digest] = canonical_url
+        return canonical_url
     content_hash_urls[digest] = image_url
+    if visual_signature is not None:
+        visual_content_urls.append((visual_signature, image_url))
     return image_url
 
 
@@ -1456,6 +1585,7 @@ def save_remote_product_image(
     name_prefix: str,
     *,
     content_hash_urls: dict[str, str] | None = None,
+    visual_content_urls: list[tuple[ProductImageVisualSignature, str]] | None = None,
 ) -> str:
     image_data = load_product_image_bytes(
         image_url,
@@ -1467,6 +1597,14 @@ def save_remote_product_image(
     canonical_url = known_content_hash_urls.get(digest)
     if canonical_url:
         return canonical_url
+    known_visual_content_urls = visual_content_urls if visual_content_urls is not None else []
+    canonical_url, visual_signature = canonical_product_image_url_by_visual_content(
+        image_data["content"],
+        known_visual_content_urls,
+    )
+    if canonical_url:
+        known_content_hash_urls[digest] = canonical_url
+        return canonical_url
     safe_name = f"{name_prefix}-{uuid.uuid4().hex[:12]}{image_data['suffix']}"
     target_url = local_product_image_url(product_id, safe_name)
     store_product_image_content(
@@ -1476,6 +1614,8 @@ def save_remote_product_image(
         LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id)) / safe_name,
     )
     known_content_hash_urls[digest] = target_url
+    if visual_signature is not None:
+        known_visual_content_urls.append((visual_signature, target_url))
     return target_url
 
 

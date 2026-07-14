@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from PIL import Image
+
 from app.services import crawler_service
 from app.services.product_image_storage import ObjectFingerprint, StoredObject
 
@@ -99,6 +101,91 @@ class ProductImageStorageIntegrationTests(unittest.TestCase):
         for item in reversed(self.patches):
             item.stop()
         self.temp_dir.cleanup()
+
+    @staticmethod
+    def encoded_test_image(
+        *,
+        size: tuple[int, int],
+        quality: int,
+    ) -> bytes:
+        image = Image.new("RGB", (320, 240), "white")
+        for x in range(40, 280):
+            for y in range(30, 210):
+                image.putpixel((x, y), ((x * 3) % 255, (y * 5) % 255, ((x + y) * 2) % 255))
+        image = image.resize(size, Image.Resampling.LANCZOS)
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=quality)
+        return output.getvalue()
+
+    def test_rakuten_image_identity_ignores_cdn_host_and_resize_query(self):
+        full_url = "https://image.rakuten.co.jp/okeya-2020/cabinet/a/b/ac03.jpg"
+        thumbnail_url = (
+            "https://tshop.r10s.jp/okeya-2020/cabinet/a/b/ac03.jpg"
+            "?_ex=200x200&s=0&r=1"
+        )
+
+        self.assertEqual(
+            crawler_service.rakuten_image_identity_key(full_url),
+            crawler_service.rakuten_image_identity_key(thumbnail_url),
+        )
+
+    def test_localization_prefers_full_rakuten_image_over_thumbnail_variant(self):
+        thumbnail_url = (
+            "https://tshop.r10s.jp/okeya-2020/cabinet/a/b/ac03.jpg"
+            "?_ex=200x200&s=0&r=1"
+        )
+        full_url = "https://image.rakuten.co.jp/okeya-2020/cabinet/a/b/ac03.jpg"
+        image_data = {
+            "content": self.encoded_test_image(size=(800, 1058), quality=92),
+            "suffix": ".jpg",
+            "contentType": "image/jpeg",
+        }
+
+        with patch.object(
+            crawler_service,
+            "load_product_image_bytes",
+            return_value=image_data,
+        ) as load_image:
+            result = crawler_service.localize_product_image_urls(
+                12,
+                [thumbnail_url, full_url],
+                prefix="p",
+            )
+
+        self.assertEqual(len(result["urls"]), 1)
+        self.assertEqual(load_image.call_count, 1)
+        self.assertEqual(load_image.call_args.args[0], full_url)
+        self.assertEqual(result["replacementMap"][thumbnail_url], result["urls"][0])
+        self.assertEqual(result["replacementMap"][full_url], result["urls"][0])
+
+    def test_localization_deduplicates_resized_reencoded_visual_copy(self):
+        full_url = "https://example.test/full.jpg"
+        thumbnail_url = "https://cdn.example.test/thumb.jpg"
+        full_image = {
+            "content": self.encoded_test_image(size=(800, 600), quality=94),
+            "suffix": ".jpg",
+            "contentType": "image/jpeg",
+        }
+        thumbnail_image = {
+            "content": self.encoded_test_image(size=(200, 150), quality=76),
+            "suffix": ".jpg",
+            "contentType": "image/jpeg",
+        }
+
+        with patch.object(
+            crawler_service,
+            "load_product_image_bytes",
+            side_effect=[full_image, thumbnail_image],
+        ):
+            result = crawler_service.localize_product_image_urls(
+                12,
+                [full_url, thumbnail_url],
+                prefix="p",
+            )
+
+        self.assertEqual(len(result["urls"]), 1)
+        self.assertEqual(result["replacementMap"][thumbnail_url], result["urls"][0])
+        self.assertEqual(len(self.storage.put_calls), 1)
 
     def test_uploaded_image_is_written_to_oss_without_local_file(self):
         upload = SimpleNamespace(

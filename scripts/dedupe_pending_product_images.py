@@ -18,7 +18,6 @@ from sqlalchemy import func, select
 from app.db.database import session_scope
 from app.db.models import ProductModel
 from app.services import crawler_service
-from app.services.product_image_storage import parse_product_image_url, product_image_storage
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,18 +50,19 @@ def product_image_references(product: ProductModel) -> tuple[dict[str, Any], lis
     return payload, main_urls, description_urls
 
 
-def image_content_digest(image_url: str) -> str:
-    stored_image = parse_product_image_url(image_url)
-    if stored_image is not None and product_image_storage.enabled:
-        fingerprint = product_image_storage.object_fingerprint(stored_image.object_key)
-        if fingerprint is not None and fingerprint.sha256:
-            return fingerprint.sha256
+def image_content_fingerprint(
+    image_url: str,
+) -> tuple[str, crawler_service.ProductImageVisualSignature | None]:
     image_data = crawler_service.load_product_image_bytes(
         image_url,
         max_bytes=crawler_service.MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
         size_error_message="图片下载大小不能超过 20MB。",
     )
-    return hashlib.sha256(image_data["content"]).hexdigest()
+    content = image_data["content"]
+    return (
+        hashlib.sha256(content).hexdigest(),
+        crawler_service.product_image_visual_signature(content),
+    )
 
 
 def build_deduplication(
@@ -72,29 +72,58 @@ def build_deduplication(
     workers: int,
 ) -> tuple[list[str], dict[str, str], list[str]]:
     all_urls = crawler_service.unique_texts([*main_urls, *description_urls])
-    digests: dict[str, str] = {}
+    fingerprints: dict[
+        str,
+        tuple[str, crawler_service.ProductImageVisualSignature | None],
+    ] = {}
     errors: list[str] = []
 
-    def resolve(image_url: str) -> tuple[str, str, str]:
+    def resolve(
+        image_url: str,
+    ) -> tuple[
+        str,
+        tuple[str, crawler_service.ProductImageVisualSignature | None] | None,
+        str,
+    ]:
         try:
-            return image_url, image_content_digest(image_url), ""
+            return image_url, image_content_fingerprint(image_url), ""
         except Exception as exc:
-            return image_url, "", str(exc)
+            return image_url, None, str(exc)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        for image_url, digest, error in executor.map(resolve, all_urls):
-            if digest:
-                digests[image_url] = digest
+        for image_url, fingerprint, error in executor.map(resolve, all_urls):
+            if fingerprint:
+                fingerprints[image_url] = fingerprint
             elif error:
                 errors.append(f"{image_url}: {error}")
 
     canonical_by_digest: dict[str, str] = {}
+    canonical_visuals: list[
+        tuple[crawler_service.ProductImageVisualSignature, str]
+    ] = []
     replacement_map: dict[str, str] = {}
     deduplicated_main_urls: list[str] = []
 
     for image_url in [*main_urls, *description_urls]:
-        digest = digests.get(image_url)
-        canonical_url = canonical_by_digest.setdefault(digest, image_url) if digest else image_url
+        fingerprint = fingerprints.get(image_url)
+        digest, visual_signature = fingerprint if fingerprint else ("", None)
+        canonical_url = canonical_by_digest.get(digest, "") if digest else ""
+        if not canonical_url and visual_signature is not None:
+            for known_signature, known_url in canonical_visuals:
+                if crawler_service.product_images_visually_equal(
+                    visual_signature,
+                    known_signature,
+                ):
+                    canonical_url = known_url
+                    break
+        if not canonical_url:
+            canonical_url = image_url
+            if digest:
+                canonical_by_digest[digest] = image_url
+            if visual_signature is not None:
+                canonical_visuals.append((visual_signature, image_url))
+        elif digest:
+            canonical_by_digest[digest] = canonical_url
         if canonical_url != image_url:
             replacement_map[image_url] = canonical_url
         if image_url in main_urls and canonical_url not in deduplicated_main_urls:
