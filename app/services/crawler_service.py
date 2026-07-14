@@ -1279,6 +1279,8 @@ def trusted_product_main_image_urls(
         pc_fields = embedded_item.get("pcFields")
         if isinstance(pc_fields, dict):
             collect(pc_fields.get("images"))
+            if urls:
+                return urls
         media = embedded_item.get("media")
         if isinstance(media, dict):
             collect(media.get("images"))

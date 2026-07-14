@@ -235,7 +235,33 @@ class ProductImageStorageIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             crawler_service.trusted_product_main_image_urls(payload, shop_code="shop"),
-            [primary_url, sku_url],
+            [primary_url],
+        )
+
+    def test_trusted_product_main_images_fall_back_to_media_when_pc_images_are_missing(self):
+        media_url = "https://tshop.r10s.jp/shop/cabinet/product/main.jpg"
+        sku_url = "https://tshop.r10s.jp/shop/cabinet/product/sku.jpg"
+        payload = {
+            "embeddedItem": {
+                "media": {
+                    "images": [{"location": media_url}],
+                    "skuImages": [{"location": sku_url}],
+                },
+                "embeddedPayload": {
+                    "newApi": {
+                        "topicsList": [
+                            {
+                                "imageUrl": "https://tshop.r10s.jp/shop/cabinet/topics/watch.jpg"
+                            }
+                        ]
+                    }
+                },
+            }
+        }
+
+        self.assertEqual(
+            crawler_service.trusted_product_main_image_urls(payload, shop_code="shop"),
+            [media_url, sku_url],
         )
 
     def test_product_shop_code_prefers_explicit_payload_over_local_image_url(self):
