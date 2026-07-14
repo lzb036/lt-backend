@@ -234,6 +234,45 @@ class ProductModel(TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
+class AiTitleSettingsModel(TimestampMixin, Base):
+    __tablename__ = "lt_ai_title_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    api_base_url: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    api_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False, default="qwen-vl-max")
+    title_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    subtitle_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    temperature: Mapped[str] = mapped_column(String(16), nullable=False, default="0.3")
+    max_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=1000, server_default="1000")
+
+
+class ProductTitleVersionModel(TimestampMixin, Base):
+    __tablename__ = "lt_product_title_versions"
+    __table_args__ = (
+        Index("ix_lt_product_title_version_product_created", "product_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("lt_products.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    subtitle: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="ai", server_default="ai")
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    input_snapshot_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    is_selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+
 class ListingTaskModel(TimestampMixin, Base):
     __tablename__ = "lt_listing_tasks"
     __table_args__ = (

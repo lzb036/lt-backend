@@ -148,6 +148,21 @@ class ProductDetailEditPayload(BaseModel):
     imageChanges: ProductImageChangesPayload | None = None
 
 
+class AiTitleSettingsPayload(BaseModel):
+    enabled: bool = True
+    apiBaseUrl: str = Field(min_length=1, max_length=500)
+    apiKey: str = Field(default="", max_length=1000)
+    modelName: str = Field(min_length=1, max_length=255)
+    titlePrompt: str = Field(min_length=1, max_length=10000)
+    subtitlePrompt: str = Field(min_length=1, max_length=10000)
+    temperature: float = Field(default=0.3, ge=0, le=2)
+    maxTokens: int = Field(default=1000, ge=100, le=10000)
+
+
+class AiTitleVersionSavePayload(BaseModel):
+    versionId: int = Field(gt=0)
+
+
 class ListingTaskPayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
     storeId: int | None = None
@@ -619,6 +634,81 @@ def update_product_local_detail(
         return {"product": crawler_service.update_product_local_detail(user["username"], product_id, payload)}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/settings/ai-title")
+def get_ai_title_settings(_: dict = Depends(require_superadmin)) -> dict:
+    from app.services import ai_title_service
+
+    return {"settings": ai_title_service.get_settings()}
+
+
+@router.put("/settings/ai-title")
+def update_ai_title_settings(payload: AiTitleSettingsPayload, _: dict = Depends(require_superadmin)) -> dict:
+    from app.services import ai_title_service
+
+    try:
+        return {"settings": ai_title_service.update_settings(payload)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/settings/ai-title/test")
+def test_ai_title_settings(_: dict = Depends(require_superadmin)) -> dict:
+    from app.services import ai_title_service
+
+    try:
+        return ai_title_service.test_settings_connection()
+    except (RuntimeError, requests.RequestException) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/products/{product_id}/title-versions")
+def list_product_title_versions(
+    product_id: int,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    from app.services import ai_title_service
+
+    try:
+        return ai_title_service.list_versions(user["username"], product_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/products/{product_id}/title-versions/save")
+def save_product_title_version(
+    product_id: int,
+    payload: AiTitleVersionSavePayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    from app.services import ai_title_service
+
+    try:
+        return {"version": ai_title_service.save_title_version(user["username"], product_id, payload.versionId)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/products/{product_id}/title-versions/generate")
+def generate_product_title_version(
+    product_id: int,
+    user: dict = Depends(require_products_permission),
+) -> StreamingResponse:
+    from app.services import ai_title_service
+
+    def stream():
+        try:
+            for event in ai_title_service.stream_generate_version(user["username"], product_id, user["username"]):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/products/{product_id}/images/{image_index}/download")

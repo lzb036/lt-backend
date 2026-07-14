@@ -8726,6 +8726,10 @@ def update_product_status(owner_username: str, product_ids: list[int], status: s
             row.review_status = status
             if message:
                 row.last_error = message if status in {"error", "rejected"} else None
+            if status == "approved":
+                from app.services.ai_title_service import cleanup_title_versions_for_approved_product
+
+                cleanup_title_versions_for_approved_product(session, row)
         session.flush()
         return [product_to_public(row) for row in rows]
 
