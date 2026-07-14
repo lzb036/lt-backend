@@ -235,7 +235,7 @@ class ProductImageStorageIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             crawler_service.trusted_product_main_image_urls(payload, shop_code="shop"),
-            [primary_url],
+            [primary_url, sku_url],
         )
 
     def test_trusted_product_main_images_fall_back_to_media_when_pc_images_are_missing(self):

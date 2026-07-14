@@ -1279,9 +1279,14 @@ def trusted_product_main_image_urls(
         pc_fields = embedded_item.get("pcFields")
         if isinstance(pc_fields, dict):
             collect(pc_fields.get("images"))
-            if urls:
-                return urls
         media = embedded_item.get("media")
+        if urls:
+            if isinstance(media, dict):
+                collect(media.get("skuImages"))
+            for sku in embedded_item.get("sku") if isinstance(embedded_item.get("sku"), list) else []:
+                if isinstance(sku, dict):
+                    collect(sku.get("images"))
+            return urls
         if isinstance(media, dict):
             collect(media.get("images"))
             collect(media.get("skuImages"))
