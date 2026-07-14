@@ -132,6 +132,73 @@ class ProductImageStorageIntegrationTests(unittest.TestCase):
         self.assertEqual(self.storage.objects[stored.object_key], b"edited")
         self.assertEqual(self.storage.put_calls[0][2], "image/png")
 
+    def test_localization_reuses_first_image_when_remote_urls_have_same_content(self):
+        first_url = "https://tshop.r10s.jp/example/a.jpg"
+        duplicate_url = "https://image.rakuten.co.jp/example/cabinet/a-copy.jpg"
+        image_data = {
+            "content": b"same-image",
+            "suffix": ".jpg",
+            "contentType": "image/jpeg",
+        }
+
+        with patch.object(
+            crawler_service,
+            "load_product_image_bytes",
+            side_effect=[image_data, image_data],
+        ):
+            result = crawler_service.localize_product_image_urls(
+                12,
+                [first_url, duplicate_url],
+                prefix="p",
+            )
+
+        self.assertEqual(len(result["urls"]), 1)
+        self.assertEqual(result["replacementMap"][first_url], result["urls"][0])
+        self.assertEqual(result["replacementMap"][duplicate_url], result["urls"][0])
+        self.assertEqual(len(self.storage.put_calls), 1)
+
+    def test_description_localization_reuses_matching_main_image_content(self):
+        main_url = "https://tshop.r10s.jp/example/main.jpg"
+        description_url = "https://tshop.r10s.jp/example/description-copy.jpg"
+        image_data = {
+            "content": b"same-image",
+            "suffix": ".jpg",
+            "contentType": "image/jpeg",
+        }
+        raw_payload = {
+            "descriptions": [
+                {
+                    "label": "PC用 商品説明文",
+                    "value": f'<img src="{description_url}">',
+                }
+            ]
+        }
+        content_hash_urls: dict[str, str] = {}
+
+        with patch.object(
+            crawler_service,
+            "load_product_image_bytes",
+            side_effect=[image_data, image_data],
+        ):
+            image_result = crawler_service.localize_product_image_urls(
+                13,
+                [main_url],
+                prefix="p",
+                content_hash_urls=content_hash_urls,
+            )
+            description_result = crawler_service.localize_product_description_images(
+                13,
+                raw_payload,
+                existing_replacements=image_result["replacementMap"],
+                content_hash_urls=content_hash_urls,
+            )
+
+        self.assertEqual(
+            description_result["replacementMap"][description_url],
+            image_result["urls"][0],
+        )
+        self.assertEqual(len(self.storage.put_calls), 1)
+
     def test_oss_read_precedes_existing_local_fallback(self):
         image_url = crawler_service.local_product_image_url(3, "a.jpg")
         local_path = self.product_root / "3" / "a.jpg"

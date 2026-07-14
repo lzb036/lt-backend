@@ -1273,11 +1273,18 @@ def localize_collected_product_images(owner_username: str, product_id: int) -> s
         if product.image_url and product.image_url not in source_images:
             source_images.insert(0, product.image_url)
 
-    image_result = localize_product_image_urls(product_id, source_images, prefix="p")
+    content_hash_urls: dict[str, str] = {}
+    image_result = localize_product_image_urls(
+        product_id,
+        source_images,
+        prefix="p",
+        content_hash_urls=content_hash_urls,
+    )
     description_result = localize_product_description_images(
         product_id,
         raw_payload,
         existing_replacements=image_result["replacementMap"],
+        content_hash_urls=content_hash_urls,
     )
     replacement_map = {**image_result["replacementMap"], **description_result["replacementMap"]}
 
@@ -1330,10 +1337,17 @@ def localize_collected_product_images(owner_username: str, product_id: int) -> s
     return result
 
 
-def localize_product_image_urls(product_id: int, image_urls: list[str], *, prefix: str) -> dict[str, Any]:
+def localize_product_image_urls(
+    product_id: int,
+    image_urls: list[str],
+    *,
+    prefix: str,
+    content_hash_urls: dict[str, str] | None = None,
+) -> dict[str, Any]:
     local_urls: list[str] = []
     replacement_map: dict[str, str] = {}
     errors: list[str] = []
+    known_content_hash_urls = content_hash_urls if content_hash_urls is not None else {}
     source_urls = unique_texts(image_urls)
     if not source_urls:
         errors.append("未采集到商品主图。")
@@ -1343,11 +1357,21 @@ def localize_product_image_urls(product_id: int, image_urls: list[str], *, prefi
         if is_gif_image_url(image_url):
             continue
         if is_local_product_image_url(image_url):
-            if image_url not in local_urls:
-                local_urls.append(image_url)
+            canonical_url = localized_product_image_url_by_content(
+                image_url,
+                known_content_hash_urls,
+            )
+            replacement_map[image_url] = canonical_url
+            if canonical_url not in local_urls:
+                local_urls.append(canonical_url)
             continue
         try:
-            local_url = save_remote_product_image(product_id, image_url, f"{prefix}{index:02d}")
+            local_url = save_remote_product_image(
+                product_id,
+                image_url,
+                f"{prefix}{index:02d}",
+                content_hash_urls=known_content_hash_urls,
+            )
         except Exception as exc:
             errors.append(f"{image_url}: {exc}")
             continue
@@ -1361,6 +1385,7 @@ def localize_product_description_images(
     raw_payload: dict[str, Any],
     *,
     existing_replacements: dict[str, str] | None = None,
+    content_hash_urls: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     description_urls = unique_texts(
         [
@@ -1375,18 +1400,28 @@ def localize_product_description_images(
     warnings: list[str] = []
     removed_urls: list[str] = []
     known_replacements = existing_replacements or {}
+    known_content_hash_urls = content_hash_urls if content_hash_urls is not None else {}
     for index, image_url in enumerate(description_urls, start=1):
         if is_gif_image_url(image_url):
             removed_urls.append(image_url)
             warnings.append(f"{image_url}: GIF 图片已从详情说明移除。")
             continue
         if is_local_product_image_url(image_url):
+            replacement_map[image_url] = localized_product_image_url_by_content(
+                image_url,
+                known_content_hash_urls,
+            )
             continue
         if image_url in known_replacements:
             replacement_map[image_url] = known_replacements[image_url]
             continue
         try:
-            replacement_map[image_url] = save_remote_product_image(product_id, image_url, f"d{index:02d}")
+            replacement_map[image_url] = save_remote_product_image(
+                product_id,
+                image_url,
+                f"d{index:02d}",
+                content_hash_urls=known_content_hash_urls,
+            )
         except ProductImageUnavailableError as exc:
             removed_urls.append(image_url)
             warnings.append(f"{image_url}: {exc}，已从详情说明移除。")
@@ -1395,12 +1430,43 @@ def localize_product_description_images(
     return {"replacementMap": replacement_map, "errors": errors, "warnings": warnings, "removedUrls": unique_texts(removed_urls)}
 
 
-def save_remote_product_image(product_id: int, image_url: str, name_prefix: str) -> str:
+def localized_product_image_url_by_content(
+    image_url: str,
+    content_hash_urls: dict[str, str],
+) -> str:
+    try:
+        image_data = load_product_image_bytes(
+            image_url,
+            max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+            size_error_message="图片下载大小不能超过 20MB。",
+        )
+    except Exception:
+        return image_url
+    digest = hashlib.sha256(image_data["content"]).hexdigest()
+    canonical_url = content_hash_urls.get(digest)
+    if canonical_url:
+        return canonical_url
+    content_hash_urls[digest] = image_url
+    return image_url
+
+
+def save_remote_product_image(
+    product_id: int,
+    image_url: str,
+    name_prefix: str,
+    *,
+    content_hash_urls: dict[str, str] | None = None,
+) -> str:
     image_data = load_product_image_bytes(
         image_url,
         max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
         size_error_message="图片下载大小不能超过 20MB。",
     )
+    digest = hashlib.sha256(image_data["content"]).hexdigest()
+    known_content_hash_urls = content_hash_urls if content_hash_urls is not None else {}
+    canonical_url = known_content_hash_urls.get(digest)
+    if canonical_url:
+        return canonical_url
     safe_name = f"{name_prefix}-{uuid.uuid4().hex[:12]}{image_data['suffix']}"
     target_url = local_product_image_url(product_id, safe_name)
     store_product_image_content(
@@ -1409,6 +1475,7 @@ def save_remote_product_image(product_id: int, image_url: str, name_prefix: str)
         image_data["contentType"],
         LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id)) / safe_name,
     )
+    known_content_hash_urls[digest] = target_url
     return target_url
 
 
