@@ -238,6 +238,20 @@ class ProductImageStorageIntegrationTests(unittest.TestCase):
             [primary_url, sku_url],
         )
 
+    def test_product_shop_code_prefers_explicit_payload_over_local_image_url(self):
+        product = SimpleNamespace(
+            image_url="/api/static/product-images/86975/p01.jpg",
+            source_url="https://item.rakuten.co.jp/okeya-2020/20230722001/",
+        )
+
+        self.assertEqual(
+            crawler_service.product_shop_code(
+                product,
+                {"shopCode": "okeya-2020"},
+            ),
+            "okeya-2020",
+        )
+
     def test_uploaded_image_is_written_to_oss_without_local_file(self):
         upload = SimpleNamespace(
             filename="photo.jpg",

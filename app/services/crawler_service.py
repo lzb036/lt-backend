@@ -1183,9 +1183,9 @@ def product_descriptions_for_display(raw_payload: dict[str, Any], images: list[s
 
 def product_shop_code(row: ProductModel, raw_payload: dict[str, Any]) -> str:
     for value in (
-        row.image_url,
-        row.source_url,
         first_text_from_keys(raw_payload, ("shopCode", "shop_code", "shopUrl", "shop_url")),
+        row.source_url,
+        row.image_url,
     ):
         shop_code = normalize_shop_code(value)
         if shop_code:
