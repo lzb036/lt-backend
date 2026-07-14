@@ -187,6 +187,57 @@ class ProductImageStorageIntegrationTests(unittest.TestCase):
         self.assertEqual(result["replacementMap"][thumbnail_url], result["urls"][0])
         self.assertEqual(len(self.storage.put_calls), 1)
 
+    def test_product_image_urls_do_not_scan_embedded_promotions_when_images_are_explicit(self):
+        product_url = "https://image.rakuten.co.jp/shop/cabinet/product/main.jpg"
+        topic_url = "https://tshop.r10s.jp/shop/cabinet/topics/watch.jpg"
+        payload = {
+            "images": [product_url],
+            "embeddedItem": {
+                "embeddedPayload": {
+                    "api": {
+                        "data": {
+                            "topicsList": [{"imageUrl": topic_url}],
+                            "mnoPromotion": {
+                                "image": {
+                                    "url": "https://www.rakuten.co.jp/com/inc/item/mno/img/mobile_pr.png"
+                                }
+                            },
+                        }
+                    }
+                }
+            },
+        }
+
+        self.assertEqual(
+            crawler_service.product_image_urls(payload, shop_code="shop"),
+            [product_url],
+        )
+
+    def test_trusted_product_main_images_use_only_whitelisted_embedded_fields(self):
+        primary_url = "https://tshop.r10s.jp/shop/cabinet/product/main.jpg"
+        sku_url = "https://tshop.r10s.jp/shop/cabinet/product/sku.jpg"
+        topic_url = "https://tshop.r10s.jp/shop/cabinet/topics/watch.jpg"
+        payload = {
+            "embeddedItem": {
+                "pcFields": {
+                    "images": [{"location": primary_url}],
+                },
+                "media": {
+                    "skuImages": [{"location": sku_url}],
+                },
+                "embeddedPayload": {
+                    "newApi": {
+                        "topicsList": [{"imageUrl": topic_url}],
+                    }
+                },
+            }
+        }
+
+        self.assertEqual(
+            crawler_service.trusted_product_main_image_urls(payload, shop_code="shop"),
+            [primary_url, sku_url],
+        )
+
     def test_uploaded_image_is_written_to_oss_without_local_file(self):
         upload = SimpleNamespace(
             filename="photo.jpg",

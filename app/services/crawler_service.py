@@ -1229,7 +1229,85 @@ def product_image_urls(raw_payload: dict[str, Any], *, shop_code: str = "") -> l
             for child in value:
                 collect(child)
 
-    collect(raw_payload)
+    explicit_images = raw_payload.get("images")
+    if isinstance(explicit_images, list):
+        collect(explicit_images)
+        if urls:
+            return urls
+
+    for image_url in trusted_product_main_image_urls(raw_payload, shop_code=shop_code):
+        remember(image_url)
+    return urls
+
+
+def trusted_product_main_image_urls(
+    raw_payload: dict[str, Any],
+    *,
+    shop_code: str = "",
+) -> list[str]:
+    urls: list[str] = []
+
+    def remember(value: Any) -> None:
+        url = normalize_product_image_url(value, shop_code=shop_code)
+        if url and url not in urls:
+            urls.append(url)
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            remember(value)
+            return
+        if isinstance(value, dict):
+            for key in ("location", "url", "imageUrl", "src", "value"):
+                collect(value.get(key))
+            return
+        if isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    explicit_images = raw_payload.get("images")
+    if isinstance(explicit_images, list):
+        explicit_remote_urls: list[str] = []
+        for image in explicit_images:
+            url = normalize_product_image_url(image, shop_code=shop_code)
+            if url and not is_local_product_image_url(url) and not is_product_image_draft_url(url):
+                explicit_remote_urls.append(url)
+        if explicit_remote_urls:
+            return unique_texts(explicit_remote_urls)
+
+    embedded_item = raw_payload.get("embeddedItem")
+    if isinstance(embedded_item, dict):
+        pc_fields = embedded_item.get("pcFields")
+        if isinstance(pc_fields, dict):
+            collect(pc_fields.get("images"))
+        media = embedded_item.get("media")
+        if isinstance(media, dict):
+            collect(media.get("images"))
+            collect(media.get("skuImages"))
+        collect(embedded_item.get("picImageUrl"))
+        for sku in embedded_item.get("sku") if isinstance(embedded_item.get("sku"), list) else []:
+            if isinstance(sku, dict):
+                collect(sku.get("images"))
+
+    media = raw_payload.get("media")
+    if isinstance(media, dict):
+        collect(media.get("images"))
+        collect(media.get("skuImages"))
+    collect(raw_payload.get("imageUrl"))
+    collect(raw_payload.get("imageUrls"))
+
+    variants = raw_payload.get("variants")
+    if isinstance(variants, dict):
+        for variant in variants.values():
+            if isinstance(variant, dict):
+                collect(variant.get("images"))
+
+    json_ld = raw_payload.get("jsonLd")
+    if isinstance(json_ld, dict):
+        collect(json_ld.get("image"))
+    elif isinstance(json_ld, list):
+        for item in json_ld:
+            if isinstance(item, dict):
+                collect(item.get("image"))
     return urls
 
 
