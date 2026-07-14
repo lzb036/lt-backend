@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from io import BytesIO
 from urllib.parse import quote
 
@@ -20,6 +21,10 @@ require_products_permission = require_permission("products.manage")
 require_stores_permission = require_permission("stores.manage")
 require_settings_permission = require_permission("settings.manage")
 require_products_or_stores_permission = require_any_permission("products.manage", "stores.manage")
+
+
+def serialize_sse_event(event: dict) -> bytes:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 SENSITIVE_WORD_TEMPLATE_FILENAME = "敏感词导入模板.xlsx"
 SENSITIVE_WORD_TEMPLATE_FALLBACK_FILENAME = "sensitive-word-template.xlsx"
 
@@ -700,9 +705,9 @@ def generate_product_title_version(
     def stream():
         try:
             for event in ai_title_service.stream_generate_version(user["username"], product_id, user["username"]):
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield serialize_sse_event(event)
         except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n".encode("utf-8")
+            yield serialize_sse_event({"type": "error", "message": str(exc)})
 
     return StreamingResponse(
         stream(),
