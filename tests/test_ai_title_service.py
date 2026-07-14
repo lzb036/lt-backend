@@ -68,3 +68,20 @@ class AiTitleServiceTests(unittest.TestCase):
 
         session.delete.assert_called_once_with(first)
         self.assertTrue(second.is_selected)
+
+    def test_ensure_current_version_adds_original_and_selects_it(self) -> None:
+        session = MagicMock()
+        product = MagicMock()
+        product.id = 7
+        product.owner_username = "operator"
+        product.title = "原始标题"
+        product.raw_payload_json = json.dumps({"tagline": "原始副标题"}, ensure_ascii=False)
+        session.scalars.return_value.all.return_value = []
+
+        version = ai_title_service.ensure_current_title_version_in_session(session, product)
+
+        self.assertEqual(version.source, "original")
+        self.assertEqual(version.title, "原始标题")
+        self.assertEqual(version.subtitle, "原始副标题")
+        self.assertTrue(version.is_selected)
+        session.add.assert_called_once_with(version)

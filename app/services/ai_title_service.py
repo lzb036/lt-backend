@@ -164,22 +164,54 @@ def version_to_public(row: ProductTitleVersionModel) -> dict[str, Any]:
     }
 
 
-def list_versions(owner_username: str, product_id: int) -> dict[str, Any]:
+def ensure_current_title_version_in_session(
+    session: Any,
+    product: ProductModel,
+) -> ProductTitleVersionModel:
     from app.services.crawler_service import product_raw_payload, product_tagline
 
+    subtitle = product_tagline(product_raw_payload(product))
+    rows = session.scalars(
+        select(ProductTitleVersionModel)
+        .where(ProductTitleVersionModel.product_id == product.id)
+        .order_by(ProductTitleVersionModel.created_at.desc(), ProductTitleVersionModel.id.desc())
+    ).all()
+    current = next(
+        (row for row in rows if row.title == product.title and row.subtitle == subtitle),
+        None,
+    )
+    if current is None:
+        current = ProductTitleVersionModel(
+            product_id=product.id,
+            owner_username=product.owner_username,
+            title=product.title,
+            subtitle=subtitle,
+            source="original",
+            model_name="",
+            input_snapshot_json="{}",
+            is_selected=True,
+            created_by=product.owner_username,
+        )
+        session.add(current)
+    for row in rows:
+        row.is_selected = row is current
+    current.is_selected = True
+    session.flush()
+    return current
+
+
+def list_versions(owner_username: str, product_id: int) -> dict[str, Any]:
     with session_scope() as session:
         product = session.get(ProductModel, product_id)
         if product is None or product.owner_username != owner_username:
             raise RuntimeError("商品不存在。")
+        ensure_current_title_version_in_session(session, product)
         rows = session.scalars(
             select(ProductTitleVersionModel)
             .where(ProductTitleVersionModel.product_id == product_id)
             .order_by(ProductTitleVersionModel.created_at.desc(), ProductTitleVersionModel.id.desc())
         ).all()
-        return {
-            "current": {"title": product.title, "subtitle": product_tagline(product_raw_payload(product))},
-            "versions": [version_to_public(row) for row in rows],
-        }
+        return {"versions": [version_to_public(row) for row in rows]}
 
 
 def save_title_version_in_session(
