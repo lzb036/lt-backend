@@ -278,6 +278,24 @@ class ProductImageStorageIntegrationTests(unittest.TestCase):
             "okeya-2020",
         )
 
+    def test_trusted_product_main_images_ignore_edited_remote_image_list(self):
+        product_url = "https://image.rakuten.co.jp/shop/cabinet/product/main.jpg"
+        promotion_url = "https://r.r10s.jp/com/img/item/Normal/direct_2000_pcv1.png"
+        payload = {
+            "images": [product_url, promotion_url],
+            "ltEditedImages": [product_url, promotion_url],
+            "embeddedItem": {
+                "pcFields": {
+                    "images": [{"location": product_url}],
+                }
+            },
+        }
+
+        self.assertEqual(
+            crawler_service.trusted_product_main_image_urls(payload, shop_code="shop"),
+            [product_url],
+        )
+
     def test_uploaded_image_is_written_to_oss_without_local_file(self):
         upload = SimpleNamespace(
             filename="photo.jpg",

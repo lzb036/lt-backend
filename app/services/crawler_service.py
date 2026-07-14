@@ -1230,7 +1230,7 @@ def product_image_urls(raw_payload: dict[str, Any], *, shop_code: str = "") -> l
                 collect(child)
 
     explicit_images = raw_payload.get("images")
-    if isinstance(explicit_images, list):
+    if isinstance(explicit_images, list) and not isinstance(raw_payload.get("ltEditedImages"), list):
         collect(explicit_images)
         if urls:
             return urls
@@ -1265,7 +1265,7 @@ def trusted_product_main_image_urls(
                 collect(child)
 
     explicit_images = raw_payload.get("images")
-    if isinstance(explicit_images, list):
+    if isinstance(explicit_images, list) and not isinstance(raw_payload.get("ltEditedImages"), list):
         explicit_remote_urls: list[str] = []
         for image in explicit_images:
             url = normalize_product_image_url(image, shop_code=shop_code)
