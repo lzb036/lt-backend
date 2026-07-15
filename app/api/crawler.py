@@ -701,6 +701,21 @@ def save_product_title_version(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.delete("/products/{product_id}/title-versions/{version_id}")
+def delete_product_title_version(
+    product_id: int,
+    version_id: int,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    from app.services import ai_title_service
+
+    try:
+        ai_title_service.delete_title_version(user["username"], product_id, version_id)
+        return {"deleted": True}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/products/{product_id}/title-versions/generate")
 def generate_product_title_version(
     product_id: int,

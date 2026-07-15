@@ -378,6 +378,37 @@ def save_title_version(owner_username: str, product_id: int, version_id: int) ->
         return version_to_public(version)
 
 
+def delete_title_version_in_session(
+    session: Any,
+    *,
+    owner_username: str,
+    product_id: int,
+    version_id: int,
+) -> None:
+    product = session.get(ProductModel, product_id)
+    version = session.get(ProductTitleVersionModel, version_id)
+    if product is None or product.owner_username != owner_username:
+        raise RuntimeError("商品不存在。")
+    if product.review_status != "pending":
+        raise RuntimeError("只有待审核商品可以删除标题历史版本。")
+    if version is None or version.product_id != product_id or version.owner_username != owner_username:
+        raise RuntimeError("标题优化版本不存在。")
+    if version.is_selected:
+        raise RuntimeError("当前使用的标题版本不能删除。")
+    session.delete(version)
+    session.flush()
+
+
+def delete_title_version(owner_username: str, product_id: int, version_id: int) -> None:
+    with session_scope() as session:
+        delete_title_version_in_session(
+            session,
+            owner_username=owner_username,
+            product_id=product_id,
+            version_id=version_id,
+        )
+
+
 def cleanup_title_versions_for_approved_product(session: Any, product: ProductModel) -> None:
     from app.services.crawler_service import product_raw_payload, product_tagline
 

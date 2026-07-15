@@ -94,3 +94,32 @@ class AiTitleServiceTests(unittest.TestCase):
         self.assertEqual(version.subtitle, "原始副标题")
         self.assertTrue(version.is_selected)
         session.add.assert_called_once_with(version)
+
+    def test_delete_title_version_rejects_current_version(self) -> None:
+        session = MagicMock()
+        product = MagicMock(owner_username="operator", review_status="pending")
+        version = MagicMock(product_id=7, owner_username="operator", is_selected=True)
+        session.get.side_effect = [product, version]
+
+        with self.assertRaisesRegex(RuntimeError, "当前使用"):
+            ai_title_service.delete_title_version_in_session(
+                session,
+                owner_username="operator",
+                product_id=7,
+                version_id=9,
+            )
+
+    def test_delete_title_version_removes_unselected_version(self) -> None:
+        session = MagicMock()
+        product = MagicMock(owner_username="operator", review_status="pending")
+        version = MagicMock(product_id=7, owner_username="operator", is_selected=False)
+        session.get.side_effect = [product, version]
+
+        ai_title_service.delete_title_version_in_session(
+            session,
+            owner_username="operator",
+            product_id=7,
+            version_id=9,
+        )
+
+        session.delete.assert_called_once_with(version)
