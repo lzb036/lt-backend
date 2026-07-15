@@ -7305,6 +7305,7 @@ def replacement_draft_from_collected_item(item: dict[str, Any]) -> dict[str, Any
     title = normalize_text(item.get("title")) or first_text_from_keys(raw, ("itemName", "title", "name"))
     genre_id = normalize_text(item.get("genre_id")) or first_text_from_keys(raw, ("genreId", "genre_id", "genre"))
     images = product_editable_image_urls(raw) or unique_texts([item.get("image_url")])
+    images, _ = preferred_rakuten_image_urls(images)
     variants = raw.get("variants") if isinstance(raw.get("variants"), dict) else {}
     price = price_from_rakuten_item(raw)
     if price is None:

@@ -68,6 +68,29 @@ class ProductReplacementTests(unittest.TestCase):
         self.assertNotIn("itemNumber", draft)
         self.assertEqual(draft["images"], ["https://example.com/new.jpg"])
 
+    def test_replacement_draft_deduplicates_rakuten_cdn_host_variants(self) -> None:
+        item = {
+            "title": "商品",
+            "genre_id": "200002",
+            "raw": {
+                "title": "商品",
+                "genreId": "200002",
+                "images": [
+                    "https://image.rakuten.co.jp/shop/cabinet/item/main.jpg",
+                    "https://tshop.r10s.jp/shop/cabinet/item/main.jpg",
+                    "https://shop.r10s.jp/shop/cabinet/item/main.jpg?_ex=128x128",
+                ],
+                "variants": {"sku": {"standardPrice": "1000"}},
+            },
+        }
+
+        draft = crawler_service.replacement_draft_from_collected_item(item)
+
+        self.assertEqual(
+            draft["images"],
+            ["https://image.rakuten.co.jp/shop/cabinet/item/main.jpg"],
+        )
+
     def test_replacement_difference_marks_changed_sections(self) -> None:
         before = {
             "title": "旧标题",
