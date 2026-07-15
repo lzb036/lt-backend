@@ -22,6 +22,7 @@ SUPERADMIN_PERMISSIONS = [
     "products.manage",
     "stores.manage",
     "settings.manage",
+    "ai.manage",
 ]
 KNOWN_PERMISSIONS = set(SUPERADMIN_PERMISSIONS)
 
@@ -113,6 +114,7 @@ def permissions_to_flags(permissions: list[str], *, role: str) -> dict[str, bool
         "manageProducts": "products.manage" in permission_set or role == "superadmin",
         "manageStores": "stores.manage" in permission_set or role == "superadmin",
         "manageSettings": "settings.manage" in permission_set or role == "superadmin",
+        "manageAi": "ai.manage" in permission_set or role == "superadmin",
     }
 
 

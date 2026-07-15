@@ -20,6 +20,7 @@ require_crawler_permission = require_permission("crawler.manage")
 require_products_permission = require_permission("products.manage")
 require_stores_permission = require_permission("stores.manage")
 require_settings_permission = require_permission("settings.manage")
+require_ai_permission = require_permission("ai.manage")
 require_products_or_stores_permission = require_any_permission("products.manage", "stores.manage")
 
 
@@ -642,14 +643,14 @@ def update_product_local_detail(
 
 
 @router.get("/settings/ai-title")
-def get_ai_title_settings(_: dict = Depends(require_superadmin)) -> dict:
+def get_ai_title_settings(_: dict = Depends(require_ai_permission)) -> dict:
     from app.services import ai_title_service
 
     return {"settings": ai_title_service.get_settings()}
 
 
 @router.put("/settings/ai-title")
-def update_ai_title_settings(payload: AiTitleSettingsPayload, _: dict = Depends(require_superadmin)) -> dict:
+def update_ai_title_settings(payload: AiTitleSettingsPayload, _: dict = Depends(require_ai_permission)) -> dict:
     from app.services import ai_title_service
 
     try:
@@ -659,7 +660,7 @@ def update_ai_title_settings(payload: AiTitleSettingsPayload, _: dict = Depends(
 
 
 @router.post("/settings/ai-title/test")
-def test_ai_title_settings(_: dict = Depends(require_superadmin)) -> dict:
+def test_ai_title_settings(_: dict = Depends(require_ai_permission)) -> dict:
     from app.services import ai_title_service
 
     try:

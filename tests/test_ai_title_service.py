@@ -5,9 +5,13 @@ import unittest
 from unittest.mock import MagicMock
 
 from app.services import ai_title_service
+from app.services.user_service import normalize_permissions
 
 
 class AiTitleServiceTests(unittest.TestCase):
+    def test_ai_manage_is_a_supported_assignable_permission(self) -> None:
+        self.assertEqual(normalize_permissions(["ai.manage"]), ["ai.manage"])
+
     def test_extract_stream_text_reads_openai_delta_content(self) -> None:
         line = 'data: {"choices":[{"delta":{"content":"{\\"title\\":\\"春物\\""}}]}'.encode()
 

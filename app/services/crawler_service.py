@@ -13320,7 +13320,7 @@ def ensure_default_roles() -> None:
             "name": "超级管理员",
             "code": "superadmin",
             "scope": "all",
-            "permissions": ["users.manage", "roles.manage", "crawler.manage", "products.manage", "stores.manage"],
+            "permissions": ["users.manage", "roles.manage", "crawler.manage", "products.manage", "stores.manage", "ai.manage"],
             "notes": "系统内置角色，拥有全部管理权限。",
         },
         {
