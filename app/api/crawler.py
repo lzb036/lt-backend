@@ -107,6 +107,10 @@ class ProductStatusPayload(BaseModel):
     message: str = ""
 
 
+class ProductGenrePayload(BaseModel):
+    genreId: str = Field(pattern=r"^\d{6}$")
+
+
 class ProductDeletePayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
 
@@ -538,6 +542,32 @@ def update_product_status(payload: ProductStatusPayload, user: dict = Depends(re
             message=payload.message,
         )
         return {"products": products}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/products/genres")
+def search_product_genres(
+    keyword: str = "",
+    limit: int = Query(default=30, ge=1, le=100),
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    return {"genres": crawler_service.search_rakuten_genres(keyword, limit)}
+
+
+@router.put("/products/{product_id}/genre")
+def update_product_genre(
+    product_id: int,
+    payload: ProductGenrePayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        product = crawler_service.update_pending_product_genre(
+            user["username"],
+            product_id,
+            payload.genreId,
+        )
+        return {"product": product}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

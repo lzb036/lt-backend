@@ -946,6 +946,7 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "currency": row.currency,
         "salesCount": product_sales_count(raw_payload),
         "genreId": row.genre_id,
+        "genrePath": rakuten_genre_path(row.genre_id),
         "reviewStatus": row.review_status,
         "lastError": row.last_error,
         "listedAt": listed_at,
@@ -8722,6 +8723,12 @@ def update_product_status(owner_username: str, product_ids: list[int], status: s
             invalid_rows = [row for row in rows if row.review_status != "pending"]
             if invalid_rows:
                 raise RuntimeError("只有待审核商品可以标记异常。")
+        if status == "approved":
+            invalid_rows = [row for row in rows if not rakuten_genre_path(row.genre_id)]
+            if invalid_rows:
+                names = "、".join(normalize_text(row.title) or f"商品 {row.id}" for row in invalid_rows[:3])
+                suffix = "等" if len(invalid_rows) > 3 else ""
+                raise RuntimeError(f"{len(invalid_rows)} 个商品缺少有效品类：{names}{suffix}。请先选择有效品类。")
         for row in rows:
             row.review_status = status
             if message:
@@ -8732,6 +8739,29 @@ def update_product_status(owner_username: str, product_ids: list[int], status: s
                 cleanup_title_versions_for_approved_product(session, row)
         session.flush()
         return [product_to_public(row) for row in rows]
+
+
+def update_pending_product_genre(owner_username: str, product_id: int, genre_id: str) -> dict[str, Any]:
+    normalized_genre_id = normalize_text(genre_id)
+    if not re.fullmatch(r"\d{6}", normalized_genre_id) or not rakuten_genre_path(normalized_genre_id):
+        raise RuntimeError("请选择有效品类。")
+    with session_scope() as session:
+        row = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id == product_id,
+            )
+        ).first()
+        if not row:
+            raise RuntimeError("没有找到可操作的商品。")
+        if row.review_status != "pending":
+            raise RuntimeError("只有待审核商品可以修改品类。")
+        raw_payload = product_raw_payload(row)
+        raw_payload["genreId"] = normalized_genre_id
+        row.genre_id = normalized_genre_id
+        row.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+        session.flush()
+        return product_to_public(row)
 
 
 def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, Any]:
@@ -9507,6 +9537,40 @@ def load_rakuten_attribute_rules() -> dict[str, Any]:
     except Exception:
         _RAKUTEN_ATTRIBUTE_RULES_CACHE = {}
     return _RAKUTEN_ATTRIBUTE_RULES_CACHE
+
+
+def rakuten_genre_path(genre_id: Any) -> str:
+    normalized_genre_id = normalize_text(genre_id)
+    if not normalized_genre_id:
+        return ""
+    rules = load_rakuten_attribute_rules()
+    genres = rules.get("genres") if isinstance(rules.get("genres"), dict) else {}
+    genre = genres.get(normalized_genre_id)
+    return normalize_text(genre.get("genrePath")) if isinstance(genre, dict) else ""
+
+
+def search_rakuten_genres(keyword: str = "", limit: int = 30) -> list[dict[str, str]]:
+    folded_keyword = normalize_text(keyword).casefold()
+    bounded_limit = min(max(int(limit or 30), 1), 100)
+    rules = load_rakuten_attribute_rules()
+    genres = rules.get("genres") if isinstance(rules.get("genres"), dict) else {}
+    results: list[dict[str, str]] = []
+    for genre_id, genre in genres.items():
+        if not isinstance(genre, dict):
+            continue
+        normalized_genre_id = normalize_text(genre_id)
+        genre_path = normalize_text(genre.get("genrePath"))
+        if not normalized_genre_id or not genre_path:
+            continue
+        if folded_keyword and (
+            folded_keyword not in normalized_genre_id.casefold()
+            and folded_keyword not in genre_path.casefold()
+        ):
+            continue
+        results.append({"genreId": normalized_genre_id, "genrePath": genre_path})
+        if len(results) >= bounded_limit:
+            break
+    return results
 
 
 def rakuten_attribute_group_rule_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
