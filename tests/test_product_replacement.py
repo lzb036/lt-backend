@@ -139,6 +139,32 @@ class ProductReplacementTests(unittest.TestCase):
 
         self.assertEqual(draft["variants"]["default"]["standardPrice"], "1880")
 
+    def test_rakuten_payload_limits_title_and_tagline_by_utf8_bytes(self) -> None:
+        product = SimpleNamespace(
+            id=9,
+            title="主" * 100,
+            genre_id="200002",
+            price=1880,
+            rakuten_manage_number="target-manage",
+        )
+        raw = {
+            "title": "主" * 100,
+            "tagline": "副" * 100,
+            "genreId": "200002",
+            "price": "1880",
+            "variants": {},
+        }
+
+        payload = crawler_service.build_rakuten_item_upsert_payload(
+            product,
+            raw,
+            [],
+            manage_number="target-manage",
+        )
+
+        self.assertLessEqual(len(payload["title"].encode("utf-8")), 255)
+        self.assertLessEqual(len(payload["tagline"].encode("utf-8")), 174)
+
     def test_replacement_difference_marks_changed_sections(self) -> None:
         before = {
             "title": "旧标题",

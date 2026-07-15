@@ -31,6 +31,11 @@ from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
+from app.core.text_limits import (
+    RAKUTEN_TAGLINE_MAX_BYTES,
+    RAKUTEN_TITLE_MAX_BYTES,
+    truncate_utf8_bytes,
+)
 from app.core.task_queue import all_task_queue_names, enqueue_task, enqueue_task_in, redis_connection, task_queue_name_for_kind
 from app.db.database import session_scope
 from app.db.models import (
@@ -12213,8 +12218,8 @@ def build_rakuten_item_upsert_payload(
     item_number = normalize_text(manage_number) or normalize_text(product.rakuten_manage_number) or generate_listing_manage_number(product, raw_payload)
     payload: dict[str, Any] = {
         "itemNumber": item_number[:32],
-        "title": title[:255],
-        "tagline": product_tagline(raw_payload)[:174],
+        "title": truncate_utf8_bytes(title, RAKUTEN_TITLE_MAX_BYTES),
+        "tagline": truncate_utf8_bytes(product_tagline(raw_payload), RAKUTEN_TAGLINE_MAX_BYTES),
         "itemType": "NORMAL",
         "genreId": normalize_text(genre_id),
         "hideItem": bool(hide_item),

@@ -10,6 +10,11 @@ from typing import Any
 from sqlalchemy import select, update
 
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
+from app.core.text_limits import (
+    RAKUTEN_TAGLINE_MAX_BYTES,
+    RAKUTEN_TITLE_MAX_BYTES,
+    truncate_utf8_bytes,
+)
 from app.db.database import session_scope
 from app.db.models import AiTitleSettingsModel, ProductModel, ProductTitleVersionModel, UserAiTitleSettingsModel
 from app.services import sensitive_word_service
@@ -17,9 +22,9 @@ from app.services import sensitive_word_service
 
 DEFAULT_API_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_TITLE_PROMPT = """你是日本乐天市场的商品标题优化专家。根据商品现有文本、属性、规格和主图，生成准确、自然、便于检索的日语商品标题。
-不得虚构品牌、材质、尺寸、认证、排名、销量、赠品、折扣、库存或发货速度；不得堆砌关键词；保留影响购买决策的真实属性。标题不超过127个字符。"""
+不得虚构品牌、材质、尺寸、认证、排名、销量、赠品、折扣、库存或发货速度；不得堆砌关键词；保留影响购买决策的真实属性。主标题的 UTF-8 编码长度不得超过255字节。"""
 DEFAULT_SUBTITLE_PROMPT = """你是日本乐天市场的商品副标题优化专家。根据商品信息和主图生成简洁自然的日语副标题，补充标题未表达的真实卖点。
-不得虚构信息，不得使用无法证明的绝对化、排名、促销或时效表述。副标题不超过255个字符。"""
+不得虚构信息，不得使用无法证明的绝对化、排名、促销或时效表述。副标题的 UTF-8 编码长度不得超过174字节。"""
 PROVIDER_CATALOG = [
     {
         "value": "aliyun",
@@ -119,9 +124,10 @@ def parse_generated_result(text: str) -> dict[str, str]:
     subtitle = str(payload.get("subtitle") or "").strip()
     if not title:
         raise RuntimeError("千问生成的商品标题为空。")
-    if len(title) > 500:
-        raise RuntimeError("千问生成的商品标题超过系统长度限制。")
-    return {"title": title, "subtitle": subtitle[:1000]}
+    return {
+        "title": truncate_utf8_bytes(title, RAKUTEN_TITLE_MAX_BYTES),
+        "subtitle": truncate_utf8_bytes(subtitle, RAKUTEN_TAGLINE_MAX_BYTES),
+    }
 
 
 def provider_catalog() -> list[dict[str, Any]]:
@@ -349,14 +355,18 @@ def save_title_version_in_session(
         raise RuntimeError("只有待审核商品可以保存优化标题。")
     if version is None or version.product_id != product_id or version.owner_username != owner_username:
         raise RuntimeError("标题优化版本不存在。")
+    title = truncate_utf8_bytes(version.title, RAKUTEN_TITLE_MAX_BYTES)
+    subtitle = truncate_utf8_bytes(version.subtitle, RAKUTEN_TAGLINE_MAX_BYTES)
     payload = patch_local_item_detail(
         product_raw_payload(product),
-        title=version.title,
-        tagline=version.subtitle,
+        title=title,
+        tagline=subtitle,
         variants=[],
     )
-    product.title = version.title
+    product.title = title
     product.raw_payload_json = json.dumps(payload, ensure_ascii=False)
+    version.title = title
+    version.subtitle = subtitle
     session.execute(
         update(ProductTitleVersionModel)
         .where(ProductTitleVersionModel.product_id == product_id)
@@ -507,6 +517,8 @@ def stream_generate_version(owner_username: str, product_id: int, created_by: st
                     "content": (
                         f"{settings.title_prompt or DEFAULT_TITLE_PROMPT}\n\n"
                         f"{settings.subtitle_prompt or DEFAULT_SUBTITLE_PROMPT}\n\n"
+                        "强制长度要求：主标题 UTF-8 编码最多255字节；副标题 UTF-8 编码最多174字节。"
+                        "日文汉字、假名通常占3字节，必须按字节计算，不是按字符数计算。\n\n"
                         "仅返回一个 JSON 对象，格式为："
                         '{"title":"日语标题","subtitle":"日语副标题"}。不要输出 Markdown。'
                     ),

@@ -30,6 +30,17 @@ class AiTitleServiceTests(unittest.TestCase):
         self.assertEqual(result["title"], "春の新作 レディースバッグ")
         self.assertEqual(result["subtitle"], "軽量で使いやすい")
 
+    def test_parse_generated_result_limits_title_and_subtitle_by_utf8_bytes(self) -> None:
+        result = ai_title_service.parse_generated_result(json.dumps({
+            "title": "日" * 100,
+            "subtitle": "副" * 100,
+        }, ensure_ascii=False))
+
+        self.assertLessEqual(len(result["title"].encode("utf-8")), 255)
+        self.assertLessEqual(len(result["subtitle"].encode("utf-8")), 174)
+        self.assertTrue(result["title"])
+        self.assertTrue(result["subtitle"])
+
     def test_save_version_updates_product_only_after_explicit_save(self) -> None:
         session = MagicMock()
         product = MagicMock()
