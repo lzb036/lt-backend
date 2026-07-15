@@ -121,6 +121,24 @@ class ProductReplacementTests(unittest.TestCase):
             ["https://image.rakuten.co.jp/shop/cabinet/item/main.jpg"],
         )
 
+    def test_replacement_draft_builds_default_sku_for_single_product(self) -> None:
+        item = {
+            "title": "单品商品",
+            "genre_id": "200002",
+            "price": 1880,
+            "raw": {
+                "title": "单品商品",
+                "genreId": "200002",
+                "price": "1880",
+                "images": ["https://example.com/product.jpg"],
+                "variants": {},
+            },
+        }
+
+        draft = crawler_service.replacement_draft_from_collected_item(item)
+
+        self.assertEqual(draft["variants"]["default"]["standardPrice"], "1880")
+
     def test_replacement_difference_marks_changed_sections(self) -> None:
         before = {
             "title": "旧标题",

@@ -7329,10 +7329,10 @@ def replacement_draft_from_collected_item(item: dict[str, Any]) -> dict[str, Any
     genre_id = normalize_text(item.get("genre_id")) or first_text_from_keys(raw, ("genreId", "genre_id", "genre"))
     images = product_editable_image_urls(raw) or unique_texts([item.get("image_url")])
     images, _ = preferred_rakuten_image_urls(images)
-    variants = raw.get("variants") if isinstance(raw.get("variants"), dict) else {}
     price = price_from_rakuten_item(raw)
     if price is None:
         price = item.get("price")
+    variants = build_rakuten_listing_variants(raw, SimpleNamespace(price=price))
     raw.update({"title": title, "itemName": title, "genreId": genre_id, "images": images})
     return {
         "title": title,
@@ -7356,6 +7356,7 @@ def product_replacement_metadata(raw_payload: dict[str, Any]) -> dict[str, Any]:
 def replacement_draft_from_pending_product(product: ProductModel) -> dict[str, Any]:
     raw = product_raw_payload(product)
     images = product_editable_image_urls(raw, shop_code=product_shop_code(product, raw))
+    variants = build_rakuten_listing_variants(raw, product)
     return {
         "title": normalize_text(product.title),
         "tagline": product_tagline(raw),
@@ -7365,7 +7366,7 @@ def replacement_draft_from_pending_product(product: ProductModel) -> dict[str, A
         "price": float(product.price) if product.price is not None else None,
         "images": images,
         "descriptions": product_descriptions(raw),
-        "variants": raw.get("variants") if isinstance(raw.get("variants"), dict) else {},
+        "variants": variants,
         "raw": raw,
     }
 
