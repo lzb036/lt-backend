@@ -43,10 +43,36 @@ def session_context(session: MagicMock):
 
 
 class ProductGenreServiceTests(unittest.TestCase):
+    def test_fixed_chinese_map_covers_every_genre_segment(self) -> None:
+        genres = crawler_service.load_rakuten_attribute_rules()["genres"]
+        translations = crawler_service.load_rakuten_genre_zh_map()
+        segments = {
+            segment.strip()
+            for genre in genres.values()
+            if isinstance(genre, dict)
+            for segment in str(genre.get("genrePath") or "").split(">")
+            if segment.strip()
+        }
+
+        self.assertEqual(segments - translations.keys(), set())
+        self.assertTrue(all(translations[segment].strip() for segment in segments))
+
     def test_rakuten_genre_path_returns_complete_path_for_known_id(self) -> None:
         genre_id, expected_path = sample_genre()
 
         self.assertEqual(crawler_service.rakuten_genre_path(genre_id), expected_path)
+
+    def test_rakuten_genre_zh_path_maps_each_segment_and_falls_back_to_source(self) -> None:
+        with patch.object(
+            crawler_service,
+            "load_rakuten_genre_zh_map",
+            return_value={"鞋": "鞋靴", "女士鞋": "女鞋", "凉鞋": "凉鞋"},
+        ):
+            self.assertEqual(
+                crawler_service.rakuten_genre_zh_path("鞋>女士鞋>凉鞋"),
+                "鞋靴>女鞋>凉鞋",
+            )
+            self.assertEqual(crawler_service.rakuten_genre_zh_path("未知分类"), "未知分类")
 
     def test_search_rakuten_genres_matches_id_and_path_and_respects_limit(self) -> None:
         genre_id, genre_path = sample_genre()
@@ -55,9 +81,32 @@ class ProductGenreServiceTests(unittest.TestCase):
         id_results = crawler_service.search_rakuten_genres(genre_id, limit=5)
         path_results = crawler_service.search_rakuten_genres(path_keyword, limit=2)
 
-        self.assertEqual(id_results[0], {"genreId": genre_id, "genrePath": genre_path})
+        self.assertEqual(
+            id_results[0],
+            {
+                "genreId": genre_id,
+                "genrePath": genre_path,
+                "genrePathZh": crawler_service.rakuten_genre_zh_path(genre_path),
+            },
+        )
         self.assertLessEqual(len(path_results), 2)
         self.assertTrue(any(path_keyword.casefold() in item["genrePath"].casefold() for item in path_results))
+
+    def test_search_rakuten_genres_matches_chinese_path(self) -> None:
+        genres = {"100001": {"genrePath": "靴>レディース靴>サンダル"}}
+        translations = {"靴": "鞋靴", "レディース靴": "女鞋", "サンダル": "凉鞋"}
+
+        with (
+            patch.object(crawler_service, "load_rakuten_attribute_rules", return_value={"genres": genres}),
+            patch.object(crawler_service, "load_rakuten_genre_zh_map", return_value=translations),
+        ):
+            results = crawler_service.search_rakuten_genres("凉鞋")
+
+        self.assertEqual(results, [{
+            "genreId": "100001",
+            "genrePath": "靴>レディース靴>サンダル",
+            "genrePathZh": "鞋靴>女鞋>凉鞋",
+        }])
 
     def test_list_rakuten_genre_children_returns_sorted_direct_children(self) -> None:
         genres = {
@@ -70,6 +119,10 @@ class ProductGenreServiceTests(unittest.TestCase):
             crawler_service,
             "load_rakuten_attribute_rules",
             return_value={"genres": genres},
+        ), patch.object(
+            crawler_service,
+            "load_rakuten_genre_zh_map",
+            return_value={"鞋": "鞋靴", "女士鞋": "女鞋", "凉鞋": "凉鞋", "靴子": "靴子", "服饰": "服饰"},
         ):
             roots = crawler_service.list_rakuten_genre_children("")
             shoe_children = crawler_service.list_rakuten_genre_children("鞋")
@@ -78,15 +131,31 @@ class ProductGenreServiceTests(unittest.TestCase):
         self.assertEqual([item["label"] for item in roots], ["服饰", "鞋"])
         self.assertEqual(shoe_children, [{
             "label": "女士鞋",
+            "labelZh": "女鞋",
             "genrePath": "鞋>女士鞋",
+            "genrePathZh": "鞋靴>女鞋",
             "genreId": "",
             "leaf": False,
         }])
         self.assertEqual(
             women_shoe_children,
             [
-                {"label": "凉鞋", "genrePath": "鞋>女士鞋>凉鞋", "genreId": "100001", "leaf": True},
-                {"label": "靴子", "genrePath": "鞋>女士鞋>靴子", "genreId": "100002", "leaf": True},
+                {
+                    "label": "凉鞋",
+                    "labelZh": "凉鞋",
+                    "genrePath": "鞋>女士鞋>凉鞋",
+                    "genrePathZh": "鞋靴>女鞋>凉鞋",
+                    "genreId": "100001",
+                    "leaf": True,
+                },
+                {
+                    "label": "靴子",
+                    "labelZh": "靴子",
+                    "genrePath": "鞋>女士鞋>靴子",
+                    "genrePathZh": "鞋靴>女鞋>靴子",
+                    "genreId": "100002",
+                    "leaf": True,
+                },
             ],
         )
 
@@ -118,6 +187,7 @@ class ProductGenreServiceTests(unittest.TestCase):
         public = crawler_service.product_to_public(row)
 
         self.assertEqual(public["genrePath"], genre_path)
+        self.assertTrue(public["genrePathZh"])
 
     def test_update_pending_product_genre_persists_id_and_raw_payload(self) -> None:
         genre_id, genre_path = sample_genre()

@@ -121,6 +121,7 @@ LOCAL_PRODUCT_IMAGE_DIR = settings.backend_dir / "data" / "product-images"
 LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX = DRAFT_IMAGE_URL_PREFIX
 LOCAL_PRODUCT_IMAGE_DRAFT_DIR = settings.backend_dir / "data" / "product-image-drafts"
 RAKUTEN_ATTRIBUTE_RULES_PATH = settings.backend_dir / "app" / "resources" / "rakuten_attribute_rules.json"
+RAKUTEN_GENRE_ZH_MAP_PATH = settings.backend_dir / "app" / "resources" / "rakuten_genre_zh_map.json"
 ALLOWED_PRODUCT_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
 ALLOWED_PRODUCT_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif"}
 MAX_PRODUCT_IMAGE_BYTES = 2 * 1024 * 1024
@@ -947,6 +948,7 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "salesCount": product_sales_count(raw_payload),
         "genreId": row.genre_id,
         "genrePath": rakuten_genre_path(row.genre_id),
+        "genrePathZh": rakuten_genre_zh_path(rakuten_genre_path(row.genre_id)),
         "reviewStatus": row.review_status,
         "lastError": row.last_error,
         "listedAt": listed_at,
@@ -9523,6 +9525,7 @@ def extract_invalid_selective_attribute_value_errors(error_text: str) -> list[di
 
 
 _RAKUTEN_ATTRIBUTE_RULES_CACHE: dict[str, Any] | None = None
+_RAKUTEN_GENRE_ZH_MAP_CACHE: dict[str, str] | None = None
 
 
 def load_rakuten_attribute_rules() -> dict[str, Any]:
@@ -9537,6 +9540,38 @@ def load_rakuten_attribute_rules() -> dict[str, Any]:
     except Exception:
         _RAKUTEN_ATTRIBUTE_RULES_CACHE = {}
     return _RAKUTEN_ATTRIBUTE_RULES_CACHE
+
+
+def load_rakuten_genre_zh_map() -> dict[str, str]:
+    global _RAKUTEN_GENRE_ZH_MAP_CACHE
+    if _RAKUTEN_GENRE_ZH_MAP_CACHE is not None:
+        return _RAKUTEN_GENRE_ZH_MAP_CACHE
+    if not RAKUTEN_GENRE_ZH_MAP_PATH.exists():
+        _RAKUTEN_GENRE_ZH_MAP_CACHE = {}
+        return _RAKUTEN_GENRE_ZH_MAP_CACHE
+    try:
+        payload = json.loads(RAKUTEN_GENRE_ZH_MAP_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    translations = payload.get("translations") if isinstance(payload, dict) else {}
+    _RAKUTEN_GENRE_ZH_MAP_CACHE = {
+        normalize_text(source): normalize_text(target)
+        for source, target in translations.items()
+        if normalize_text(source) and normalize_text(target)
+    } if isinstance(translations, dict) else {}
+    return _RAKUTEN_GENRE_ZH_MAP_CACHE
+
+
+def rakuten_genre_zh_path(genre_path: Any) -> str:
+    normalized_path = normalize_text(genre_path)
+    if not normalized_path:
+        return ""
+    translations = load_rakuten_genre_zh_map()
+    return ">".join(
+        translations.get(segment, segment)
+        for segment in (normalize_text(part) for part in normalized_path.split(">"))
+        if segment
+    )
 
 
 def rakuten_genre_path(genre_id: Any) -> str:
@@ -9560,14 +9595,20 @@ def search_rakuten_genres(keyword: str = "", limit: int = 30) -> list[dict[str, 
             continue
         normalized_genre_id = normalize_text(genre_id)
         genre_path = normalize_text(genre.get("genrePath"))
+        genre_path_zh = rakuten_genre_zh_path(genre_path)
         if not normalized_genre_id or not genre_path:
             continue
         if folded_keyword and (
             folded_keyword not in normalized_genre_id.casefold()
             and folded_keyword not in genre_path.casefold()
+            and folded_keyword not in genre_path_zh.casefold()
         ):
             continue
-        results.append({"genreId": normalized_genre_id, "genrePath": genre_path})
+        results.append({
+            "genreId": normalized_genre_id,
+            "genrePath": genre_path,
+            "genrePathZh": genre_path_zh,
+        })
         if len(results) >= bounded_limit:
             break
     return results
@@ -9593,7 +9634,9 @@ def list_rakuten_genre_children(parent_path: str = "") -> list[dict[str, Any]]:
             child_path,
             {
                 "label": label,
+                "labelZh": load_rakuten_genre_zh_map().get(label, label),
                 "genrePath": child_path,
+                "genrePathZh": rakuten_genre_zh_path(child_path),
                 "genreId": "",
                 "leaf": True,
             },
