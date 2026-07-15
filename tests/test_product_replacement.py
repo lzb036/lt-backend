@@ -69,6 +69,7 @@ def listed_master_product() -> SimpleNamespace:
 def pending_replacement_product() -> SimpleNamespace:
     return SimpleNamespace(
         id=21,
+        parent_product_id=None,
         owner_username="operator",
         store_id=None,
         review_status="pending",
@@ -92,6 +93,7 @@ def pending_replacement_product() -> SimpleNamespace:
             },
         }, ensure_ascii=False),
         listing_task_id=None,
+        listed_at=None,
         last_error=None,
     )
 
@@ -503,7 +505,7 @@ class ProductReplacementTests(unittest.TestCase):
         self.assertEqual(task.status, "cancelled")
         session.delete.assert_called_once_with(pending)
 
-    def test_perform_replacement_preserves_target_identity_after_remote_success(self) -> None:
+    def test_perform_replacement_creates_new_listed_master_and_preserves_old_master(self) -> None:
         target = listed_product()
         parent = listed_master_product()
         pending = pending_replacement_product()
@@ -623,14 +625,26 @@ class ProductReplacementTests(unittest.TestCase):
         self.assertEqual(target.item_number, "target-item")
         self.assertEqual(target.source_url, "https://www.rakuten.co.jp/target/target-item/")
         self.assertEqual(target.review_status, "listed")
-        self.assertEqual(parent.title, "替换后标题")
-        self.assertEqual(parent.genre_id, "200002")
-        self.assertEqual(parent.price, 2880)
+        self.assertEqual(target.parent_product_id, pending.id)
+        self.assertEqual(parent.title, "主商品旧标题")
+        self.assertEqual(parent.genre_id, "100001")
+        self.assertEqual(parent.price, 1000)
+        self.assertEqual(parent.review_status, "approved")
+        self.assertEqual(json.loads(parent.raw_payload_json)["listedStores"], [])
+        self.assertEqual(pending.review_status, "listed_master")
+        self.assertEqual(pending.title, "替换后标题")
+        self.assertEqual(pending.genre_id, "200002")
+        self.assertEqual(pending.price, 2880)
+        self.assertEqual(pending.image_url, "https://image.rakuten.co.jp/target-shop/cabinet/cabinet/new.jpg")
         self.assertEqual(
-            json.loads(parent.raw_payload_json)["listedStores"][0]["manageNumber"],
+            json.loads(pending.raw_payload_json)["listedStores"][0]["manageNumber"],
             "target-manage",
         )
-        session.delete.assert_called_once_with(pending)
+        self.assertEqual(
+            json.loads(pending.raw_payload_json)["listedStores"][0]["productId"],
+            target.id,
+        )
+        session.delete.assert_not_called()
 
 
 if __name__ == "__main__":

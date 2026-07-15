@@ -7929,26 +7929,34 @@ def perform_product_replacement(
             and parent.owner_username == owner_username
             and parent.review_status == "listed_master"
         ):
-            parent_raw = product_raw_payload(parent)
-            parent_updated_raw = json.loads(json.dumps(updated_raw, ensure_ascii=False))
-            listed_stores = parent_raw.get("listedStores")
-            if isinstance(listed_stores, list):
-                parent_updated_raw["listedStores"] = listed_stores
-            for key in ("manageNumber", "itemNumber", "listingStore"):
-                if key in parent_raw:
-                    parent_updated_raw[key] = parent_raw[key]
-                else:
-                    parent_updated_raw.pop(key, None)
-            parent.title = transient.title
-            parent.genre_id = transient.genre_id
-            parent.price = price_from_rakuten_item(parent_updated_raw) or transient.price
-            parent.image_url = image_url
-            parent.raw_payload_json = json.dumps(parent_updated_raw, ensure_ascii=False)
-            parent.last_error = None
+            remove_product_listed_store_mark(parent, store_id)
         pending_product_id = int(payload.get("pendingProductId") or 0)
         pending = session.get(ProductModel, pending_product_id) if pending_product_id else None
-        if pending is not None and pending.owner_username == owner_username:
-            session.delete(pending)
+        if pending is None or pending.owner_username != owner_username or pending.review_status != "pending":
+            raise RuntimeError("乐天更新成功，但待审核替换商品不存在，请立即同步店铺。")
+        master_raw = json.loads(json.dumps(updated_raw, ensure_ascii=False))
+        master_raw.pop("_replacement", None)
+        for key in ("manageNumber", "itemNumber", "listingStore"):
+            master_raw.pop(key, None)
+        pending.title = transient.title
+        pending.genre_id = transient.genre_id
+        pending.price = price_from_rakuten_item(master_raw) or transient.price
+        pending.image_url = image_url
+        pending.raw_payload_json = json.dumps(master_raw, ensure_ascii=False)
+        pending.review_status = "listed_master"
+        pending.listing_task_id = None
+        pending.listed_at = pending.listed_at or now
+        pending.last_error = None
+        target.parent_product_id = pending.id
+        record_product_listed_store(
+            pending,
+            target,
+            store,
+            {
+                "manageNumber": target_identity["manageNumber"] or manage_number,
+                "itemNumber": target_identity["itemNumber"] or manage_number,
+            },
+        )
         session.flush()
         updated_product = product_detail_to_public(target)
     payload["result"] = {
