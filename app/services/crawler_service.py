@@ -9573,6 +9573,38 @@ def search_rakuten_genres(keyword: str = "", limit: int = 30) -> list[dict[str, 
     return results
 
 
+def list_rakuten_genre_children(parent_path: str = "") -> list[dict[str, Any]]:
+    normalized_parent = normalize_text(parent_path)
+    parent_parts = [normalize_text(part) for part in normalized_parent.split(">") if normalize_text(part)]
+    rules = load_rakuten_attribute_rules()
+    genres = rules.get("genres") if isinstance(rules.get("genres"), dict) else {}
+    nodes: dict[str, dict[str, Any]] = {}
+    for genre_id, genre in genres.items():
+        if not isinstance(genre, dict):
+            continue
+        genre_path = normalize_text(genre.get("genrePath"))
+        parts = [normalize_text(part) for part in genre_path.split(">") if normalize_text(part)]
+        if len(parts) <= len(parent_parts) or parts[:len(parent_parts)] != parent_parts:
+            continue
+        label = parts[len(parent_parts)]
+        child_parts = [*parent_parts, label]
+        child_path = ">".join(child_parts)
+        node = nodes.setdefault(
+            child_path,
+            {
+                "label": label,
+                "genrePath": child_path,
+                "genreId": "",
+                "leaf": True,
+            },
+        )
+        if len(parts) > len(child_parts):
+            node["leaf"] = False
+        elif genre_path == child_path:
+            node["genreId"] = normalize_text(genre_id)
+    return sorted(nodes.values(), key=lambda item: normalize_text(item["label"]).casefold())
+
+
 def rakuten_attribute_group_rule_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
     genre_id = first_text_from_keys(payload, ("genreId", "genre_id", "genre"))
     if not genre_id:

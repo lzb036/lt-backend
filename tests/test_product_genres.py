@@ -59,6 +59,37 @@ class ProductGenreServiceTests(unittest.TestCase):
         self.assertLessEqual(len(path_results), 2)
         self.assertTrue(any(path_keyword.casefold() in item["genrePath"].casefold() for item in path_results))
 
+    def test_list_rakuten_genre_children_returns_sorted_direct_children(self) -> None:
+        genres = {
+            "100001": {"genrePath": "鞋>女士鞋>凉鞋"},
+            "100002": {"genrePath": "鞋>女士鞋>靴子"},
+            "100003": {"genrePath": "服饰>女士服饰"},
+        }
+
+        with patch.object(
+            crawler_service,
+            "load_rakuten_attribute_rules",
+            return_value={"genres": genres},
+        ):
+            roots = crawler_service.list_rakuten_genre_children("")
+            shoe_children = crawler_service.list_rakuten_genre_children("鞋")
+            women_shoe_children = crawler_service.list_rakuten_genre_children("鞋>女士鞋")
+
+        self.assertEqual([item["label"] for item in roots], ["服饰", "鞋"])
+        self.assertEqual(shoe_children, [{
+            "label": "女士鞋",
+            "genrePath": "鞋>女士鞋",
+            "genreId": "",
+            "leaf": False,
+        }])
+        self.assertEqual(
+            women_shoe_children,
+            [
+                {"label": "凉鞋", "genrePath": "鞋>女士鞋>凉鞋", "genreId": "100001", "leaf": True},
+                {"label": "靴子", "genrePath": "鞋>女士鞋>靴子", "genreId": "100002", "leaf": True},
+            ],
+        )
+
     def test_product_to_public_includes_derived_genre_path(self) -> None:
         genre_id, genre_path = sample_genre()
         row = product(1, genre_id=genre_id)
@@ -215,6 +246,24 @@ class ProductGenreApiTests(unittest.TestCase):
         self.assertEqual(update_result, {"product": updated})
         search_mock.assert_called_once_with(genre_id, 10)
         update_mock.assert_called_once_with("operator", 7, genre_id)
+
+    def test_genre_children_route_wraps_service_result(self) -> None:
+        children = [{
+            "label": "女士鞋",
+            "genrePath": "鞋>女士鞋",
+            "genreId": "",
+            "leaf": False,
+        }]
+
+        with patch.object(
+            self.api.crawler_service,
+            "list_rakuten_genre_children",
+            return_value=children,
+        ) as mock_children:
+            result = self.api.list_product_genre_children(parentPath="鞋", user=self.user)
+
+        self.assertEqual(result, {"genres": children})
+        mock_children.assert_called_once_with("鞋")
 
     def test_update_route_maps_service_error_to_bad_request(self) -> None:
         genre_id, _ = sample_genre()

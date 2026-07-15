@@ -555,6 +555,14 @@ def search_product_genres(
     return {"genres": crawler_service.search_rakuten_genres(keyword, limit)}
 
 
+@router.get("/products/genres/children")
+def list_product_genre_children(
+    parentPath: str = "",
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    return {"genres": crawler_service.list_rakuten_genre_children(parentPath)}
+
+
 @router.put("/products/{product_id}/genre")
 def update_product_genre(
     product_id: int,
