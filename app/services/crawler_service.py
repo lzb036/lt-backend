@@ -7647,6 +7647,98 @@ def confirm_product_replacement(owner_username: str, task_id: str, manage_number
     return result
 
 
+def confirm_pending_product_replacement(owner_username: str, product_id: int, manage_number: str) -> dict[str, Any]:
+    with session_scope() as session:
+        pending = session.get(ProductModel, product_id)
+        if pending is None or pending.owner_username != owner_username or pending.review_status != "pending":
+            raise RuntimeError("待审核替换商品不存在或状态已变化。")
+        raw_payload = product_raw_payload(pending)
+        metadata = product_replacement_metadata(raw_payload)
+        target_product_id = int(metadata.get("targetProductId") or 0)
+        if not target_product_id:
+            raise RuntimeError("当前待审核商品不是替换商品。")
+        target = session.get(ProductModel, target_product_id)
+        if target is None or target.owner_username != owner_username or target.review_status != "listed":
+            raise RuntimeError("目标店铺商品不存在或状态已变化。")
+        store = session.get(StoreModel, target.store_id) if target.store_id else None
+        if store is None or not store.enabled:
+            raise RuntimeError("目标商品所属店铺不存在或已停用。")
+        expected = normalize_text(target.rakuten_manage_number or target.item_number)
+        if normalize_text(manage_number) != expected:
+            raise RuntimeError("商品管理编号输入不正确。")
+
+        draft = replacement_draft_from_pending_product(pending)
+        if not normalize_text(draft.get("title")):
+            raise RuntimeError("替换后商品标题不能为空。")
+        if not rakuten_genre_path(draft.get("genreId")):
+            raise RuntimeError("替换后商品缺少有效品类。")
+        if not draft.get("images"):
+            raise RuntimeError("替换后商品缺少图片。")
+        if not isinstance(draft.get("variants"), dict) or not draft.get("variants"):
+            raise RuntimeError("替换后商品缺少 SKU。")
+
+        previous_task_id = normalize_text(metadata.get("taskId"))
+        task = session.get(SyncTaskModel, previous_task_id) if previous_task_id else None
+        if task is not None and task.owner_username == owner_username and task.task_type == "product_replace":
+            if task.status in {"queued", "running"}:
+                raise RuntimeError("商品替换任务已创建，请到同步任务中查看进度。")
+            if task.status not in {"preview_ready"}:
+                task = None
+        else:
+            task = None
+
+        target_public = product_detail_to_public(target)
+        payload = {
+            "targetProductId": target.id,
+            "pendingProductId": pending.id,
+            "crawlTaskId": getattr(pending, "task_id", None),
+            "sourceUrl": pending.source_url,
+            "targetSnapshot": target_public,
+            "sourcePayload": draft,
+            "draftPayload": draft,
+            "difference": product_replacement_difference(
+                replacement_detail_from_product_public(target_public),
+                draft,
+            ),
+            "pendingProduct": product_to_public(pending),
+        }
+        if task is None:
+            task = SyncTaskModel(
+                id=uuid.uuid4().hex,
+                owner_username=owner_username,
+                store_id=store.id,
+                store_name=store.alias_name or store.store_name,
+                task_name=f"替换商品 {expected}",
+                task_type="product_replace",
+                status="queued",
+                total_count=1,
+                message="等待执行商品替换",
+            )
+            session.add(task)
+        task.payload_json = json.dumps(payload, ensure_ascii=False)
+        task.status = "queued"
+        task.total_count = 1
+        task.success_count = 0
+        task.failed_count = 0
+        task.message = "等待执行商品替换"
+        task.error_detail = None
+        task.started_at = None
+        task.finished_at = None
+        metadata.update({
+            "taskId": task.id,
+            "targetProductId": target.id,
+            "targetManageNumber": expected,
+            "targetStoreId": store.id,
+            "targetStoreName": store.alias_name or store.store_name,
+        })
+        raw_payload["_replacement"] = metadata
+        pending.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+        session.flush()
+        result = product_replacement_to_public(task)
+    dispatch_next_sync_task()
+    return result
+
+
 def cancel_product_replacement(owner_username: str, task_id: str) -> dict[str, Any]:
     with session_scope() as session:
         task = session.get(SyncTaskModel, task_id)

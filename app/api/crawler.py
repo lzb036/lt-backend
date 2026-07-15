@@ -748,6 +748,22 @@ def confirm_product_replacement(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/products/{product_id}/confirm-replacement")
+def confirm_pending_product_replacement(
+    product_id: int,
+    payload: ProductReplacementConfirmPayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return crawler_service.confirm_pending_product_replacement(
+            user["username"],
+            product_id,
+            payload.manageNumber,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/product-replacements/{task_id}/cancel")
 def cancel_product_replacement(
     task_id: str,

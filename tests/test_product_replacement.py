@@ -376,6 +376,58 @@ class ProductReplacementTests(unittest.TestCase):
         self.assertEqual(payload["draftPayload"]["images"], ["https://example.com/edited.jpg"])
         self.assertEqual(task.status, "queued")
 
+    def test_confirm_pending_product_creates_new_sync_task_when_old_task_is_missing(self) -> None:
+        target = listed_product()
+        pending = pending_replacement_product()
+        pending.raw_payload_json = json.dumps({
+            **json.loads(pending.raw_payload_json),
+            "_replacement": {
+                "taskId": "deleted-task",
+                "targetProductId": target.id,
+                "targetManageNumber": "target-manage",
+                "targetStoreId": 3,
+                "targetStoreName": "目标店铺",
+            },
+        }, ensure_ascii=False)
+        store = SimpleNamespace(id=3, enabled=True, alias_name="目标店铺", store_name="目标店铺")
+        session = MagicMock()
+
+        def get_model(model: object, key: object) -> object:
+            if model is crawler_service.ProductModel and key == pending.id:
+                return pending
+            if model is crawler_service.ProductModel and key == target.id:
+                return target
+            if model is crawler_service.StoreModel and key == store.id:
+                return store
+            if model is crawler_service.SyncTaskModel:
+                return None
+            return None
+
+        session.get.side_effect = get_model
+
+        with (
+            patch.object(crawler_service, "session_scope", return_value=session_context(session)),
+            patch.object(crawler_service, "dispatch_next_sync_task"),
+            patch.object(crawler_service, "rakuten_genre_path", return_value="分类"),
+            patch.object(crawler_service, "product_detail_to_public", return_value={"id": 9, "title": "替换前标题"}),
+            patch.object(crawler_service, "product_to_public", return_value={"id": 21, "reviewStatus": "pending"}),
+            patch.object(crawler_service, "sync_task_to_public", return_value={"id": "new-task", "status": "queued"}),
+        ):
+            result = crawler_service.confirm_pending_product_replacement(
+                "operator",
+                pending.id,
+                "target-manage",
+            )
+
+        created_task = next(
+            row for row in (call.args[0] for call in session.add.call_args_list)
+            if isinstance(row, crawler_service.SyncTaskModel)
+        )
+        self.assertEqual(created_task.status, "queued")
+        self.assertEqual(created_task.task_type, "product_replace")
+        self.assertEqual(json.loads(pending.raw_payload_json)["_replacement"]["taskId"], created_task.id)
+        self.assertEqual(result["task"]["status"], "queued")
+
     def test_cancel_replacement_removes_pending_product(self) -> None:
         pending = pending_replacement_product()
         task = SimpleNamespace(
