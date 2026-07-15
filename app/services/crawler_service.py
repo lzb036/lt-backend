@@ -7299,6 +7299,407 @@ def create_sync_task_record(
         return task.id
 
 
+def replacement_draft_from_collected_item(item: dict[str, Any]) -> dict[str, Any]:
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    raw = json.loads(json.dumps(raw, ensure_ascii=False))
+    title = normalize_text(item.get("title")) or first_text_from_keys(raw, ("itemName", "title", "name"))
+    genre_id = normalize_text(item.get("genre_id")) or first_text_from_keys(raw, ("genreId", "genre_id", "genre"))
+    images = product_editable_image_urls(raw) or unique_texts([item.get("image_url")])
+    variants = raw.get("variants") if isinstance(raw.get("variants"), dict) else {}
+    price = price_from_rakuten_item(raw)
+    if price is None:
+        price = item.get("price")
+    raw.update({"title": title, "itemName": title, "genreId": genre_id, "images": images})
+    return {
+        "title": title,
+        "tagline": product_tagline(raw),
+        "genreId": genre_id,
+        "genrePath": rakuten_genre_path(genre_id),
+        "genrePathZh": rakuten_genre_zh_path(rakuten_genre_path(genre_id)),
+        "price": float(price) if price is not None else None,
+        "images": images,
+        "descriptions": product_descriptions(raw),
+        "variants": variants,
+        "raw": raw,
+    }
+
+
+def replacement_detail_from_product_public(product: dict[str, Any]) -> dict[str, Any]:
+    detail = product.get("detail") if isinstance(product.get("detail"), dict) else {}
+    raw = detail.get("raw") if isinstance(detail.get("raw"), dict) else {}
+    return {
+        "title": normalize_text(detail.get("title") or product.get("title")),
+        "tagline": normalize_text(detail.get("tagline") or product.get("tagline")),
+        "genreId": normalize_text(detail.get("genreId") or product.get("genreId")),
+        "genrePath": normalize_text(product.get("genrePath")),
+        "genrePathZh": normalize_text(product.get("genrePathZh")),
+        "price": product.get("price"),
+        "images": list(detail.get("images") or product.get("images") or []),
+        "descriptions": list(detail.get("descriptions") or []),
+        "variants": raw.get("variants") if isinstance(raw.get("variants"), dict) else {},
+        "raw": raw,
+    }
+
+
+def product_replacement_difference(before: dict[str, Any], after: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for key in ("title", "tagline", "price"):
+        result[key] = {"changed": before.get(key) != after.get(key), "before": before.get(key), "after": after.get(key)}
+    result["genre"] = {
+        "changed": normalize_text(before.get("genreId")) != normalize_text(after.get("genreId")),
+        "before": before.get("genrePathZh") or before.get("genrePath") or before.get("genreId"),
+        "after": after.get("genrePathZh") or after.get("genrePath") or after.get("genreId"),
+    }
+    for key in ("images", "variants", "descriptions"):
+        before_value = before.get(key) or ([] if key != "variants" else {})
+        after_value = after.get(key) or ([] if key != "variants" else {})
+        result[key] = {
+            "changed": before_value != after_value,
+            "beforeCount": len(before_value),
+            "afterCount": len(after_value),
+        }
+    return result
+
+
+def product_replacement_payload(row: SyncTaskModel) -> dict[str, Any]:
+    try:
+        payload = json.loads(row.payload_json or "{}")
+    except ValueError:
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def product_replacement_to_public(row: SyncTaskModel) -> dict[str, Any]:
+    payload = product_replacement_payload(row)
+    return {
+        "task": sync_task_to_public(row),
+        "targetProductId": payload.get("targetProductId"),
+        "sourceUrl": payload.get("sourceUrl"),
+        "before": payload.get("targetSnapshot") or {},
+        "after": payload.get("draftPayload") or {},
+        "difference": payload.get("difference") or {},
+        "result": payload.get("result") or {},
+    }
+
+
+def create_product_replacement_preview(owner_username: str, product_id: int, source_url: str) -> dict[str, Any]:
+    normalized_url = normalize_rakuten_product_target(source_url)
+    collected_item = collect_product_detail(normalized_url)
+    draft = replacement_draft_from_collected_item(collected_item)
+    if not draft["title"]:
+        raise RuntimeError("来源商品没有有效标题。")
+    with session_scope() as session:
+        target = session.get(ProductModel, product_id)
+        if target is None or target.owner_username != owner_username:
+            raise RuntimeError("目标店铺商品不存在。")
+        if target.review_status != "listed" or not target.store_id:
+            raise RuntimeError("只有店铺商品可以执行商品替换。")
+        store = session.get(StoreModel, target.store_id)
+        if store is None or not store.enabled:
+            raise RuntimeError("目标商品所属店铺不存在或已停用。")
+        active = session.scalar(
+            select(SyncTaskModel.id).where(
+                SyncTaskModel.owner_username == owner_username,
+                SyncTaskModel.task_type == "product_replace",
+                SyncTaskModel.status.in_(["preview_ready", "queued", "running"]),
+                SyncTaskModel.payload_json.like(f'%"targetProductId": {product_id}%'),
+            )
+        )
+        if active:
+            raise RuntimeError("当前商品已有进行中的替换任务。")
+        cleaned_raw, _ = sanitize_product_payload(draft.get("raw") or {}, active_sensitive_words(session))
+        draft["raw"] = cleaned_raw
+        draft["title"] = first_text_from_keys(cleaned_raw, ("itemName", "title", "name")) or draft["title"]
+        draft["tagline"] = product_tagline(cleaned_raw)
+        if not normalize_text(draft["title"]):
+            raise RuntimeError(EMPTY_SENSITIVE_TITLE_SAVE_ERROR)
+        target_public = product_detail_to_public(target)
+        before = replacement_detail_from_product_public(target_public)
+        payload = {
+            "targetProductId": target.id,
+            "sourceUrl": normalized_url,
+            "targetSnapshot": target_public,
+            "sourcePayload": draft,
+            "draftPayload": draft,
+            "difference": product_replacement_difference(before, draft),
+        }
+        task = SyncTaskModel(
+            id=uuid.uuid4().hex,
+            owner_username=owner_username,
+            store_id=store.id,
+            store_name=store.alias_name or store.store_name,
+            task_name=f"替换商品 {target.rakuten_manage_number or target.item_number}",
+            task_type="product_replace",
+            payload_json=json.dumps(payload, ensure_ascii=False),
+            status="preview_ready",
+            total_count=1,
+            message="采集完成，等待确认替换",
+        )
+        session.add(task)
+        session.flush()
+        return product_replacement_to_public(task)
+
+
+def get_product_replacement(owner_username: str, task_id: str) -> dict[str, Any]:
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        if task is None or task.owner_username != owner_username or task.task_type != "product_replace":
+            raise RuntimeError("商品替换任务不存在。")
+        return product_replacement_to_public(task)
+
+
+def update_product_replacement_draft(owner_username: str, task_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        if task is None or task.owner_username != owner_username or task.task_type != "product_replace":
+            raise RuntimeError("商品替换任务不存在。")
+        if task.status != "preview_ready":
+            raise RuntimeError("当前替换任务不能再编辑。")
+        payload = product_replacement_payload(task)
+        draft = dict(payload.get("draftPayload") or {})
+        for key in ("title", "tagline", "genreId", "price", "images", "descriptions", "variants"):
+            if key in updates and updates[key] is not None:
+                draft[key] = float(updates[key]) if key == "price" else updates[key]
+        genre_id = normalize_text(draft.get("genreId"))
+        draft["genrePath"] = rakuten_genre_path(genre_id)
+        draft["genrePathZh"] = rakuten_genre_zh_path(draft["genrePath"])
+        raw = dict(draft.get("raw") or {})
+        raw.update({
+            "title": normalize_text(draft.get("title")),
+            "itemName": normalize_text(draft.get("title")),
+            "tagline": normalize_text(draft.get("tagline")),
+            "genreId": genre_id,
+            "images": list(draft.get("images") or []),
+            "descriptions": list(draft.get("descriptions") or []),
+            "variants": draft.get("variants") if isinstance(draft.get("variants"), dict) else {},
+        })
+        draft["raw"] = raw
+        before = replacement_detail_from_product_public(payload.get("targetSnapshot") or {})
+        payload["draftPayload"] = draft
+        payload["difference"] = product_replacement_difference(before, draft)
+        task.payload_json = json.dumps(payload, ensure_ascii=False)
+        session.flush()
+        return product_replacement_to_public(task)
+
+
+def confirm_product_replacement(owner_username: str, task_id: str, manage_number: str) -> dict[str, Any]:
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        if task is None or task.owner_username != owner_username or task.task_type != "product_replace":
+            raise RuntimeError("商品替换任务不存在。")
+        if task.status != "preview_ready":
+            raise RuntimeError("当前替换任务不能确认。")
+        payload = product_replacement_payload(task)
+        target = session.get(ProductModel, int(payload.get("targetProductId") or 0))
+        if target is None or target.owner_username != owner_username or target.review_status != "listed":
+            raise RuntimeError("目标店铺商品不存在或状态已变化。")
+        expected = normalize_text(target.rakuten_manage_number or target.item_number)
+        if normalize_text(manage_number) != expected:
+            raise RuntimeError("商品管理编号输入不正确。")
+        draft = payload.get("draftPayload") if isinstance(payload.get("draftPayload"), dict) else {}
+        if not normalize_text(draft.get("title")):
+            raise RuntimeError("替换后商品标题不能为空。")
+        if not rakuten_genre_path(draft.get("genreId")):
+            raise RuntimeError("替换后商品缺少有效品类。")
+        if not draft.get("images"):
+            raise RuntimeError("替换后商品缺少图片。")
+        if not isinstance(draft.get("variants"), dict) or not draft.get("variants"):
+            raise RuntimeError("替换后商品缺少 SKU。")
+        task.status = "queued"
+        task.message = "等待执行商品替换"
+        task.error_detail = None
+        task.finished_at = None
+        session.flush()
+        result = product_replacement_to_public(task)
+    dispatch_next_sync_task()
+    return result
+
+
+def cancel_product_replacement(owner_username: str, task_id: str) -> dict[str, Any]:
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        if task is None or task.owner_username != owner_username or task.task_type != "product_replace":
+            raise RuntimeError("商品替换任务不存在。")
+        if task.status not in {"preview_ready", "failed"}:
+            raise RuntimeError("当前替换任务不能取消。")
+        task.status = "cancelled"
+        task.message = "已取消商品替换"
+        task.finished_at = datetime.now()
+        session.flush()
+        return product_replacement_to_public(task)
+
+
+def perform_product_replacement(
+    owner_username: str,
+    store_id: int,
+    payload: dict[str, Any],
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    raise_if_task_cancelled(SyncTaskModel, task_id)
+    target_product_id = int(payload.get("targetProductId") or 0)
+    draft = payload.get("draftPayload") if isinstance(payload.get("draftPayload"), dict) else {}
+    with session_scope() as session:
+        target = session.get(ProductModel, target_product_id)
+        store = session.get(StoreModel, store_id)
+        if target is None or target.owner_username != owner_username:
+            raise RuntimeError("目标店铺商品不存在。")
+        if target.review_status != "listed" or target.store_id != store_id:
+            raise RuntimeError("目标店铺商品状态或店铺已变化。")
+        if store is None or not store.enabled:
+            raise RuntimeError("目标店铺不存在或已停用。")
+        service_secret = decrypt_text(store.rakuten_service_secret_encrypted)
+        license_key = decrypt_text(store.rakuten_license_key_encrypted)
+        if not service_secret or not license_key:
+            raise RuntimeError("目标店铺缺少乐天 Secret 或乐天 Key。")
+        manage_number = normalize_text(target.rakuten_manage_number or target.item_number)
+        if not manage_number:
+            raise RuntimeError("目标商品缺少商品管理编号。")
+        target_identity = {
+            "id": target.id,
+            "sourceUrl": target.source_url,
+            "manageNumber": target.rakuten_manage_number,
+            "itemNumber": target.item_number,
+            "storeId": target.store_id,
+            "reviewStatus": target.review_status,
+            "listingStatus": target.rakuten_listing_status,
+        }
+        raw = json.loads(json.dumps(draft.get("raw") or {}, ensure_ascii=False))
+        raw.update({
+            "title": normalize_text(draft.get("title")),
+            "itemName": normalize_text(draft.get("title")),
+            "tagline": normalize_text(draft.get("tagline")),
+            "genreId": normalize_text(draft.get("genreId")),
+            "images": list(draft.get("images") or []),
+            "descriptions": list(draft.get("descriptions") or []),
+            "variants": draft.get("variants") if isinstance(draft.get("variants"), dict) else {},
+        })
+        transient = SimpleNamespace(
+            id=target.id,
+            owner_username=target.owner_username,
+            store_id=target.store_id,
+            title=normalize_text(draft.get("title")),
+            genre_id=normalize_text(draft.get("genreId")),
+            price=Decimal(str(draft.get("price"))) if draft.get("price") is not None else target.price,
+            image_url=normalize_text((draft.get("images") or [""])[0]),
+            raw_payload_json=json.dumps(raw, ensure_ascii=False),
+            rakuten_manage_number=manage_number,
+            item_number=target.item_number,
+            source_url=target.source_url,
+            currency=target.currency,
+        )
+
+    uploaded_product_images: list[dict[str, str]] = []
+    uploaded_description_images: list[dict[str, str]] = []
+    remote_write_started = False
+    try:
+        update_task_progress(SyncTaskModel, task_id, total_count=1, message="正在上传替换商品图片")
+        uploaded_product_images = upload_product_images_to_rakuten(
+            service_secret,
+            license_key,
+            store,
+            transient,
+            manage_number,
+            cabinet_context={},
+            cancel_check=lambda: sync_task_cancel_requested(task_id),
+        )
+        raise_if_task_cancelled(SyncTaskModel, task_id)
+        description_result = upload_product_description_images_to_rakuten(
+            service_secret,
+            license_key,
+            store,
+            transient,
+            manage_number,
+            raw,
+            cabinet_context={},
+            cancel_check=lambda: sync_task_cancel_requested(task_id),
+        )
+        raw = description_result["rawPayload"]
+        uploaded_description_images = description_result["uploadedImages"]
+        update_task_progress(SyncTaskModel, task_id, total_count=1, message="正在更新乐天商品内容")
+        item_payload = build_rakuten_item_upsert_payload(
+            transient,
+            raw,
+            uploaded_product_images,
+            manage_number=manage_number,
+            hide_item=target_identity["listingStatus"] == "unlisted",
+        )
+        item_payload["itemNumber"] = normalize_text(target_identity["itemNumber"] or manage_number)[:32]
+        item_payload = put_rakuten_item_with_attribute_retry(
+            service_secret,
+            license_key,
+            manage_number,
+            item_payload,
+        )
+        remote_write_started = True
+        inventory_payloads = build_rakuten_inventory_upsert_payloads(
+            manage_number,
+            item_payload.get("variants") if isinstance(item_payload.get("variants"), dict) else {},
+        )
+        bulk_upsert_rakuten_inventories(service_secret, license_key, inventory_payloads)
+        patch_rakuten_item_visibility(
+            service_secret,
+            license_key,
+            manage_number,
+            hide_item=target_identity["listingStatus"] == "unlisted",
+        )
+    except Exception as exc:
+        if not remote_write_started:
+            rollback_uploaded_listing_images(
+                service_secret,
+                license_key,
+                [*uploaded_product_images, *uploaded_description_images],
+            )
+        else:
+            payload["recoveryRequired"] = True
+            payload["uploadedImages"] = [*uploaded_product_images, *uploaded_description_images]
+        raise RuntimeError(f"商品替换失败：{exc}") from exc
+
+    now = datetime.now()
+    updated_raw = dict(raw)
+    updated_raw.update(item_payload)
+    updated_raw.update({
+        "manageNumber": target_identity["manageNumber"] or manage_number,
+        "itemNumber": target_identity["itemNumber"] or manage_number,
+        "images": uploaded_product_images,
+        "descriptionImages": uploaded_description_images,
+        "listingStore": product_replacement_payload_store_snapshot(store),
+        "updated": now.isoformat(timespec="seconds"),
+    })
+    image_url = (
+        build_rakuten_cabinet_image_url(store.store_code, uploaded_product_images[0]["location"])
+        if uploaded_product_images else transient.image_url
+    )
+    with session_scope() as session:
+        target = session.get(ProductModel, target_product_id)
+        if target is None or target.owner_username != owner_username:
+            raise RuntimeError("乐天更新成功，但本地目标商品不存在，请立即同步店铺。")
+        target.title = transient.title
+        target.genre_id = transient.genre_id
+        target.price = price_from_rakuten_item(updated_raw) or transient.price
+        target.image_url = image_url
+        target.raw_payload_json = json.dumps(updated_raw, ensure_ascii=False)
+        target.store_last_seen_at = now
+        target.last_error = None
+        session.flush()
+        updated_product = product_detail_to_public(target)
+    payload["result"] = {
+        "product": updated_product,
+        "preservedIdentity": target_identity,
+        "uploadedImageCount": len(uploaded_product_images) + len(uploaded_description_images),
+    }
+    return {"product": updated_product}
+
+
+def product_replacement_payload_store_snapshot(store: StoreModel) -> dict[str, Any]:
+    return {
+        "storeId": store.id,
+        "storeCode": store.store_code,
+        "storeName": store.store_name,
+        "aliasName": store.alias_name,
+    }
+
+
 def run_sync_task(owner_username: str, task_id: str) -> None:
     defer_start = False
     with session_scope() as session:
@@ -7341,7 +7742,16 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
     try:
         if store_id is None:
             raise RuntimeError("同步任务没有关联店铺。")
-        if task_type == "listing_status":
+        if task_type == "product_replace":
+            result = perform_product_replacement(owner_username, store_id, payload, task_id=task_id)
+            total_count = 1
+            success_count = 1
+            failed_count = 0
+            status = "success"
+            message = "商品替换完成"
+            error_detail = None
+            payload["result"] = result
+        elif task_type == "listing_status":
             listing_status = normalize_text(payload.get("listingStatus"))
             result = perform_store_listing_status_sync(owner_username, store_id, listing_status, task_id=task_id)
             payload["result"] = {
@@ -7456,6 +7866,8 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
 
 def sync_task_running_message(task: SyncTaskModel) -> str:
     task_type = task.task_type or "store_sync"
+    if task_type == "product_replace":
+        return "正在替换店铺商品"
     if task_type in {"listing_status", "product_listing_status"}:
         try:
             payload = json.loads(task.payload_json or "{}")

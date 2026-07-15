@@ -340,7 +340,7 @@ class SyncTaskModel(TimestampMixin, Base):
     store_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     task_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     task_type: Mapped[str] = mapped_column(String(32), nullable=False, default="store_sync", server_default="store_sync")
-    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    payload_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", server_default="queued")
     total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")

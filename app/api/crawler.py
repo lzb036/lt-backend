@@ -159,6 +159,24 @@ class ProductDetailEditPayload(BaseModel):
     imageChanges: ProductImageChangesPayload | None = None
 
 
+class ProductReplacementCreatePayload(BaseModel):
+    sourceUrl: str = Field(min_length=1, max_length=2000)
+
+
+class ProductReplacementDraftPayload(BaseModel):
+    title: str | None = Field(default=None, max_length=500)
+    tagline: str | None = Field(default=None, max_length=1000)
+    genreId: str | None = Field(default=None, pattern=r"^\d{6}$")
+    price: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+    images: list[str] | None = None
+    descriptions: list[dict[str, Any]] | None = None
+    variants: dict[str, dict[str, Any]] | None = None
+
+
+class ProductReplacementConfirmPayload(BaseModel):
+    manageNumber: str = Field(min_length=1, max_length=255)
+
+
 class AiTitleSettingsPayload(BaseModel):
     provider: str = Field(min_length=1, max_length=64)
     apiBaseUrl: str = Field(default="", max_length=500)
@@ -675,6 +693,68 @@ def update_product_local_detail(
 ) -> dict:
     try:
         return {"product": crawler_service.update_product_local_detail(user["username"], product_id, payload)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/store-products/{product_id}/replacement")
+def create_product_replacement(
+    product_id: int,
+    payload: ProductReplacementCreatePayload,
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        return crawler_service.create_product_replacement_preview(user["username"], product_id, payload.sourceUrl)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/product-replacements/{task_id}")
+def get_product_replacement(
+    task_id: str,
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        return crawler_service.get_product_replacement(user["username"], task_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/product-replacements/{task_id}/draft")
+def update_product_replacement_draft(
+    task_id: str,
+    payload: ProductReplacementDraftPayload,
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        return crawler_service.update_product_replacement_draft(
+            user["username"],
+            task_id,
+            payload.model_dump(exclude_unset=True),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/product-replacements/{task_id}/confirm")
+def confirm_product_replacement(
+    task_id: str,
+    payload: ProductReplacementConfirmPayload,
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        return crawler_service.confirm_product_replacement(user["username"], task_id, payload.manageNumber)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/product-replacements/{task_id}/cancel")
+def cancel_product_replacement(
+    task_id: str,
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        return crawler_service.cancel_product_replacement(user["username"], task_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
