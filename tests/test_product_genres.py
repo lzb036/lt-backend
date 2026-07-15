@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from contextlib import contextmanager
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -282,6 +283,43 @@ class ProductGenreServiceTests(unittest.TestCase):
                 crawler_service.update_product_local_detail("operator", 7, payload)
 
         self.assertEqual(row.genre_id, "")
+
+    def test_store_detail_patch_sends_and_persists_genre(self) -> None:
+        genre_id, _ = sample_genre()
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        raw_payload = {
+            "title": "旧标题",
+            "tagline": "旧副标题",
+            "genreId": "100001",
+            "variants": {
+                "sku-1": {
+                    "standardPrice": "1000",
+                    "hidden": False,
+                },
+            },
+        }
+        variant = SimpleNamespace(
+            variantId="sku-1",
+            standardPrice=Decimal("1200"),
+            hidden=False,
+        )
+
+        with patch.object(crawler_service.requests, "patch", return_value=response) as request:
+            updated = crawler_service.patch_rakuten_item_detail(
+                "secret",
+                "key",
+                "manage-number",
+                raw_payload,
+                title="更新标题",
+                tagline="更新副标题",
+                genre_id=genre_id,
+                variants=[variant],
+            )
+
+        sent_payload = request.call_args.kwargs["json"]
+        self.assertEqual(sent_payload["genreId"], genre_id)
+        self.assertEqual(updated["genreId"], genre_id)
 
     def test_approval_rejects_invalid_genre_before_mutating_any_product(self) -> None:
         genre_id, _ = sample_genre()

@@ -4499,6 +4499,7 @@ def patch_rakuten_item_detail(
     *,
     title: str,
     tagline: str,
+    genre_id: str,
     variants: list[Any],
 ) -> dict[str, Any]:
     if not service_secret or not license_key:
@@ -4510,6 +4511,9 @@ def patch_rakuten_item_detail(
     normalized_title = normalize_text(title)
     if not normalized_title:
         raise RuntimeError("商品标题不能为空。")
+    normalized_genre_id = normalize_text(genre_id)
+    if not re.fullmatch(r"\d{6}", normalized_genre_id) or not rakuten_genre_path(normalized_genre_id):
+        raise RuntimeError("请选择有效品类。")
 
     raw_variants = raw_payload.get("variants")
     if not isinstance(raw_variants, dict) or not raw_variants:
@@ -4536,6 +4540,7 @@ def patch_rakuten_item_detail(
     payload = {
         "title": normalized_title,
         "tagline": str(tagline or "").strip(),
+        "genreId": normalized_genre_id,
         "variants": patch_variants,
     }
     response = requests.patch(
@@ -4560,6 +4565,7 @@ def patch_rakuten_item_detail(
     updated_payload = dict(raw_payload)
     updated_payload["title"] = normalized_title
     updated_payload["tagline"] = str(tagline or "").strip()
+    updated_payload["genreId"] = normalized_genre_id
     updated_variants = dict(raw_variants)
     for variant_id, variant_patch in patch_variants.items():
         current_variant = raw_variants.get(variant_id)
@@ -9747,6 +9753,9 @@ def update_store_product_detail(owner_username: str, product_id: int, payload: A
             raise RuntimeError("商品关联店铺已停用，不能同步修改乐天商品详情。")
 
         raw_payload = product_raw_payload(product)
+        genre_id = normalize_text(getattr(payload, "genreId", None)) or product.genre_id
+        if not re.fullmatch(r"\d{6}", genre_id) or not rakuten_genre_path(genre_id):
+            raise RuntimeError("请选择有效品类。")
         try:
             updated_payload = patch_rakuten_item_detail(
                 decrypt_text(store.rakuten_service_secret_encrypted),
@@ -9755,6 +9764,7 @@ def update_store_product_detail(owner_username: str, product_id: int, payload: A
                 raw_payload,
                 title=getattr(payload, "title", ""),
                 tagline=getattr(payload, "tagline", ""),
+                genre_id=genre_id,
                 variants=list(getattr(payload, "variants", []) or []),
             )
         except Exception as exc:
@@ -9762,6 +9772,7 @@ def update_store_product_detail(owner_username: str, product_id: int, payload: A
             raise
 
         product.title = first_text_from_keys(updated_payload, ("itemName", "title", "name")) or product.title
+        product.genre_id = genre_id
         product.price = price_from_rakuten_item(updated_payload)
         product.listed_at = parse_rakuten_datetime_value(updated_payload.get("created")) or product.listed_at
         product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
