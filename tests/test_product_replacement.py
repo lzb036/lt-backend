@@ -440,6 +440,35 @@ class ProductReplacementTests(unittest.TestCase):
             },
         }
 
+        def upload_product_images(
+            _secret: str,
+            _key: str,
+            _store: object,
+            _product: object,
+            _manage_number: str,
+            *,
+            cabinet_context: dict[str, object],
+            cancel_check: object,
+        ) -> list[dict[str, str]]:
+            self.assertEqual(cabinet_context, {})
+            self.assertFalse(cancel_check())
+            return [{"location": "/cabinet/new.jpg", "alt": "替换后标题"}]
+
+        def upload_description_images(
+            _secret: str,
+            _key: str,
+            _store: object,
+            _product: object,
+            _manage_number: str,
+            raw_payload: dict[str, object],
+            *,
+            cabinet_context: dict[str, object],
+            cancel_check: object,
+        ) -> dict[str, object]:
+            self.assertEqual(cabinet_context, {})
+            self.assertFalse(cancel_check())
+            return {"rawPayload": raw_payload, "uploadedImages": []}
+
         with (
             patch.object(crawler_service, "session_scope", side_effect=lambda: session_context(session)),
             patch.object(crawler_service, "decrypt_text", side_effect=lambda value: value),
@@ -448,12 +477,12 @@ class ProductReplacementTests(unittest.TestCase):
             patch.object(
                 crawler_service,
                 "upload_product_images_to_rakuten",
-                return_value=[{"location": "/cabinet/new.jpg", "alt": "替换后标题"}],
+                side_effect=upload_product_images,
             ),
             patch.object(
                 crawler_service,
                 "upload_product_description_images_to_rakuten",
-                return_value={"rawPayload": payload["draftPayload"]["raw"], "uploadedImages": []},
+                side_effect=upload_description_images,
             ),
             patch.object(
                 crawler_service,

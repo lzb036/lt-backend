@@ -7738,7 +7738,7 @@ def perform_product_replacement(
             transient,
             manage_number,
             cabinet_context={},
-            cancel_check=lambda: sync_task_cancel_requested(task_id),
+            cancel_check=lambda: is_task_cancel_requested(SyncTaskModel, task_id),
         )
         raise_if_task_cancelled(SyncTaskModel, task_id)
         description_result = upload_product_description_images_to_rakuten(
@@ -7749,7 +7749,7 @@ def perform_product_replacement(
             manage_number,
             raw,
             cabinet_context={},
-            cancel_check=lambda: sync_task_cancel_requested(task_id),
+            cancel_check=lambda: is_task_cancel_requested(SyncTaskModel, task_id),
         )
         raw = description_result["rawPayload"]
         uploaded_description_images = description_result["uploadedImages"]
