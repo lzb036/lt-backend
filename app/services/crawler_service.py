@@ -950,6 +950,13 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "genrePath": rakuten_genre_path(row.genre_id),
         "genrePathZh": rakuten_genre_zh_path(rakuten_genre_path(row.genre_id)),
         "reviewStatus": row.review_status,
+        "replacementTaskId": normalize_text(product_replacement_metadata(raw_payload).get("taskId")) or None,
+        "replacementTargetProductId": (
+            int(product_replacement_metadata(raw_payload).get("targetProductId") or 0) or None
+        ),
+        "replacementTargetManageNumber": (
+            normalize_text(product_replacement_metadata(raw_payload).get("targetManageNumber")) or None
+        ),
         "lastError": row.last_error,
         "listedAt": listed_at,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -7325,6 +7332,28 @@ def replacement_draft_from_collected_item(item: dict[str, Any]) -> dict[str, Any
     }
 
 
+def product_replacement_metadata(raw_payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = raw_payload.get("_replacement")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def replacement_draft_from_pending_product(product: ProductModel) -> dict[str, Any]:
+    raw = product_raw_payload(product)
+    images = product_editable_image_urls(raw, shop_code=product_shop_code(product, raw))
+    return {
+        "title": normalize_text(product.title),
+        "tagline": product_tagline(raw),
+        "genreId": normalize_text(product.genre_id),
+        "genrePath": rakuten_genre_path(product.genre_id),
+        "genrePathZh": rakuten_genre_zh_path(rakuten_genre_path(product.genre_id)),
+        "price": float(product.price) if product.price is not None else None,
+        "images": images,
+        "descriptions": product_descriptions(raw),
+        "variants": raw.get("variants") if isinstance(raw.get("variants"), dict) else {},
+        "raw": raw,
+    }
+
+
 def replacement_detail_from_product_public(product: dict[str, Any]) -> dict[str, Any]:
     detail = product.get("detail") if isinstance(product.get("detail"), dict) else {}
     raw = detail.get("raw") if isinstance(detail.get("raw"), dict) else {}
@@ -7379,6 +7408,7 @@ def product_replacement_to_public(row: SyncTaskModel) -> dict[str, Any]:
         "before": payload.get("targetSnapshot") or {},
         "after": payload.get("draftPayload") or {},
         "difference": payload.get("difference") or {},
+        "pendingProduct": payload.get("pendingProduct") or None,
         "result": payload.get("result") or {},
     }
 
@@ -7438,6 +7468,42 @@ def create_product_replacement_preview(owner_username: str, product_id: int, sou
         )
         session.add(task)
         session.flush()
+        pending_raw = json.loads(json.dumps(draft.get("raw") or {}, ensure_ascii=False))
+        pending_raw.update({
+            "title": draft["title"],
+            "itemName": draft["title"],
+            "tagline": draft["tagline"],
+            "genreId": draft["genreId"],
+            "images": list(draft["images"]),
+            "variants": draft["variants"],
+            "_replacement": {
+                "taskId": task.id,
+                "targetProductId": target.id,
+                "targetManageNumber": target.rakuten_manage_number or target.item_number,
+            },
+        })
+        pending = ProductModel(
+            owner_username=owner_username,
+            task_id=None,
+            store_id=None,
+            source_url=normalized_url,
+            source_url_hash=make_source_url_hash(f"{normalized_url}#replacement:{target.id}:{task.id}"),
+            title=draft["title"][:500],
+            image_url=normalize_text((draft["images"] or [""])[0]),
+            item_number=first_text_from_keys(pending_raw, ("itemNumber", "manageNumber")),
+            shop_name=first_text_from_keys(pending_raw, ("shopName", "shop")),
+            genre_id=draft["genreId"],
+            price=Decimal(str(draft["price"])) if draft["price"] is not None else None,
+            currency="JPY",
+            review_status="pending",
+            raw_payload_json=json.dumps(pending_raw, ensure_ascii=False),
+        )
+        session.add(pending)
+        session.flush()
+        payload["pendingProductId"] = pending.id
+        payload["pendingProduct"] = product_to_public(pending)
+        task.payload_json = json.dumps(payload, ensure_ascii=False)
+        session.flush()
         return product_replacement_to_public(task)
 
 
@@ -7494,10 +7560,16 @@ def confirm_product_replacement(owner_username: str, task_id: str, manage_number
         target = session.get(ProductModel, int(payload.get("targetProductId") or 0))
         if target is None or target.owner_username != owner_username or target.review_status != "listed":
             raise RuntimeError("目标店铺商品不存在或状态已变化。")
+        pending = session.get(ProductModel, int(payload.get("pendingProductId") or 0))
+        if pending is None or pending.owner_username != owner_username or pending.review_status != "pending":
+            raise RuntimeError("待审核替换商品不存在或状态已变化。")
+        metadata = product_replacement_metadata(product_raw_payload(pending))
+        if normalize_text(metadata.get("taskId")) != task.id:
+            raise RuntimeError("待审核替换商品与替换任务不匹配。")
         expected = normalize_text(target.rakuten_manage_number or target.item_number)
         if normalize_text(manage_number) != expected:
             raise RuntimeError("商品管理编号输入不正确。")
-        draft = payload.get("draftPayload") if isinstance(payload.get("draftPayload"), dict) else {}
+        draft = replacement_draft_from_pending_product(pending)
         if not normalize_text(draft.get("title")):
             raise RuntimeError("替换后商品标题不能为空。")
         if not rakuten_genre_path(draft.get("genreId")):
@@ -7506,6 +7578,9 @@ def confirm_product_replacement(owner_username: str, task_id: str, manage_number
             raise RuntimeError("替换后商品缺少图片。")
         if not isinstance(draft.get("variants"), dict) or not draft.get("variants"):
             raise RuntimeError("替换后商品缺少 SKU。")
+        payload["draftPayload"] = draft
+        payload["pendingProduct"] = product_to_public(pending)
+        task.payload_json = json.dumps(payload, ensure_ascii=False)
         task.status = "queued"
         task.message = "等待执行商品替换"
         task.error_detail = None
@@ -7526,6 +7601,11 @@ def cancel_product_replacement(owner_username: str, task_id: str) -> dict[str, A
         task.status = "cancelled"
         task.message = "已取消商品替换"
         task.finished_at = datetime.now()
+        payload = product_replacement_payload(task)
+        pending_product_id = int(payload.get("pendingProductId") or 0)
+        pending = session.get(ProductModel, pending_product_id) if pending_product_id else None
+        if pending is not None and pending.owner_username == owner_username and pending.review_status == "pending":
+            session.delete(pending)
         session.flush()
         return product_replacement_to_public(task)
 
@@ -7682,6 +7762,10 @@ def perform_product_replacement(
         target.raw_payload_json = json.dumps(updated_raw, ensure_ascii=False)
         target.store_last_seen_at = now
         target.last_error = None
+        pending_product_id = int(payload.get("pendingProductId") or 0)
+        pending = session.get(ProductModel, pending_product_id) if pending_product_id else None
+        if pending is not None and pending.owner_username == owner_username:
+            session.delete(pending)
         session.flush()
         updated_product = product_detail_to_public(target)
     payload["result"] = {
@@ -9139,6 +9223,12 @@ def update_product_status(owner_username: str, product_ids: list[int], status: s
             if invalid_rows:
                 raise RuntimeError("只有待审核商品可以标记异常。")
         if status == "approved":
+            replacement_rows = [
+                row for row in rows
+                if product_replacement_metadata(product_raw_payload(row))
+            ]
+            if replacement_rows:
+                raise RuntimeError("替换采集商品请使用“确认替换”，不能执行普通审核通过。")
             invalid_rows = [row for row in rows if not rakuten_genre_path(row.genre_id)]
             if invalid_rows:
                 names = "、".join(normalize_text(row.title) or f"商品 {row.id}" for row in invalid_rows[:3])
@@ -9239,6 +9329,19 @@ def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, An
                 ).all()
                 for child in child_rows:
                     child.parent_product_id = None
+            replacement = product_replacement_metadata(product_raw_payload(row))
+            replacement_task_id = normalize_text(replacement.get("taskId"))
+            if replacement_task_id:
+                replacement_task = session.get(SyncTaskModel, replacement_task_id)
+                if (
+                    replacement_task is not None
+                    and replacement_task.owner_username == owner_username
+                    and replacement_task.task_type == "product_replace"
+                    and replacement_task.status in {"preview_ready", "failed"}
+                ):
+                    replacement_task.status = "cancelled"
+                    replacement_task.message = "待审核替换商品已删除"
+                    replacement_task.finished_at = datetime.now()
             deleted_ids.append(row.id)
             session.delete(row)
             success_count += 1

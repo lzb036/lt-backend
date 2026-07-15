@@ -40,6 +40,36 @@ def listed_product() -> SimpleNamespace:
     )
 
 
+def pending_replacement_product() -> SimpleNamespace:
+    return SimpleNamespace(
+        id=21,
+        owner_username="operator",
+        store_id=None,
+        review_status="pending",
+        rakuten_manage_number=None,
+        item_number="source-item",
+        source_url="https://item.rakuten.co.jp/source-shop/source-item/",
+        title="待审核替换标题",
+        genre_id="200002",
+        image_url="https://example.com/edited.jpg",
+        price=3880,
+        currency="JPY",
+        raw_payload_json=json.dumps({
+            "title": "待审核替换标题",
+            "tagline": "已编辑副标题",
+            "genreId": "200002",
+            "images": ["https://example.com/edited.jpg"],
+            "variants": {"edited-sku": {"standardPrice": "3880"}},
+            "_replacement": {
+                "taskId": "task-id",
+                "targetProductId": 9,
+            },
+        }, ensure_ascii=False),
+        listing_task_id=None,
+        last_error=None,
+    )
+
+
 class ProductReplacementTests(unittest.TestCase):
     def test_replacement_draft_uses_collected_content_without_source_identity(self) -> None:
         item = {
@@ -119,7 +149,7 @@ class ProductReplacementTests(unittest.TestCase):
         self.assertEqual(difference["images"]["beforeCount"], 1)
         self.assertEqual(difference["images"]["afterCount"], 2)
 
-    def test_create_preview_keeps_target_unchanged_and_saves_preview_task(self) -> None:
+    def test_create_preview_keeps_target_unchanged_and_creates_pending_replacement_product(self) -> None:
         target = listed_product()
         store = SimpleNamespace(id=3, enabled=True, alias_name="店铺", store_name="店铺")
         session = MagicMock()
@@ -143,6 +173,7 @@ class ProductReplacementTests(unittest.TestCase):
             patch.object(crawler_service, "session_scope", side_effect=lambda: session_context(session)),
             patch.object(crawler_service, "collect_product_detail", return_value=item),
             patch.object(crawler_service, "product_detail_to_public", return_value={"id": 9, "title": "替换前标题"}),
+            patch.object(crawler_service, "product_to_public", return_value={"id": 21, "reviewStatus": "pending"}),
             patch.object(crawler_service, "sync_task_to_public", return_value={"id": "task-id", "status": "preview_ready"}),
         ):
             result = crawler_service.create_product_replacement_preview(
@@ -152,25 +183,58 @@ class ProductReplacementTests(unittest.TestCase):
             )
 
         self.assertEqual(target.title, "替换前标题")
-        task = session.add.call_args.args[0]
+        task = session.add.call_args_list[0].args[0]
         self.assertEqual(task.task_type, "product_replace")
         self.assertEqual(task.status, "preview_ready")
+        pending = session.add.call_args_list[1].args[0]
+        self.assertEqual(pending.review_status, "pending")
+        self.assertIsNone(pending.store_id)
+        self.assertEqual(
+            json.loads(pending.raw_payload_json)["_replacement"]["targetProductId"],
+            target.id,
+        )
         self.assertEqual(result["task"]["status"], "preview_ready")
+        self.assertEqual(result["pendingProduct"]["reviewStatus"], "pending")
+
+    def test_normal_approval_rejects_replacement_pending_product(self) -> None:
+        pending = pending_replacement_product()
+        session = MagicMock()
+        session.scalars.return_value.all.return_value = [pending]
+
+        with patch.object(crawler_service, "session_scope", return_value=session_context(session)):
+            with self.assertRaisesRegex(RuntimeError, "确认替换"):
+                crawler_service.update_product_status("operator", [pending.id], "approved")
+
+        self.assertEqual(pending.review_status, "pending")
 
     def test_confirm_requires_exact_target_manage_number(self) -> None:
         target = listed_product()
+        pending = pending_replacement_product()
         task = SimpleNamespace(
             id="task-id",
             owner_username="operator",
             task_type="product_replace",
             status="preview_ready",
-            payload_json=json.dumps({"targetProductId": 9, "draftPayload": {"title": "新标题"}}),
+            payload_json=json.dumps({
+                "targetProductId": 9,
+                "pendingProductId": 21,
+                "draftPayload": {"title": "新标题"},
+            }),
             message="",
             error_detail=None,
             finished_at=None,
         )
         session = MagicMock()
-        session.get.side_effect = lambda model, key: task if model is crawler_service.SyncTaskModel else target
+        def get_model(model: object, key: object) -> object:
+            if model is crawler_service.SyncTaskModel:
+                return task
+            if key == target.id:
+                return target
+            if key == pending.id:
+                return pending
+            return None
+
+        session.get.side_effect = get_model
 
         with patch.object(crawler_service, "session_scope", return_value=session_context(session)):
             with self.assertRaisesRegex(RuntimeError, "商品管理编号"):
@@ -178,8 +242,76 @@ class ProductReplacementTests(unittest.TestCase):
 
         self.assertEqual(task.status, "preview_ready")
 
+    def test_confirm_uses_latest_pending_product_content(self) -> None:
+        target = listed_product()
+        pending = pending_replacement_product()
+        task = SimpleNamespace(
+            id="task-id",
+            owner_username="operator",
+            task_type="product_replace",
+            status="preview_ready",
+            payload_json=json.dumps({
+                "targetProductId": 9,
+                "pendingProductId": 21,
+                "draftPayload": {"title": "旧预览标题"},
+            }, ensure_ascii=False),
+            message="",
+            error_detail=None,
+            finished_at=None,
+        )
+        session = MagicMock()
+
+        def get_model(model: object, key: object) -> object:
+            if model is crawler_service.SyncTaskModel:
+                return task
+            if key == target.id:
+                return target
+            if key == pending.id:
+                return pending
+            return None
+
+        session.get.side_effect = get_model
+
+        with (
+            patch.object(crawler_service, "session_scope", return_value=session_context(session)),
+            patch.object(crawler_service, "dispatch_next_sync_task"),
+            patch.object(crawler_service, "rakuten_genre_path", return_value="分类"),
+            patch.object(crawler_service, "product_to_public", return_value={"id": 21, "reviewStatus": "pending"}),
+            patch.object(crawler_service, "sync_task_to_public", return_value={"id": "task-id", "status": "queued"}),
+        ):
+            crawler_service.confirm_product_replacement("operator", "task-id", "target-manage")
+
+        payload = json.loads(task.payload_json)
+        self.assertEqual(payload["draftPayload"]["title"], "待审核替换标题")
+        self.assertEqual(payload["draftPayload"]["images"], ["https://example.com/edited.jpg"])
+        self.assertEqual(task.status, "queued")
+
+    def test_cancel_replacement_removes_pending_product(self) -> None:
+        pending = pending_replacement_product()
+        task = SimpleNamespace(
+            id="task-id",
+            owner_username="operator",
+            task_type="product_replace",
+            status="preview_ready",
+            payload_json=json.dumps({"pendingProductId": pending.id}),
+            message="",
+            finished_at=None,
+        )
+        session = MagicMock()
+        session.get.side_effect = lambda model, key: task if model is crawler_service.SyncTaskModel else pending
+
+        with (
+            patch.object(crawler_service, "session_scope", return_value=session_context(session)),
+            patch.object(crawler_service, "sync_task_to_public", return_value={"id": "task-id", "status": "cancelled"}),
+        ):
+            crawler_service.cancel_product_replacement("operator", "task-id")
+
+        self.assertEqual(task.status, "cancelled")
+        session.delete.assert_called_once_with(pending)
+
     def test_perform_replacement_preserves_target_identity_after_remote_success(self) -> None:
         target = listed_product()
+        pending = pending_replacement_product()
         target.rakuten_listing_status = "listed"
         target.store_last_seen_at = None
         target.currency = "JPY"
@@ -193,9 +325,19 @@ class ProductReplacementTests(unittest.TestCase):
             rakuten_license_key_encrypted="key",
         )
         session = MagicMock()
-        session.get.side_effect = lambda model, key: target if model is crawler_service.ProductModel else store
+        def get_model(model: object, key: object) -> object:
+            if model is crawler_service.StoreModel:
+                return store
+            if key == target.id:
+                return target
+            if key == pending.id:
+                return pending
+            return None
+
+        session.get.side_effect = get_model
         payload = {
             "targetProductId": 9,
+            "pendingProductId": 21,
             "draftPayload": {
                 "title": "替换后标题",
                 "tagline": "替换后副标题",
@@ -255,6 +397,7 @@ class ProductReplacementTests(unittest.TestCase):
         self.assertEqual(target.item_number, "target-item")
         self.assertEqual(target.source_url, "https://www.rakuten.co.jp/target/target-item/")
         self.assertEqual(target.review_status, "listed")
+        session.delete.assert_called_once_with(pending)
 
 
 if __name__ == "__main__":
