@@ -7033,7 +7033,13 @@ def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: 
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步", owner_username=owner_username)
         reconcile_interrupted_running_tasks(session, SyncTaskModel, owner_username=owner_username)
-        query = select(SyncTaskModel).where(SyncTaskModel.owner_username == owner_username)
+        query = select(SyncTaskModel).where(
+            SyncTaskModel.owner_username == owner_username,
+            or_(
+                SyncTaskModel.task_type != "product_replace",
+                SyncTaskModel.status != "preview_ready",
+            ),
+        )
         return paginate_query(
             session,
             query,
@@ -7043,6 +7049,10 @@ def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: 
             response_key="syncTasks",
             serializer=sync_task_to_public,
         )
+
+
+def sync_task_visible_in_list(task_type: str, status: str) -> bool:
+    return not (normalize_text(task_type) == "product_replace" and normalize_text(status) == "preview_ready")
 
 
 def delete_sync_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
@@ -7415,96 +7425,133 @@ def product_replacement_to_public(row: SyncTaskModel) -> dict[str, Any]:
 
 def create_product_replacement_preview(owner_username: str, product_id: int, source_url: str) -> dict[str, Any]:
     normalized_url = normalize_rakuten_product_target(source_url)
-    collected_item = collect_product_detail(normalized_url)
-    draft = replacement_draft_from_collected_item(collected_item)
-    if not draft["title"]:
-        raise RuntimeError("来源商品没有有效标题。")
+    crawl_task_id = uuid.uuid4().hex
     with session_scope() as session:
-        target = session.get(ProductModel, product_id)
-        if target is None or target.owner_username != owner_username:
-            raise RuntimeError("目标店铺商品不存在。")
-        if target.review_status != "listed" or not target.store_id:
-            raise RuntimeError("只有店铺商品可以执行商品替换。")
-        store = session.get(StoreModel, target.store_id)
-        if store is None or not store.enabled:
-            raise RuntimeError("目标商品所属店铺不存在或已停用。")
-        active = session.scalar(
-            select(SyncTaskModel.id).where(
-                SyncTaskModel.owner_username == owner_username,
-                SyncTaskModel.task_type == "product_replace",
-                SyncTaskModel.status.in_(["preview_ready", "queued", "running"]),
-                SyncTaskModel.payload_json.like(f'%"targetProductId": {product_id}%'),
-            )
-        )
-        if active:
-            raise RuntimeError("当前商品已有进行中的替换任务。")
-        cleaned_raw, _ = sanitize_product_payload(draft.get("raw") or {}, active_sensitive_words(session))
-        draft["raw"] = cleaned_raw
-        draft["title"] = first_text_from_keys(cleaned_raw, ("itemName", "title", "name")) or draft["title"]
-        draft["tagline"] = product_tagline(cleaned_raw)
-        if not normalize_text(draft["title"]):
-            raise RuntimeError(EMPTY_SENSITIVE_TITLE_SAVE_ERROR)
-        target_public = product_detail_to_public(target)
-        before = replacement_detail_from_product_public(target_public)
-        payload = {
-            "targetProductId": target.id,
-            "sourceUrl": normalized_url,
-            "targetSnapshot": target_public,
-            "sourcePayload": draft,
-            "draftPayload": draft,
-            "difference": product_replacement_difference(before, draft),
-        }
-        task = SyncTaskModel(
-            id=uuid.uuid4().hex,
+        session.add(CrawlTaskModel(
+            id=crawl_task_id,
             owner_username=owner_username,
-            store_id=store.id,
-            store_name=store.alias_name or store.store_name,
-            task_name=f"替换商品 {target.rakuten_manage_number or target.item_number}",
-            task_type="product_replace",
-            payload_json=json.dumps(payload, ensure_ascii=False),
-            status="preview_ready",
+            source_type="product_replace",
+            target=normalized_url,
+            mode="manual",
+            status="running",
             total_count=1,
-            message="采集完成，等待确认替换",
-        )
-        session.add(task)
+            success_count=0,
+            failed_count=0,
+            message="正在采集替换商品",
+            started_at=datetime.now(),
+        ))
         session.flush()
-        pending_raw = json.loads(json.dumps(draft.get("raw") or {}, ensure_ascii=False))
-        pending_raw.update({
-            "title": draft["title"],
-            "itemName": draft["title"],
-            "tagline": draft["tagline"],
-            "genreId": draft["genreId"],
-            "images": list(draft["images"]),
-            "variants": draft["variants"],
-            "_replacement": {
-                "taskId": task.id,
+    try:
+        collected_item = collect_product_detail(normalized_url)
+        draft = replacement_draft_from_collected_item(collected_item)
+        if not draft["title"]:
+            raise RuntimeError("来源商品没有有效标题。")
+        with session_scope() as session:
+            crawl_task = session.get(CrawlTaskModel, crawl_task_id)
+            target = session.get(ProductModel, product_id)
+            if target is None or target.owner_username != owner_username:
+                raise RuntimeError("目标店铺商品不存在。")
+            if target.review_status != "listed" or not target.store_id:
+                raise RuntimeError("只有店铺商品可以执行商品替换。")
+            store = session.get(StoreModel, target.store_id)
+            if store is None or not store.enabled:
+                raise RuntimeError("目标商品所属店铺不存在或已停用。")
+            active = session.scalar(
+                select(SyncTaskModel.id).where(
+                    SyncTaskModel.owner_username == owner_username,
+                    SyncTaskModel.task_type == "product_replace",
+                    SyncTaskModel.status.in_(["preview_ready", "queued", "running"]),
+                    SyncTaskModel.payload_json.like(f'%"targetProductId": {product_id}%'),
+                )
+            )
+            if active:
+                raise RuntimeError("当前商品已有进行中的替换任务。")
+            cleaned_raw, _ = sanitize_product_payload(draft.get("raw") or {}, active_sensitive_words(session))
+            draft["raw"] = cleaned_raw
+            draft["title"] = first_text_from_keys(cleaned_raw, ("itemName", "title", "name")) or draft["title"]
+            draft["tagline"] = product_tagline(cleaned_raw)
+            if not normalize_text(draft["title"]):
+                raise RuntimeError(EMPTY_SENSITIVE_TITLE_SAVE_ERROR)
+            target_public = product_detail_to_public(target)
+            before = replacement_detail_from_product_public(target_public)
+            payload = {
                 "targetProductId": target.id,
-                "targetManageNumber": target.rakuten_manage_number or target.item_number,
-            },
-        })
-        pending = ProductModel(
-            owner_username=owner_username,
-            task_id=None,
-            store_id=None,
-            source_url=normalized_url,
-            source_url_hash=make_source_url_hash(f"{normalized_url}#replacement:{target.id}:{task.id}"),
-            title=draft["title"][:500],
-            image_url=normalize_text((draft["images"] or [""])[0]),
-            item_number=first_text_from_keys(pending_raw, ("itemNumber", "manageNumber")),
-            shop_name=first_text_from_keys(pending_raw, ("shopName", "shop")),
-            genre_id=draft["genreId"],
-            price=Decimal(str(draft["price"])) if draft["price"] is not None else None,
-            currency="JPY",
-            review_status="pending",
-            raw_payload_json=json.dumps(pending_raw, ensure_ascii=False),
-        )
-        session.add(pending)
-        session.flush()
-        payload["pendingProductId"] = pending.id
-        payload["pendingProduct"] = product_to_public(pending)
-        task.payload_json = json.dumps(payload, ensure_ascii=False)
-        session.flush()
-        return product_replacement_to_public(task)
+                "sourceUrl": normalized_url,
+                "crawlTaskId": crawl_task_id,
+                "targetSnapshot": target_public,
+                "sourcePayload": draft,
+                "draftPayload": draft,
+                "difference": product_replacement_difference(before, draft),
+            }
+            task = SyncTaskModel(
+                id=uuid.uuid4().hex,
+                owner_username=owner_username,
+                store_id=store.id,
+                store_name=store.alias_name or store.store_name,
+                task_name=f"替换商品 {target.rakuten_manage_number or target.item_number}",
+                task_type="product_replace",
+                payload_json=json.dumps(payload, ensure_ascii=False),
+                status="preview_ready",
+                total_count=1,
+                message="采集完成，等待确认替换",
+            )
+            session.add(task)
+            session.flush()
+            pending_raw = json.loads(json.dumps(draft.get("raw") or {}, ensure_ascii=False))
+            pending_raw.update({
+                "title": draft["title"],
+                "itemName": draft["title"],
+                "tagline": draft["tagline"],
+                "genreId": draft["genreId"],
+                "images": list(draft["images"]),
+                "variants": draft["variants"],
+                "_replacement": {
+                    "taskId": task.id,
+                    "targetProductId": target.id,
+                    "targetManageNumber": target.rakuten_manage_number or target.item_number,
+                },
+            })
+            pending = ProductModel(
+                owner_username=owner_username,
+                task_id=crawl_task_id,
+                store_id=None,
+                source_url=normalized_url,
+                source_url_hash=make_source_url_hash(f"{normalized_url}#replacement:{target.id}:{task.id}"),
+                title=draft["title"][:500],
+                image_url=normalize_text((draft["images"] or [""])[0]),
+                item_number=first_text_from_keys(pending_raw, ("itemNumber", "manageNumber")),
+                shop_name=first_text_from_keys(pending_raw, ("shopName", "shop")),
+                genre_id=draft["genreId"],
+                price=Decimal(str(draft["price"])) if draft["price"] is not None else None,
+                currency="JPY",
+                review_status="pending",
+                raw_payload_json=json.dumps(pending_raw, ensure_ascii=False),
+            )
+            session.add(pending)
+            session.flush()
+            payload["pendingProductId"] = pending.id
+            payload["pendingProduct"] = product_to_public(pending)
+            task.payload_json = json.dumps(payload, ensure_ascii=False)
+            if crawl_task is not None:
+                crawl_task.status = "success"
+                crawl_task.success_count = 1
+                crawl_task.failed_count = 0
+                crawl_task.message = "替换商品采集完成，已进入待审核商品"
+                crawl_task.finished_at = datetime.now()
+            session.flush()
+            return product_replacement_to_public(task)
+    except Exception as exc:
+        with session_scope() as session:
+            crawl_task = session.get(CrawlTaskModel, crawl_task_id)
+            if crawl_task is not None:
+                crawl_task.status = "failed"
+                crawl_task.success_count = 0
+                crawl_task.failed_count = 1
+                crawl_task.message = "替换商品采集失败"
+                crawl_task.error_detail = str(exc)
+                crawl_task.finished_at = datetime.now()
+                session.flush()
+        raise
 
 
 def get_product_replacement(owner_username: str, task_id: str) -> dict[str, Any]:
@@ -14115,6 +14162,8 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("采集任务不存在。")
         if task.owner_username != owner_username:
             raise RuntimeError("不能重启其他用户的采集任务。")
+        if task.source_type == "product_replace":
+            raise RuntimeError("商品替换采集请从店铺商品中重新发起。")
         if task.status in {"queued", "running"}:
             raise RuntimeError("采集任务正在执行中，不能重新采集。")
         task.status = "queued"

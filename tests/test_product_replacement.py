@@ -153,8 +153,26 @@ class ProductReplacementTests(unittest.TestCase):
         target = listed_product()
         store = SimpleNamespace(id=3, enabled=True, alias_name="店铺", store_name="店铺")
         session = MagicMock()
-        session.get.side_effect = lambda model, key: target if model is crawler_service.ProductModel else store
+        crawl_task = None
+
+        def get_model(model: object, key: object) -> object:
+            if model is crawler_service.CrawlTaskModel:
+                return crawl_task
+            if model is crawler_service.ProductModel:
+                return target
+            if model is crawler_service.StoreModel:
+                return store
+            return None
+
+        session.get.side_effect = get_model
         session.scalar.return_value = None
+
+        def capture_added_row(row: object) -> None:
+            nonlocal crawl_task
+            if isinstance(row, crawler_service.CrawlTaskModel):
+                crawl_task = row
+
+        session.add.side_effect = capture_added_row
         item = {
             "title": "替换后标题",
             "source_url": "https://item.rakuten.co.jp/source-shop/source-item/",
@@ -183,18 +201,64 @@ class ProductReplacementTests(unittest.TestCase):
             )
 
         self.assertEqual(target.title, "替换前标题")
-        task = session.add.call_args_list[0].args[0]
+        crawl_task = session.add.call_args_list[0].args[0]
+        self.assertEqual(crawl_task.mode, "manual")
+        self.assertEqual(crawl_task.source_type, "product_replace")
+        self.assertEqual(crawl_task.status, "success")
+        self.assertEqual(crawl_task.success_count, 1)
+        task = session.add.call_args_list[1].args[0]
         self.assertEqual(task.task_type, "product_replace")
         self.assertEqual(task.status, "preview_ready")
-        pending = session.add.call_args_list[1].args[0]
+        pending = session.add.call_args_list[2].args[0]
         self.assertEqual(pending.review_status, "pending")
         self.assertIsNone(pending.store_id)
+        self.assertEqual(pending.task_id, crawl_task.id)
         self.assertEqual(
             json.loads(pending.raw_payload_json)["_replacement"]["targetProductId"],
             target.id,
         )
         self.assertEqual(result["task"]["status"], "preview_ready")
         self.assertEqual(result["pendingProduct"]["reviewStatus"], "pending")
+
+    def test_failed_replacement_collection_is_recorded_as_manual_crawl_failure(self) -> None:
+        session = MagicMock()
+        crawl_task = None
+
+        def get_model(model: object, key: object) -> object:
+            if model is crawler_service.CrawlTaskModel:
+                return crawl_task
+            return None
+
+        session.get.side_effect = get_model
+
+        def capture_task(row: object) -> None:
+            nonlocal crawl_task
+            if isinstance(row, crawler_service.CrawlTaskModel):
+                crawl_task = row
+
+        session.add.side_effect = capture_task
+
+        with (
+            patch.object(crawler_service, "session_scope", side_effect=lambda: session_context(session)),
+            patch.object(crawler_service, "collect_product_detail", side_effect=RuntimeError("采集失败")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "采集失败"):
+                crawler_service.create_product_replacement_preview(
+                    "operator",
+                    9,
+                    "https://item.rakuten.co.jp/source-shop/source-item/",
+                )
+
+        self.assertIsNotNone(crawl_task)
+        self.assertEqual(crawl_task.status, "failed")
+        self.assertEqual(crawl_task.failed_count, 1)
+        self.assertIn("采集失败", crawl_task.error_detail)
+
+    def test_preview_replacement_sync_task_is_hidden_until_confirmed(self) -> None:
+        self.assertFalse(crawler_service.sync_task_visible_in_list("product_replace", "preview_ready"))
+        self.assertTrue(crawler_service.sync_task_visible_in_list("product_replace", "queued"))
+        self.assertTrue(crawler_service.sync_task_visible_in_list("product_replace", "running"))
+        self.assertTrue(crawler_service.sync_task_visible_in_list("store_sync", "queued"))
 
     def test_normal_approval_rejects_replacement_pending_product(self) -> None:
         pending = pending_replacement_product()
