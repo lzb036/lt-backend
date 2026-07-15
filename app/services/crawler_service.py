@@ -12069,6 +12069,12 @@ def update_product_local_detail(owner_username: str, product_id: int, payload: A
             raise RuntimeError("店铺商品请使用同步修改。")
         if product.review_status != "pending" and getattr(payload, "imageChanges", None):
             raise RuntimeError("只有待审核商品可以修改图片。")
+        genre_id = normalize_text(getattr(payload, "genreId", None))
+        if genre_id:
+            if product.review_status != "pending":
+                raise RuntimeError("只有待审核商品可以修改品类。")
+            if not re.fullmatch(r"\d{6}", genre_id) or not rakuten_genre_path(genre_id):
+                raise RuntimeError("请选择有效品类。")
 
         updated_payload = patch_local_item_detail(
             product_raw_payload(product),
@@ -12076,6 +12082,9 @@ def update_product_local_detail(owner_username: str, product_id: int, payload: A
             tagline=getattr(payload, "tagline", ""),
             variants=list(getattr(payload, "variants", []) or []),
         )
+        if genre_id:
+            updated_payload["genreId"] = genre_id
+            product.genre_id = genre_id
         image_changes = getattr(payload, "imageChanges", None)
         if product.review_status == "pending":
             updated_payload, cleanup_urls = apply_product_image_changes(product, updated_payload, image_changes)

@@ -154,6 +154,7 @@ class ProductImageBase64DraftPayload(BaseModel):
 class ProductDetailEditPayload(BaseModel):
     title: str = Field(min_length=1, max_length=500)
     tagline: str = ""
+    genreId: str | None = Field(default=None, pattern=r"^\d{6}$")
     variants: list[ProductVariantEditPayload] = Field(default_factory=list)
     imageChanges: ProductImageChangesPayload | None = None
 
