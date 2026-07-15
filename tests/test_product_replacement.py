@@ -17,6 +17,7 @@ def session_context(session: MagicMock):
 def listed_product() -> SimpleNamespace:
     return SimpleNamespace(
         id=9,
+        parent_product_id=8,
         owner_username="operator",
         store_id=3,
         review_status="listed",
@@ -36,6 +37,31 @@ def listed_product() -> SimpleNamespace:
             "variants": {"old-sku": {"standardPrice": "1000"}},
         }, ensure_ascii=False),
         listing_task_id=None,
+        last_error=None,
+    )
+
+
+def listed_master_product() -> SimpleNamespace:
+    return SimpleNamespace(
+        id=8,
+        owner_username="operator",
+        store_id=None,
+        review_status="listed_master",
+        title="主商品旧标题",
+        genre_id="100001",
+        image_url="https://example.com/master-old.jpg",
+        price=1000,
+        raw_payload_json=json.dumps({
+            "title": "主商品旧标题",
+            "genreId": "100001",
+            "images": ["https://example.com/master-old.jpg"],
+            "variants": {"old-sku": {"standardPrice": "1000"}},
+            "listedStores": [{
+                "storeId": 3,
+                "storeName": "目标店铺",
+                "manageNumber": "target-manage",
+            }],
+        }, ensure_ascii=False),
         last_error=None,
     )
 
@@ -479,6 +505,7 @@ class ProductReplacementTests(unittest.TestCase):
 
     def test_perform_replacement_preserves_target_identity_after_remote_success(self) -> None:
         target = listed_product()
+        parent = listed_master_product()
         pending = pending_replacement_product()
         target.rakuten_listing_status = "listed"
         target.store_last_seen_at = None
@@ -498,6 +525,8 @@ class ProductReplacementTests(unittest.TestCase):
                 return store
             if key == target.id:
                 return target
+            if key == parent.id:
+                return parent
             if key == pending.id:
                 return pending
             return None
@@ -594,6 +623,13 @@ class ProductReplacementTests(unittest.TestCase):
         self.assertEqual(target.item_number, "target-item")
         self.assertEqual(target.source_url, "https://www.rakuten.co.jp/target/target-item/")
         self.assertEqual(target.review_status, "listed")
+        self.assertEqual(parent.title, "替换后标题")
+        self.assertEqual(parent.genre_id, "200002")
+        self.assertEqual(parent.price, 2880)
+        self.assertEqual(
+            json.loads(parent.raw_payload_json)["listedStores"][0]["manageNumber"],
+            "target-manage",
+        )
         session.delete.assert_called_once_with(pending)
 
 

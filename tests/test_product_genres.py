@@ -263,6 +263,39 @@ class ProductGenreServiceTests(unittest.TestCase):
         self.assertEqual(json.loads(row.raw_payload_json)["genreId"], genre_id)
         self.assertEqual(result["genreId"], genre_id)
 
+    def test_local_detail_save_persists_drafted_genre_for_listed_master(self) -> None:
+        genre_id, _ = sample_genre()
+        row = product(7, status="listed_master")
+        row.price = 1000
+        row.image_url = ""
+        row.last_error = None
+        session = MagicMock()
+        session.get.return_value = row
+        payload = SimpleNamespace(
+            title="更新标题",
+            tagline="更新副标题",
+            variants=[],
+            imageChanges=None,
+            genreId=genre_id,
+        )
+
+        with (
+            patch.object(crawler_service, "session_scope", return_value=session_context(session)),
+            patch.object(
+                crawler_service,
+                "patch_local_item_detail",
+                return_value={"itemName": "更新标题", "genreId": genre_id},
+            ),
+            patch.object(crawler_service, "price_from_rakuten_item", return_value=1000),
+            patch.object(crawler_service, "product_detail_to_public", return_value={"id": 7, "genreId": genre_id}),
+            patch.object(crawler_service, "cleanup_product_image_urls"),
+        ):
+            result = crawler_service.update_product_local_detail("operator", 7, payload)
+
+        self.assertEqual(row.genre_id, genre_id)
+        self.assertEqual(json.loads(row.raw_payload_json)["genreId"], genre_id)
+        self.assertEqual(result["genreId"], genre_id)
+
     def test_local_detail_save_rejects_invalid_genre_without_mutating_product(self) -> None:
         row = product(7, genre_id="")
         row.price = 1000

@@ -7797,6 +7797,7 @@ def perform_product_replacement(
             raise RuntimeError("目标商品缺少商品管理编号。")
         target_identity = {
             "id": target.id,
+            "parentProductId": target.parent_product_id,
             "sourceUrl": target.source_url,
             "manageNumber": target.rakuten_manage_number,
             "itemNumber": target.item_number,
@@ -7921,6 +7922,29 @@ def perform_product_replacement(
         target.raw_payload_json = json.dumps(updated_raw, ensure_ascii=False)
         target.store_last_seen_at = now
         target.last_error = None
+        parent_product_id = int(target_identity.get("parentProductId") or 0)
+        parent = session.get(ProductModel, parent_product_id) if parent_product_id else None
+        if (
+            parent is not None
+            and parent.owner_username == owner_username
+            and parent.review_status == "listed_master"
+        ):
+            parent_raw = product_raw_payload(parent)
+            parent_updated_raw = json.loads(json.dumps(updated_raw, ensure_ascii=False))
+            listed_stores = parent_raw.get("listedStores")
+            if isinstance(listed_stores, list):
+                parent_updated_raw["listedStores"] = listed_stores
+            for key in ("manageNumber", "itemNumber", "listingStore"):
+                if key in parent_raw:
+                    parent_updated_raw[key] = parent_raw[key]
+                else:
+                    parent_updated_raw.pop(key, None)
+            parent.title = transient.title
+            parent.genre_id = transient.genre_id
+            parent.price = price_from_rakuten_item(parent_updated_raw) or transient.price
+            parent.image_url = image_url
+            parent.raw_payload_json = json.dumps(parent_updated_raw, ensure_ascii=False)
+            parent.last_error = None
         pending_product_id = int(payload.get("pendingProductId") or 0)
         pending = session.get(ProductModel, pending_product_id) if pending_product_id else None
         if pending is not None and pending.owner_username == owner_username:
@@ -12751,8 +12775,8 @@ def update_product_local_detail(owner_username: str, product_id: int, payload: A
             raise RuntimeError("只有待审核商品可以修改图片。")
         genre_id = normalize_text(getattr(payload, "genreId", None))
         if genre_id:
-            if product.review_status != "pending":
-                raise RuntimeError("只有待审核商品可以修改品类。")
+            if product.review_status not in {"pending", "listed_master"}:
+                raise RuntimeError("只有待审核商品或已上架商品可以修改品类。")
             if not re.fullmatch(r"\d{6}", genre_id) or not rakuten_genre_path(genre_id):
                 raise RuntimeError("请选择有效品类。")
 
