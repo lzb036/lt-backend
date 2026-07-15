@@ -217,6 +217,14 @@ class ProductReplacementTests(unittest.TestCase):
             json.loads(pending.raw_payload_json)["_replacement"]["targetProductId"],
             target.id,
         )
+        self.assertEqual(
+            json.loads(pending.raw_payload_json)["_replacement"]["targetStoreName"],
+            "店铺",
+        )
+        self.assertEqual(
+            json.loads(pending.raw_payload_json)["_replacement"]["targetManageNumber"],
+            "target-manage",
+        )
         self.assertEqual(result["task"]["status"], "preview_ready")
         self.assertEqual(result["pendingProduct"]["reviewStatus"], "pending")
 

@@ -957,6 +957,12 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "replacementTargetManageNumber": (
             normalize_text(product_replacement_metadata(raw_payload).get("targetManageNumber")) or None
         ),
+        "replacementTargetStoreId": (
+            int(product_replacement_metadata(raw_payload).get("targetStoreId") or 0) or None
+        ),
+        "replacementTargetStoreName": (
+            normalize_text(product_replacement_metadata(raw_payload).get("targetStoreName")) or None
+        ),
         "lastError": row.last_error,
         "listedAt": listed_at,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -7509,6 +7515,8 @@ def create_product_replacement_preview(owner_username: str, product_id: int, sou
                     "taskId": task.id,
                     "targetProductId": target.id,
                     "targetManageNumber": target.rakuten_manage_number or target.item_number,
+                    "targetStoreId": store.id,
+                    "targetStoreName": store.alias_name or store.store_name,
                 },
             })
             pending = ProductModel(
