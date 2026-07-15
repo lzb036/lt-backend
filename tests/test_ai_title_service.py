@@ -12,6 +12,11 @@ class AiTitleServiceTests(unittest.TestCase):
     def test_ai_manage_is_a_supported_assignable_permission(self) -> None:
         self.assertEqual(normalize_permissions(["ai.manage"]), ["ai.manage"])
 
+    def test_provider_catalog_includes_generic_openai_and_major_providers(self) -> None:
+        values = {item["value"] for item in ai_title_service.provider_catalog()}
+
+        self.assertTrue({"custom_openai", "aliyun", "openai", "anthropic", "gemini", "openrouter"} <= values)
+
     def test_extract_stream_text_reads_openai_delta_content(self) -> None:
         line = 'data: {"choices":[{"delta":{"content":"{\\"title\\":\\"春物\\""}}]}'.encode()
 

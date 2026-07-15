@@ -14,6 +14,7 @@ class AiTitleApiTests(unittest.TestCase):
     def test_ai_settings_routes_require_ai_manage_permission(self) -> None:
         expected = {
             ("GET", "/crawler/settings/ai-title"),
+            ("GET", "/crawler/settings/ai-title/providers"),
             ("PUT", "/crawler/settings/ai-title"),
             ("POST", "/crawler/settings/ai-title/test"),
         }

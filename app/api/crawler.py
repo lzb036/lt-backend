@@ -155,14 +155,12 @@ class ProductDetailEditPayload(BaseModel):
 
 
 class AiTitleSettingsPayload(BaseModel):
-    enabled: bool = True
-    apiBaseUrl: str = Field(min_length=1, max_length=500)
+    provider: str = Field(min_length=1, max_length=64)
+    apiBaseUrl: str = Field(default="", max_length=500)
     apiKey: str = Field(default="", max_length=1000)
     modelName: str = Field(min_length=1, max_length=255)
     titlePrompt: str = Field(min_length=1, max_length=10000)
     subtitlePrompt: str = Field(min_length=1, max_length=10000)
-    temperature: float = Field(default=0.3, ge=0, le=2)
-    maxTokens: int = Field(default=1000, ge=100, le=10000)
 
 
 class AiTitleVersionSavePayload(BaseModel):
@@ -643,29 +641,36 @@ def update_product_local_detail(
 
 
 @router.get("/settings/ai-title")
-def get_ai_title_settings(_: dict = Depends(require_ai_permission)) -> dict:
+def get_ai_title_settings(user: dict = Depends(require_ai_permission)) -> dict:
     from app.services import ai_title_service
 
-    return {"settings": ai_title_service.get_settings()}
+    return {"settings": ai_title_service.get_settings(user["username"])}
+
+
+@router.get("/settings/ai-title/providers")
+def get_ai_title_providers(_: dict = Depends(require_ai_permission)) -> dict:
+    from app.services import ai_title_service
+
+    return {"providers": ai_title_service.provider_catalog()}
 
 
 @router.put("/settings/ai-title")
-def update_ai_title_settings(payload: AiTitleSettingsPayload, _: dict = Depends(require_ai_permission)) -> dict:
+def update_ai_title_settings(payload: AiTitleSettingsPayload, user: dict = Depends(require_ai_permission)) -> dict:
     from app.services import ai_title_service
 
     try:
-        return {"settings": ai_title_service.update_settings(payload)}
+        return {"settings": ai_title_service.update_settings(user["username"], payload)}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/settings/ai-title/test")
-def test_ai_title_settings(_: dict = Depends(require_ai_permission)) -> dict:
+def test_ai_title_settings(user: dict = Depends(require_ai_permission)) -> dict:
     from app.services import ai_title_service
 
     try:
-        return ai_title_service.test_settings_connection()
-    except (RuntimeError, requests.RequestException) as exc:
+        return ai_title_service.test_settings_connection(user["username"])
+    except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

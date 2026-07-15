@@ -248,6 +248,24 @@ class AiTitleSettingsModel(TimestampMixin, Base):
     max_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=1000, server_default="1000")
 
 
+class UserAiTitleSettingsModel(TimestampMixin, Base):
+    __tablename__ = "lt_user_ai_title_settings"
+
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False, default="custom_openai")
+    api_base_url: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    api_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    title_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    subtitle_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
 class ProductTitleVersionModel(TimestampMixin, Base):
     __tablename__ = "lt_product_title_versions"
     __table_args__ = (
