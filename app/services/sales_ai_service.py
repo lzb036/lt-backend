@@ -6,7 +6,7 @@ import re
 import unicodedata
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import func, select
 
@@ -39,6 +39,15 @@ MAX_MODEL_HISTORY_CHARS = 12_000
 MAX_MODEL_HISTORY_ENTRY_CHARS = 2_000
 MAX_HISTORY_ROWS_SCAN = 50
 MAX_HISTORY_SOURCE_CHARS = 4_000
+HISTORY_PAGE_SIZE_MAX = 100
+HISTORY_PAGE_MAX = 10_000
+HISTORY_MESSAGE_MAX_BYTES = 32 * 1024
+HISTORY_RESPONSE_MAX_BYTES = 256 * 1024
+HISTORY_RESULT_MAX_ROWS = 10
+HISTORY_GENERIC_LIST_MAX = 20
+HISTORY_TEXT_MAX_BYTES = 2_048
+HISTORY_QUESTION_MAX_BYTES = 4_096
+HISTORY_ANSWER_MAX_BYTES = 16_384
 MAX_MODEL_INTERMEDIATE_CONTENT_CHARS = 2_000
 MAX_TOOL_CALL_ID_CHARS = 128
 MAX_MODEL_TOOL_RESULT_CHARS = 16_000
@@ -84,6 +93,12 @@ MAX_COMPARISON_SERIES_ROWS = 7_500
 MAX_SKU_ROWS = 100
 MAX_SLOW_MOVING_ROWS = 100
 MAX_ADJUSTMENT_ROWS = 16
+
+
+def _analysis_cancelled(
+    is_cancelled: Callable[[], bool] | None,
+) -> bool:
+    return bool(is_cancelled is not None and is_cancelled())
 
 
 def _schema_object(fields: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -621,6 +636,270 @@ def create_conversation(
         session.add(row)
         session.flush()
         return _conversation_to_public(row)
+
+
+def get_conversation(
+    owner_username: str,
+    conversation_id: int,
+) -> dict[str, Any]:
+    normalized_owner = str(owner_username or "").strip()
+    with session_scope() as session:
+        row = session.scalar(
+            select(SalesAnalysisConversationModel).where(
+                SalesAnalysisConversationModel.id == int(conversation_id),
+                SalesAnalysisConversationModel.owner_username
+                == normalized_owner,
+            )
+        )
+        if row is None:
+            raise LookupError("会话不存在或无权访问。")
+        return _conversation_to_public(row)
+
+
+def delete_conversation(
+    owner_username: str,
+    conversation_id: int,
+) -> None:
+    normalized_owner = str(owner_username or "").strip()
+    with session_scope() as session:
+        row = session.scalar(
+            select(SalesAnalysisConversationModel).where(
+                SalesAnalysisConversationModel.id == int(conversation_id),
+                SalesAnalysisConversationModel.owner_username
+                == normalized_owner,
+            )
+        )
+        if row is None:
+            raise LookupError("会话不存在或无权访问。")
+        session.delete(row)
+
+
+def _json_size_bytes(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _truncate_utf8_text(value: Any, max_bytes: int) -> str:
+    text = str(value or "")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    marker = TRUNCATION_MARKER.encode("utf-8")
+    if max_bytes <= len(marker):
+        return marker[:max_bytes].decode("utf-8", errors="ignore")
+    prefix = encoded[: max_bytes - len(marker)].decode(
+        "utf-8",
+        errors="ignore",
+    )
+    return prefix + TRUNCATION_MARKER
+
+
+def _compact_history_value(
+    value: Any,
+    *,
+    field_name: str = "",
+    depth: int = 0,
+) -> tuple[Any, bool]:
+    if depth >= 5:
+        return TRUNCATION_MARKER, True
+    if isinstance(value, dict):
+        compact: dict[str, Any] = {}
+        truncated = False
+        for index, (key, child) in enumerate(value.items()):
+            if index >= 32:
+                truncated = True
+                break
+            compact_child, child_truncated = _compact_history_value(
+                child,
+                field_name=str(key),
+                depth=depth + 1,
+            )
+            compact[str(key)[:128]] = compact_child
+            truncated = truncated or child_truncated
+        return compact, truncated
+    if isinstance(value, list):
+        limit = (
+            HISTORY_RESULT_MAX_ROWS
+            if field_name in {"rows", "series"}
+            else HISTORY_GENERIC_LIST_MAX
+        )
+        compact_items: list[Any] = []
+        truncated = len(value) > limit
+        for child in value[:limit]:
+            compact_child, child_truncated = _compact_history_value(
+                child,
+                field_name=field_name,
+                depth=depth + 1,
+            )
+            compact_items.append(compact_child)
+            truncated = truncated or child_truncated
+        return compact_items, truncated
+    if isinstance(value, str):
+        compact_text = _truncate_utf8_text(
+            value,
+            HISTORY_TEXT_MAX_BYTES,
+        )
+        return compact_text, compact_text != value
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, False
+    compact_text = _truncate_utf8_text(
+        value,
+        HISTORY_TEXT_MAX_BYTES,
+    )
+    return compact_text, True
+
+
+def _history_message_to_public(
+    row: SalesAnalysisMessageModel,
+) -> dict[str, Any]:
+    full = _message_to_public(row)
+    tool_arguments, arguments_truncated = _compact_history_value(
+        full["toolArguments"],
+        field_name="toolArguments",
+    )
+    result_summary, result_truncated = _compact_history_value(
+        full["resultSummary"],
+        field_name="resultSummary",
+    )
+    store_scope, store_scope_truncated = _compact_history_value(
+        full["storeScope"],
+        field_name="storeScope",
+    )
+    statistics_window, statistics_truncated = _compact_history_value(
+        full["statisticsWindow"],
+        field_name="statisticsWindow",
+    )
+    question = _truncate_utf8_text(
+        full["question"],
+        HISTORY_QUESTION_MAX_BYTES,
+    )
+    answer = _truncate_utf8_text(
+        full["answer"],
+        HISTORY_ANSWER_MAX_BYTES,
+    )
+    payload = {
+        "id": full["id"],
+        "conversationId": full["conversationId"],
+        "question": question,
+        "answer": answer,
+        "toolName": _truncate_utf8_text(
+            full["toolName"],
+            HISTORY_TEXT_MAX_BYTES,
+        ),
+        "toolArguments": tool_arguments,
+        "resultSummary": result_summary,
+        "modelName": _truncate_utf8_text(
+            full["modelName"],
+            HISTORY_TEXT_MAX_BYTES,
+        ),
+        "storeScope": store_scope,
+        "statisticsWindow": statistics_window,
+        "createdAt": full["createdAt"],
+        "updatedAt": full["updatedAt"],
+        "historyTruncated": bool(
+            arguments_truncated
+            or result_truncated
+            or store_scope_truncated
+            or statistics_truncated
+            or question != full["question"]
+            or answer != full["answer"]
+        ),
+    }
+    if _json_size_bytes(payload) > HISTORY_MESSAGE_MAX_BYTES:
+        payload["resultSummary"] = []
+        payload["historyTruncated"] = True
+    if _json_size_bytes(payload) > HISTORY_MESSAGE_MAX_BYTES:
+        payload["toolArguments"] = []
+    if _json_size_bytes(payload) > HISTORY_MESSAGE_MAX_BYTES:
+        payload["answer"] = _truncate_utf8_text(
+            payload["answer"],
+            8_192,
+        )
+    if _json_size_bytes(payload) > HISTORY_MESSAGE_MAX_BYTES:
+        payload["question"] = _truncate_utf8_text(
+            payload["question"],
+            2_048,
+        )
+    if _json_size_bytes(payload) > HISTORY_MESSAGE_MAX_BYTES:
+        payload["answer"] = _truncate_utf8_text(
+            payload["answer"],
+            2_048,
+        )
+    if _json_size_bytes(payload) > HISTORY_MESSAGE_MAX_BYTES:
+        payload["storeScope"] = []
+        payload["statisticsWindow"] = {}
+        payload["modelName"] = ""
+        payload["toolName"] = ""
+    return payload
+
+
+def list_messages(
+    owner_username: str,
+    conversation_id: int,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    normalized_owner = str(owner_username or "").strip()
+    normalized_page = min(HISTORY_PAGE_MAX, max(1, int(page)))
+    normalized_page_size = min(
+        HISTORY_PAGE_SIZE_MAX,
+        max(1, int(page_size)),
+    )
+    with session_scope() as session:
+        conversation = session.scalar(
+            select(SalesAnalysisConversationModel.id).where(
+                SalesAnalysisConversationModel.id == int(conversation_id),
+                SalesAnalysisConversationModel.owner_username
+                == normalized_owner,
+            )
+        )
+        if conversation is None:
+            raise LookupError("会话不存在或无权访问。")
+        message_filter = (
+            SalesAnalysisMessageModel.conversation_id
+            == int(conversation_id),
+            SalesAnalysisMessageModel.owner_username == normalized_owner,
+        )
+        total = int(
+            session.scalar(
+                select(func.count()).where(*message_filter)
+            )
+            or 0
+        )
+        rows = list(
+            session.scalars(
+                select(SalesAnalysisMessageModel)
+                .where(*message_filter)
+                .order_by(SalesAnalysisMessageModel.id.desc())
+                .offset((normalized_page - 1) * normalized_page_size)
+                .limit(normalized_page_size)
+            ).all()
+        )
+        rows.reverse()
+        messages = [_history_message_to_public(row) for row in rows]
+
+    payload = {
+        "messages": messages,
+        "total": total,
+        "page": normalized_page,
+        "pageSize": normalized_page_size,
+        "truncated": any(
+            bool(message.get("historyTruncated"))
+            for message in messages
+        ),
+    }
+    while (
+        payload["messages"]
+        and _json_size_bytes(payload) > HISTORY_RESPONSE_MAX_BYTES
+    ):
+        payload["messages"].pop(0)
+        payload["truncated"] = True
+    return payload
 
 
 def _owned_stores(
@@ -1943,7 +2222,11 @@ def stream_analysis(
     owner_username: str,
     conversation_id: int,
     message: str,
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> Iterator[dict[str, Any]]:
+    if _analysis_cancelled(is_cancelled):
+        return
     normalized_owner = str(owner_username or "").strip()
     normalized_message = str(message or "").strip()
     if not normalized_owner:
@@ -1954,11 +2237,15 @@ def stream_analysis(
         normalized_message,
         MAX_INPUT_MESSAGE_CHARS,
     )
+    if _analysis_cancelled(is_cancelled):
+        return
     turn = _start_turn(
         normalized_owner,
         int(conversation_id),
         input_message,
     )
+    if _analysis_cancelled(is_cancelled):
+        return
     persisted_message = turn["question"]
     message_id = int(turn["messageId"])
     selected_store = turn["selectedStore"]
@@ -1969,6 +2256,8 @@ def stream_analysis(
     yield {"type": "status", "message": "正在准备销量分析。"}
 
     if selected_store is None:
+        if _analysis_cancelled(is_cancelled):
+            return
         answer = _clarification_answer(
             turn["stores"],
             owner_username=normalized_owner,
@@ -1984,14 +2273,22 @@ def stream_analysis(
             relative_window=relative_window,
             tool_records=tool_records,
         )
+        if _analysis_cancelled(is_cancelled):
+            return
         yield {"type": "delta", "content": persisted["answer"]}
         yield {"type": "completed", "message": persisted}
         return
 
     try:
+        if _analysis_cancelled(is_cancelled):
+            return
         model_configuration = _load_model_configuration(normalized_owner)
+        if _analysis_cancelled(is_cancelled):
+            return
         model_name = model_configuration["modelName"]
     except Exception as exc:
+        if _analysis_cancelled(is_cancelled):
+            return
         answer = (
             str(exc)
             if isinstance(exc, RuntimeError)
@@ -2036,10 +2333,14 @@ def stream_analysis(
     executed_tool_calls = 0
 
     while True:
+        if _analysis_cancelled(is_cancelled):
+            return
         try:
             response = litellm_completion(
                 **_completion_kwargs(model_configuration, messages)
             )
+            if _analysis_cancelled(is_cancelled):
+                return
             response_message = _response_message(response)
             raw_content = _tool_call_field(
                 response_message,
@@ -2057,6 +2358,8 @@ def stream_analysis(
                 secrets=redaction_secrets,
             )
         except Exception:
+            if _analysis_cancelled(is_cancelled):
+                return
             if tool_records:
                 fallback_answer = _fallback_answer(
                     selected_store,
@@ -2097,6 +2400,8 @@ def stream_analysis(
             return
 
         if not tool_calls:
+            if _analysis_cancelled(is_cancelled):
+                return
             if not tool_records:
                 answer = (
                     "模型未调用销量分析工具，无法生成可信的销量结论。"
@@ -2121,6 +2426,8 @@ def stream_analysis(
                 owner_username=normalized_owner,
                 secrets=redaction_secrets,
             )
+            if _analysis_cancelled(is_cancelled):
+                return
             persisted = _finalize_message(
                 owner_username=normalized_owner,
                 conversation_id=conversation_id,
@@ -2148,6 +2455,8 @@ def stream_analysis(
             )
         )
         for tool_call in tool_calls:
+            if _analysis_cancelled(is_cancelled):
+                return
             if executed_tool_calls >= MAX_TOOL_CALLS_PER_TURN:
                 answer = (
                     f"单次分析最多调用 {MAX_TOOL_CALLS_PER_TURN} 次工具，"
@@ -2210,13 +2519,19 @@ def stream_analysis(
                 "label": TOOL_LABELS[tool_name],
                 "arguments": arguments,
             }
+            if _analysis_cancelled(is_cancelled):
+                return
             try:
                 raw_result = execute_sales_tool(
                     normalized_owner,
                     tool_name,
                     arguments,
                 )
+                if _analysis_cancelled(is_cancelled):
+                    return
             except Exception:
+                if _analysis_cancelled(is_cancelled):
+                    return
                 answer = "销量分析工具执行失败，请检查查询条件。"
                 _finalize_message(
                     owner_username=normalized_owner,
@@ -2242,6 +2557,8 @@ def stream_analysis(
                 "result": sanitized_result,
             }
             tool_records.append(record)
+            if _analysis_cancelled(is_cancelled):
+                return
             _persist_tool_audit(
                 owner_username=normalized_owner,
                 conversation_id=conversation_id,
@@ -2257,6 +2574,8 @@ def stream_analysis(
                 "label": TOOL_LABELS[tool_name],
                 "result": sanitized_result,
             }
+            if _analysis_cancelled(is_cancelled):
+                return
             messages.append(
                 {
                     "role": "tool",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
+from threading import Event
 from typing import Any
 from urllib.parse import quote
 
@@ -1023,16 +1024,17 @@ def delete_sales_analysis_conversation(
 )
 def list_sales_analysis_messages(
     conversation_id: int = ApiPath(gt=0),
-    limit: int = Query(default=200, ge=1, le=200),
+    page: int = Query(default=1, ge=1, le=10_000),
+    limit: int = Query(default=50, ge=1, le=100),
     user: dict = Depends(require_ai_permission),
 ) -> dict:
     try:
-        messages = crawler_service.list_sales_analysis_messages(
+        return crawler_service.list_sales_analysis_messages(
             user["username"],
             conversation_id,
+            page,
             limit,
         )
-        return {"messages": messages, "total": len(messages)}
     except (LookupError, RuntimeError, ValueError) as exc:
         _raise_sales_analysis_http_error(exc)
 
@@ -1055,12 +1057,14 @@ def stream_sales_analysis_message(
 
     def stream():
         iterator = None
+        cancel_event = Event()
         terminal_event_sent = False
         try:
             iterator = crawler_service.stream_sales_analysis(
                 user["username"],
                 conversation_id,
                 payload.message,
+                cancel_event=cancel_event,
             )
             for event in iterator:
                 if not isinstance(event, dict):
@@ -1095,6 +1099,7 @@ def stream_sales_analysis_message(
                     }
                 )
         finally:
+            cancel_event.set()
             close = getattr(iterator, "close", None)
             if callable(close):
                 close()

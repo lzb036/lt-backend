@@ -38,6 +38,10 @@ SALES_SYNC_HEARTBEAT_INTERVAL_SECONDS = (
     SALES_SYNC_LEASE_TIMEOUT.total_seconds() / 3
 )
 RUNNING_SYNC_STATUS_PREFIX = "running:"
+MISSING_SALES_SYNC_CREDENTIALS_MESSAGE = (
+    "店铺未配置乐天订单同步凭证，"
+    "请先在店铺管理中检查并保存店铺配置。"
+)
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,18 @@ class IncompleteSnapshotError(ValueError):
 
 class SalesSyncLeaseLostError(RuntimeError):
     pass
+
+
+def store_has_sync_credentials(store: StoreModel) -> bool:
+    return bool(
+        str(store.rakuten_service_secret_encrypted or "").strip()
+        and str(store.rakuten_license_key_encrypted or "").strip()
+    )
+
+
+def require_store_sync_credentials(store: StoreModel) -> None:
+    if not store_has_sync_credentials(store):
+        raise ValueError(MISSING_SALES_SYNC_CREDENTIALS_MESSAGE)
 
 
 class _PeriodicLeaseHeartbeat:
@@ -277,6 +293,7 @@ def sync_owned_store(
         )
         if store is None:
             raise LookupError("店铺不存在或无权访问。")
+        require_store_sync_credentials(store)
 
         _ensure_sync_state(
             session,

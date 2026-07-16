@@ -14,6 +14,8 @@ import unicodedata
 import xml.etree.ElementTree as ET
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from queue import Empty, Full, Queue
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -45,8 +47,6 @@ from app.db.models import (
     ListingTaskModel,
     ProductModel,
     RoleModel,
-    SalesAnalysisConversationModel,
-    SalesAnalysisMessageModel,
     SalesSyncStateModel,
     ScheduledCrawlModel,
     StoreModel,
@@ -471,8 +471,30 @@ SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS = 7
 STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY = 1
 STORE_UNLISTED_PRODUCT_CLEANUP_TIME = "01:00"
 SALES_ANALYSIS_SYNC_INTERVAL = timedelta(minutes=30)
-SALES_ANALYSIS_SYNC_ACTIVE_TIMEOUT = timedelta(minutes=10)
+SALES_ANALYSIS_SYNC_FAILURE_COOLDOWN = timedelta(minutes=30)
+SALES_ANALYSIS_SYNC_BATCH_SIZE = 20
+SALES_ANALYSIS_SYNC_LOCAL_MAX_PENDING = 20
 SALES_ANALYSIS_SYNC_TASK_PREFIX = "sales-"
+SALES_ANALYSIS_SYNC_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(
+        1,
+        min(4, int(settings.max_running_sync_tasks_per_user)),
+    ),
+    thread_name_prefix="lt-sales-sync",
+)
+SALES_ANALYSIS_SYNC_LOCAL_SLOTS = threading.BoundedSemaphore(
+    SALES_ANALYSIS_SYNC_LOCAL_MAX_PENDING
+)
+SALES_ANALYSIS_STREAM_MAX_WORKERS = 4
+SALES_ANALYSIS_STREAM_QUEUE_SIZE = 32
+SALES_ANALYSIS_STREAM_HEARTBEAT_SECONDS = 5.0
+SALES_ANALYSIS_STREAM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=SALES_ANALYSIS_STREAM_MAX_WORKERS,
+    thread_name_prefix="lt-sales-analysis",
+)
+SALES_ANALYSIS_STREAM_SLOTS = threading.BoundedSemaphore(
+    SALES_ANALYSIS_STREAM_MAX_WORKERS
+)
 sales_sync_service: Any | None = None
 
 
@@ -9430,21 +9452,27 @@ def _sales_analysis_sync_state_to_public(
 
 def _sales_analysis_sync_status_is_active(
     sync_status: str | None,
-    state_updated_at: datetime | None,
-    *,
-    now: datetime | None = None,
+    _state_updated_at: datetime | None,
 ) -> bool:
     normalized_status = str(sync_status or "")
-    if (
-        normalized_status != "queued"
-        and not normalized_status.startswith("running")
-    ):
+    return (
+        normalized_status == "queued"
+        or normalized_status.startswith("running")
+    )
+
+
+def _sales_analysis_sync_error_is_cooling_down(
+    sync_status: str | None,
+    state_updated_at: datetime | None,
+    *,
+    now: datetime,
+) -> bool:
+    if str(sync_status or "") != "error":
         return False
     if state_updated_at is None:
         return True
-    current = now or datetime.now()
     return state_updated_at > (
-        current - SALES_ANALYSIS_SYNC_ACTIVE_TIMEOUT
+        now - SALES_ANALYSIS_SYNC_FAILURE_COOLDOWN
     )
 
 
@@ -9505,10 +9533,28 @@ def run_sales_analysis_sync_task(
     owner_username: str,
     store_id: int,
 ) -> None:
-    _loaded_sales_sync_service().sync_owned_store(
-        str(owner_username or "").strip(),
-        int(store_id),
-    )
+    normalized_owner = str(owner_username or "").strip()
+    normalized_store_id = int(store_id)
+    try:
+        _loaded_sales_sync_service().sync_owned_store(
+            normalized_owner,
+            normalized_store_id,
+        )
+    except Exception:
+        with session_scope() as session:
+            state = session.scalar(
+                select(SalesSyncStateModel).where(
+                    SalesSyncStateModel.store_id == normalized_store_id,
+                    SalesSyncStateModel.owner_username == normalized_owner,
+                    SalesSyncStateModel.sync_status == "queued",
+                )
+            )
+            if state is not None:
+                failed_at = datetime.now()
+                state.sync_status = "error"
+                state.last_error = "销量同步失败，请稍后重试。"
+                state.updated_at = failed_at
+        raise
 
 
 def dispatch_sales_analysis_sync_task(
@@ -9526,11 +9572,25 @@ def dispatch_sales_analysis_sync_task(
             queue_name=task_queue_name_for_kind("sync"),
         )
         return
-    start_background_task(
-        run_sales_analysis_sync_task,
-        owner_username,
-        store_id,
-    )
+    if not SALES_ANALYSIS_SYNC_LOCAL_SLOTS.acquire(blocking=False):
+        raise RuntimeError("本地销量同步队列已满，请稍后重试。")
+    try:
+        future = SALES_ANALYSIS_SYNC_EXECUTOR.submit(
+            run_sales_analysis_sync_task,
+            owner_username,
+            store_id,
+        )
+    except Exception:
+        SALES_ANALYSIS_SYNC_LOCAL_SLOTS.release()
+        raise
+
+    add_done_callback = getattr(future, "add_done_callback", None)
+    if callable(add_done_callback):
+        add_done_callback(
+            lambda _future: SALES_ANALYSIS_SYNC_LOCAL_SLOTS.release()
+        )
+    else:
+        SALES_ANALYSIS_SYNC_LOCAL_SLOTS.release()
 
 
 def queue_sales_analysis_sync(
@@ -9540,16 +9600,31 @@ def queue_sales_analysis_sync(
     normalized_owner = str(owner_username or "").strip()
     normalized_store_id = int(store_id)
     with session_scope() as session:
-        _owned_sales_analysis_store(
+        store = _owned_sales_analysis_store(
             session,
             normalized_owner,
             normalized_store_id,
         )
-        state = _ensure_sales_analysis_sync_state(
+        sync_service = _loaded_sales_sync_service()
+        if not sync_service.store_has_sync_credentials(store):
+            raise ValueError(
+                sync_service.MISSING_SALES_SYNC_CREDENTIALS_MESSAGE
+            )
+        _ensure_sales_analysis_sync_state(
             session,
             owner_username=normalized_owner,
             store_id=normalized_store_id,
         )
+        state = session.scalar(
+            select(SalesSyncStateModel)
+            .where(
+                SalesSyncStateModel.store_id == normalized_store_id,
+                SalesSyncStateModel.owner_username == normalized_owner,
+            )
+            .with_for_update()
+        )
+        if state is None:
+            raise RuntimeError("店铺销量同步状态不存在。")
         active = _sales_analysis_sync_status_is_active(
             state.sync_status,
             state.updated_at,
@@ -9580,8 +9655,10 @@ def queue_sales_analysis_sync(
                 )
             )
             if state is not None:
+                failed_at = datetime.now()
                 state.sync_status = "error"
                 state.last_error = "销量同步任务投递失败，请稍后重试。"
+                state.updated_at = failed_at
         raise
     return queued_task
 
@@ -9592,18 +9669,10 @@ def require_sales_analysis_conversation(
 ) -> dict[str, Any]:
     from app.services import sales_ai_service
 
-    normalized_owner = str(owner_username or "").strip()
-    with session_scope() as session:
-        conversation = session.scalar(
-            select(SalesAnalysisConversationModel).where(
-                SalesAnalysisConversationModel.id == int(conversation_id),
-                SalesAnalysisConversationModel.owner_username
-                == normalized_owner,
-            )
-        )
-        if conversation is None:
-            raise LookupError("会话不存在或无权访问。")
-        return sales_ai_service._conversation_to_public(conversation)
+    return sales_ai_service.get_conversation(
+        str(owner_username or "").strip(),
+        int(conversation_id),
+    )
 
 
 def list_sales_analysis_conversations(
@@ -9630,71 +9699,141 @@ def delete_sales_analysis_conversation(
     owner_username: str,
     conversation_id: int,
 ) -> None:
-    normalized_owner = str(owner_username or "").strip()
-    with session_scope() as session:
-        conversation = session.scalar(
-            select(SalesAnalysisConversationModel).where(
-                SalesAnalysisConversationModel.id == int(conversation_id),
-                SalesAnalysisConversationModel.owner_username
-                == normalized_owner,
-            )
-        )
-        if conversation is None:
-            raise LookupError("会话不存在或无权访问。")
-        session.delete(conversation)
+    from app.services.sales_ai_service import delete_conversation
+
+    delete_conversation(
+        str(owner_username or "").strip(),
+        int(conversation_id),
+    )
 
 
 def list_sales_analysis_messages(
     owner_username: str,
     conversation_id: int,
-    limit: int = 200,
-) -> list[dict[str, Any]]:
-    from app.services import sales_ai_service
+    page: int = 1,
+    limit: int = 50,
+) -> dict[str, Any]:
+    from app.services.sales_ai_service import list_messages
 
-    normalized_owner = str(owner_username or "").strip()
-    bounded_limit = min(200, max(1, int(limit)))
-    with session_scope() as session:
-        conversation = session.scalar(
-            select(SalesAnalysisConversationModel.id).where(
-                SalesAnalysisConversationModel.id == int(conversation_id),
-                SalesAnalysisConversationModel.owner_username
-                == normalized_owner,
-            )
-        )
-        if conversation is None:
-            raise LookupError("会话不存在或无权访问。")
-        rows = list(
-            session.scalars(
-                select(SalesAnalysisMessageModel)
-                .where(
-                    SalesAnalysisMessageModel.conversation_id
-                    == int(conversation_id),
-                    SalesAnalysisMessageModel.owner_username
-                    == normalized_owner,
-                )
-                .order_by(SalesAnalysisMessageModel.id.desc())
-                .limit(bounded_limit)
-            ).all()
-        )
-        rows.reverse()
-        return [
-            sales_ai_service._message_to_public(row)
-            for row in rows
-        ]
+    return list_messages(
+        str(owner_username or "").strip(),
+        int(conversation_id),
+        int(page),
+        int(limit),
+    )
 
 
 def stream_sales_analysis(
     owner_username: str,
     conversation_id: int,
     message: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    heartbeat_interval: float = SALES_ANALYSIS_STREAM_HEARTBEAT_SECONDS,
 ) -> Any:
-    from app.services.sales_ai_service import stream_analysis
+    normalized_owner = str(owner_username or "").strip()
+    normalized_conversation_id = int(conversation_id)
+    normalized_message = str(message or "")
+    cancellation = cancel_event or threading.Event()
+    wait_seconds = max(0.01, float(heartbeat_interval))
 
-    return stream_analysis(
-        str(owner_username or "").strip(),
-        int(conversation_id),
-        str(message or ""),
-    )
+    def events():
+        if not SALES_ANALYSIS_STREAM_SLOTS.acquire(blocking=False):
+            yield {
+                "type": "error",
+                "message": "当前销量分析任务较多，请稍后重试。",
+            }
+            return
+
+        event_queue: Queue[tuple[str, Any]] = Queue(
+            maxsize=SALES_ANALYSIS_STREAM_QUEUE_SIZE
+        )
+
+        def enqueue(kind: str, payload: Any = None) -> bool:
+            while not cancellation.is_set():
+                try:
+                    event_queue.put(
+                        (kind, payload),
+                        timeout=min(0.1, wait_seconds),
+                    )
+                    return True
+                except Full:
+                    continue
+            return False
+
+        def produce() -> None:
+            inner_iterator = None
+            try:
+                from app.services import sales_ai_service
+
+                inner_iterator = sales_ai_service.stream_analysis(
+                    normalized_owner,
+                    normalized_conversation_id,
+                    normalized_message,
+                    is_cancelled=cancellation.is_set,
+                )
+                for event in inner_iterator:
+                    if cancellation.is_set():
+                        break
+                    if not enqueue("event", event):
+                        break
+            except Exception:
+                if not cancellation.is_set():
+                    enqueue("error")
+            finally:
+                close = getattr(inner_iterator, "close", None)
+                if callable(close):
+                    close()
+                if not cancellation.is_set():
+                    enqueue("done")
+                SALES_ANALYSIS_STREAM_SLOTS.release()
+
+        try:
+            future = SALES_ANALYSIS_STREAM_EXECUTOR.submit(produce)
+        except Exception:
+            SALES_ANALYSIS_STREAM_SLOTS.release()
+            yield {
+                "type": "error",
+                "message": "销量分析任务启动失败，请稍后重试。",
+            }
+            return
+        future.add_done_callback(
+            lambda completed: (
+                SALES_ANALYSIS_STREAM_SLOTS.release()
+                if completed.cancelled()
+                else None
+            )
+        )
+
+        try:
+            while not cancellation.is_set():
+                try:
+                    kind, payload = event_queue.get(
+                        timeout=wait_seconds
+                    )
+                except Empty:
+                    if future.done():
+                        break
+                    yield {
+                        "type": "status",
+                        "message": "销量分析仍在处理中。",
+                        "heartbeat": True,
+                    }
+                    continue
+                if kind == "event":
+                    yield payload
+                    continue
+                if kind == "error":
+                    yield {
+                        "type": "error",
+                        "message": "销量分析失败，请稍后重试。",
+                    }
+                break
+        finally:
+            cancellation.set()
+            future.cancel()
+
+    return events()
 
 
 def sales_analysis_sync_is_due(
@@ -9706,6 +9845,11 @@ def sales_analysis_sync_is_due(
 ) -> bool:
     current = now or datetime.now()
     if _sales_analysis_sync_status_is_active(
+        sync_status,
+        state_updated_at,
+    ):
+        return False
+    if _sales_analysis_sync_error_is_cooling_down(
         sync_status,
         state_updated_at,
         now=current,
@@ -9722,10 +9866,27 @@ def sales_analysis_sync_due_candidates(
     now: datetime,
 ) -> list[tuple[str, int]]:
     cutoff = now - SALES_ANALYSIS_SYNC_INTERVAL
-    stale_active_before = (
-        now - SALES_ANALYSIS_SYNC_ACTIVE_TIMEOUT
+    failed_before = (
+        now - SALES_ANALYSIS_SYNC_FAILURE_COOLDOWN
     )
     with session_scope() as session:
+        active_count = int(
+            session.scalar(
+                select(func.count()).where(
+                    or_(
+                        SalesSyncStateModel.sync_status == "queued",
+                        SalesSyncStateModel.sync_status.like("running%"),
+                    )
+                )
+            )
+            or 0
+        )
+        available_slots = max(
+            0,
+            SALES_ANALYSIS_SYNC_BATCH_SIZE - active_count,
+        )
+        if available_slots <= 0:
+            return []
         rows = session.execute(
             select(
                 StoreModel.owner_username,
@@ -9741,6 +9902,18 @@ def sales_analysis_sync_due_candidates(
             )
             .where(
                 StoreModel.enabled.is_(True),
+                func.length(
+                    func.trim(
+                        StoreModel.rakuten_service_secret_encrypted
+                    )
+                )
+                > 0,
+                func.length(
+                    func.trim(
+                        StoreModel.rakuten_license_key_encrypted
+                    )
+                )
+                > 0,
                 or_(
                     SalesSyncStateModel.store_id.is_(None),
                     SalesSyncStateModel.last_successful_sync_at.is_(None),
@@ -9752,13 +9925,15 @@ def sales_analysis_sync_due_candidates(
                         SalesSyncStateModel.sync_status != "queued",
                         SalesSyncStateModel.sync_status.not_like("running%"),
                     ),
-                    SalesSyncStateModel.updated_at <= stale_active_before,
+                ),
+                or_(
+                    SalesSyncStateModel.store_id.is_(None),
+                    SalesSyncStateModel.sync_status != "error",
+                    SalesSyncStateModel.updated_at <= failed_before,
                 ),
             )
-            .order_by(
-                SalesSyncStateModel.last_successful_sync_at.asc(),
-                StoreModel.id.asc(),
-            )
+            .order_by(StoreModel.id.asc())
+            .limit(available_slots)
         ).all()
     return [
         (str(row.owner_username), int(row.id))
