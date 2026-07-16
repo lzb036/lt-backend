@@ -303,3 +303,100 @@ raw_order_json LONGTEXT NOT NULL
 ### Remaining concern
 
 The compatibility DDL was tested through SQLite controlled-failure paths and SQLAlchemy's MySQL DDL generation. It was not executed against a live MySQL schema in this task.
+
+## Review Fix Pass 3
+
+Date: 2026-07-16
+
+### Findings fixed
+
+1. Named every foreign key declared on the seven sales tables, including all column-level owner/store foreign keys.
+2. Changed compatibility enumeration to reject any unnamed required `ForeignKeyConstraint` or `UniqueConstraint` instead of silently omitting it.
+3. Added complete legacy conversation-table coverage:
+   - an existing unnamed owner foreign key is detected structurally
+   - a missing owner foreign key fails with a table/constraint-specific `RuntimeError`
+4. Replaced the sales-order parent identity with:
+   - `uq_lt_sales_order_id_owner_store_number`
+   - columns `(id, owner_username, store_id, order_number)`
+5. Replaced the item parent foreign key with:
+   - `fk_lt_sales_order_item_parent_order_number`
+   - columns `(sales_order_id, owner_username, store_id, order_number)`
+6. Added a persistence test proving an item using `ORDER-B` cannot reference the database row for `ORDER-A`.
+7. Added a complete legacy order-item compatibility test proving the missing four-column parent constraint is rejected when the dialect cannot install it.
+
+### Red evidence
+
+Command:
+
+```powershell
+pytest tests/test_sales_models.py -v
+```
+
+Result before implementation:
+
+```text
+6 failed, 27 passed in 0.91s
+```
+
+The failures covered unnamed sales foreign keys, the missing four-column parent key, the accepted `ORDER-B`/`ORDER-A` mismatch, omitted conversation owner enforcement, and missing legacy item constraint handling.
+
+### Final verification
+
+Command:
+
+```powershell
+pytest tests/test_sales_models.py -v
+```
+
+Result:
+
+```text
+33 passed in 0.83s
+```
+
+Command:
+
+```powershell
+python -m compileall app/db/models.py app/db/database.py tests/test_sales_models.py
+```
+
+Result:
+
+```text
+Compiling 'tests/test_sales_models.py'...
+```
+
+Exit code: `0`
+
+Command:
+
+```powershell
+git diff --check
+```
+
+Result: exit code `0`; only Git's existing LF-to-CRLF working-copy warnings were printed.
+
+Command:
+
+```powershell
+pytest -q
+```
+
+Result:
+
+```text
+220 passed, 2 warnings, 4 subtests passed in 7.97s
+```
+
+The warnings remain the existing FastAPI `on_event` deprecation warnings from `app/main.py`.
+
+### MySQL generated DDL check
+
+```text
+ALTER TABLE lt_sales_orders ADD CONSTRAINT uq_lt_sales_order_id_owner_store_number UNIQUE (id, owner_username, store_id, order_number)
+ALTER TABLE lt_sales_order_items ADD CONSTRAINT fk_lt_sales_order_item_parent_order_number FOREIGN KEY(sales_order_id, owner_username, store_id, order_number) REFERENCES lt_sales_orders (id, owner_username, store_id, order_number) ON DELETE CASCADE
+```
+
+### Remaining concern
+
+The new and newly named constraints were validated with SQLite enforcement/controlled-failure tests and SQLAlchemy MySQL DDL generation, but were not applied to a live MySQL schema in this task.

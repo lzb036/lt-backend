@@ -505,8 +505,21 @@ def _ensure_table_layout(connection: Connection, table) -> dict[str, list[str]]:
         constraint
         for constraint in table.constraints
         if isinstance(constraint, (UniqueConstraint, ForeignKeyConstraint))
-        and constraint.name
     ]
+    unnamed_constraints = [
+        constraint
+        for constraint in required_constraints
+        if not constraint.name
+    ]
+    if unnamed_constraints:
+        descriptions = ", ".join(
+            f"{type(constraint).__name__}({', '.join(column.name for column in constraint.columns)})"
+            for constraint in unnamed_constraints
+        )
+        raise _compatibility_error(
+            table.name,
+            f"required constraints must be named: {descriptions}",
+        )
     required_constraints.sort(
         key=lambda constraint: (
             0 if isinstance(constraint, UniqueConstraint) else 1,

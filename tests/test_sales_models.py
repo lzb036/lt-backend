@@ -40,6 +40,17 @@ from app.db.models import (
 )
 
 
+SALES_TABLES = (
+    SalesOrderModel.__table__,
+    SalesOrderItemModel.__table__,
+    SalesItemAdjustmentModel.__table__,
+    ProductSalesDailyModel.__table__,
+    SalesSyncStateModel.__table__,
+    SalesAnalysisConversationModel.__table__,
+    SalesAnalysisMessageModel.__table__,
+)
+
+
 @pytest.fixture()
 def sqlite_engine():
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
@@ -182,6 +193,54 @@ def test_store_exposes_composite_identity_for_tenant_foreign_keys(sqlite_engine)
     }
 
     assert constraints["uq_lt_store_id_owner"] == ("id", "owner_username")
+
+
+def test_all_sales_foreign_keys_are_named_for_compatibility():
+    unnamed = {
+        table.name: [
+            tuple(column.name for column in constraint.columns)
+            for constraint in table.constraints
+            if isinstance(constraint, ForeignKeyConstraint)
+            and not constraint.name
+        ]
+        for table in SALES_TABLES
+    }
+
+    assert unnamed == {table.name: [] for table in SALES_TABLES}
+
+
+def test_sales_order_item_parent_key_includes_order_number():
+    parent_constraint = next(
+        constraint
+        for constraint in SalesOrderModel.__table__.constraints
+        if constraint.name == "uq_lt_sales_order_id_owner_store_number"
+    )
+    child_constraint = next(
+        constraint
+        for constraint in SalesOrderItemModel.__table__.constraints
+        if constraint.name == "fk_lt_sales_order_item_parent_order_number"
+    )
+
+    assert tuple(column.name for column in parent_constraint.columns) == (
+        "id",
+        "owner_username",
+        "store_id",
+        "order_number",
+    )
+    assert tuple(column.name for column in child_constraint.columns) == (
+        "sales_order_id",
+        "owner_username",
+        "store_id",
+        "order_number",
+    )
+    assert tuple(
+        element.target_fullname for element in child_constraint.elements
+    ) == (
+        "lt_sales_orders.id",
+        "lt_sales_orders.owner_username",
+        "lt_sales_orders.store_id",
+        "lt_sales_orders.order_number",
+    )
 
 
 def test_sales_order_enforces_store_and_order_number_uniqueness(sqlite_engine):
@@ -583,6 +642,48 @@ def test_sales_order_item_rejects_cross_owner_or_store_order_reference(sqlite_en
             session.commit()
 
 
+def test_sales_order_item_rejects_mismatched_parent_order_number(sqlite_engine):
+    with Session(sqlite_engine, future=True) as session:
+        store, order_a = seed_owner_store_and_order(session)
+        order_b = SalesOrderModel(
+            owner_username="alice",
+            store_id=store.id,
+            order_number="ORDER-B",
+            order_progress="100",
+            order_status="sent",
+            ordered_at=datetime(2026, 7, 16, 13, 0, 0),
+            total_amount=Decimal("100.00"),
+            currency="JPY",
+            raw_order_json='{"orderNumber":"ORDER-B"}',
+            last_synced_at=datetime(2026, 7, 16, 13, 1, 0),
+        )
+        session.add(order_b)
+        session.flush()
+
+        session.add(
+            SalesOrderItemModel.from_service_payload(
+                owner_username="alice",
+                store_id=store.id,
+                sales_order_id=order_a.id,
+                order_number=order_b.order_number,
+                item_detail_id="detail-wrong-parent-number",
+                manage_number="MN-WRONG",
+                item_number="ITEM-WRONG",
+                item_id="rakuten-item-wrong",
+                sku_key="default",
+                sku_json='{"sku":"default"}',
+                item_name="Wrong Parent Number",
+                unit_price=Decimal("10.00"),
+                ordered_units=1,
+                latest_units=1,
+                ordered_at=order_a.ordered_at,
+            )
+        )
+
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
 def test_sales_adjustment_rejects_cross_owner_or_store_item_reference(sqlite_engine):
     with Session(sqlite_engine, future=True) as session:
         _, _, alice_item = seed_owner_store_order_item(session)
@@ -762,21 +863,180 @@ def test_ensure_table_layout_adds_safe_defaulted_columns_to_partial_populated_ta
         partial_engine.dispose()
 
 
-def test_ensure_table_layout_is_idempotent_for_complete_sales_tables(sqlite_engine):
-    tables = (
+def _create_complete_legacy_conversation_engine(*, include_owner_fk: bool):
+    legacy_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    owner_fk_sql = (
+        ", FOREIGN KEY (owner_username) "
+        "REFERENCES lt_user_accounts(username) ON DELETE CASCADE"
+        if include_owner_fk
+        else ""
+    )
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE lt_user_accounts (
+                    username VARCHAR(255) PRIMARY KEY
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                f"""
+                CREATE TABLE lt_sales_analysis_conversations (
+                    id INTEGER PRIMARY KEY,
+                    owner_username VARCHAR(255) NOT NULL,
+                    title VARCHAR(255) NOT NULL DEFAULT 'Legacy',
+                    store_scope_json TEXT NOT NULL,
+                    last_message_at DATETIME NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT uq_lt_sales_analysis_conversation_id_owner
+                        UNIQUE (id, owner_username)
+                    {owner_fk_sql}
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE INDEX ix_lt_sales_analysis_conversation_owner_updated
+                ON lt_sales_analysis_conversations (owner_username, updated_at)
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO lt_user_accounts (username)
+                VALUES ('alice')
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO lt_sales_analysis_conversations (
+                    id,
+                    owner_username,
+                    title,
+                    store_scope_json
+                )
+                VALUES (1, 'alice', 'Legacy', '[]')
+                """
+            )
+        )
+    return legacy_engine
+
+
+def test_complete_legacy_conversation_owner_fk_is_detected():
+    legacy_engine = _create_complete_legacy_conversation_engine(
+        include_owner_fk=True
+    )
+    try:
+        owner_constraint = next(
+            constraint
+            for constraint in SalesAnalysisConversationModel.__table__.constraints
+            if constraint.name
+            == "fk_lt_sales_analysis_conversation_owner_user"
+        )
+        with legacy_engine.begin() as connection:
+            assert database_module._constraint_is_present(
+                connection,
+                SalesAnalysisConversationModel.__table__,
+                owner_constraint,
+            )
+            result = database_module._ensure_table_layout(
+                connection,
+                SalesAnalysisConversationModel.__table__,
+            )
+
+        assert result["added_constraints"] == []
+    finally:
+        legacy_engine.dispose()
+
+
+def test_complete_legacy_conversation_missing_owner_fk_fails_clearly():
+    legacy_engine = _create_complete_legacy_conversation_engine(
+        include_owner_fk=False
+    )
+    try:
+        with legacy_engine.begin() as connection:
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    r"lt_sales_analysis_conversations.*"
+                    r"fk_lt_sales_analysis_conversation_owner_user.*"
+                    r"cannot install"
+                ),
+            ):
+                database_module._ensure_table_layout(
+                    connection,
+                    SalesAnalysisConversationModel.__table__,
+                )
+    finally:
+        legacy_engine.dispose()
+
+
+def test_complete_legacy_order_item_missing_order_number_fk_fails_clearly():
+    legacy_metadata = MetaData()
+    for table in (
+        UserAccountModel.__table__,
+        StoreModel.__table__,
         SalesOrderModel.__table__,
         SalesOrderItemModel.__table__,
-        SalesItemAdjustmentModel.__table__,
-        ProductSalesDailyModel.__table__,
-        SalesSyncStateModel.__table__,
-        SalesAnalysisConversationModel.__table__,
-        SalesAnalysisMessageModel.__table__,
-    )
+    ):
+        table.to_metadata(legacy_metadata)
 
+    legacy_item = legacy_metadata.tables["lt_sales_order_items"]
+    order_number_constraint = next(
+        constraint
+        for constraint in legacy_item.constraints
+        if constraint.name == "fk_lt_sales_order_item_parent_order_number"
+    )
+    legacy_item.constraints.remove(order_number_constraint)
+
+    legacy_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        legacy_metadata.create_all(legacy_engine)
+        reflected_foreign_keys = inspect(legacy_engine).get_foreign_keys(
+            "lt_sales_order_items"
+        )
+        assert not any(
+            tuple(item["constrained_columns"])
+            == (
+                "sales_order_id",
+                "owner_username",
+                "store_id",
+                "order_number",
+            )
+            for item in reflected_foreign_keys
+        )
+
+        with legacy_engine.begin() as connection:
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    r"lt_sales_order_items.*"
+                    r"fk_lt_sales_order_item_parent_order_number.*"
+                    r"cannot install"
+                ),
+            ):
+                database_module._ensure_table_layout(
+                    connection,
+                    SalesOrderItemModel.__table__,
+                )
+    finally:
+        legacy_engine.dispose()
+
+
+def test_ensure_table_layout_is_idempotent_for_complete_sales_tables(sqlite_engine):
     with sqlite_engine.begin() as connection:
         results = [
             database_module._ensure_table_layout(connection, table)
-            for table in tables
+            for table in SALES_TABLES
         ]
 
     assert all(

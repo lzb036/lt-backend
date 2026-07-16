@@ -408,7 +408,13 @@ class SalesOrderModel(TimestampMixin, Base):
             name="fk_lt_sales_order_store_owner",
         ),
         UniqueConstraint("store_id", "order_number", name="uq_lt_sales_order_store_order_number"),
-        UniqueConstraint("id", "owner_username", "store_id", name="uq_lt_sales_order_id_owner_store"),
+        UniqueConstraint(
+            "id",
+            "owner_username",
+            "store_id",
+            "order_number",
+            name="uq_lt_sales_order_id_owner_store_number",
+        ),
         Index("ix_lt_sales_order_owner_store", "owner_username", "store_id"),
         Index("ix_lt_sales_order_store_synced", "store_id", "last_synced_at"),
     )
@@ -416,7 +422,11 @@ class SalesOrderModel(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     owner_username: Mapped[str] = mapped_column(
         String(255),
-        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_sales_order_owner_user",
+        ),
         nullable=False,
     )
     store_id: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -450,14 +460,15 @@ class SalesOrderItemModel(TimestampMixin, Base):
     __tablename__ = "lt_sales_order_items"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["sales_order_id", "owner_username", "store_id"],
+            ["sales_order_id", "owner_username", "store_id", "order_number"],
             [
                 "lt_sales_orders.id",
                 "lt_sales_orders.owner_username",
                 "lt_sales_orders.store_id",
+                "lt_sales_orders.order_number",
             ],
             ondelete="CASCADE",
-            name="fk_lt_sales_order_item_parent_order",
+            name="fk_lt_sales_order_item_parent_order_number",
         ),
         UniqueConstraint(
             "store_id",
@@ -474,10 +485,21 @@ class SalesOrderItemModel(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     owner_username: Mapped[str] = mapped_column(
         String(255),
-        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_sales_order_item_owner_user",
+        ),
         nullable=False,
     )
-    store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
+    store_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "lt_stores.id",
+            ondelete="CASCADE",
+            name="fk_lt_sales_order_item_store",
+        ),
+        nullable=False,
+    )
     sales_order_id: Mapped[int] = mapped_column(Integer, nullable=False)
     order_number: Mapped[str] = mapped_column(String(64), nullable=False)
     item_detail_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -664,10 +686,21 @@ class SalesItemAdjustmentModel(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     owner_username: Mapped[str] = mapped_column(
         String(255),
-        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_sales_adjustment_owner_user",
+        ),
         nullable=False,
     )
-    store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
+    store_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "lt_stores.id",
+            ondelete="CASCADE",
+            name="fk_lt_sales_adjustment_store",
+        ),
+        nullable=False,
+    )
     sales_order_item_id: Mapped[int] = mapped_column(Integer, nullable=False)
     adjustment_type: Mapped[str] = mapped_column(String(32), nullable=False)
     units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -708,7 +741,11 @@ class ProductSalesDailyModel(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     owner_username: Mapped[str] = mapped_column(
         String(255),
-        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_product_sales_daily_owner_user",
+        ),
         nullable=False,
     )
     store_id: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -742,7 +779,11 @@ class SalesSyncStateModel(TimestampMixin, Base):
     store_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_username: Mapped[str] = mapped_column(
         String(255),
-        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_sales_sync_state_owner_user",
+        ),
         nullable=False,
     )
     initial_sync_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
@@ -764,7 +805,11 @@ class SalesAnalysisConversationModel(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     owner_username: Mapped[str] = mapped_column(
         String(255),
-        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_sales_analysis_conversation_owner_user",
+        ),
         nullable=False,
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="新分析", server_default="新分析")
@@ -801,7 +846,11 @@ class SalesAnalysisMessageModel(TimestampMixin, Base):
     conversation_id: Mapped[int] = mapped_column(Integer, nullable=False)
     owner_username: Mapped[str] = mapped_column(
         String(255),
-        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_sales_analysis_message_owner_user",
+        ),
         nullable=False,
     )
     question_text: Mapped[str] = mapped_column(
