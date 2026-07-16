@@ -15,7 +15,7 @@ Implemented only:
 ## Requirements Covered
 
 - Enforces `owner_username + store_id` before reading credentials or calling the order client.
-- Uses the owned store row and `SalesSyncStateModel` row with `FOR UPDATE` as the store-level synchronization lock.
+- Uses a tokenized conditional `UPDATE` as the store-level lease; no row lock is held during remote API calls or reconciliation. A short `FOR UPDATE` current read is used only after failed acquisition to read the active state in a fresh transaction.
 - Returns the existing running state instead of starting a duplicate synchronization.
 - Preserves the first observed `ordered_units` while updating `latest_units`.
 - Reconciles orders and item rows idempotently by store/order/item identity.
@@ -142,14 +142,14 @@ Result: exit code `0`.
 ## Concerns
 
 - The HTTP contract remains mock-tested only; no live Rakuten RMS request was made.
-- SQLite does not enforce `SELECT ... FOR UPDATE`, so lock query construction and running-state behavior are covered locally, but real concurrent MySQL contention was not integration-tested in this task.
+- SQLite does not enforce `SELECT ... FOR UPDATE`; MySQL acquisition/current-read SQL is dialect-compiled and token/rowcount behavior is tested locally, but real concurrent MySQL contention was not integration-tested in this task.
 - Remote refund/return field aliases are handled defensively from the approved snapshot rules, but exact production payload variants should be checked when a sanitized real version-7 order sample is available.
 
 ## Review Fix Takeover
 
 The interrupted review patch was preserved and finalized. The review fixes now:
 
-- Acquire the store lease with one conditional `UPDATE`, return an active running state without API calls, reclaim only stale running leases, heartbeat with the current token, and protect completion/error writes with token-matched row counts.
+- Acquire the store lease with one conditional `UPDATE`, return an active running state without API calls, reclaim only stale running leases, maintain an independent periodic heartbeat with the current token, and protect completion/error writes with token-matched row counts.
 - Reject older or unversioned snapshots before they can overwrite a versioned order, including an older duplicate later in the same API batch.
 - Skip malformed package/item containers and incomplete item records before mutation.
 - Treat empty item lists as authoritative only for explicit cancellation, full refund, or full return; completed/shipped empty snapshots do not cancel existing lines.
@@ -235,3 +235,114 @@ Result: exit code `0`.
 ### Remaining Concern
 
 - Real concurrent MySQL contention is represented by dialect compilation and rowcount/token tests, not a live multi-connection MySQL integration test.
+
+## Remaining Review Findings
+
+The final Task 3 review findings were implemented without changing files outside the owned Task 3 service, tests, and report.
+
+### Lease Lifecycle And Contention
+
+- Added an immediate and periodic lease heartbeat that runs throughout credential handling, remote search, local candidate selection, `getOrder`, reconciliation, and daily rebuild.
+- Each heartbeat pulse uses a separate short-lived database session.
+- Heartbeat token loss is captured by the worker thread and raised in the main synchronization flow before later API/reconciliation work can continue.
+- Heartbeat shutdown waits for the active short database pulse to finish before the terminal lease compare-and-set.
+- Sync-state creation commits before acquisition. Failed acquisition ends its transaction and reads the active task in a fresh `FOR UPDATE` current-read transaction, avoiding a stale MySQL `REPEATABLE READ` snapshot.
+
+### Reconciliation And Parsing
+
+- Residual refund/return units and amounts subtract only final confirmed item attribution after quantity clamping and return-refund deduplication.
+- Missing item adjustment amounts are inferred as `unit_price * confirmed_units`.
+- `partialRefund`, `hasPartialRefund`, `unresolvedRefund`, and matching return flags create zero-value unresolved marker rows even when no numeric fields are supplied.
+- Text, integer, decimal, and boolean alias readers skip null or malformed values and continue to later aliases.
+- Aware timestamps are normalized to UTC-naive before comparison/storage.
+- Strictly older snapshots cannot change accepted state. Equal remote versions update only local sync metadata, so the first accepted business snapshot wins.
+
+### Daily Keys And Recheck Policy
+
+- Daily aggregation uses `manageNumber`, then prefixed `item-number:`, then prefixed `item-id:` as the deterministic product key, with an `item-detail:` last-resort safeguard.
+- Products with blank `manageNumber` no longer merge solely because they share a SKU.
+- Every sync performs a seven-day remote search.
+- Local candidates add incomplete/adjusted orders from the last 30 days.
+- Completed orders up to 90 days old are added only when their stored sync/update timestamp is at least one day old.
+- Remote and local order numbers are normalized and order-preserving deduplicated before `getOrder`.
+- The legacy `initial_days` argument remains interface-compatible but no longer changes the approved 7/30/90-day policy.
+
+### Additional Red-Green Evidence
+
+Periodic heartbeat and fresh-transaction acquisition tests initially produced:
+
+```text
+5 failed, 44 deselected in 1.13s
+```
+
+Residual/parser/product-key/timestamp tests initially produced:
+
+```text
+13 failed, 49 deselected in 3.95s
+```
+
+The recheck-policy regression initially failed because initial sync still searched the legacy caller window:
+
+```text
+1 failed in 2.34s
+```
+
+Confirmed-attribution and fixed 90-day policy edge tests initially produced:
+
+```text
+2 failed, 64 deselected in 2.47s
+```
+
+### Final Verification
+
+Focused:
+
+```powershell
+pytest tests/test_sales_sync_service.py -q
+```
+
+```text
+66 passed in 5.03s
+```
+
+Full:
+
+```powershell
+pytest -q
+```
+
+```text
+314 passed, 2 warnings, 4 subtests passed in 13.67s
+```
+
+The warnings remain the existing FastAPI `on_event` deprecations from `app/main.py`.
+
+Compilation:
+
+```powershell
+python -m compileall app tests/test_sales_sync_service.py
+```
+
+Result: exit code `0`.
+
+Diff validation:
+
+```powershell
+git diff --check
+```
+
+Result: exit code `0`.
+
+### Final Self-Review
+
+- Confirmed no heartbeat survives into the terminal `idle`/`error` update.
+- Confirmed active contention returns before credential decryption or Rakuten API calls.
+- Confirmed every requested order number is deduplicated before `getOrder`.
+- Confirmed unresolved markers never reduce effective units.
+- Confirmed equal-version conflicts cannot revert accepted adjustments.
+- Confirmed no frontend/backend process, UI, browser, or live Rakuten request was started.
+
+### Remaining Concerns
+
+- Real multi-connection MySQL contention is not available in the local test environment; MySQL behavior is covered through dialect compilation, fresh-transaction boundaries, current-read SQL, rowcount mocks, and token tests.
+- Rakuten adjustment aliases remain based on the approved snapshot contract rather than a live sanitized production version-7 payload.

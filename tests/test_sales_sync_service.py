@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from threading import Event
+import time as time_module
 from unittest.mock import Mock
 
 import pytest
@@ -373,6 +375,324 @@ def test_lease_acquisition_requires_exactly_one_updated_row(
     session.execute.assert_called_once()
 
 
+def test_active_sync_state_read_uses_mysql_current_read():
+    statement = sales_sync_service._active_sync_state_statement(
+        "alice",
+        7,
+    )
+
+    compiled = str(
+        statement.compile(
+            dialect=mysql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "owner_username = 'alice'" in compiled
+    assert "store_id = 7" in compiled
+    assert compiled.endswith("FOR UPDATE")
+
+
+def test_failed_acquisition_reads_active_state_in_fresh_transaction(
+    monkeypatch,
+    session_factory,
+):
+    now = datetime(2026, 7, 16, 12, 0, 0)
+    with session_factory() as session:
+        store = seed_store(session)
+        session.add(
+            SalesSyncStateModel(
+                owner_username="alice",
+                store_id=store.id,
+                sync_status="running:active-owner-token",
+                progress_current=2,
+                progress_total=8,
+                updated_at=now,
+            )
+        )
+        store_id = store.id
+        session.commit()
+
+    scope_sessions: list[Session] = []
+
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        scope_sessions.append(session)
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(sales_sync_service, "_now", lambda: now)
+    monkeypatch.setattr(
+        sales_sync_service,
+        "_acquire_sync_lease",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "search_order_numbers",
+        lambda *_args, **_kwargs: pytest.fail("API call must not run"),
+    )
+
+    result = sales_sync_service.sync_owned_store("alice", store_id)
+
+    assert result["status"] == "running"
+    assert result["alreadyRunning"] is True
+    assert result["progressCurrent"] == 2
+    assert result["progressTotal"] == 8
+    assert len(scope_sessions) == 3
+    assert len({id(session) for session in scope_sessions}) == 3
+
+
+def test_periodic_lease_heartbeat_starts_ticks_and_stops(monkeypatch):
+    calls: list[tuple[int | None, int | None]] = []
+    ticked = Event()
+
+    def fake_heartbeat(
+        _owner_username,
+        _store_id,
+        _lease_status,
+        *,
+        progress_current=None,
+        progress_total=None,
+    ):
+        calls.append((progress_current, progress_total))
+        if len(calls) >= 2:
+            ticked.set()
+
+    monkeypatch.setattr(
+        sales_sync_service,
+        "_heartbeat_lease_in_new_transaction",
+        fake_heartbeat,
+    )
+
+    heartbeat = sales_sync_service._PeriodicLeaseHeartbeat(
+        "alice",
+        7,
+        "running:owner-token",
+        interval_seconds=0.01,
+    )
+    with heartbeat:
+        heartbeat.set_progress(1, 5)
+        assert ticked.wait(1)
+        heartbeat.raise_if_failed()
+
+    stopped_count = len(calls)
+    time_module.sleep(0.04)
+
+    assert stopped_count >= 2
+    assert len(calls) == stopped_count
+    assert calls[-1] == (1, 5)
+
+
+def test_periodic_lease_heartbeat_propagates_token_loss(monkeypatch):
+    token_lost = Event()
+    call_count = 0
+
+    def fake_heartbeat(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            token_lost.set()
+            raise sales_sync_service.SalesSyncLeaseLostError(
+                "销量同步租约已失效。"
+            )
+
+    monkeypatch.setattr(
+        sales_sync_service,
+        "_heartbeat_lease_in_new_transaction",
+        fake_heartbeat,
+    )
+
+    heartbeat = sales_sync_service._PeriodicLeaseHeartbeat(
+        "alice",
+        7,
+        "running:owner-token",
+        interval_seconds=0.01,
+    )
+
+    with pytest.raises(
+        sales_sync_service.SalesSyncLeaseLostError,
+        match="销量同步租约已失效",
+    ):
+        with heartbeat:
+            assert token_lost.wait(1)
+            heartbeat.raise_if_failed()
+
+    stopped_count = call_count
+    time_module.sleep(0.04)
+    assert call_count == stopped_count
+
+
+def test_periodic_heartbeat_covers_search_get_and_reconciliation(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    heartbeat_count = 0
+    heartbeat_changed = Event()
+
+    def fake_heartbeat(*_args, **_kwargs):
+        nonlocal heartbeat_count
+        heartbeat_count += 1
+        heartbeat_changed.set()
+
+    def wait_for_next_heartbeat():
+        baseline = heartbeat_count
+        deadline = time_module.monotonic() + 1
+        while heartbeat_count <= baseline:
+            heartbeat_changed.clear()
+            remaining = deadline - time_module.monotonic()
+            assert remaining > 0
+            assert heartbeat_changed.wait(remaining)
+
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    snapshot = order_snapshot()
+    original_reconcile = sales_sync_service._reconcile_order_snapshot
+
+    def slow_search(*_args, **_kwargs):
+        wait_for_next_heartbeat()
+        return ["ORDER-1"]
+
+    def slow_get(*_args, **_kwargs):
+        wait_for_next_heartbeat()
+        return [snapshot]
+
+    def slow_reconcile(*args, **kwargs):
+        wait_for_next_heartbeat()
+        return original_reconcile(*args, **kwargs)
+
+    monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(sales_sync_service, "decrypt_text", lambda value: value)
+    monkeypatch.setattr(
+        sales_sync_service,
+        "SALES_SYNC_HEARTBEAT_INTERVAL_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        sales_sync_service,
+        "_heartbeat_lease_in_new_transaction",
+        fake_heartbeat,
+    )
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "search_order_numbers",
+        slow_search,
+    )
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "get_orders",
+        slow_get,
+    )
+    monkeypatch.setattr(
+        sales_sync_service,
+        "_reconcile_order_snapshot",
+        slow_reconcile,
+    )
+
+    result = sales_sync_service.sync_owned_store("alice", store_id)
+
+    assert result["status"] == "completed"
+    assert heartbeat_count >= 4
+
+
+def test_periodic_token_loss_aborts_sync_before_get_order(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    heartbeat_count = 0
+    token_lost = Event()
+    get_called = False
+
+    def fake_heartbeat(*_args, **_kwargs):
+        nonlocal heartbeat_count
+        heartbeat_count += 1
+        if heartbeat_count >= 2:
+            token_lost.set()
+            raise sales_sync_service.SalesSyncLeaseLostError(
+                "销量同步租约已失效。"
+            )
+
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def slow_search(*_args, **_kwargs):
+        assert token_lost.wait(1)
+        return ["ORDER-1"]
+
+    def unexpected_get(*_args, **_kwargs):
+        nonlocal get_called
+        get_called = True
+        return []
+
+    monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(sales_sync_service, "decrypt_text", lambda value: value)
+    monkeypatch.setattr(
+        sales_sync_service,
+        "SALES_SYNC_HEARTBEAT_INTERVAL_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        sales_sync_service,
+        "_heartbeat_lease_in_new_transaction",
+        fake_heartbeat,
+    )
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "search_order_numbers",
+        slow_search,
+    )
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "get_orders",
+        unexpected_get,
+    )
+
+    with pytest.raises(
+        sales_sync_service.SalesSyncLeaseLostError,
+        match="销量同步租约已失效",
+    ):
+        sales_sync_service.sync_owned_store("alice", store_id)
+
+    assert get_called is False
+
+
 def test_lease_heartbeat_requires_current_token(session_factory):
     now = datetime(2026, 7, 16, 12, 0, 0)
     with session_factory() as session:
@@ -434,6 +754,54 @@ def test_lease_heartbeat_updates_current_token(session_factory):
     assert state.updated_at == now
     assert state.progress_current == 3
     assert state.progress_total == 7
+
+
+def test_heartbeat_pulses_use_fresh_short_lived_sessions(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        session.add(
+            SalesSyncStateModel(
+                owner_username="alice",
+                store_id=store.id,
+                sync_status="running:owner-token",
+            )
+        )
+        store_id = store.id
+        session.commit()
+
+    opened_sessions: list[Session] = []
+
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        opened_sessions.append(session)
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
+
+    sales_sync_service._heartbeat_lease_in_new_transaction(
+        "alice",
+        store_id,
+        "running:owner-token",
+    )
+    sales_sync_service._heartbeat_lease_in_new_transaction(
+        "alice",
+        store_id,
+        "running:owner-token",
+    )
+
+    assert len(opened_sessions) == 2
+    assert opened_sessions[0] is not opened_sessions[1]
 
 
 def test_stale_running_lease_is_reclaimed(
@@ -561,6 +929,200 @@ def test_credential_decryption_failure_marks_current_lease_error(
     assert state.last_error == "销量同步失败，请稍后重试。"
 
 
+def test_sync_recheck_policy_combines_recent_incomplete_adjusted_and_due(
+    monkeypatch,
+    session_factory,
+):
+    now = datetime(2026, 7, 16, 12, 0, 0)
+
+    def add_order(
+        session,
+        store,
+        order_number,
+        *,
+        age_days,
+        completed,
+        last_synced_age,
+        unresolved=False,
+    ):
+        order = SalesOrderModel(
+            owner_username="alice",
+            store_id=store.id,
+            order_number=order_number,
+            order_progress="700" if completed else "300",
+            order_status="completed" if completed else "normal",
+            ordered_at=now - timedelta(days=age_days),
+            updated_at_remote=now - timedelta(days=age_days),
+            has_unresolved_adjustment=unresolved,
+            raw_order_json="{}",
+            last_synced_at=now - last_synced_age,
+        )
+        session.add(order)
+        session.flush()
+        return order
+
+    with session_factory() as session:
+        store = seed_store(session)
+        add_order(
+            session,
+            store,
+            "RECENT-DUP",
+            age_days=5,
+            completed=False,
+            last_synced_age=timedelta(hours=1),
+        )
+        add_order(
+            session,
+            store,
+            "INCOMPLETE-20",
+            age_days=20,
+            completed=False,
+            last_synced_age=timedelta(hours=1),
+        )
+        adjusted = add_order(
+            session,
+            store,
+            "ADJUSTED-25",
+            age_days=25,
+            completed=True,
+            last_synced_age=timedelta(hours=1),
+        )
+        adjusted_item = SalesOrderItemModel.from_service_payload(
+            owner_username="alice",
+            store_id=store.id,
+            sales_order_id=adjusted.id,
+            order_number=adjusted.order_number,
+            item_detail_id="adjusted-detail",
+            manage_number="MN-ADJUSTED",
+            item_number="ITEM-ADJUSTED",
+            item_id="item-adjusted",
+            ordered_units=1,
+            ordered_at=adjusted.ordered_at,
+        )
+        session.add(adjusted_item)
+        session.flush()
+        session.add(
+            SalesItemAdjustmentModel(
+                owner_username="alice",
+                store_id=store.id,
+                sales_order_item_id=adjusted_item.id,
+                adjustment_type="refund",
+                units=1,
+                amount=Decimal("100"),
+                source="seed:adjusted",
+                status="confirmed",
+                reason="seed",
+                raw_payload_json="{}",
+            )
+        )
+        add_order(
+            session,
+            store,
+            "COMPLETED-DUE-80",
+            age_days=80,
+            completed=True,
+            last_synced_age=timedelta(days=2),
+        )
+        add_order(
+            session,
+            store,
+            "COMPLETED-FRESH-80",
+            age_days=80,
+            completed=True,
+            last_synced_age=timedelta(hours=12),
+        )
+        add_order(
+            session,
+            store,
+            "INCOMPLETE-31",
+            age_days=31,
+            completed=False,
+            last_synced_age=timedelta(days=2),
+        )
+        add_order(
+            session,
+            store,
+            "COMPLETED-DUE-91",
+            age_days=91,
+            completed=True,
+            last_synced_age=timedelta(days=2),
+        )
+        store_id = store.id
+        session.commit()
+
+    search_call: dict[str, object] = {}
+    requested_order_numbers: list[str] = []
+
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def fake_search(
+        _secret,
+        _key,
+        start_at,
+        end_at,
+        statuses,
+    ):
+        search_call.update(
+            {
+                "startAt": start_at,
+                "endAt": end_at,
+                "statuses": statuses,
+            }
+        )
+        return [
+            "RECENT-DUP",
+            "RECENT-ONLY",
+            "RECENT-DUP",
+            "",
+        ]
+
+    def fake_get(_secret, _key, order_numbers):
+        requested_order_numbers.extend(order_numbers)
+        return []
+
+    monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(sales_sync_service, "decrypt_text", lambda value: value)
+    monkeypatch.setattr(sales_sync_service, "_now", lambda: now)
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "search_order_numbers",
+        fake_search,
+    )
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "get_orders",
+        fake_get,
+    )
+
+    result = sales_sync_service.sync_owned_store(
+        "alice",
+        store_id,
+        initial_days=1,
+    )
+
+    assert result["status"] == "completed"
+    assert search_call["startAt"] == now - timedelta(days=7)
+    assert search_call["endAt"] == now
+    assert search_call["statuses"] == sales_sync_service.RAKUTEN_ORDER_STATUSES
+    assert requested_order_numbers == [
+        "RECENT-DUP",
+        "RECENT-ONLY",
+        "INCOMPLETE-20",
+        "ADJUSTED-25",
+        "COMPLETED-DUE-80",
+    ]
+
+
 def test_syncing_same_snapshot_twice_is_idempotent(
     monkeypatch,
     session_factory,
@@ -677,6 +1239,73 @@ def test_newer_snapshot_wins_when_same_batch_contains_older_duplicate(
     assert adjustments[0].status == "confirmed"
 
 
+def test_equivalent_offset_timestamp_keeps_first_accepted_snapshot(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshots = [
+        order_snapshot(
+            item_overrides={"refundUnits": 2},
+            order_overrides={
+                "updateDatetime": "2026-07-15T10:10:00+09:00"
+            },
+        ),
+        order_snapshot(
+            order_overrides={"updateDatetime": "2026-07-15T01:10:00Z"},
+        ),
+    ]
+    patch_local_sync_dependencies(monkeypatch, session_factory, snapshots)
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        order = session.scalars(select(SalesOrderModel)).one()
+        item = session.scalars(select(SalesOrderItemModel)).one()
+        adjustment = session.scalars(select(SalesItemAdjustmentModel)).one()
+
+    assert order.updated_at_remote == datetime(2026, 7, 15, 1, 10, 0)
+    assert item.refunded_units == 2
+    assert item.effective_units == 3
+    assert adjustment.status == "confirmed"
+
+
+def test_equal_timestamp_conflict_cannot_reverse_accepted_snapshot(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshots = [
+        order_snapshot(
+            item_overrides={"refundUnits": 2},
+            order_overrides={"updateDatetime": "2026-07-15T10:10:00"},
+        )
+    ]
+    patch_local_sync_dependencies(monkeypatch, session_factory, snapshots)
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    snapshots[0] = order_snapshot(
+        order_overrides={"updateDatetime": "2026-07-15T10:10:00"},
+    )
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        item = session.scalars(select(SalesOrderItemModel)).one()
+        adjustment = session.scalars(select(SalesItemAdjustmentModel)).one()
+
+    assert item.refunded_units == 2
+    assert item.effective_units == 3
+    assert adjustment.status == "confirmed"
+
+
 def test_snapshot_without_remote_version_does_not_overwrite_versioned_order(
     monkeypatch,
     session_factory,
@@ -759,7 +1388,10 @@ def test_reconciliation_preserves_first_units_and_reverts_removed_adjustment(
     patch_local_sync_dependencies(monkeypatch, session_factory, snapshots)
     sales_sync_service.sync_owned_store("alice", store_id)
 
-    snapshots[0] = order_snapshot(units=5)
+    snapshots[0] = order_snapshot(
+        units=5,
+        order_overrides={"updateDatetime": "2026-07-15T10:10:00"},
+    )
     sales_sync_service.sync_owned_store("alice", store_id)
 
     with session_factory() as session:
@@ -1060,6 +1692,90 @@ def test_partial_item_attribution_creates_unresolved_residual(
     }
 
 
+def test_inferred_refund_amount_is_subtracted_from_order_residual(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshot = order_snapshot(
+        item_overrides={"refundUnits": 2},
+        order_overrides={
+            "partialRefund": True,
+            "refundUnits": 3,
+            "refundAmount": 300,
+        },
+    )
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        [snapshot],
+    )
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        adjustments = session.scalars(
+            select(SalesItemAdjustmentModel).order_by(
+                SalesItemAdjustmentModel.status.asc()
+            )
+        ).all()
+
+    assert {
+        (row.status, row.units, row.amount)
+        for row in adjustments
+    } == {
+        ("confirmed", 2, Decimal("200")),
+        ("unresolved", 1, Decimal("100")),
+    }
+
+
+def test_residual_amount_uses_only_clamped_confirmed_item_units(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshot = order_snapshot(
+        item_overrides={"refundUnits": 10},
+        order_overrides={
+            "partialRefund": True,
+            "refundUnits": 7,
+            "refundAmount": 700,
+        },
+    )
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        [snapshot],
+    )
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        item = session.scalars(select(SalesOrderItemModel)).one()
+        adjustments = session.scalars(
+            select(SalesItemAdjustmentModel).order_by(
+                SalesItemAdjustmentModel.status.asc()
+            )
+        ).all()
+
+    assert item.refunded_units == 5
+    assert {
+        (row.status, row.units, row.amount)
+        for row in adjustments
+    } == {
+        ("confirmed", 5, Decimal("500")),
+        ("unresolved", 2, Decimal("200")),
+    }
+
+
 def test_partial_return_attribution_creates_unresolved_residual(
     monkeypatch,
     session_factory,
@@ -1112,6 +1828,184 @@ def test_partial_return_attribution_creates_unresolved_residual(
         ("return", "confirmed", 2, Decimal("200")),
         ("return", "unresolved", 1, Decimal("100")),
     }
+
+
+def test_inferred_return_amount_is_subtracted_from_order_residual(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshot = order_snapshot(
+        item_overrides={"returnUnits": 2},
+        order_overrides={
+            "partialReturn": True,
+            "returnUnits": 3,
+            "returnAmount": 300,
+        },
+    )
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        [snapshot],
+    )
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        adjustments = session.scalars(
+            select(SalesItemAdjustmentModel).order_by(
+                SalesItemAdjustmentModel.status.asc()
+            )
+        ).all()
+
+    assert {
+        (
+            row.adjustment_type,
+            row.status,
+            row.units,
+            row.amount,
+        )
+        for row in adjustments
+    } == {
+        ("return", "confirmed", 2, Decimal("200")),
+        ("return", "unresolved", 1, Decimal("100")),
+    }
+
+
+@pytest.mark.parametrize(
+    ("flag_name", "adjustment_type"),
+    [
+        ("partialRefund", "refund"),
+        ("hasPartialRefund", "refund"),
+        ("unresolvedRefund", "refund"),
+        ("partialReturn", "return"),
+        ("hasPartialReturn", "return"),
+        ("unresolvedReturn", "return"),
+    ],
+)
+def test_partial_flags_create_zero_value_unresolved_marker(
+    monkeypatch,
+    session_factory,
+    flag_name,
+    adjustment_type,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshot = order_snapshot(order_overrides={flag_name: True})
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        [snapshot],
+    )
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        order = session.scalars(select(SalesOrderModel)).one()
+        adjustment = session.scalars(select(SalesItemAdjustmentModel)).one()
+
+    assert order.has_unresolved_adjustment is True
+    assert adjustment.adjustment_type == adjustment_type
+    assert adjustment.status == "unresolved"
+    assert adjustment.units == 0
+    assert adjustment.amount == Decimal("0")
+
+
+def test_alias_parsers_skip_null_and_malformed_values_end_to_end(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshot = order_snapshot(
+        item_overrides={
+            "refundedUnits": None,
+            "refundUnits": 2,
+            "refundedAmount": "invalid",
+            "refundAmount": 200,
+        },
+        order_overrides={
+            "partialRefund": None,
+            "hasPartialRefund": True,
+            "orderStatus": {"malformed": True},
+            "status": "normal",
+            "currencyCode": ["malformed"],
+            "currency": "USD",
+            "totalRefundUnits": None,
+            "refundedUnits": "invalid",
+            "refundUnits": 3,
+            "totalRefundAmount": None,
+            "refundedAmount": "invalid",
+            "refundAmount": 300,
+        },
+    )
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        [snapshot],
+    )
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        order = session.scalars(select(SalesOrderModel)).one()
+        item = session.scalars(select(SalesOrderItemModel)).one()
+        adjustments = session.scalars(
+            select(SalesItemAdjustmentModel).order_by(
+                SalesItemAdjustmentModel.status.asc()
+            )
+        ).all()
+
+    assert order.order_status == "normal"
+    assert order.currency == "USD"
+    assert item.refunded_units == 2
+    assert {
+        (row.status, row.units, row.amount)
+        for row in adjustments
+    } == {
+        ("confirmed", 2, Decimal("200")),
+        ("unresolved", 1, Decimal("100")),
+    }
+
+
+def test_boolean_alias_parser_skips_null_full_refund_flag(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshot = order_snapshot(
+        order_overrides={
+            "isFullRefund": None,
+            "fullRefund": True,
+        },
+    )
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        [snapshot],
+    )
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        item = session.scalars(select(SalesOrderItemModel)).one()
+
+    assert item.refunded_units == 5
+    assert item.effective_units == 0
 
 
 def test_full_refund_fallback_is_not_suppressed_by_partial_item_attribution(
@@ -1250,6 +2144,76 @@ def test_sync_rebuilds_multi_order_multi_sku_daily_aggregates(
     } == {
         (2, 3, 3),
         (1, 4, 4),
+    }
+
+
+def test_daily_aggregation_separates_blank_manage_number_products(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshots = [
+        order_snapshot(
+            order_number="ORDER-A",
+            units=2,
+            item_overrides={
+                "itemDetailId": "detail-a",
+                "manageNumber": "",
+                "itemNumber": "ITEM-A",
+                "itemId": "item-a",
+                "SkuModelList": [{"variantId": "same-sku"}],
+            },
+        ),
+        order_snapshot(
+            order_number="ORDER-B",
+            units=3,
+            item_overrides={
+                "itemDetailId": "detail-b",
+                "manageNumber": "",
+                "itemNumber": "ITEM-B",
+                "itemId": "item-b",
+                "SkuModelList": [{"variantId": "same-sku"}],
+            },
+        ),
+        order_snapshot(
+            order_number="ORDER-C",
+            units=4,
+            item_overrides={
+                "itemDetailId": "detail-c",
+                "manageNumber": "",
+                "itemNumber": "",
+                "itemId": "item-c",
+                "SkuModelList": [{"variantId": "same-sku"}],
+            },
+        ),
+    ]
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        snapshots,
+    )
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        rows = session.scalars(
+            select(ProductSalesDailyModel).order_by(
+                ProductSalesDailyModel.manage_number.asc()
+            )
+        ).all()
+
+    assert len(rows) == 3
+    assert {
+        (row.manage_number, row.ordered_units, row.order_count)
+        for row in rows
+    } == {
+        ("item-id:item-c", 4, 1),
+        ("item-number:ITEM-A", 2, 1),
+        ("item-number:ITEM-B", 3, 1),
     }
 
 
