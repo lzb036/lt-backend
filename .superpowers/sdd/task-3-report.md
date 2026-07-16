@@ -144,3 +144,94 @@ Result: exit code `0`.
 - The HTTP contract remains mock-tested only; no live Rakuten RMS request was made.
 - SQLite does not enforce `SELECT ... FOR UPDATE`, so lock query construction and running-state behavior are covered locally, but real concurrent MySQL contention was not integration-tested in this task.
 - Remote refund/return field aliases are handled defensively from the approved snapshot rules, but exact production payload variants should be checked when a sanitized real version-7 order sample is available.
+
+## Review Fix Takeover
+
+The interrupted review patch was preserved and finalized. The review fixes now:
+
+- Acquire the store lease with one conditional `UPDATE`, return an active running state without API calls, reclaim only stale running leases, heartbeat with the current token, and protect completion/error writes with token-matched row counts.
+- Reject older or unversioned snapshots before they can overwrite a versioned order, including an older duplicate later in the same API batch.
+- Skip malformed package/item containers and incomplete item records before mutation.
+- Treat empty item lists as authoritative only for explicit cancellation, full refund, or full return; completed/shipped empty snapshots do not cancel existing lines.
+- Preserve first-observed `ordered_units` while applying newer `latest_units` such as `5 -> 3`.
+- Keep attributed refund/return deductions confirmed while recording any order-level residual units or amounts as unresolved.
+- Rebuild daily rows across multiple orders and SKUs with distinct order counts and aggregated unit totals.
+- Compile the acquisition statement with the MySQL dialect and verify exact `rowcount == 1` acquisition semantics with mocks.
+
+### Additional TDD Evidence
+
+The takeover added regressions before changing the incomplete-snapshot rules:
+
+```powershell
+pytest tests/test_sales_sync_service.py -q
+```
+
+```text
+4 failed, 37 passed in 1.93s
+```
+
+The failures showed completed-empty snapshots and incomplete item records still bypassed the prior validation.
+
+A second parser-alignment regression exposed `"5.0"` being accepted by validation but normalized to zero:
+
+```powershell
+pytest tests/test_sales_sync_service.py::test_incomplete_item_record_is_skipped_without_canceling_lines -q
+```
+
+```text
+1 failed, 3 passed in 1.28s
+```
+
+After the narrow validation fixes:
+
+```powershell
+pytest tests/test_sales_sync_service.py -v
+```
+
+```text
+44 passed in 1.73s
+```
+
+### Final Verification
+
+Full suite:
+
+```powershell
+pytest -q
+```
+
+```text
+292 passed, 2 warnings, 4 subtests passed in 5.41s
+```
+
+The warnings remain the existing FastAPI `on_event` deprecations from `app/main.py`.
+
+Compilation:
+
+```powershell
+python -m compileall app tests/test_sales_sync_service.py
+```
+
+Result: exit code `0`.
+
+Diff validation:
+
+```powershell
+git diff --check
+```
+
+Result: exit code `0`.
+
+### Final Self-Review
+
+- Confirmed lease acquisition, heartbeat, completion, and failure writes all use the lease token or atomic acquisition predicate.
+- Confirmed an active lease returns before credential decryption or either Rakuten order API call.
+- Confirmed stale and incomplete snapshots do not alter orders, items, adjustments, or daily aggregates.
+- Confirmed accepted item quantities use the same integer semantics as downstream normalization.
+- Confirmed unresolved refund/return remainders do not reduce effective units.
+- Confirmed the focused tests cover `5 -> 3`, same-batch out-of-order snapshots, multi-order/SKU aggregation, MySQL SQL compilation, and rowcount behavior.
+- Confirmed no frontend/backend process, UI, browser, or live Rakuten request was started.
+
+### Remaining Concern
+
+- Real concurrent MySQL contention is represented by dialect compilation and rowcount/token tests, not a live multi-connection MySQL integration test.

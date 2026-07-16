@@ -6,8 +6,10 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from typing import Any, Iterable
+import uuid
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.secure_storage import decrypt_text
@@ -26,6 +28,8 @@ from app.services import rakuten_order_service
 INCREMENTAL_RECHECK_DAYS = 7
 RAKUTEN_ORDER_STATUSES = [100, 200, 300, 400, 500, 600, 700, 800, 900]
 SNAPSHOT_ADJUSTMENT_SOURCE_PREFIX = "sales_sync:"
+SALES_SYNC_LEASE_TIMEOUT = timedelta(minutes=10)
+RUNNING_SYNC_STATUS_PREFIX = "running:"
 
 
 @dataclass(frozen=True)
@@ -34,7 +38,23 @@ class AdjustmentDerivation:
     refunded_units: int
     returned_units: int
     unresolved_refund_units: int
+    unresolved_return_units: int
     effective_units: int
+
+
+@dataclass(frozen=True)
+class ReconcileOutcome:
+    affected_dates: set[date]
+    remote_updated_at: datetime | None
+    disposition: str
+
+
+class IncompleteSnapshotError(ValueError):
+    pass
+
+
+class SalesSyncLeaseLostError(RuntimeError):
+    pass
 
 
 def calculate_effective_units(
@@ -63,6 +83,7 @@ def derive_adjustments(
     return_units: int = 0,
     return_refund: bool = False,
     unresolved_refund_units: int = 0,
+    unresolved_return_units: int = 0,
 ) -> AdjustmentDerivation:
     ordered = _non_negative_int(ordered_units)
     latest = ordered if latest_units is None else _non_negative_int(latest_units)
@@ -70,6 +91,7 @@ def derive_adjustments(
     refunded = _non_negative_int(refund_units)
     returned = _non_negative_int(return_units)
     unresolved = _non_negative_int(unresolved_refund_units)
+    unresolved_returned = _non_negative_int(unresolved_return_units)
 
     if return_refund:
         refunded -= min(refunded, returned)
@@ -98,6 +120,7 @@ def derive_adjustments(
         refunded_units=refunded,
         returned_units=returned,
         unresolved_refund_units=unresolved,
+        unresolved_return_units=unresolved_returned,
         effective_units=calculate_effective_units(
             ordered,
             canceled,
@@ -116,48 +139,47 @@ def sync_owned_store(
     normalized_owner = _text(owner_username)
     normalized_store_id = int(store_id)
     normalized_initial_days = max(1, int(initial_days))
+    lease_status = _new_lease_status()
+    acquired_at = _now()
 
     with session_scope() as session:
         store = session.scalar(
-            select(StoreModel)
-            .where(
+            select(StoreModel).where(
                 StoreModel.id == normalized_store_id,
                 StoreModel.owner_username == normalized_owner,
             )
-            .with_for_update()
         )
         if store is None:
             raise LookupError("店铺不存在或无权访问。")
 
+        _ensure_sync_state(
+            session,
+            owner_username=normalized_owner,
+            store_id=normalized_store_id,
+        )
+        acquired = _acquire_sync_lease(
+            session,
+            owner_username=normalized_owner,
+            store_id=normalized_store_id,
+            lease_status=lease_status,
+            now=acquired_at,
+        )
         state = session.scalar(
-            select(SalesSyncStateModel)
-            .where(
+            select(SalesSyncStateModel).where(
                 SalesSyncStateModel.store_id == normalized_store_id,
                 SalesSyncStateModel.owner_username == normalized_owner,
             )
-            .with_for_update()
         )
         if state is None:
-            state = SalesSyncStateModel(
-                owner_username=normalized_owner,
-                store_id=normalized_store_id,
-                initial_sync_completed=False,
-                sync_status="idle",
-            )
-            session.add(state)
-            session.flush()
-        if state.sync_status == "running":
+            raise RuntimeError("店铺销量同步状态不存在。")
+        if not acquired:
             return _sync_state_payload(state, already_running=True)
 
         initial_sync_completed = bool(state.initial_sync_completed)
-        state.sync_status = "running"
-        state.progress_current = 0
-        state.progress_total = 0
-        state.last_error = None
-        service_secret = decrypt_text(store.rakuten_service_secret_encrypted)
-        license_key = decrypt_text(store.rakuten_license_key_encrypted)
+        encrypted_service_secret = store.rakuten_service_secret_encrypted
+        encrypted_license_key = store.rakuten_license_key_encrypted
 
-    now = datetime.now()
+    now = _now()
     lookback_days = (
         INCREMENTAL_RECHECK_DAYS
         if initial_sync_completed
@@ -166,6 +188,8 @@ def sync_owned_store(
     start_at = now - timedelta(days=lookback_days)
 
     try:
+        service_secret = decrypt_text(encrypted_service_secret)
+        license_key = decrypt_text(encrypted_license_key)
         order_numbers = rakuten_order_service.search_order_numbers(
             service_secret,
             license_key,
@@ -173,10 +197,24 @@ def sync_owned_store(
             now,
             RAKUTEN_ORDER_STATUSES,
         )
+        _heartbeat_lease_in_new_transaction(
+            normalized_owner,
+            normalized_store_id,
+            lease_status,
+            progress_current=0,
+            progress_total=len(order_numbers),
+        )
         orders = rakuten_order_service.get_orders(
             service_secret,
             license_key,
             order_numbers,
+        )
+        _heartbeat_lease_in_new_transaction(
+            normalized_owner,
+            normalized_store_id,
+            lease_status,
+            progress_current=0,
+            progress_total=len(orders),
         )
 
         with session_scope() as session:
@@ -188,28 +226,36 @@ def sync_owned_store(
             )
             if store is None:
                 raise LookupError("店铺不存在或无权访问。")
+            affected_dates: set[date] = set()
             state = session.scalar(
-                select(SalesSyncStateModel)
-                .where(
+                select(SalesSyncStateModel).where(
                     SalesSyncStateModel.store_id == normalized_store_id,
                     SalesSyncStateModel.owner_username == normalized_owner,
                 )
-                .with_for_update()
             )
             if state is None:
                 raise RuntimeError("店铺销量同步状态不存在。")
-
-            state.progress_total = len(orders)
-            affected_dates: set[date] = set()
+            if state.sync_status != lease_status:
+                raise SalesSyncLeaseLostError("销量同步租约已失效。")
             last_remote_updated_at = state.last_remote_updated_at
-            for index, order_payload in enumerate(orders, start=1):
-                order_dates, remote_updated_at = _reconcile_order_snapshot(
-                    session,
-                    store,
-                    order_payload,
-                    synced_at=now,
-                )
-                affected_dates.update(order_dates)
+            stale_order_count = 0
+            incomplete_order_count = 0
+            for order_payload in orders:
+                try:
+                    outcome = _reconcile_order_snapshot(
+                        session,
+                        store,
+                        order_payload,
+                        synced_at=now,
+                    )
+                except IncompleteSnapshotError:
+                    incomplete_order_count += 1
+                    continue
+
+                affected_dates.update(outcome.affected_dates)
+                if outcome.disposition == "stale":
+                    stale_order_count += 1
+                remote_updated_at = outcome.remote_updated_at
                 if (
                     remote_updated_at is not None
                     and (
@@ -218,7 +264,6 @@ def sync_owned_store(
                     )
                 ):
                     last_remote_updated_at = remote_updated_at
-                state.progress_current = index
 
             if affected_dates:
                 rebuild_daily_sales(
@@ -228,34 +273,205 @@ def sync_owned_store(
                     max(affected_dates),
                 )
 
-            state.initial_sync_completed = True
-            state.last_successful_sync_at = now
-            state.last_remote_updated_at = last_remote_updated_at
-            state.sync_status = "idle"
-            state.last_error = None
+            completed_at = _now()
+            completed = session.execute(
+                update(SalesSyncStateModel)
+                .where(
+                    SalesSyncStateModel.store_id == normalized_store_id,
+                    SalesSyncStateModel.owner_username == normalized_owner,
+                    SalesSyncStateModel.sync_status == lease_status,
+                )
+                .values(
+                    initial_sync_completed=True,
+                    last_successful_sync_at=completed_at,
+                    last_remote_updated_at=last_remote_updated_at,
+                    sync_status="idle",
+                    progress_current=len(orders),
+                    progress_total=len(orders),
+                    last_error=None,
+                    updated_at=completed_at,
+                )
+            ).rowcount
+            if completed != 1:
+                raise SalesSyncLeaseLostError("销量同步租约已失效。")
+            state = session.scalar(
+                select(SalesSyncStateModel).where(
+                    SalesSyncStateModel.store_id == normalized_store_id,
+                    SalesSyncStateModel.owner_username == normalized_owner,
+                )
+            )
+            if state is None:
+                raise RuntimeError("店铺销量同步状态不存在。")
             result = _sync_state_payload(state, already_running=False)
             result.update(
                 {
                     "status": "completed",
                     "orderCount": len(orders),
                     "affectedDateCount": len(affected_dates),
+                    "staleOrderCount": stale_order_count,
+                    "incompleteOrderCount": incomplete_order_count,
                 }
             )
             return result
     except Exception:
         with session_scope() as session:
-            state = session.scalar(
-                select(SalesSyncStateModel)
+            failed_at = _now()
+            session.execute(
+                update(SalesSyncStateModel)
                 .where(
                     SalesSyncStateModel.store_id == normalized_store_id,
                     SalesSyncStateModel.owner_username == normalized_owner,
+                    SalesSyncStateModel.sync_status == lease_status,
                 )
-                .with_for_update()
+                .values(
+                    sync_status="error",
+                    last_error="销量同步失败，请稍后重试。",
+                    updated_at=failed_at,
+                )
             )
-            if state is not None:
-                state.sync_status = "error"
-                state.last_error = "销量同步失败，请稍后重试。"
         raise
+
+
+def _now() -> datetime:
+    return datetime.now()
+
+
+def _new_lease_status() -> str:
+    return f"{RUNNING_SYNC_STATUS_PREFIX}{uuid.uuid4().hex[:20]}"
+
+
+def _ensure_sync_state(
+    session: Session,
+    *,
+    owner_username: str,
+    store_id: int,
+) -> None:
+    existing = session.scalar(
+        select(SalesSyncStateModel.store_id).where(
+            SalesSyncStateModel.store_id == store_id,
+            SalesSyncStateModel.owner_username == owner_username,
+        )
+    )
+    if existing is not None:
+        return
+    try:
+        with session.begin_nested():
+            session.add(
+                SalesSyncStateModel(
+                    owner_username=owner_username,
+                    store_id=store_id,
+                    initial_sync_completed=False,
+                    sync_status="idle",
+                )
+            )
+            session.flush()
+    except IntegrityError:
+        session.expire_all()
+
+
+def _lease_acquisition_statement(
+    owner_username: str,
+    store_id: int,
+    lease_status: str,
+    now: datetime,
+):
+    stale_before = now - SALES_SYNC_LEASE_TIMEOUT
+    running_condition = SalesSyncStateModel.sync_status.like("running%")
+    return (
+        update(SalesSyncStateModel)
+        .where(
+            SalesSyncStateModel.store_id == store_id,
+            SalesSyncStateModel.owner_username == owner_username,
+            or_(
+                SalesSyncStateModel.sync_status.not_like("running%"),
+                and_(
+                    running_condition,
+                    SalesSyncStateModel.updated_at < stale_before,
+                ),
+            ),
+        )
+        .values(
+            sync_status=lease_status,
+            progress_current=0,
+            progress_total=0,
+            last_error=None,
+            updated_at=now,
+        )
+    )
+
+
+def _acquire_sync_lease(
+    session: Session,
+    *,
+    owner_username: str,
+    store_id: int,
+    lease_status: str,
+    now: datetime,
+) -> bool:
+    result = session.execute(
+        _lease_acquisition_statement(
+            owner_username,
+            store_id,
+            lease_status,
+            now,
+        )
+    )
+    return result.rowcount == 1
+
+
+def _heartbeat_lease(
+    session: Session,
+    *,
+    owner_username: str,
+    store_id: int,
+    lease_status: str,
+    now: datetime,
+    progress_current: int | None = None,
+    progress_total: int | None = None,
+) -> bool:
+    values: dict[str, Any] = {"updated_at": now}
+    if progress_current is not None:
+        values["progress_current"] = progress_current
+    if progress_total is not None:
+        values["progress_total"] = progress_total
+    result = session.execute(
+        update(SalesSyncStateModel)
+        .where(
+            SalesSyncStateModel.store_id == store_id,
+            SalesSyncStateModel.owner_username == owner_username,
+            SalesSyncStateModel.sync_status == lease_status,
+        )
+        .values(**values)
+    )
+    return result.rowcount == 1
+
+
+def _require_lease_heartbeat(
+    session: Session,
+    **kwargs: Any,
+) -> None:
+    if not _heartbeat_lease(session, **kwargs):
+        raise SalesSyncLeaseLostError("销量同步租约已失效。")
+
+
+def _heartbeat_lease_in_new_transaction(
+    owner_username: str,
+    store_id: int,
+    lease_status: str,
+    *,
+    progress_current: int | None = None,
+    progress_total: int | None = None,
+) -> None:
+    with session_scope() as session:
+        _require_lease_heartbeat(
+            session,
+            owner_username=owner_username,
+            store_id=store_id,
+            lease_status=lease_status,
+            now=_now(),
+            progress_current=progress_current,
+            progress_total=progress_total,
+        )
 
 
 def rebuild_daily_sales(
@@ -369,20 +585,11 @@ def _reconcile_order_snapshot(
     payload: dict[str, Any],
     *,
     synced_at: datetime,
-) -> tuple[set[date], datetime | None]:
+) -> ReconcileOutcome:
     order_number = _first_text(payload, ("orderNumber",))
     if not order_number:
-        raise ValueError("订单号缺失。")
+        raise IncompleteSnapshotError("订单号缺失。")
 
-    ordered_at = _first_datetime(
-        payload,
-        (
-            "orderDatetime",
-            "orderDateTime",
-            "orderDate",
-            "orderTimestamp",
-        ),
-    ) or synced_at
     remote_updated_at = _first_datetime(
         payload,
         (
@@ -397,6 +604,44 @@ def _reconcile_order_snapshot(
             SalesOrderModel.order_number == order_number,
         )
     )
+    if (
+        order is not None
+        and order.updated_at_remote is not None
+        and remote_updated_at is None
+    ):
+        raise IncompleteSnapshotError("订单远端更新时间缺失。")
+    if (
+        order is not None
+        and order.updated_at_remote is not None
+        and remote_updated_at is not None
+        and remote_updated_at < order.updated_at_remote
+    ):
+        return ReconcileOutcome(
+            affected_dates=set(),
+            remote_updated_at=order.updated_at_remote,
+            disposition="stale",
+        )
+
+    item_pairs = _validated_order_item_pairs(payload)
+    order_canceled = _order_is_canceled(payload)
+    full_refund = _order_is_full_refund(payload)
+    full_return = _order_is_full_return(payload)
+    if not item_pairs and not (
+        order_canceled or full_refund or full_return
+    ):
+        raise IncompleteSnapshotError(
+            "无明确取消、全额退款或全部退货的空商品快照不允许删除已有商品。"
+        )
+
+    ordered_at = _first_datetime(
+        payload,
+        (
+            "orderDatetime",
+            "orderDateTime",
+            "orderDate",
+            "orderTimestamp",
+        ),
+    ) or (order.ordered_at if order is not None else synced_at)
     affected_dates = {ordered_at.date()}
     if order is None:
         order = SalesOrderModel(
@@ -426,7 +671,7 @@ def _reconcile_order_snapshot(
     order.currency = (
         _first_text(payload, ("currencyCode", "currency")) or "JPY"
     )
-    order.is_canceled = _order_is_canceled(payload)
+    order.is_canceled = order_canceled
     order.raw_order_json = _json(payload)
     order.last_synced_at = synced_at
 
@@ -441,17 +686,55 @@ def _reconcile_order_snapshot(
             )
         ).all()
     }
-    item_pairs = list(_order_item_pairs(payload))
-    full_refund = _order_is_full_refund(payload)
-    has_item_refund_attribution = any(
-        _item_refund_units(raw_item) > 0
-        or _item_return_units(raw_item) > 0
+    attributed_refund_units = sum(
+        _item_refund_units(raw_item)
         for _, raw_item in item_pairs
     )
-    unresolved_units = _order_unresolved_refund_units(payload)
-    unresolved_amount = _order_unresolved_refund_amount(payload)
-    unresolved = _order_has_unresolved_refund(payload) and not (
-        full_refund or has_item_refund_attribution
+    attributed_return_units = sum(
+        _item_return_units(raw_item)
+        for _, raw_item in item_pairs
+    )
+    attributed_refund_amount = sum(
+        (
+            _item_refund_amount(raw_item)
+            for _, raw_item in item_pairs
+        ),
+        Decimal("0"),
+    )
+    attributed_return_amount = sum(
+        (
+            _item_return_amount(raw_item)
+            for _, raw_item in item_pairs
+        ),
+        Decimal("0"),
+    )
+    residual_refund_units = max(
+        0,
+        _order_refund_units(payload) - attributed_refund_units,
+    )
+    residual_return_units = max(
+        0,
+        _order_return_units(payload) - attributed_return_units,
+    )
+    residual_refund_amount = max(
+        Decimal("0"),
+        _order_refund_amount(payload) - attributed_refund_amount,
+    )
+    residual_return_amount = max(
+        Decimal("0"),
+        _order_return_amount(payload) - attributed_return_amount,
+    )
+    if full_refund:
+        residual_refund_units = 0
+        residual_refund_amount = Decimal("0")
+    if full_return:
+        residual_return_units = 0
+        residual_return_amount = Decimal("0")
+    unresolved = bool(
+        residual_refund_units
+        or residual_return_units
+        or residual_refund_amount
+        or residual_return_amount
     )
     seen_item_ids: set[str] = set()
 
@@ -477,24 +760,40 @@ def _reconcile_order_snapshot(
         )
         refund_units = _item_refund_units(raw_item)
         return_units = _item_return_units(raw_item)
-        if full_refund and not has_item_refund_attribution:
-            refund_units = ordered_units
-        item_unresolved_units = (
-            unresolved_units if unresolved and position == 1 else 0
+        if full_refund:
+            refund_units = max(refund_units, ordered_units)
+        if full_return:
+            return_units = max(return_units, ordered_units)
+        item_unresolved_refund_units = (
+            residual_refund_units if position == 1 else 0
         )
-        item_unresolved_amount = (
-            unresolved_amount if unresolved and position == 1 else Decimal("0")
+        item_unresolved_return_units = (
+            residual_return_units if position == 1 else 0
+        )
+        item_unresolved_refund_amount = (
+            residual_refund_amount if position == 1 else Decimal("0")
+        )
+        item_unresolved_return_amount = (
+            residual_return_amount if position == 1 else Decimal("0")
         )
         derivation = derive_adjustments(
             ordered_units=ordered_units,
             latest_units=current_units,
             order_canceled=order.is_canceled,
-            delete_item=bool(normalized_item.get("deleteItemFlag")),
+            delete_item=(
+                bool(normalized_item.get("deleteItemFlag"))
+                and not (full_refund or full_return)
+            ),
             canceled_units=_item_canceled_units(raw_item),
             refund_units=refund_units,
             return_units=return_units,
-            return_refund=_item_is_return_refund(raw_item),
-            unresolved_refund_units=item_unresolved_units,
+            return_refund=(
+                _item_is_return_refund(raw_item)
+                or (full_refund and return_units > 0)
+                or (full_return and refund_units > 0)
+            ),
+            unresolved_refund_units=item_unresolved_refund_units,
+            unresolved_return_units=item_unresolved_return_units,
         )
         sku_models = normalized_item.get("SkuModelList")
         sku_json = _json(sku_models if isinstance(sku_models, list) else [])
@@ -563,22 +862,28 @@ def _reconcile_order_snapshot(
             derivation,
             raw_payload=raw_item,
             remote_updated_at=remote_updated_at,
-            unresolved_amount=item_unresolved_amount,
+            unresolved_refund_amount=item_unresolved_refund_amount,
+            unresolved_return_amount=item_unresolved_return_amount,
         )
 
     for item_detail_id, item in existing_items.items():
         if item_detail_id in seen_item_ids:
             continue
+        missing_refund_units = item.ordered_units if full_refund else 0
+        missing_return_units = item.ordered_units if full_return else 0
         derivation = derive_adjustments(
             ordered_units=item.ordered_units,
             latest_units=0,
             order_canceled=order.is_canceled,
-            delete_item=True,
+            delete_item=not (full_refund or full_return),
+            refund_units=missing_refund_units,
+            return_units=missing_return_units,
+            return_refund=full_refund and full_return,
         )
         item.latest_units = 0
         item.canceled_units = derivation.canceled_units
-        item.refunded_units = 0
-        item.returned_units = 0
+        item.refunded_units = derivation.refunded_units
+        item.returned_units = derivation.returned_units
         item.effective_units = derivation.effective_units
         item.effective_amount = item.unit_price * derivation.effective_units
         item.delete_item_flag = True
@@ -588,11 +893,16 @@ def _reconcile_order_snapshot(
             derivation,
             raw_payload={"missingFromLatestSnapshot": True},
             remote_updated_at=remote_updated_at,
-            unresolved_amount=Decimal("0"),
+            unresolved_refund_amount=Decimal("0"),
+            unresolved_return_amount=Decimal("0"),
         )
 
     order.has_unresolved_adjustment = unresolved
-    return affected_dates, remote_updated_at
+    return ReconcileOutcome(
+        affected_dates=affected_dates,
+        remote_updated_at=remote_updated_at,
+        disposition="applied",
+    )
 
 
 def _reconcile_item_adjustments(
@@ -602,7 +912,8 @@ def _reconcile_item_adjustments(
     *,
     raw_payload: dict[str, Any],
     remote_updated_at: datetime | None,
-    unresolved_amount: Decimal,
+    unresolved_refund_amount: Decimal,
+    unresolved_return_amount: Decimal,
 ) -> None:
     expected: dict[str, dict[str, Any]] = {}
     if derivation.canceled_units:
@@ -629,13 +940,21 @@ def _reconcile_item_adjustments(
             "status": "confirmed",
             "reason": "商品退货已确认",
         }
-    if derivation.unresolved_refund_units or unresolved_amount:
+    if derivation.unresolved_refund_units or unresolved_refund_amount:
         expected[f"{SNAPSHOT_ADJUSTMENT_SOURCE_PREFIX}refund_unresolved"] = {
             "adjustment_type": "refund",
             "units": derivation.unresolved_refund_units,
-            "amount": unresolved_amount,
+            "amount": unresolved_refund_amount,
             "status": "unresolved",
             "reason": "部分退款无法定位到具体商品",
+        }
+    if derivation.unresolved_return_units or unresolved_return_amount:
+        expected[f"{SNAPSHOT_ADJUSTMENT_SOURCE_PREFIX}return_unresolved"] = {
+            "adjustment_type": "return",
+            "units": derivation.unresolved_return_units,
+            "amount": unresolved_return_amount,
+            "status": "unresolved",
+            "reason": "部分退货无法定位到具体商品",
         }
 
     existing_rows = session.scalars(
@@ -690,10 +1009,11 @@ def _sync_state_payload(
     *,
     already_running: bool,
 ) -> dict[str, Any]:
+    public_status = _public_sync_status(state.sync_status)
     payload = {
         "storeId": state.store_id,
         "ownerUsername": state.owner_username,
-        "status": state.sync_status,
+        "status": public_status,
         "alreadyRunning": already_running,
         "initialSyncCompleted": bool(state.initial_sync_completed),
         "progressCurrent": state.progress_current,
@@ -705,36 +1025,52 @@ def _sync_state_payload(
     if already_running:
         payload["activeTask"] = {
             "storeId": state.store_id,
-            "status": state.sync_status,
+            "status": public_status,
             "progressCurrent": state.progress_current,
             "progressTotal": state.progress_total,
         }
     return payload
 
 
-def _order_item_pairs(
+def _public_sync_status(sync_status: str) -> str:
+    if _text(sync_status).startswith("running"):
+        return "running"
+    return _text(sync_status)
+
+
+def _validated_order_item_pairs(
     order: dict[str, Any],
-) -> Iterable[tuple[dict[str, Any], dict[str, Any]]]:
-    normalized_items = list(rakuten_order_service.iter_order_items(order))
-    raw_items = list(_raw_order_items(order))
-    for index, normalized in enumerate(normalized_items):
-        raw = raw_items[index] if index < len(raw_items) else {}
-        yield normalized, raw
-
-
-def _raw_order_items(order: dict[str, Any]) -> Iterable[dict[str, Any]]:
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    if "PackageModelList" not in order:
+        raise IncompleteSnapshotError("订单包裹列表缺失。")
     packages = order.get("PackageModelList")
     if not isinstance(packages, list):
-        return
+        raise IncompleteSnapshotError("订单包裹列表格式无效。")
+
+    raw_items: list[dict[str, Any]] = []
     for package in packages:
         if not isinstance(package, dict):
-            continue
+            raise IncompleteSnapshotError("订单包裹格式无效。")
+        if "ItemModelList" not in package:
+            raise IncompleteSnapshotError("订单商品列表缺失。")
         items = package.get("ItemModelList")
         if not isinstance(items, list):
-            continue
+            raise IncompleteSnapshotError("订单商品列表格式无效。")
         for item in items:
-            if isinstance(item, dict):
-                yield item
+            if not isinstance(item, dict):
+                raise IncompleteSnapshotError("订单商品格式无效。")
+            raw_items.append(item)
+
+    normalized_items = list(rakuten_order_service.iter_order_items(order))
+    if len(normalized_items) != len(raw_items):
+        raise IncompleteSnapshotError("订单商品归一化结果不完整。")
+    item_pairs = list(zip(normalized_items, raw_items))
+    for normalized_item, raw_item in item_pairs:
+        if not _has_item_identity(normalized_item):
+            raise IncompleteSnapshotError("订单商品标识缺失。")
+        if not _has_valid_item_units(raw_item):
+            raise IncompleteSnapshotError("订单商品数量缺失或格式无效。")
+    return item_pairs
 
 
 def _order_is_canceled(payload: dict[str, Any]) -> bool:
@@ -770,36 +1106,69 @@ def _order_is_full_refund(payload: dict[str, Any]) -> bool:
     )
 
 
-def _order_has_unresolved_refund(payload: dict[str, Any]) -> bool:
-    if _first_bool(
-        payload,
-        ("partialRefund", "hasPartialRefund", "unresolvedRefund"),
-    ):
+def _order_is_full_return(payload: dict[str, Any]) -> bool:
+    if _first_bool(payload, ("isFullReturn", "fullReturn")):
         return True
-    return (
-        _order_unresolved_refund_units(payload) > 0
-        or _order_unresolved_refund_amount(payload) > 0
+    status = _first_text(
+        payload,
+        ("returnStatus", "orderStatus", "orderProgressName"),
+    ).lower()
+    if status in {"full", "fully_returned", "returned"}:
+        return True
+    return any(
+        token in status
+        for token in ("full return", "全部退货", "全返品")
     )
 
 
-def _order_unresolved_refund_units(payload: dict[str, Any]) -> int:
+def _order_refund_units(payload: dict[str, Any]) -> int:
     return _first_int(
         payload,
         (
+            "totalRefundUnits",
+            "refundedUnits",
+            "refundUnits",
             "unresolvedRefundUnits",
             "partialRefundUnits",
-            "refundUnits",
         ),
     )
 
 
-def _order_unresolved_refund_amount(payload: dict[str, Any]) -> Decimal:
+def _order_refund_amount(payload: dict[str, Any]) -> Decimal:
     return _first_decimal(
         payload,
         (
+            "totalRefundAmount",
+            "refundedAmount",
+            "refundAmount",
             "unresolvedRefundAmount",
             "partialRefundAmount",
-            "refundAmount",
+        ),
+    )
+
+
+def _order_return_units(payload: dict[str, Any]) -> int:
+    return _first_int(
+        payload,
+        (
+            "totalReturnUnits",
+            "returnedUnits",
+            "returnUnits",
+            "unresolvedReturnUnits",
+            "partialReturnUnits",
+        ),
+    )
+
+
+def _order_return_amount(payload: dict[str, Any]) -> Decimal:
+    return _first_decimal(
+        payload,
+        (
+            "totalReturnAmount",
+            "returnedAmount",
+            "returnAmount",
+            "unresolvedReturnAmount",
+            "partialReturnAmount",
         ),
     )
 
@@ -816,6 +1185,20 @@ def _item_return_units(payload: dict[str, Any]) -> int:
     return _first_int(payload, ("returnedUnits", "returnUnits"))
 
 
+def _item_refund_amount(payload: dict[str, Any]) -> Decimal:
+    return _first_decimal(
+        payload,
+        ("refundedAmount", "refundAmount"),
+    )
+
+
+def _item_return_amount(payload: dict[str, Any]) -> Decimal:
+    return _first_decimal(
+        payload,
+        ("returnedAmount", "returnAmount"),
+    )
+
+
 def _item_is_return_refund(payload: dict[str, Any]) -> bool:
     return _first_bool(
         payload,
@@ -824,6 +1207,34 @@ def _item_is_return_refund(payload: dict[str, Any]) -> bool:
             "returnRefundFlag",
             "isReturnRefund",
         ),
+    )
+
+
+def _has_item_identity(payload: dict[str, Any]) -> bool:
+    return any(
+        _text(payload.get(key))
+        for key in (
+            "itemDetailId",
+            "itemId",
+            "itemNumber",
+            "manageNumber",
+        )
+    )
+
+
+def _has_valid_item_units(payload: dict[str, Any]) -> bool:
+    if "units" not in payload or isinstance(payload.get("units"), bool):
+        return False
+    value = payload.get("units")
+    try:
+        parsed_units = int(value)
+        exact_units = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return (
+        exact_units.is_finite()
+        and parsed_units >= 0
+        and exact_units == Decimal(parsed_units)
     )
 
 
