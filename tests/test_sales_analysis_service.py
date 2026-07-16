@@ -676,6 +676,20 @@ def test_every_store_scoped_result_has_completeness_and_amount_metadata(
         )
 
 
+def test_effective_sales_amount_definition_names_all_unallocated_effects():
+    definition = (
+        sales_analysis_service.EFFECTIVE_SALES_AMOUNT_DEFINITION
+    )
+
+    assert "商品行单价" in definition
+    assert "有效销量" in definition
+    assert "优惠券" in definition
+    assert "折扣" in definition
+    assert "退款金额" in definition
+    assert "税额" in definition
+    assert "不代表权威净收入" in definition
+
+
 def test_completed_initial_sync_clears_data_incomplete(
     seeded_sales,
     session_factory,

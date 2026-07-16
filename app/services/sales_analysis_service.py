@@ -47,8 +47,8 @@ MAX_COMPARISON_PRODUCTS = 20
 MAX_RANKING_FACT_ROWS = 50_000
 EFFECTIVE_SALES_AMOUNT_DEFINITION = (
     "估算商品金额：按商品行单价 × 有效销量计算；"
-    "未分摊优惠券、折扣或税额，存在口径差异，"
-    "不代表权威净收入。"
+    "未分摊优惠券、折扣、退款金额或税额，"
+    "仅反映数量扣减后的商品行估算，不代表权威净收入。"
 )
 
 ManageNumber = Annotated[

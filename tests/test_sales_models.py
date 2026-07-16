@@ -22,7 +22,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.schema import CreateColumn
 
 import app.db.models  # noqa: F401
@@ -1812,6 +1812,94 @@ def test_init_database_preflights_sales_parent_before_create_all(
         "create-all",
         "compatibility",
     ]
+
+
+def test_init_database_real_create_all_sees_existing_store_parent_key(
+    monkeypatch,
+):
+    from app.services import (
+        crawler_service,
+        sensitive_word_service,
+        user_service,
+    )
+
+    legacy_engine = _legacy_store_schema_engine()
+    local_session_factory = sessionmaker(
+        bind=legacy_engine,
+        autoflush=False,
+        expire_on_commit=False,
+        future=True,
+    )
+    parent_key_seen_before_child_create: list[bool] = []
+
+    def record_parent_key(_target, connection, **_kwargs):
+        indexes = inspect(connection).get_indexes("lt_stores")
+        parent_key_seen_before_child_create.append(
+            any(
+                bool(index.get("unique"))
+                and tuple(index.get("column_names") or ())
+                == ("id", "owner_username")
+                for index in indexes
+            )
+        )
+
+    event.listen(
+        SalesOrderModel.__table__,
+        "before_create",
+        record_parent_key,
+    )
+    try:
+        monkeypatch.setattr(
+            database_module.settings,
+            "database_auto_create",
+            False,
+        )
+        monkeypatch.setattr(database_module, "engine", legacy_engine)
+        monkeypatch.setattr(
+            database_module,
+            "SessionLocal",
+            local_session_factory,
+        )
+        monkeypatch.setattr(
+            database_module,
+            "ensure_schema_compatibility",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            user_service,
+            "ensure_initial_superadmin",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            crawler_service,
+            "ensure_default_roles",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            sensitive_word_service,
+            "seed_default_sensitive_words",
+            lambda _session: None,
+        )
+
+        database_module.init_database()
+
+        with Session(legacy_engine) as session:
+            session.add(
+                SalesSyncStateModel(
+                    store_id=1,
+                    owner_username="alice",
+                )
+            )
+            session.commit()
+    finally:
+        event.remove(
+            SalesOrderModel.__table__,
+            "before_create",
+            record_parent_key,
+        )
+        legacy_engine.dispose()
+
+    assert parent_key_seen_before_child_create == [True]
 
 
 class _FakeResult:

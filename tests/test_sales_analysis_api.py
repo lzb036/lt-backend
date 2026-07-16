@@ -41,6 +41,17 @@ AI_USER = {
 }
 
 
+def _wait_for_owner_stream_capacity_release(
+    timeout_seconds: float = 1.0,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while (
+        crawler_service.SALES_ANALYSIS_STREAM_OWNER_ACTIVE
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.005)
+
+
 def test_requirements_declares_testclient_httpx_dependency() -> None:
     requirements = (
         Path(__file__).resolve().parents[1] / "requirements.txt"
@@ -655,6 +666,12 @@ def test_closing_background_stream_cancels_and_closes_inner_iterator(
     cancel_event = Event()
     inner_closed = Event()
     cancellation_seen = Event()
+    monkeypatch.setattr(
+        crawler_service,
+        "SALES_ANALYSIS_STREAM_OWNER_ACTIVE",
+        {},
+        raising=False,
+    )
 
     def cancellable_stream(
         _owner: str,
@@ -691,6 +708,8 @@ def test_closing_background_stream_cancels_and_closes_inner_iterator(
     assert cancel_event.is_set()
     assert cancellation_seen.wait(timeout=1)
     assert inner_closed.wait(timeout=1)
+    _wait_for_owner_stream_capacity_release()
+    assert crawler_service.SALES_ANALYSIS_STREAM_OWNER_ACTIVE == {}
 
 
 def test_background_stream_rejects_when_producer_slots_are_full(
@@ -732,6 +751,7 @@ def test_background_stream_enforces_per_owner_fairness(
 ) -> None:
     release = Event()
     first_started = Event()
+    second_started = Event()
     monkeypatch.setattr(
         crawler_service,
         "SALES_ANALYSIS_STREAM_OWNER_ACTIVE",
@@ -741,13 +761,16 @@ def test_background_stream_enforces_per_owner_fairness(
 
     def owner_stream(
         owner: str,
-        _conversation_id: int,
+        conversation_id: int,
         _message: str,
         *,
         is_cancelled,
     ) -> Iterator[dict[str, Any]]:
         if owner == "owner-a":
-            first_started.set()
+            if conversation_id == 11:
+                first_started.set()
+            if conversation_id == 12:
+                second_started.set()
             release.wait(timeout=2)
             if is_cancelled():
                 return
@@ -767,11 +790,19 @@ def test_background_stream_enforces_per_owner_fairness(
 
     assert next(first)["heartbeat"] is True
     assert first_started.wait(timeout=1)
+    second = crawler_service.stream_sales_analysis(
+        "owner-a",
+        12,
+        "同一用户的第二个请求",
+        heartbeat_interval=0.01,
+    )
+    assert next(second)["heartbeat"] is True
+    assert second_started.wait(timeout=1)
     assert list(
         crawler_service.stream_sales_analysis(
             "owner-a",
-            12,
-            "同一用户的第二个请求",
+            13,
+            "同一用户的第三个请求",
             heartbeat_interval=0.01,
         )
     ) == [
@@ -792,8 +823,57 @@ def test_background_stream_enforces_per_owner_fairness(
 
     release.set()
     assert next(first)["type"] == "completed"
+    assert next(second)["type"] == "completed"
     first.close()
-    assert crawler_service.SALES_ANALYSIS_STREAM_MAX_PER_OWNER == 1
+    second.close()
+    assert crawler_service.SALES_ANALYSIS_STREAM_MAX_WORKERS == 4
+    assert crawler_service.SALES_ANALYSIS_STREAM_MAX_PER_OWNER == 2
+    assert crawler_service.SALES_ANALYSIS_STREAM_OWNER_ACTIVE == {}
+
+
+def test_background_stream_error_releases_owner_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        crawler_service,
+        "SALES_ANALYSIS_STREAM_OWNER_ACTIVE",
+        {},
+        raising=False,
+    )
+
+    def broken_stream(
+        _owner: str,
+        _conversation_id: int,
+        _message: str,
+        *,
+        is_cancelled,
+    ) -> Iterator[dict[str, Any]]:
+        del is_cancelled
+        raise RuntimeError("producer failed")
+        yield
+
+    monkeypatch.setattr(
+        sales_ai_service,
+        "stream_analysis",
+        broken_stream,
+    )
+
+    events = list(
+        crawler_service.stream_sales_analysis(
+            "owner-a",
+            11,
+            "分析近期销量",
+            heartbeat_interval=0.01,
+        )
+    )
+
+    assert events == [
+        {
+            "type": "error",
+            "message": "销量分析失败，请稍后重试。",
+        }
+    ]
+    _wait_for_owner_stream_capacity_release()
     assert crawler_service.SALES_ANALYSIS_STREAM_OWNER_ACTIVE == {}
 
 
