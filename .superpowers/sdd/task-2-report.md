@@ -144,4 +144,81 @@ What I checked:
 ## Concerns
 
 - The order-client behavior was validated through mocked HTTP contract tests and compile checks only. No live RMS request was made in this task.
-- The `RMS_SAFE_ORDER_BATCH_SIZE = 100` ceiling is intentionally conservative and test-covered, but it was not validated against a live Rakuten sandbox or production credential in this task.
+- The `RMS_SAFE_ORDER_BATCH_SIZE = 30` ceiling is intentionally conservative and test-covered, but it was not validated against a live Rakuten sandbox or production credential in this task.
+
+## Review Fix Pass
+
+Date: 2026-07-16
+
+### Findings fixed
+
+1. Changed `getOrder` batching from `100` to the verified existing ceiling `30`.
+   - Added a literal `30` assertion in tests.
+   - Verified the batch split is `30 / 30 / 5` for a 65-order request.
+
+2. Treated `totalPages = 0` as a valid empty `searchOrder` result.
+   - Empty order searches now return `[]` instead of raising a pagination error.
+
+3. Reworked pagination progression to use a local monotonic request-page counter.
+   - The client now advances by the locally requested page number, not the remote echo.
+   - It validates stale or malformed pagination responses and fails fast instead of looping or skipping pages.
+
+4. Added a stable `SortModelList` to `searchOrder` requests.
+   - The request now sends a deterministic sort payload to keep pagination ordering stable.
+
+5. Separated `itemDetailId` and `itemId` handling in `iter_order_items(...)`.
+   - `itemId` no longer backfills `itemDetailId`.
+   - When `itemDetailId` is missing, the client now emits:
+     - `packagePosition`
+     - `lineFingerprintInputs`
+     - `lineFingerprint`
+
+6. Added `MessageModelList` error inspection for RMS API responses.
+   - `ERROR` entries are categorized into:
+     - credential failure
+     - rate limiting
+     - general API error
+   - Raised messages stay generic and do not include raw remote message text.
+
+7. Tightened redaction by removing chained causes.
+   - Request and JSON parsing failures now raise with `from None`.
+   - Tests inspect both `__cause__` and rendered traceback output to confirm no leaked chained detail.
+
+### Additional test coverage
+
+`tests/test_rakuten_order_service.py` now also verifies:
+
+1. `searchOrder` accepts `totalPages = 0` as a valid empty result.
+2. `searchOrder` rejects stale `requestPage` echoes without looping.
+3. `searchOrder` rejects `totalPages` values below the requested page.
+4. `searchOrder` includes a stable `SortModelList`.
+5. `getOrder` uses a literal `30` batch limit.
+6. `iter_order_items(...)` keeps `itemDetailId` and `itemId` separate.
+7. `iter_order_items(...)` emits deterministic fallback fingerprint fields when `itemDetailId` is missing.
+8. `MessageModelList` credential errors are categorized and redacted.
+9. `MessageModelList` rate-limit errors are categorized and redacted.
+10. `MessageModelList` general API errors are categorized and redacted.
+11. Network failures suppress chained causes and redact traceback output.
+12. Malformed JSON suppresses chained causes and redact traceback output.
+
+### Verification
+
+Commands executed:
+
+```powershell
+pytest tests/test_rakuten_order_service.py -v
+pytest -q
+python -m compileall app/services/rakuten_order_service.py tests/test_rakuten_order_service.py
+git diff --check -- app/services/rakuten_order_service.py tests/test_rakuten_order_service.py .superpowers/sdd/task-2-report.md
+```
+
+Observed results:
+
+- `pytest tests/test_rakuten_order_service.py -v` -> `13 passed in 0.86s`
+- `pytest -q` -> `241 passed, 2 warnings, 4 subtests passed in 10.01s`
+- compile check exited successfully
+- `git diff --check` exited `0`; only Git's existing LF-to-CRLF working-copy warnings were printed
+
+### Remaining concern
+
+- This pass hardened the mocked HTTP contract and traceback-redaction behavior, but it still did not exercise a live Rakuten RMS response with real credentials.

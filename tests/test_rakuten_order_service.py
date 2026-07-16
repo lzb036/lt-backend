@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import traceback
 import unittest
 from unittest.mock import Mock, patch
 
@@ -18,8 +19,19 @@ def json_response(payload: object, *, status_code: int = 200, text: str = "") ->
     return response
 
 
+def traceback_text(exc: BaseException) -> str:
+    return "".join(traceback.TracebackException.from_exception(exc).format())
+
+
 class RakutenOrderServiceTests(unittest.TestCase):
-    def test_search_order_numbers_paginates_and_uses_esa_authorization(self) -> None:
+    def assert_redacted_exception(self, exc: BaseException, *forbidden: str) -> None:
+        self.assertIsNone(exc.__cause__)
+        rendered = traceback_text(exc)
+        for text in forbidden:
+            self.assertNotIn(text, str(exc))
+            self.assertNotIn(text, rendered)
+
+    def test_search_order_numbers_paginates_with_local_counter_and_stable_sort(self) -> None:
         first_page = json_response({
             "orderNumberList": ["1001", "1002"],
             "PaginationResponseModel": {
@@ -67,44 +79,118 @@ class RakutenOrderServiceTests(unittest.TestCase):
             {"http": "http://proxy", "https": "http://proxy"},
         )
         self.assertEqual(
-            post.call_args_list[0].kwargs["json"]["PaginationRequestModel"]["requestPage"],
-            1,
+            post.call_args_list[0].kwargs["json"]["SortModelList"],
+            [{"sortColumn": "orderNumber", "sortDirection": "asc"}],
         )
         self.assertEqual(
-            post.call_args_list[1].kwargs["json"]["PaginationRequestModel"]["requestPage"],
-            2,
+            [call.kwargs["json"]["PaginationRequestModel"]["requestPage"] for call in post.call_args_list],
+            [1, 2],
         )
         self.assertEqual(post.call_args_list[0].args[0], rakuten_order_service.RAKUTEN_ORDER_SEARCH_URL)
 
-    def test_get_orders_uses_version_7_and_rms_safe_batches(self) -> None:
-        order_numbers = [f"ORDER-{index:03d}" for index in range(205)]
-        pages = [
-            json_response({"OrderModelList": [{"orderNumber": batch[0]}]})
-            for batch in (
-                order_numbers[:100],
-                order_numbers[100:200],
-                order_numbers[200:],
+    def test_search_order_numbers_accepts_total_pages_zero_empty_result(self) -> None:
+        response = json_response({
+            "orderNumberList": [],
+            "PaginationResponseModel": {
+                "totalPages": 0,
+                "requestPage": 0,
+            },
+        })
+
+        with patch.object(rakuten_order_service.requests.Session, "post", return_value=response) as post:
+            result = rakuten_order_service.search_order_numbers(
+                "secret-123",
+                "key-456",
+                datetime(2026, 7, 1, 0, 0, 0),
+                datetime(2026, 7, 2, 0, 0, 0),
+                [100],
             )
+
+        self.assertEqual(result, [])
+        post.assert_called_once()
+
+    def test_search_order_numbers_rejects_stale_response_page_without_looping(self) -> None:
+        first_page = json_response({
+            "orderNumberList": ["1001"],
+            "PaginationResponseModel": {
+                "totalPages": 2,
+                "requestPage": 1,
+            },
+        })
+        stale_second_page = json_response({
+            "orderNumberList": ["1002"],
+            "PaginationResponseModel": {
+                "totalPages": 2,
+                "requestPage": 1,
+            },
+        })
+
+        with patch.object(
+            rakuten_order_service.requests.Session,
+            "post",
+            side_effect=[first_page, stale_second_page],
+        ) as post:
+            with self.assertRaisesRegex(RuntimeError, "分页响应无效") as exc_info:
+                rakuten_order_service.search_order_numbers(
+                    "secret-123",
+                    "key-456",
+                    datetime(2026, 7, 1, 0, 0, 0),
+                    datetime(2026, 7, 2, 0, 0, 0),
+                    [100],
+                )
+
+        self.assertEqual(post.call_count, 2)
+        self.assert_redacted_exception(exc_info.exception, "secret-123", "key-456")
+
+    def test_search_order_numbers_rejects_total_pages_lower_than_requested_page(self) -> None:
+        response = json_response({
+            "orderNumberList": ["1002"],
+            "PaginationResponseModel": {
+                "totalPages": 1,
+                "requestPage": 2,
+            },
+        })
+
+        with patch.object(rakuten_order_service.requests.Session, "post", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "分页响应无效") as exc_info:
+                rakuten_order_service.search_order_numbers(
+                    "secret-123",
+                    "key-456",
+                    datetime(2026, 7, 1, 0, 0, 0),
+                    datetime(2026, 7, 2, 0, 0, 0),
+                    [100],
+                )
+
+        self.assert_redacted_exception(exc_info.exception, "secret-123", "key-456")
+
+    def test_get_orders_uses_version_7_and_literal_30_batch_limit(self) -> None:
+        order_numbers = [f"ORDER-{index:03d}" for index in range(65)]
+        responses = [
+            json_response({"OrderModelList": [{"orderNumber": "first"}]}),
+            json_response({"OrderModelList": [{"orderNumber": "second"}]}),
+            json_response({"OrderModelList": [{"orderNumber": "third"}]}),
         ]
 
         with patch.object(
             rakuten_order_service.requests.Session,
             "post",
-            side_effect=pages,
+            side_effect=responses,
         ) as post:
             result = rakuten_order_service.get_orders("secret-123", "key-456", order_numbers)
 
         self.assertEqual(len(result), 3)
         self.assertEqual(post.call_count, 3)
+        self.assertEqual(rakuten_order_service.RMS_SAFE_ORDER_BATCH_SIZE, 30)
+        self.assertEqual(
+            [len(call.kwargs["json"]["orderNumberList"]) for call in post.call_args_list],
+            [30, 30, 5],
+        )
         for call in post.call_args_list:
             self.assertEqual(call.args[0], rakuten_order_service.RAKUTEN_ORDER_GET_URL)
             self.assertEqual(call.kwargs["json"]["version"], 7)
-            self.assertLessEqual(
-                len(call.kwargs["json"]["orderNumberList"]),
-                rakuten_order_service.RMS_SAFE_ORDER_BATCH_SIZE,
-            )
+            self.assertEqual(call.kwargs["timeout"], settings.crawler_timeout_seconds)
 
-    def test_iter_order_items_normalizes_package_items(self) -> None:
+    def test_iter_order_items_keeps_item_detail_id_and_item_id_separate(self) -> None:
         order = {
             "orderNumber": "1001",
             "PackageModelList": [
@@ -112,6 +198,7 @@ class RakutenOrderServiceTests(unittest.TestCase):
                     "ItemModelList": [
                         {
                             "itemDetailId": "detail-1",
+                            "itemId": "item-id-1",
                             "manageNumber": "manage-1",
                             "itemNumber": "item-1",
                             "SkuModelList": [{"variantId": "sku-1"}],
@@ -120,19 +207,46 @@ class RakutenOrderServiceTests(unittest.TestCase):
                             "priceTaxIncl": 1320,
                             "deleteItemFlag": 0,
                             "restoreInventoryFlag": 1,
-                        }
-                    ]
-                },
-                {
-                    "ItemModelList": [
+                        },
                         {
-                            "itemDetailId": "detail-2",
+                            "itemId": "item-id-2",
                             "manageNumber": "manage-2",
                             "itemNumber": "item-2",
                             "SkuModelList": None,
                             "units": None,
                             "price": "900",
                             "priceTaxIncl": "990",
+                            "deleteItemFlag": True,
+                            "restoreInventoryFlag": False,
+                        },
+                    ]
+                },
+            ],
+        }
+
+        result = list(rakuten_order_service.iter_order_items(order))
+
+        self.assertEqual(result[0]["itemDetailId"], "detail-1")
+        self.assertEqual(result[0]["itemId"], "item-id-1")
+        self.assertEqual(result[1]["itemDetailId"], "")
+        self.assertEqual(result[1]["itemId"], "item-id-2")
+        self.assertEqual(result[1]["packagePosition"], 1)
+        self.assertEqual(result[1]["SkuModelList"], [])
+
+    def test_iter_order_items_emits_deterministic_line_fingerprint_when_detail_id_missing(self) -> None:
+        order = {
+            "orderNumber": "1001",
+            "PackageModelList": [
+                {
+                    "ItemModelList": [
+                        {
+                            "itemId": "item-id-2",
+                            "manageNumber": "manage-2",
+                            "itemNumber": "item-2",
+                            "SkuModelList": [{"variantId": "sku-z", "variantName": "Blue"}],
+                            "units": 3,
+                            "price": 900,
+                            "priceTaxIncl": 990,
                             "deleteItemFlag": True,
                             "restoreInventoryFlag": False,
                         }
@@ -147,40 +261,46 @@ class RakutenOrderServiceTests(unittest.TestCase):
             {
                 "orderNumber": "1001",
                 "packagePosition": 1,
-                "itemDetailId": "detail-1",
-                "manageNumber": "manage-1",
-                "itemNumber": "item-1",
-                "SkuModelList": [{"variantId": "sku-1"}],
-                "units": 2,
-                "price": 1200,
-                "priceTaxIncl": 1320,
-                "deleteItemFlag": False,
-                "restoreInventoryFlag": True,
-            },
-            {
-                "orderNumber": "1001",
-                "packagePosition": 2,
-                "itemDetailId": "detail-2",
+                "itemDetailId": "",
+                "itemId": "item-id-2",
                 "manageNumber": "manage-2",
                 "itemNumber": "item-2",
-                "SkuModelList": [],
-                "units": 0,
-                "price": "900",
-                "priceTaxIncl": "990",
+                "SkuModelList": [{"variantId": "sku-z", "variantName": "Blue"}],
+                "units": 3,
+                "price": 900,
+                "priceTaxIncl": 990,
                 "deleteItemFlag": True,
                 "restoreInventoryFlag": False,
-            },
+                "lineFingerprintInputs": {
+                    "orderNumber": "1001",
+                    "packagePosition": 1,
+                    "itemId": "item-id-2",
+                    "manageNumber": "manage-2",
+                    "itemNumber": "item-2",
+                    "skuSignature": "variantId=sku-z,variantName=Blue",
+                    "units": 3,
+                    "price": "900",
+                    "priceTaxIncl": "990",
+                },
+                "lineFingerprint": "1001|1|item-id-2|manage-2|item-2|variantId=sku-z,variantName=Blue|3|900|990",
+            }
         ])
 
-    def test_search_order_numbers_rejects_credential_failure_without_leaking_data(self) -> None:
-        response = json_response(
-            {"error": "bad auth"},
-            status_code=403,
-            text='{"message":"secret-123 key-456 should not leak"}',
-        )
+    def test_search_order_numbers_categorizes_message_model_credential_error_without_leaks(self) -> None:
+        response = json_response({
+            "MessageModelList": [
+                {
+                    "messageType": "ERROR",
+                    "messageCode": "AUTH-001",
+                    "message": "invalid license key secret-123 key-456",
+                }
+            ],
+            "PaginationResponseModel": {"totalPages": 1, "requestPage": 1},
+            "orderNumberList": [],
+        })
 
         with patch.object(rakuten_order_service.requests.Session, "post", return_value=response):
-            with self.assertRaises(RuntimeError) as exc_info:
+            with self.assertRaisesRegex(RuntimeError, "认证失败") as exc_info:
                 rakuten_order_service.search_order_numbers(
                     "secret-123",
                     "key-456",
@@ -189,61 +309,78 @@ class RakutenOrderServiceTests(unittest.TestCase):
                     [100],
                 )
 
-        message = str(exc_info.exception)
-        self.assertIn("认证失败", message)
-        self.assertNotIn("secret-123", message)
-        self.assertNotIn("key-456", message)
-        self.assertNotIn("should not leak", message)
+        self.assert_redacted_exception(exc_info.exception, "secret-123", "key-456", "invalid license key")
+
+    def test_get_orders_categorizes_message_model_rate_limit_error_without_leaks(self) -> None:
+        response = json_response({
+            "MessageModelList": [
+                {
+                    "messageType": "ERROR",
+                    "messageCode": "RATE-001",
+                    "message": "Too many requests for secret-123",
+                }
+            ],
+            "OrderModelList": [],
+        })
+
+        with patch.object(rakuten_order_service.requests.Session, "post", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "限流") as exc_info:
+                rakuten_order_service.get_orders("secret-123", "key-456", ["1001"])
+
+        self.assert_redacted_exception(exc_info.exception, "secret-123", "Too many requests")
+
+    def test_get_orders_categorizes_message_model_general_api_error_without_leaks(self) -> None:
+        response = json_response({
+            "MessageModelList": [
+                {
+                    "messageType": "ERROR",
+                    "messageCode": "ORDER-500",
+                    "message": "remote body should stay remote",
+                }
+            ],
+            "OrderModelList": [],
+        })
+
+        with patch.object(rakuten_order_service.requests.Session, "post", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "接口错误") as exc_info:
+                rakuten_order_service.get_orders("secret-123", "key-456", ["1001"])
+
+        self.assert_redacted_exception(exc_info.exception, "secret-123", "remote body should stay remote")
 
     def test_search_order_numbers_rejects_missing_pagination(self) -> None:
         response = json_response({"orderNumberList": ["1001"]})
 
-        with (
-            patch.object(rakuten_order_service.requests.Session, "post", return_value=response),
-            self.assertRaisesRegex(RuntimeError, "分页信息缺失"),
-        ):
-            rakuten_order_service.search_order_numbers(
-                "secret-123",
-                "key-456",
-                datetime(2026, 7, 1, 0, 0, 0),
-                datetime(2026, 7, 2, 0, 0, 0),
-                [100],
-            )
-
-    def test_get_orders_rejects_rate_limiting_without_echoing_response_body(self) -> None:
-        response = json_response(
-            {"error": "too many requests"},
-            status_code=429,
-            text='{"details":"remote body should stay remote"}',
-        )
-
         with patch.object(rakuten_order_service.requests.Session, "post", return_value=response):
-            with self.assertRaises(RuntimeError) as exc_info:
-                rakuten_order_service.get_orders("secret-123", "key-456", ["1001"])
+            with self.assertRaisesRegex(RuntimeError, "分页信息缺失") as exc_info:
+                rakuten_order_service.search_order_numbers(
+                    "secret-123",
+                    "key-456",
+                    datetime(2026, 7, 1, 0, 0, 0),
+                    datetime(2026, 7, 2, 0, 0, 0),
+                    [100],
+                )
 
-        message = str(exc_info.exception)
-        self.assertIn("限流", message)
-        self.assertNotIn("remote body", message)
+        self.assert_redacted_exception(exc_info.exception, "secret-123", "key-456")
 
     def test_get_orders_rejects_malformed_json(self) -> None:
         response = Mock()
         response.status_code = 200
         response.text = "{not-json}"
-        response.json.side_effect = ValueError("broken json")
+        response.json.side_effect = ValueError("broken json with secret-123")
 
-        with (
-            patch.object(rakuten_order_service.requests.Session, "post", return_value=response),
-            self.assertRaisesRegex(RuntimeError, "返回格式无法解析"),
-        ):
-            rakuten_order_service.get_orders("secret-123", "key-456", ["1001"])
+        with patch.object(rakuten_order_service.requests.Session, "post", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "返回格式无法解析") as exc_info:
+                rakuten_order_service.get_orders("secret-123", "key-456", ["1001"])
 
-    def test_search_order_numbers_wraps_network_failure(self) -> None:
+        self.assert_redacted_exception(exc_info.exception, "secret-123", "broken json")
+
+    def test_search_order_numbers_wraps_network_failure_without_chained_cause(self) -> None:
         with patch.object(
             rakuten_order_service.requests.Session,
             "post",
-            side_effect=requests.ConnectionError("network down"),
+            side_effect=requests.ConnectionError("network down secret-123 key-456"),
         ):
-            with self.assertRaises(RuntimeError) as exc_info:
+            with self.assertRaisesRegex(RuntimeError, "请求失败") as exc_info:
                 rakuten_order_service.search_order_numbers(
                     "secret-123",
                     "key-456",
@@ -252,7 +389,7 @@ class RakutenOrderServiceTests(unittest.TestCase):
                     [100],
                 )
 
-        self.assertIn("请求失败", str(exc_info.exception))
+        self.assert_redacted_exception(exc_info.exception, "secret-123", "key-456", "network down")
 
 
 if __name__ == "__main__":
