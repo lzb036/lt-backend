@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from sqlalchemy import UniqueConstraint, create_engine, inspect, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.schema import AddConstraint, CreateColumn
@@ -17,6 +18,149 @@ class Base(DeclarativeBase):
 
 def _quote_mysql_identifier(value: str) -> str:
     return f"`{value.replace('`', '``')}`"
+
+
+def _table_names(connection: Connection) -> set[str]:
+    return set(inspect(connection).get_table_names())
+
+
+def _column_info(connection: Connection, table_name: str) -> dict[str, dict]:
+    if table_name not in _table_names(connection):
+        return {}
+    return {
+        column["name"]: column
+        for column in inspect(connection).get_columns(table_name)
+    }
+
+
+def _unique_constraint_names(connection: Connection, table_name: str) -> set[str]:
+    if table_name not in _table_names(connection):
+        return set()
+    return {
+        constraint["name"]
+        for constraint in inspect(connection).get_unique_constraints(table_name)
+        if constraint.get("name")
+    }
+
+
+def _index_names(connection: Connection, table_name: str) -> set[str]:
+    if table_name not in _table_names(connection):
+        return set()
+    return {
+        index["name"]
+        for index in inspect(connection).get_indexes(table_name)
+        if index.get("name")
+    }
+
+
+def _has_safe_server_default(column, dialect_name: str) -> bool:
+    server_default = getattr(column, "server_default", None)
+    if server_default is None:
+        return False
+    if isinstance(server_default.arg, str):
+        return True
+    default_sql = str(server_default.arg).strip()
+    normalized = default_sql.upper()
+    if dialect_name == "sqlite" and normalized in {"CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"}:
+        return False
+    if "(" in normalized and not normalized.startswith("("):
+        return False
+    return True
+
+
+def _can_add_column_safely(column, dialect_name: str) -> bool:
+    if column.primary_key:
+        return False
+    if column.foreign_keys:
+        return False
+    if column.nullable:
+        return True
+    return _has_safe_server_default(column, dialect_name)
+
+
+def _ensure_table_layout(connection: Connection, table) -> dict[str, list[str]]:
+    table_was_missing = table.name not in _table_names(connection)
+    if table_was_missing:
+        table.create(bind=connection, checkfirst=True)
+        return {
+            "created_table": [table.name],
+            "added_columns": [],
+            "skipped_columns": [],
+            "added_constraints": [],
+            "added_indexes": [],
+        }
+
+    added_columns: list[str] = []
+    skipped_columns: list[str] = []
+    dialect_name = connection.dialect.name
+
+    existing_columns = _column_info(connection, table.name)
+    for column in table.columns:
+        if column.name in existing_columns:
+            continue
+        if not _can_add_column_safely(column, dialect_name):
+            skipped_columns.append(column.name)
+            continue
+        compiled_column = str(CreateColumn(column).compile(dialect=connection.dialect))
+        connection.execute(
+            text(
+                f"ALTER TABLE {table.name if dialect_name == 'sqlite' else _quote_mysql_identifier(table.name)} "
+                f"ADD COLUMN {compiled_column}"
+            )
+        )
+        added_columns.append(column.name)
+
+    refreshed_columns = _column_info(connection, table.name)
+    for column in table.columns:
+        compiled_type = str(column.type.compile(dialect=connection.dialect)).strip().lower()
+        current_column = refreshed_columns.get(column.name)
+        if compiled_type != "longtext" or not current_column or not connection.dialect.supports_alter:
+            continue
+        current_type = str(current_column["type"]).strip().lower()
+        if current_type == "longtext":
+            continue
+        compiled_column = str(CreateColumn(column).compile(dialect=connection.dialect))
+        connection.execute(
+            text(
+                f"ALTER TABLE {_quote_mysql_identifier(table.name)} "
+                f"MODIFY COLUMN {compiled_column}"
+            )
+        )
+
+    added_constraints: list[str] = []
+    if connection.dialect.supports_alter:
+        existing_unique_constraints = _unique_constraint_names(connection, table.name)
+        available_columns = set(_column_info(connection, table.name))
+        for constraint in table.constraints:
+            if not isinstance(constraint, UniqueConstraint) or not constraint.name:
+                continue
+            if constraint.name in existing_unique_constraints:
+                continue
+            if any(column.name not in available_columns for column in constraint.columns):
+                continue
+            compiled_constraint = str(AddConstraint(constraint).compile(dialect=connection.dialect)).strip()
+            if compiled_constraint:
+                connection.execute(text(compiled_constraint))
+                added_constraints.append(constraint.name)
+
+    existing_indexes = _index_names(connection, table.name)
+    available_columns = set(_column_info(connection, table.name))
+    added_indexes: list[str] = []
+    for index in table.indexes:
+        if not index.name or index.name in existing_indexes:
+            continue
+        if any(column.name not in available_columns for column in index.columns):
+            continue
+        index.create(bind=connection, checkfirst=True)
+        added_indexes.append(index.name)
+
+    return {
+        "created_table": [],
+        "added_columns": added_columns,
+        "skipped_columns": skipped_columns,
+        "added_constraints": added_constraints,
+        "added_indexes": added_indexes,
+    }
 
 
 def ensure_mysql_database_exists() -> None:
@@ -46,82 +190,6 @@ def ensure_schema_compatibility() -> None:
     from app.db import models as model_module
 
     with engine.begin() as connection:
-        def table_names() -> set[str]:
-            return set(inspect(connection).get_table_names())
-
-        def column_info(table_name: str) -> dict[str, dict]:
-            if table_name not in table_names():
-                return {}
-            return {
-                column["name"]: column
-                for column in inspect(connection).get_columns(table_name)
-            }
-
-        def unique_constraint_names(table_name: str) -> set[str]:
-            if table_name not in table_names():
-                return set()
-            return {
-                constraint["name"]
-                for constraint in inspect(connection).get_unique_constraints(table_name)
-                if constraint.get("name")
-            }
-
-        def index_names(table_name: str) -> set[str]:
-            if table_name not in table_names():
-                return set()
-            return {
-                index["name"]
-                for index in inspect(connection).get_indexes(table_name)
-                if index.get("name")
-            }
-
-        def ensure_table_layout(table) -> None:
-            table.create(bind=connection, checkfirst=True)
-
-            existing_columns = column_info(table.name)
-            for column in table.columns:
-                if column.name not in existing_columns:
-                    compiled_column = str(CreateColumn(column).compile(dialect=connection.dialect))
-                    connection.execute(
-                        text(
-                            f"ALTER TABLE {_quote_mysql_identifier(table.name)} "
-                            f"ADD COLUMN {compiled_column}"
-                        )
-                    )
-
-            refreshed_columns = column_info(table.name)
-            for column in table.columns:
-                compiled_type = str(column.type.compile(dialect=connection.dialect)).strip().lower()
-                current_column = refreshed_columns.get(column.name)
-                if compiled_type != "longtext" or not current_column:
-                    continue
-                current_type = str(current_column["type"]).strip().lower()
-                if current_type == "longtext":
-                    continue
-                compiled_column = str(CreateColumn(column).compile(dialect=connection.dialect))
-                connection.execute(
-                    text(
-                        f"ALTER TABLE {_quote_mysql_identifier(table.name)} "
-                        f"MODIFY COLUMN {compiled_column}"
-                    )
-                )
-
-            existing_unique_constraints = unique_constraint_names(table.name)
-            for constraint in table.constraints:
-                if not isinstance(constraint, UniqueConstraint) or not constraint.name:
-                    continue
-                if constraint.name in existing_unique_constraints:
-                    continue
-                compiled_constraint = str(AddConstraint(constraint).compile(dialect=connection.dialect)).strip()
-                if compiled_constraint:
-                    connection.execute(text(compiled_constraint))
-
-            existing_indexes = index_names(table.name)
-            for index in table.indexes:
-                if not index.name or index.name in existing_indexes:
-                    continue
-                index.create(bind=connection, checkfirst=True)
-
         user_columns = set(
             connection.execute(
                 text(
@@ -529,7 +597,7 @@ def ensure_schema_compatibility() -> None:
             model_module.SalesAnalysisMessageModel.__table__,
         )
         for sales_table in sales_tables:
-            ensure_table_layout(sales_table)
+            _ensure_table_layout(connection, sales_table)
 
 
 engine = create_engine(

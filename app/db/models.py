@@ -5,7 +5,7 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -401,6 +401,7 @@ class SalesOrderModel(TimestampMixin, Base):
     __tablename__ = "lt_sales_orders"
     __table_args__ = (
         UniqueConstraint("store_id", "order_number", name="uq_lt_sales_order_store_order_number"),
+        UniqueConstraint("id", "owner_username", "store_id", name="uq_lt_sales_order_id_owner_store"),
         Index("ix_lt_sales_order_owner_store", "owner_username", "store_id"),
         Index("ix_lt_sales_order_store_synced", "store_id", "last_synced_at"),
     )
@@ -421,7 +422,12 @@ class SalesOrderModel(TimestampMixin, Base):
     currency: Mapped[str] = mapped_column(String(16), nullable=False, default="JPY", server_default="JPY")
     is_canceled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     has_unresolved_adjustment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
-    raw_order_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    raw_order_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="{}",
+        server_default="{}",
+    )
     last_synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False),
         nullable=False,
@@ -437,12 +443,23 @@ class SalesOrderModel(TimestampMixin, Base):
 class SalesOrderItemModel(TimestampMixin, Base):
     __tablename__ = "lt_sales_order_items"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["sales_order_id", "owner_username", "store_id"],
+            [
+                "lt_sales_orders.id",
+                "lt_sales_orders.owner_username",
+                "lt_sales_orders.store_id",
+            ],
+            ondelete="CASCADE",
+            name="fk_lt_sales_order_item_parent_order",
+        ),
         UniqueConstraint(
             "store_id",
             "order_number",
             "item_detail_id",
             name="uq_lt_sales_order_item_store_order_detail",
         ),
+        UniqueConstraint("id", "owner_username", "store_id", name="uq_lt_sales_order_item_id_owner_store"),
         Index("ix_lt_sales_order_item_owner_store", "owner_username", "store_id"),
         Index("ix_lt_sales_order_item_store_manage", "store_id", "manage_number"),
         Index("ix_lt_sales_order_item_store_manage_sku", "store_id", "manage_number", "sku_key"),
@@ -455,17 +472,19 @@ class SalesOrderItemModel(TimestampMixin, Base):
         nullable=False,
     )
     store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
-    sales_order_id: Mapped[int] = mapped_column(
-        ForeignKey("lt_sales_orders.id", ondelete="CASCADE"),
-        nullable=False,
-    )
+    sales_order_id: Mapped[int] = mapped_column(Integer, nullable=False)
     order_number: Mapped[str] = mapped_column(String(64), nullable=False)
     item_detail_id: Mapped[str] = mapped_column(String(255), nullable=False)
     manage_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     item_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     item_id: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     sku_key: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
-    sku_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    sku_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="{}",
+        server_default="{}",
+    )
     item_name: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="")
     unit_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
     ordered_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -494,6 +513,30 @@ class SalesOrderItemModel(TimestampMixin, Base):
     ) -> int:
         return max(0, ordered_units - canceled_units - refunded_units - returned_units)
 
+    @staticmethod
+    def validate_deductions(
+        *,
+        ordered_units: int,
+        canceled_units: int,
+        refunded_units: int,
+        returned_units: int,
+        unresolved_refunded_units: int = 0,
+    ) -> None:
+        counts = {
+            "ordered_units": ordered_units,
+            "canceled_units": canceled_units,
+            "refunded_units": refunded_units,
+            "returned_units": returned_units,
+            "unresolved_refunded_units": unresolved_refunded_units,
+        }
+        for field_name, value in counts.items():
+            if value < 0:
+                raise ValueError(f"{field_name} must be >= 0")
+
+        total_confirmed_deductions = canceled_units + refunded_units + returned_units
+        if total_confirmed_deductions > ordered_units:
+            raise ValueError("confirmed deductions cannot exceed ordered_units")
+
     @classmethod
     def from_service_payload(
         cls,
@@ -515,10 +558,18 @@ class SalesOrderItemModel(TimestampMixin, Base):
         canceled_units: int = 0,
         refunded_units: int = 0,
         returned_units: int = 0,
+        unresolved_refunded_units: int = 0,
         delete_item_flag: bool = False,
         restore_inventory_flag: bool = False,
         ordered_at: datetime | None = None,
     ) -> SalesOrderItemModel:
+        cls.validate_deductions(
+            ordered_units=ordered_units,
+            canceled_units=canceled_units,
+            refunded_units=refunded_units,
+            returned_units=returned_units,
+            unresolved_refunded_units=unresolved_refunded_units,
+        )
         normalized_unit_price = _normalize_decimal(unit_price)
         computed_effective_units = cls.calculate_effective_units(
             ordered_units=ordered_units,
@@ -555,6 +606,16 @@ class SalesOrderItemModel(TimestampMixin, Base):
 class SalesItemAdjustmentModel(TimestampMixin, Base):
     __tablename__ = "lt_sales_item_adjustments"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["sales_order_item_id", "owner_username", "store_id"],
+            [
+                "lt_sales_order_items.id",
+                "lt_sales_order_items.owner_username",
+                "lt_sales_order_items.store_id",
+            ],
+            ondelete="CASCADE",
+            name="fk_lt_sales_adjustment_parent_item",
+        ),
         Index("ix_lt_sales_item_adjustment_owner_store", "owner_username", "store_id"),
         Index("ix_lt_sales_item_adjustment_item_status", "sales_order_item_id", "status"),
     )
@@ -566,10 +627,7 @@ class SalesItemAdjustmentModel(TimestampMixin, Base):
         nullable=False,
     )
     store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
-    sales_order_item_id: Mapped[int] = mapped_column(
-        ForeignKey("lt_sales_order_items.id", ondelete="CASCADE"),
-        nullable=False,
-    )
+    sales_order_item_id: Mapped[int] = mapped_column(Integer, nullable=False)
     adjustment_type: Mapped[str] = mapped_column(String(32), nullable=False)
     units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
@@ -577,7 +635,12 @@ class SalesItemAdjustmentModel(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="confirmed", server_default="confirmed")
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
     remote_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
-    raw_payload_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    raw_payload_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="{}",
+        server_default="{}",
+    )
 
     sales_order_item: Mapped[SalesOrderItemModel] = relationship(back_populates="adjustments")
 
@@ -645,6 +708,7 @@ class SalesSyncStateModel(TimestampMixin, Base):
 class SalesAnalysisConversationModel(TimestampMixin, Base):
     __tablename__ = "lt_sales_analysis_conversations"
     __table_args__ = (
+        UniqueConstraint("id", "owner_username", name="uq_lt_sales_analysis_conversation_id_owner"),
         Index("ix_lt_sales_analysis_conversation_owner_updated", "owner_username", "updated_at"),
     )
 
@@ -655,7 +719,12 @@ class SalesAnalysisConversationModel(TimestampMixin, Base):
         nullable=False,
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="新分析", server_default="新分析")
-    store_scope_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="[]")
+    store_scope_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="[]",
+        server_default="[]",
+    )
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
 
     messages: Mapped[list[SalesAnalysisMessageModel]] = relationship(
@@ -667,28 +736,64 @@ class SalesAnalysisConversationModel(TimestampMixin, Base):
 class SalesAnalysisMessageModel(TimestampMixin, Base):
     __tablename__ = "lt_sales_analysis_messages"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["conversation_id", "owner_username"],
+            [
+                "lt_sales_analysis_conversations.id",
+                "lt_sales_analysis_conversations.owner_username",
+            ],
+            ondelete="CASCADE",
+            name="fk_lt_sales_analysis_message_conversation_owner",
+        ),
         Index("ix_lt_sales_analysis_message_conversation_created", "conversation_id", "created_at"),
         Index("ix_lt_sales_analysis_message_owner_created", "owner_username", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    conversation_id: Mapped[int] = mapped_column(
-        ForeignKey("lt_sales_analysis_conversations.id", ondelete="CASCADE"),
-        nullable=False,
-    )
+    conversation_id: Mapped[int] = mapped_column(Integer, nullable=False)
     owner_username: Mapped[str] = mapped_column(
         String(255),
         ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
         nullable=False,
     )
-    question_text: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="")
-    answer_text: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="")
+    question_text: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="",
+        server_default="",
+    )
+    answer_text: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="",
+        server_default="",
+    )
     tool_name: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default="")
-    tool_arguments_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
-    result_summary_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    tool_arguments_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="{}",
+        server_default="{}",
+    )
+    result_summary_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="{}",
+        server_default="{}",
+    )
     model_name: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
-    store_scope_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="[]")
-    statistics_window_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    store_scope_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="[]",
+        server_default="[]",
+    )
+    statistics_window_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="{}",
+        server_default="{}",
+    )
 
     conversation: Mapped[SalesAnalysisConversationModel] = relationship(back_populates="messages")
 
