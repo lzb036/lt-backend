@@ -64,11 +64,11 @@ def _foreign_key_info(connection: Connection, table_name: str) -> list[dict]:
     return list(inspect(connection).get_foreign_keys(table_name))
 
 
-def _index_names(connection: Connection, table_name: str) -> set[str]:
+def _index_info(connection: Connection, table_name: str) -> dict[str, dict]:
     if table_name not in _table_names(connection):
-        return set()
+        return {}
     return {
-        index["name"]
+        index["name"]: index
         for index in inspect(connection).get_indexes(table_name)
         if index.get("name")
     }
@@ -234,44 +234,187 @@ def _unique_constraint_matches(existing: dict, constraint: UniqueConstraint) -> 
     )
 
 
-def _foreign_key_constraint_matches(
+def _normalize_referential_action(value) -> str:
+    return str(value or "NO ACTION").strip().upper().replace("_", " ")
+
+
+def _foreign_key_structure_matches(
     existing: dict,
     constraint: ForeignKeyConstraint,
 ) -> bool:
     elements = list(constraint.elements)
     referred_table = elements[0].column.table
-    existing_options = existing.get("options") or {}
-    existing_ondelete = str(existing_options.get("ondelete") or "").upper()
-    expected_ondelete = str(constraint.ondelete or "").upper()
     return (
         tuple(existing.get("constrained_columns") or ())
         == tuple(column.name for column in constraint.columns)
+        and (existing.get("referred_schema") or None)
+        == (referred_table.schema or None)
         and existing.get("referred_table") == referred_table.name
         and tuple(existing.get("referred_columns") or ())
         == tuple(element.column.name for element in elements)
-        and existing_ondelete == expected_ondelete
+    )
+
+
+def _foreign_key_actions(existing: dict) -> tuple[str, str]:
+    existing_options = existing.get("options") or {}
+    return (
+        _normalize_referential_action(existing_options.get("ondelete")),
+        _normalize_referential_action(existing_options.get("onupdate")),
+    )
+
+
+def _foreign_key_constraint_matches(
+    existing: dict,
+    constraint: ForeignKeyConstraint,
+) -> bool:
+    return (
+        _foreign_key_structure_matches(existing, constraint)
+        and _foreign_key_actions(existing)
+        == (
+            _normalize_referential_action(constraint.ondelete),
+            _normalize_referential_action(constraint.onupdate),
+        )
     )
 
 
 def _constraint_is_present(connection: Connection, table, constraint) -> bool:
     if isinstance(constraint, UniqueConstraint):
         existing_constraints = _unique_constraint_info(connection, table.name)
-        matcher = _unique_constraint_matches
-    elif isinstance(constraint, ForeignKeyConstraint):
-        existing_constraints = _foreign_key_info(connection, table.name)
-        matcher = _foreign_key_constraint_matches
-    else:
+        for existing in existing_constraints:
+            if _unique_constraint_matches(existing, constraint):
+                return True
+            if constraint.name and existing.get("name") == constraint.name:
+                raise _compatibility_error(
+                    table.name,
+                    f"constraint {constraint.name} has a conflicting definition",
+                )
+        return False
+
+    if not isinstance(constraint, ForeignKeyConstraint):
         return True
 
-    for existing in existing_constraints:
-        if matcher(existing, constraint):
-            return True
+    exact_match = False
+    expected_local_columns = tuple(
+        column.name for column in constraint.columns
+    )
+    expected_actions = (
+        _normalize_referential_action(constraint.ondelete),
+        _normalize_referential_action(constraint.onupdate),
+    )
+    for existing in _foreign_key_info(connection, table.name):
+        existing_name = existing.get("name") or "<unnamed>"
+        existing_local_columns = tuple(
+            existing.get("constrained_columns") or ()
+        )
+        same_structure = _foreign_key_structure_matches(
+            existing,
+            constraint,
+        )
+        if same_structure:
+            existing_actions = _foreign_key_actions(existing)
+            if existing_actions != expected_actions:
+                raise _compatibility_error(
+                    table.name,
+                    f"constraint {constraint.name} conflicts with existing foreign key "
+                    f"{existing_name}: referential action mismatch "
+                    f"(expected ON DELETE {expected_actions[0]} / ON UPDATE {expected_actions[1]}, "
+                    f"found ON DELETE {existing_actions[0]} / ON UPDATE {existing_actions[1]})",
+                )
+            exact_match = True
+            continue
+
         if constraint.name and existing.get("name") == constraint.name:
             raise _compatibility_error(
                 table.name,
                 f"constraint {constraint.name} has a conflicting definition",
             )
-    return False
+        if existing_local_columns == expected_local_columns:
+            raise _compatibility_error(
+                table.name,
+                f"constraint {constraint.name} conflicts with existing foreign key "
+                f"{existing_name}: incompatible referenced target",
+            )
+    return exact_match
+
+
+def _normalize_index_option_value(value):
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (
+                    key,
+                    _normalize_index_option_value(item),
+                )
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_normalize_index_option_value(item) for item in value)
+    if isinstance(value, str):
+        return value.lower()
+    return value
+
+
+def _meaningful_index_options(options: dict, dialect_name: str) -> dict:
+    prefix = f"{dialect_name}_"
+    normalized: dict[str, object] = {}
+
+    nested_options = options.get(dialect_name)
+    if isinstance(nested_options, dict):
+        options = {
+            **options,
+            **{
+                f"{prefix}{key}": value
+                for key, value in nested_options.items()
+            },
+        }
+
+    for key, value in options.items():
+        if key == dialect_name and isinstance(value, dict):
+            continue
+        normalized_key = key if key.startswith(prefix) else f"{prefix}{key}"
+        if value is None or value == {} or value == [] or value == ():
+            continue
+        normalized[normalized_key] = _normalize_index_option_value(value)
+    return normalized
+
+
+def _expected_index_dialect_options(index, dialect_name: str) -> dict:
+    prefix = f"{dialect_name}_"
+    options = {
+        key: value
+        for key, value in dict(index.dialect_kwargs).items()
+        if key.startswith(prefix)
+    }
+    length_key = f"{prefix}length"
+    length_value = options.get(length_key)
+    if length_value is not None and not isinstance(length_value, dict):
+        options[length_key] = {
+            column.name: length_value
+            for column in index.columns
+        }
+    return _meaningful_index_options(
+        options,
+        dialect_name,
+    )
+
+
+def _existing_index_dialect_options(existing: dict, dialect_name: str) -> dict:
+    return _meaningful_index_options(
+        existing.get("dialect_options") or {},
+        dialect_name,
+    )
+
+
+def _index_definition_matches(existing: dict, index, dialect_name: str) -> bool:
+    return (
+        tuple(existing.get("column_names") or ())
+        == tuple(column.name for column in index.columns)
+        and bool(existing.get("unique"))
+        == bool(index.unique)
+        and _existing_index_dialect_options(existing, dialect_name)
+        == _expected_index_dialect_options(index, dialect_name)
+    )
 
 
 def _validate_unique_constraint_data(
@@ -530,11 +673,26 @@ def _ensure_table_layout(connection: Connection, table) -> dict[str, list[str]]:
         if _ensure_constraint(connection, table, constraint):
             added_constraints.append(constraint.name)
 
-    existing_indexes = _index_names(connection, table.name)
+    existing_indexes = _index_info(connection, table.name)
     available_columns = set(_column_info(connection, table.name))
     added_indexes: list[str] = []
     for index in table.indexes:
-        if not index.name or index.name in existing_indexes:
+        if not index.name:
+            raise _compatibility_error(
+                table.name,
+                "required indexes must be named",
+            )
+        existing_index = existing_indexes.get(index.name)
+        if existing_index is not None:
+            if not _index_definition_matches(
+                existing_index,
+                index,
+                connection.dialect.name,
+            ):
+                raise _compatibility_error(
+                    table.name,
+                    f"index {index.name} has a conflicting definition",
+                )
             continue
         if any(column.name not in available_columns for column in index.columns):
             raise _compatibility_error(

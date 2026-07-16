@@ -400,3 +400,94 @@ ALTER TABLE lt_sales_order_items ADD CONSTRAINT fk_lt_sales_order_item_parent_or
 ### Remaining concern
 
 The new and newly named constraints were validated with SQLite enforcement/controlled-failure tests and SQLAlchemy MySQL DDL generation, but were not applied to a live MySQL schema in this task.
+
+## Review Fix Pass 4
+
+Date: 2026-07-16
+
+### Findings fixed
+
+1. Foreign-key compatibility now separates:
+   - local/remote structural identity
+   - `ON DELETE` behavior
+   - `ON UPDATE` behavior
+2. A differently named foreign key using the same local and remote columns but incompatible referential actions now fails before any second constraint is added.
+3. A same-name foreign key with an incompatible target or structure continues to fail clearly.
+4. Structurally and behaviorally equivalent foreign keys remain accepted whether unnamed or differently named.
+5. Existing indexes are now validated by:
+   - index name
+   - ordered column list
+   - uniqueness
+   - non-empty dialect options
+6. A same-name index with a conflicting definition now raises a table/index-specific `RuntimeError` instead of being silently accepted.
+7. MySQL scalar index prefix lengths are normalized to reflected per-column mappings before comparison.
+
+### Red evidence
+
+Command:
+
+```powershell
+pytest tests/test_sales_models.py -v
+```
+
+Result before implementation:
+
+```text
+4 failed, 34 passed in 0.87s
+```
+
+The failures reproduced the differently named `NO ACTION` versus required `CASCADE` foreign key, wrong ordered index columns, wrong index uniqueness, and missing dialect-option matching.
+
+### Final verification
+
+Command:
+
+```powershell
+pytest tests/test_sales_models.py -v
+```
+
+Result:
+
+```text
+39 passed in 0.79s
+```
+
+Command:
+
+```powershell
+python -m compileall app/db/models.py app/db/database.py tests/test_sales_models.py
+```
+
+Result:
+
+```text
+Compiling 'tests/test_sales_models.py'...
+```
+
+Exit code: `0`
+
+Command:
+
+```powershell
+git diff --check
+```
+
+Result: exit code `0`; only Git's existing LF-to-CRLF working-copy warnings were printed.
+
+Command:
+
+```powershell
+pytest -q
+```
+
+Result:
+
+```text
+226 passed, 2 warnings, 4 subtests passed in 8.18s
+```
+
+The warnings remain the existing FastAPI `on_event` deprecation warnings from `app/main.py`.
+
+### Remaining concern
+
+The referential-action and index-option comparisons were verified through SQLite reflection, synthetic MySQL reflection dictionaries, and focused tests. No live MySQL migration was run in this task.

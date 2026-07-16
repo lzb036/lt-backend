@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import (
     Column,
     ForeignKeyConstraint,
+    Index,
     Integer,
     MetaData,
     String,
@@ -863,14 +864,37 @@ def test_ensure_table_layout_adds_safe_defaulted_columns_to_partial_populated_ta
         partial_engine.dispose()
 
 
-def _create_complete_legacy_conversation_engine(*, include_owner_fk: bool):
+def _create_complete_legacy_conversation_engine(
+    *,
+    include_owner_fk: bool,
+    owner_fk_name: str | None = None,
+    owner_fk_ondelete: str | None = "CASCADE",
+    owner_fk_onupdate: str | None = None,
+):
     legacy_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
-    owner_fk_sql = (
-        ", FOREIGN KEY (owner_username) "
-        "REFERENCES lt_user_accounts(username) ON DELETE CASCADE"
-        if include_owner_fk
-        else ""
-    )
+    if include_owner_fk:
+        constraint_name = (
+            f"CONSTRAINT {owner_fk_name} "
+            if owner_fk_name
+            else ""
+        )
+        ondelete_sql = (
+            f" ON DELETE {owner_fk_ondelete}"
+            if owner_fk_ondelete
+            else ""
+        )
+        onupdate_sql = (
+            f" ON UPDATE {owner_fk_onupdate}"
+            if owner_fk_onupdate
+            else ""
+        )
+        owner_fk_sql = (
+            f", {constraint_name}FOREIGN KEY (owner_username) "
+            "REFERENCES lt_user_accounts(username)"
+            f"{ondelete_sql}{onupdate_sql}"
+        )
+    else:
+        owner_fk_sql = ""
     with legacy_engine.begin() as connection:
         connection.execute(
             text(
@@ -958,6 +982,73 @@ def test_complete_legacy_conversation_owner_fk_is_detected():
         legacy_engine.dispose()
 
 
+def test_complete_legacy_named_equivalent_conversation_owner_fk_is_detected():
+    legacy_engine = _create_complete_legacy_conversation_engine(
+        include_owner_fk=True,
+        owner_fk_name="fk_legacy_conversation_owner",
+    )
+    try:
+        with legacy_engine.begin() as connection:
+            result = database_module._ensure_table_layout(
+                connection,
+                SalesAnalysisConversationModel.__table__,
+            )
+
+        assert result["added_constraints"] == []
+    finally:
+        legacy_engine.dispose()
+
+
+def test_complete_legacy_conversation_owner_fk_action_conflict_fails():
+    legacy_engine = _create_complete_legacy_conversation_engine(
+        include_owner_fk=True,
+        owner_fk_name="fk_legacy_conversation_owner_no_action",
+        owner_fk_ondelete=None,
+    )
+    try:
+        with legacy_engine.begin() as connection:
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    r"lt_sales_analysis_conversations.*"
+                    r"fk_lt_sales_analysis_conversation_owner_user.*"
+                    r"fk_legacy_conversation_owner_no_action.*"
+                    r"referential action"
+                ),
+            ):
+                database_module._ensure_table_layout(
+                    connection,
+                    SalesAnalysisConversationModel.__table__,
+                )
+    finally:
+        legacy_engine.dispose()
+
+
+def test_complete_legacy_conversation_owner_fk_onupdate_conflict_fails():
+    legacy_engine = _create_complete_legacy_conversation_engine(
+        include_owner_fk=True,
+        owner_fk_name="fk_legacy_conversation_owner_onupdate",
+        owner_fk_onupdate="CASCADE",
+    )
+    try:
+        with legacy_engine.begin() as connection:
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    r"lt_sales_analysis_conversations.*"
+                    r"fk_lt_sales_analysis_conversation_owner_user.*"
+                    r"fk_legacy_conversation_owner_onupdate.*"
+                    r"referential action"
+                ),
+            ):
+                database_module._ensure_table_layout(
+                    connection,
+                    SalesAnalysisConversationModel.__table__,
+                )
+    finally:
+        legacy_engine.dispose()
+
+
 def test_complete_legacy_conversation_missing_owner_fk_fails_clearly():
     legacy_engine = _create_complete_legacy_conversation_engine(
         include_owner_fk=False
@@ -1030,6 +1121,152 @@ def test_complete_legacy_order_item_missing_order_number_fk_fails_clearly():
                 )
     finally:
         legacy_engine.dispose()
+
+
+def test_ensure_table_layout_fails_for_named_index_with_wrong_ordered_columns():
+    target_metadata = MetaData()
+    target_table = Table(
+        "lt_compat_wrong_index_columns",
+        target_metadata,
+        Column("id", Integer, primary_key=True),
+        Column("owner_username", String(255), nullable=False),
+        Column("status", String(32), nullable=False),
+        Index(
+            "ix_lt_compat_wrong_index_columns_owner_status",
+            "owner_username",
+            "status",
+        ),
+    )
+    legacy_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with legacy_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE lt_compat_wrong_index_columns (
+                        id INTEGER PRIMARY KEY,
+                        owner_username VARCHAR(255) NOT NULL,
+                        status VARCHAR(32) NOT NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX ix_lt_compat_wrong_index_columns_owner_status
+                    ON lt_compat_wrong_index_columns (status, owner_username)
+                    """
+                )
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    r"lt_compat_wrong_index_columns.*"
+                    r"ix_lt_compat_wrong_index_columns_owner_status.*"
+                    r"conflicting definition"
+                ),
+            ):
+                database_module._ensure_table_layout(
+                    connection,
+                    target_table,
+                )
+    finally:
+        legacy_engine.dispose()
+
+
+def test_ensure_table_layout_fails_for_named_index_with_wrong_uniqueness():
+    target_metadata = MetaData()
+    target_table = Table(
+        "lt_compat_wrong_index_unique",
+        target_metadata,
+        Column("id", Integer, primary_key=True),
+        Column("remote_key", String(64), nullable=False),
+        Index(
+            "ix_lt_compat_wrong_index_unique_remote_key",
+            "remote_key",
+            unique=True,
+        ),
+    )
+    legacy_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with legacy_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE lt_compat_wrong_index_unique (
+                        id INTEGER PRIMARY KEY,
+                        remote_key VARCHAR(64) NOT NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX ix_lt_compat_wrong_index_unique_remote_key
+                    ON lt_compat_wrong_index_unique (remote_key)
+                    """
+                )
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    r"lt_compat_wrong_index_unique.*"
+                    r"ix_lt_compat_wrong_index_unique_remote_key.*"
+                    r"conflicting definition"
+                ),
+            ):
+                database_module._ensure_table_layout(
+                    connection,
+                    target_table,
+                )
+    finally:
+        legacy_engine.dispose()
+
+
+def test_index_definition_matching_includes_mysql_dialect_options():
+    target_metadata = MetaData()
+    target_table = Table(
+        "lt_compat_mysql_index_options",
+        target_metadata,
+        Column("code", String(255), nullable=False),
+    )
+    target_index = Index(
+        "ix_lt_compat_mysql_index_options_code",
+        target_table.c.code,
+        mysql_length=32,
+        mysql_using="btree",
+    )
+    exact_existing = {
+        "name": target_index.name,
+        "column_names": ["code"],
+        "unique": False,
+        "dialect_options": {
+            "mysql_length": {"code": 32},
+            "mysql_using": "btree",
+        },
+    }
+    wrong_existing = {
+        **exact_existing,
+        "dialect_options": {
+            "mysql_length": {"code": 16},
+            "mysql_using": "btree",
+        },
+    }
+
+    assert database_module._index_definition_matches(
+        exact_existing,
+        target_index,
+        "mysql",
+    )
+    assert not database_module._index_definition_matches(
+        wrong_existing,
+        target_index,
+        "mysql",
+    )
 
 
 def test_ensure_table_layout_is_idempotent_for_complete_sales_tables(sqlite_engine):
