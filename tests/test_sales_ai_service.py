@@ -25,6 +25,9 @@ from app.services import sales_ai_service
 CURRENT_DATE = date(2026, 7, 16)
 RECENT_START = "2026-06-16"
 RECENT_END = "2026-07-15"
+EFFECTIVE_SALES_DEFINITION_TEXT = (
+    "有效销量 = 下单数量 - 取消数量 - 退款数量 - 退货数量"
+)
 OWNER = "tenant-secret-owner"
 API_KEY = "credential-that-must-not-enter-messages"
 
@@ -387,7 +390,15 @@ def test_one_store_auto_selects_expands_recent_dates_and_sanitizes_model_payload
         )
 
     assert row is not None
-    assert row.answer_text == "Analysis Shop 1 的近期有效销量已完成分析。"
+    assert row.answer_text.startswith(
+        "Analysis Shop 1 的近期有效销量已完成分析。"
+    )
+    assert f"日期：{RECENT_START} 至 {RECENT_END}" in row.answer_text
+    assert EFFECTIVE_SALES_DEFINITION_TEXT in row.answer_text
+    assert "数据最后更新时间：2026-07-16T14:30:00+08:00" in (
+        row.answer_text
+    )
+    assert "未决调整数量：2" in row.answer_text
     assert row.model_name == "openai/test-model"
     assert json.loads(row.store_scope_json) == [store_id]
     assert json.loads(row.statistics_window_json) == {
@@ -401,6 +412,172 @@ def test_one_store_auto_selects_expands_recent_dates_and_sanitizes_model_payload
     assert stored_conversation is not None
     assert json.loads(stored_conversation.store_scope_json) == [store_id]
     assert stored_conversation.last_message_at is not None
+
+
+def test_sensitive_user_question_is_sanitized_before_storage_model_and_public(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    model_calls: list[dict[str, Any]] = []
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content="受控分析完成。"),
+        ]
+    )
+
+    def fake_completion(**kwargs):
+        model_calls.append(copy.deepcopy(kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(sales_ai_service, "litellm_completion", fake_completion)
+    result = _compact_result(store_id)
+    result["rows"][0]["manageNumber"] = "123456789012"
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: copy.deepcopy(result),
+    )
+    question = (
+        "查看近期销量；buyerName=Alice Buyer；recipient=Bob Receiver；"
+        "shippingAddress=Tokyo Secret Address；email=buyer@example.com；"
+        "phone=13912345678；orderNumber=ORDER-SECRET；"
+        'OrderModelList=[{"OrderNumber":"ORDER-LIST-SECRET"}]；'
+        "credentials=CREDENTIAL-SECRET；apiBase=https://api.secret.test；"
+        "accessKeyId=ACCESS-SECRET；licenseKey=LICENSE-SECRET；"
+        "serviceSecret=SERVICE-SECRET；query=private query；"
+        "pragma=table_info(secret)；SELECT * FROM private_orders"
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            question,
+        )
+    )
+
+    assert events[-1]["type"] == "completed"
+    public_question = events[-1]["message"]["question"]
+    model_question = model_calls[0]["messages"][-1]["content"]
+    with session_factory() as session:
+        row = session.scalar(
+            select(SalesAnalysisMessageModel).where(
+                SalesAnalysisMessageModel.conversation_id
+                == conversation["id"]
+            )
+        )
+    assert row is not None
+    assert row.question_text == public_question
+    serialized = json.dumps(
+        {
+            "stored": row.question_text,
+            "public": public_question,
+            "model": model_question,
+        },
+        ensure_ascii=False,
+    )
+    for forbidden in (
+        "Alice Buyer",
+        "Bob Receiver",
+        "Tokyo Secret Address",
+        "buyer@example.com",
+        "13912345678",
+        "ORDER-SECRET",
+        "ORDER-LIST-SECRET",
+        "CREDENTIAL-SECRET",
+        "api.secret.test",
+        "ACCESS-SECRET",
+        "LICENSE-SECRET",
+        "SERVICE-SECRET",
+        "private query",
+        "table_info",
+        "private_orders",
+    ):
+        assert forbidden not in serialized
+
+
+def test_allowed_display_fields_redact_phone_email_and_keep_identifiers(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                            "includeSku": True,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content="分析完成。"),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    result = _compact_result(store_id)
+    result["store"]["name"] = "Shop buyer@example.com 13700001111"
+    result["rows"] = [
+        {
+            "manageNumber": "123456789012",
+            "itemNumber": "000000000001",
+            "itemName": "Product buyer@example.com 13700001111",
+            "skuKey": "999999999999",
+            "orderCount": 1,
+            "orderedUnits": 1,
+            "effectiveUnits": 1,
+            "grossSalesAmount": 100.0,
+            "effectiveSalesAmount": 100.0,
+            "metricValue": 1,
+        }
+    ]
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: copy.deepcopy(result),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看 SKU 排行",
+        )
+    )
+
+    tool_result = next(
+        event["result"] for event in events if event["type"] == "tool_result"
+    )
+    serialized = json.dumps(tool_result, ensure_ascii=False)
+    assert "buyer@example.com" not in serialized
+    assert "13700001111" not in serialized
+    assert tool_result["rows"][0]["manageNumber"] == "123456789012"
+    assert tool_result["rows"][0]["itemNumber"] == "000000000001"
+    assert tool_result["rows"][0]["skuKey"] == "999999999999"
 
 
 def test_store_display_name_is_sanitized_before_entering_system_message(
@@ -462,6 +639,101 @@ def test_store_display_name_is_sanitized_before_entering_system_message(
     assert "SELECT *" not in serialized_messages
     assert "raw_orders" not in serialized_messages
     assert "buyer@example.com" not in serialized_messages
+
+
+def test_clarification_and_fallback_use_sanitized_store_names(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        _add_user(session, OWNER)
+        first = _add_store(
+            session,
+            OWNER,
+            "first",
+            "First buyer@example.com 13912345678",
+        )
+        _add_store(
+            session,
+            OWNER,
+            "second",
+            "Second recipient@example.com 13812345678",
+        )
+        session.commit()
+        first_store_id = first.id
+    clarification_conversation = _create_conversation()
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: pytest.fail("clarification must not call model"),
+    )
+
+    clarification_events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            clarification_conversation["id"],
+            "查看近期销量",
+        )
+    )
+    clarification_text = json.dumps(
+        clarification_events,
+        ensure_ascii=False,
+    )
+    assert "buyer@example.com" not in clarification_text
+    assert "recipient@example.com" not in clarification_text
+    assert "13912345678" not in clarification_text
+    assert "13812345678" not in clarification_text
+
+    with session_factory() as session:
+        scoped_conversation = SalesAnalysisConversationModel(
+            owner_username=OWNER,
+            title="Fallback",
+            store_scope_json=json.dumps([first_store_id]),
+        )
+        session.add(scoped_conversation)
+        session.commit()
+        fallback_conversation_id = scoped_conversation.id
+    calls = 0
+
+    def fail_after_tool(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": first_store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            )
+        raise RuntimeError("explanation failed")
+
+    monkeypatch.setattr(sales_ai_service, "litellm_completion", fail_after_tool)
+    fallback_result = _compact_result(first_store_id)
+    fallback_result["store"]["name"] = (
+        "First buyer@example.com 13912345678"
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: copy.deepcopy(fallback_result),
+    )
+
+    fallback_events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            fallback_conversation_id,
+            "查看近期销量",
+        )
+    )
+    fallback_text = fallback_events[-1]["message"]["answer"]
+    assert "buyer@example.com" not in fallback_text
+    assert "13912345678" not in fallback_text
 
 
 def test_model_content_without_successful_tool_call_is_rejected_and_persisted(
@@ -631,6 +903,186 @@ def test_explicit_owned_store_in_current_message_overrides_persisted_scope(
     ]
     assert message_row is not None
     assert json.loads(message_row.store_scope_json) == [second_store_id]
+
+
+def test_unique_longest_explicit_store_name_overrides_overlapping_match(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        _add_user(session, OWNER)
+        short_store = _add_store(
+            session,
+            OWNER,
+            "tokyo",
+            "Tokyo",
+        )
+        long_store = _add_store(
+            session,
+            OWNER,
+            "tokyo-plus",
+            "Tokyo Plus",
+        )
+        session.commit()
+        short_store_id = short_store.id
+        long_store_id = long_store.id
+    conversation = _create_conversation()
+    with session_factory() as session:
+        row = session.get(
+            SalesAnalysisConversationModel,
+            conversation["id"],
+        )
+        assert row is not None
+        row.store_scope_json = json.dumps([short_store_id])
+        session.commit()
+
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content="Tokyo Plus 分析完成。"),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    executed: list[dict[str, Any]] = []
+
+    def fake_execute(_owner, _tool_name, arguments):
+        executed.append(copy.deepcopy(arguments))
+        result = _compact_result(long_store_id)
+        result["store"]["name"] = "Tokyo Plus"
+        return result
+
+    monkeypatch.setattr(sales_ai_service, "execute_sales_tool", fake_execute)
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "请分析 Tokyo Plus 的近期销量",
+        )
+    )
+
+    assert events[-1]["type"] == "completed"
+    assert executed[0]["storeId"] == long_store_id
+
+
+def test_ambiguous_longest_explicit_store_match_requires_clarification(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        _add_user(session, OWNER)
+        first = _add_store(session, OWNER, "shared-one", "Shared Shop")
+        _add_store(session, OWNER, "shared-two", "Shared Shop")
+        session.commit()
+        first_store_id = first.id
+    conversation = _create_conversation()
+    with session_factory() as session:
+        row = session.get(
+            SalesAnalysisConversationModel,
+            conversation["id"],
+        )
+        assert row is not None
+        row.store_scope_json = json.dumps([first_store_id])
+        session.commit()
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: pytest.fail("ambiguous explicit match must clarify"),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看 Shared Shop 的近期销量",
+        )
+    )
+
+    assert [event["type"] for event in events] == [
+        "status",
+        "delta",
+        "completed",
+    ]
+    assert "请选择一家店铺" in events[-1]["message"]["answer"]
+    assert events[-1]["message"]["storeScope"] == []
+
+
+def test_short_store_code_requires_boundary_and_does_not_match_sales_word(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        _add_user(session, OWNER)
+        short = _add_store(session, OWNER, "a", "Alpha")
+        scoped = _add_store(session, OWNER, "main", "Main Shop")
+        session.commit()
+        short_store_id = short.id
+        scoped_store_id = scoped.id
+    conversation = _create_conversation()
+    with session_factory() as session:
+        row = session.get(
+            SalesAnalysisConversationModel,
+            conversation["id"],
+        )
+        assert row is not None
+        row.store_scope_json = json.dumps([scoped_store_id])
+        session.commit()
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content="Main Shop 分析完成。"),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    executed: list[dict[str, Any]] = []
+
+    def fake_execute(_owner, _tool_name, arguments):
+        executed.append(copy.deepcopy(arguments))
+        result = _compact_result(scoped_store_id)
+        result["store"]["name"] = "Main Shop"
+        return result
+
+    monkeypatch.setattr(sales_ai_service, "execute_sales_tool", fake_execute)
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "sales analysis 近期销量",
+        )
+    )
+
+    assert events[-1]["type"] == "completed"
+    assert executed[0]["storeId"] == scoped_store_id
+    assert executed[0]["storeId"] != short_store_id
 
 
 def test_unknown_model_tool_is_rejected_and_never_executed(
@@ -1200,6 +1652,119 @@ def test_model_context_is_bounded_and_keeps_newest_history(
     )
 
 
+def test_intermediate_content_tool_call_id_and_total_messages_are_bounded(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    first_response = _model_response(
+        content="INTERMEDIATE-" + ("I" * 100_000),
+        tool_calls=[
+            (
+                "get_product_sales_ranking",
+                {
+                    "storeId": store_id,
+                    "startDate": RECENT_START,
+                    "endDate": RECENT_END,
+                },
+            )
+        ],
+    )
+    first_response["choices"][0]["message"]["tool_calls"][0]["id"] = (
+        "CALL-ID-" + ("Z" * 100_000)
+    )
+    responses = iter(
+        [
+            first_response,
+            _model_response(content="分析完成。"),
+        ]
+    )
+    model_calls: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs):
+        model_calls.append(copy.deepcopy(kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(sales_ai_service, "litellm_completion", fake_completion)
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: _compact_result(store_id),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    assert events[-1]["type"] == "completed"
+    second_messages = model_calls[1]["messages"]
+    assistant_message = next(
+        message
+        for message in second_messages
+        if message["role"] == "assistant"
+        and message.get("tool_calls")
+    )
+    tool_message = next(
+        message for message in second_messages if message["role"] == "tool"
+    )
+    assert len(assistant_message["content"]) <= (
+        sales_ai_service.MAX_MODEL_INTERMEDIATE_CONTENT_CHARS
+    )
+    bounded_id = assistant_message["tool_calls"][0]["id"]
+    assert len(bounded_id) <= sales_ai_service.MAX_TOOL_CALL_ID_CHARS
+    assert tool_message["tool_call_id"] == bounded_id
+    assert len(json.dumps(second_messages, ensure_ascii=False)) <= (
+        sales_ai_service.MAX_MODEL_MESSAGES_TOTAL_CHARS
+    )
+
+
+def test_history_budget_keeps_newest_contiguous_suffix():
+    short_oldest = {
+        "question": "OLDEST-SHOULD-NOT-RETURN",
+        "answer": "OLDEST-ANSWER",
+    }
+    overflowing_middle = {
+        "question": "OVERFLOW-" + ("Q" * 3_000),
+        "answer": "OVERFLOW-" + ("A" * 3_000),
+    }
+    recent_small = {
+        "question": "RECENT-SMALL-Q-" + ("Q" * 900),
+        "answer": "RECENT-SMALL-A-" + ("A" * 900),
+    }
+    recent_large_one = {
+        "question": "RECENT-LARGE-1-Q-" + ("Q" * 3_000),
+        "answer": "RECENT-LARGE-1-A-" + ("A" * 3_000),
+    }
+    recent_large_two = {
+        "question": "RECENT-LARGE-2-Q-" + ("Q" * 3_000),
+        "answer": "RECENT-LARGE-2-A-" + ("A" * 3_000),
+    }
+
+    messages = sales_ai_service._bounded_history_model_messages(
+        [
+            short_oldest,
+            overflowing_middle,
+            recent_small,
+            recent_large_one,
+            recent_large_two,
+        ],
+        owner_username=OWNER,
+        secrets=(),
+    )
+
+    serialized = json.dumps(messages, ensure_ascii=False)
+    assert "RECENT-LARGE-2-Q" in serialized
+    assert "RECENT-LARGE-1-Q" in serialized
+    assert "RECENT-SMALL-Q" in serialized
+    assert "OVERFLOW-" not in serialized
+    assert "OLDEST-SHOULD-NOT-RETURN" not in serialized
+
+
 def test_turn_executes_at_most_four_model_tool_calls(
     monkeypatch,
     session_factory,
@@ -1319,6 +1884,121 @@ def test_explanation_failure_after_tool_success_uses_deterministic_fallback(
         )
     assert row is not None
     assert row.answer_text == answer
+
+
+def test_valid_model_answer_gets_mandatory_grounding_footer(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(
+                content="Safe Product 的有效销量为 12。"
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: _compact_result(store_id),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    assert events[-1]["type"] == "completed"
+    assert events[-1]["message"]["fallback"] is False
+    answer = events[-1]["message"]["answer"]
+    assert "Safe Product 的有效销量为 12。" in answer
+    for required in (
+        "店铺：Analysis Shop 1",
+        f"日期：{RECENT_START} 至 {RECENT_END}",
+        "有效销量 = 下单数量 - 取消数量 - 退款数量 - 退货数量",
+        "数据最后更新时间：2026-07-16T14:30:00+08:00",
+        "未决调整数量：2",
+    ):
+        assert required in answer
+
+
+def test_fabricated_numeric_model_answer_after_tool_uses_fallback(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(
+                content="Safe Product 的有效销量为 999999。"
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    result = _compact_result(store_id)
+    result["rows"][0]["manageNumber"] = "123456789012"
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: copy.deepcopy(result),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    assert events[-1]["type"] == "completed"
+    assert events[-1]["message"]["fallback"] is True
+    answer = events[-1]["message"]["answer"]
+    assert "999999" not in answer
+    assert "123456789012" in answer
+    assert "Safe Product" in answer
+    assert '"effectiveUnits":12' in answer
+    assert "店铺：Analysis Shop 1" in answer
+    assert f"日期：{RECENT_START} 至 {RECENT_END}" in answer
 
 
 def test_missing_verified_user_ai_settings_emits_error_without_model_call(

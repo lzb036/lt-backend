@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import func, select
@@ -30,6 +32,7 @@ from app.services.sales_analysis_service import (
 
 
 MAX_TOOL_CALLS_PER_TURN = 4
+MAX_INPUT_MESSAGE_CHARS = 100_000
 MAX_PERSISTED_QUESTION_CHARS = 12_000
 MAX_PERSISTED_ANSWER_CHARS = 24_000
 MAX_MODEL_CURRENT_MESSAGE_CHARS = 4_000
@@ -37,8 +40,11 @@ MAX_MODEL_HISTORY_CHARS = 12_000
 MAX_MODEL_HISTORY_ENTRY_CHARS = 2_000
 MAX_HISTORY_ROWS_SCAN = 50
 MAX_HISTORY_SOURCE_CHARS = 4_000
+MAX_MODEL_INTERMEDIATE_CONTENT_CHARS = 2_000
+MAX_TOOL_CALL_ID_CHARS = 128
 MAX_MODEL_TOOL_RESULT_CHARS = 16_000
 MAX_MODEL_TOOL_RESULT_ROWS = 40
+MAX_MODEL_MESSAGES_TOTAL_CHARS = 64_000
 TRUNCATION_MARKER = "…[已截断]"
 SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
 DEFAULT_CONVERSATION_TITLE = "新分析"
@@ -93,10 +99,10 @@ def _schema_list(
 def _schema_text(
     max_chars: int,
     *,
-    sensitive: bool = False,
+    policy: str = "public",
     nullable: bool = False,
-) -> tuple[str, int, bool, bool]:
-    return ("text", max_chars, sensitive, nullable)
+) -> tuple[str, int, str, bool]:
+    return ("text", max_chars, policy, nullable)
 
 
 INTEGER_SCHEMA = ("integer",)
@@ -106,7 +112,7 @@ BOOLEAN_SCHEMA = ("boolean",)
 STORE_SCHEMA = _schema_object(
     {
         "id": INTEGER_SCHEMA,
-        "name": _schema_text(255, sensitive=True),
+        "name": _schema_text(255),
     }
 )
 RANGE_SCHEMA = _schema_object(
@@ -134,10 +140,10 @@ SALES_TOTAL_FIELDS = {
 }
 RANKING_ROW_SCHEMA = _schema_object(
     {
-        "manageNumber": _schema_text(255, sensitive=True),
-        "itemNumber": _schema_text(255, sensitive=True),
-        "itemName": _schema_text(500, sensitive=True),
-        "skuKey": _schema_text(255, sensitive=True),
+        "manageNumber": _schema_text(255, policy="identifier"),
+        "itemNumber": _schema_text(255, policy="identifier"),
+        "itemName": _schema_text(500),
+        "skuKey": _schema_text(255, policy="identifier"),
         "orderCount": INTEGER_SCHEMA,
         "orderedUnits": INTEGER_SCHEMA,
         "effectiveUnits": INTEGER_SCHEMA,
@@ -156,8 +162,8 @@ TREND_ROW_SCHEMA = _schema_object(
 )
 COMPARISON_SUMMARY_ROW_SCHEMA = _schema_object(
     {
-        "manageNumber": _schema_text(255, sensitive=True),
-        "itemName": _schema_text(500, sensitive=True),
+        "manageNumber": _schema_text(255, policy="identifier"),
+        "itemName": _schema_text(500),
         "orderedUnits": INTEGER_SCHEMA,
         "effectiveUnits": INTEGER_SCHEMA,
         "effectiveSalesAmount": NUMBER_SCHEMA,
@@ -166,7 +172,7 @@ COMPARISON_SUMMARY_ROW_SCHEMA = _schema_object(
 )
 COMPARISON_SERIES_ROW_SCHEMA = _schema_object(
     {
-        "manageNumber": _schema_text(255, sensitive=True),
+        "manageNumber": _schema_text(255, policy="identifier"),
         **TREND_ROW_SCHEMA[1],
     }
 )
@@ -178,8 +184,8 @@ TOOL_RESULT_SCHEMAS = {
                 _schema_object(
                     {
                         "id": INTEGER_SCHEMA,
-                        "name": _schema_text(255, sensitive=True),
-                        "code": _schema_text(120, sensitive=True),
+                        "name": _schema_text(255),
+                        "code": _schema_text(120, policy="identifier"),
                         "enabled": BOOLEAN_SCHEMA,
                     }
                 ),
@@ -221,7 +227,7 @@ TOOL_RESULT_SCHEMAS = {
     "get_product_sales_trend": _schema_object(
         {
             **COMMON_RESULT_FIELDS,
-            "manageNumber": _schema_text(255, sensitive=True),
+            "manageNumber": _schema_text(255, policy="identifier"),
             "grain": _schema_text(16),
             "rows": _schema_list(TREND_ROW_SCHEMA, MAX_TREND_ROWS),
         }
@@ -243,12 +249,15 @@ TOOL_RESULT_SCHEMAS = {
     "get_sku_sales_breakdown": _schema_object(
         {
             **COMMON_RESULT_FIELDS,
-            "manageNumber": _schema_text(255, sensitive=True),
+            "manageNumber": _schema_text(255, policy="identifier"),
             "rows": _schema_list(
                 _schema_object(
                     {
-                        "skuKey": _schema_text(255, sensitive=True),
-                        "itemName": _schema_text(500, sensitive=True),
+                        "skuKey": _schema_text(
+                            255,
+                            policy="identifier",
+                        ),
+                        "itemName": _schema_text(500),
                         "orderedUnits": INTEGER_SCHEMA,
                         "effectiveUnits": INTEGER_SCHEMA,
                         "effectiveSalesAmount": NUMBER_SCHEMA,
@@ -274,9 +283,9 @@ TOOL_RESULT_SCHEMAS = {
                     {
                         "manageNumber": _schema_text(
                             255,
-                            sensitive=True,
+                            policy="identifier",
                         ),
-                        "itemName": _schema_text(500, sensitive=True),
+                        "itemName": _schema_text(500),
                         "listedAt": _schema_text(10),
                         "listedDays": INTEGER_SCHEMA,
                         "effectiveUnits": INTEGER_SCHEMA,
@@ -306,25 +315,36 @@ TOOL_RESULT_SCHEMAS = {
     ),
 }
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(?:"
+    r"(?i)(?<![A-Z0-9_])(?:"
     r"owner(?:_?username|_?name)?|"
-    r"api(?:_?key|_?secret|_?token)?|"
-    r"license(?:_?key)?|service(?:_?secret)?|"
     r"buyer(?:_?name|_?email|_?phone|_?address)?|"
     r"customer(?:_?name|_?email|_?phone|_?address)?|"
     r"recipient(?:_?name|_?email|_?phone|_?address)?|"
+    r"shipping(?:_?name|_?email|_?phone|_?address)?|"
     r"contact(?:_?name|_?email|_?phone|_?address)?|"
-    r"password|authorization|raw(?:_?order|_?payload)"
+    r"email|e_?mail|phone|mobile|telephone|address|"
+    r"order(?:_?number|_?no|_?list|_?model_?list)?|"
+    r"credentials?|password|authorization|"
+    r"api(?:_?base|_?key|_?secret|_?token)?|"
+    r"access(?:_?key_?id|_?key_?secret|_?token)?|"
+    r"license(?:_?key)?|service(?:_?secret)?|secret|"
+    r"sql(?:_?metadata)?|query|pragma|"
+    r"raw(?:_?order|_?payload)"
     r")\s*[:=：]\s*[^,，;；\n]+"
 )
 _CHINESE_SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?:"
+    r"buyer(?:_?name|_?email|_?phone|_?address)?|"
     r"买家(?:姓名|名称|邮箱|电话|手机|地址)?|"
     r"购买者(?:姓名|名称|邮箱|电话|手机|地址)?|"
     r"客户(?:姓名|名称|邮箱|电话|手机|地址)?|"
     r"收件人(?:姓名|名称|邮箱|电话|手机|地址)?|"
-    r"收件地址|联系地址|联系电话|联系手机|手机号码|电话号码|"
-    r"邮箱地址"
+    r"收货人(?:姓名|名称|邮箱|电话|手机|地址)?|"
+    r"收件地址|收货地址|配送地址|联系地址|"
+    r"联系电话|联系手机|手机号码|电话号码|邮箱地址|"
+    r"订单号|订单编号|订单列表|订单明细|"
+    r"凭证|证书|密码|授权|访问密钥|接口密钥|许可证|密钥|"
+    r"接口地址|查询|数据库语句"
     r")\s*[:=：]\s*[^,，;；\n]+"
 )
 _EMAIL_RE = re.compile(
@@ -347,8 +367,16 @@ _RAW_ORDER_MARKER_RE = re.compile(
 )
 _DATABASE_STATEMENT_RE = re.compile(
     r"(?is)\b(?:select|insert|update|delete|drop|alter|create|replace|"
-    r"truncate|merge)\b.*?(?=(?:[,;；\n]|$))"
+    r"truncate|merge|pragma)\b.*?(?=(?:[,;；\n]|$))"
 )
+_NUMERIC_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?"
+    r"(?![A-Za-z0-9_])"
+)
+ALLOWED_FORMATTING_NUMBERS = {
+    str(value) for value in range(0, 11)
+} | {"20", "30", "50", "100"}
 
 
 def _current_shanghai_date() -> date:
@@ -385,6 +413,29 @@ def _truncate_text(value: Any, max_chars: int) -> str:
     return text[: max_chars - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
 
 
+def _collect_tool_identifiers(value: Any) -> tuple[str, ...]:
+    identifiers: list[str] = []
+
+    def visit(item: Any, field_name: str = "") -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                visit(child, str(key))
+            return
+        if isinstance(item, list):
+            for child in item:
+                visit(child, field_name)
+            return
+        if (
+            field_name in {"manageNumber", "itemNumber", "skuKey"}
+            and isinstance(item, str)
+            and item
+        ):
+            identifiers.append(item)
+
+    visit(value)
+    return tuple(dict.fromkeys(identifiers))
+
+
 def _timestamp_to_public(value: datetime | None) -> str | None:
     return value.isoformat(timespec="seconds") if value is not None else None
 
@@ -395,7 +446,12 @@ def _conversation_to_public(
     scope = _json_load(row.store_scope_json, [])
     return {
         "id": row.id,
-        "title": row.title,
+        "title": _safe_text(
+            row.title,
+            owner_username=row.owner_username,
+            max_chars=255,
+        )
+        or DEFAULT_CONVERSATION_TITLE,
         "storeScope": scope if isinstance(scope, list) else [],
         "lastMessageAt": _timestamp_to_public(row.last_message_at),
         "createdAt": _timestamp_to_public(row.created_at),
@@ -410,13 +466,25 @@ def _message_to_public(
 ) -> dict[str, Any]:
     tool_arguments = _json_load(row.tool_arguments_json, [])
     result_summary = _json_load(row.result_summary_json, [])
+    protected_identifiers = _collect_tool_identifiers(result_summary)
     store_scope = _json_load(row.store_scope_json, [])
     statistics_window = _json_load(row.statistics_window_json, {})
     return {
         "id": row.id,
         "conversationId": row.conversation_id,
-        "question": row.question_text,
-        "answer": row.answer_text,
+        "question": _safe_text(
+            row.question_text,
+            owner_username=row.owner_username,
+            max_chars=MAX_PERSISTED_QUESTION_CHARS,
+        )
+        or "",
+        "answer": _safe_text(
+            row.answer_text,
+            owner_username=row.owner_username,
+            protected_identifiers=protected_identifiers,
+            max_chars=MAX_PERSISTED_ANSWER_CHARS,
+        )
+        or "",
         "toolName": row.tool_name,
         "toolArguments": tool_arguments,
         "resultSummary": result_summary,
@@ -455,9 +523,14 @@ def create_conversation(
     normalized_owner = str(owner_username or "").strip()
     if not normalized_owner:
         raise ValueError("用户不能为空。")
-    normalized_title = str(title or "").strip() or DEFAULT_CONVERSATION_TITLE
-    if len(normalized_title) > 255:
-        normalized_title = normalized_title[:255]
+    normalized_title = (
+        _safe_text(
+            str(title or "").strip(),
+            owner_username=normalized_owner,
+            max_chars=255,
+        )
+        or DEFAULT_CONVERSATION_TITLE
+    )
     with session_scope() as session:
         row = SalesAnalysisConversationModel(
             owner_username=normalized_owner,
@@ -486,17 +559,25 @@ def _explicit_store_matches(
     message: str,
     stores: list[StoreModel],
 ) -> list[StoreModel]:
-    normalized_message = str(message or "").casefold()
-    matches: list[StoreModel] = []
+    normalized_message = _normalize_store_match_text(message)
+    scores: dict[int, int] = {}
     for store in stores:
-        text_candidates = {
-            str(store.store_name or "").strip().casefold(),
-            str(store.store_code or "").strip().casefold(),
-            str(store.alias_name or "").strip().casefold(),
+        candidates = {
+            _normalize_store_match_text(store.store_name),
+            _normalize_store_match_text(store.store_code),
+            _normalize_store_match_text(store.alias_name),
         }
-        text_match = any(
-            candidate and candidate in normalized_message
-            for candidate in text_candidates
+        best_score = max(
+            (
+                len(candidate)
+                for candidate in candidates
+                if candidate
+                and _store_phrase_matches(
+                    normalized_message,
+                    candidate,
+                )
+            ),
+            default=0,
         )
         id_match = bool(
             re.search(
@@ -504,9 +585,36 @@ def _explicit_store_matches(
                 str(message or ""),
             )
         )
-        if text_match or id_match:
-            matches.append(store)
-    return matches
+        if id_match:
+            best_score = max(best_score, 10_000)
+        if best_score:
+            scores[store.id] = best_score
+    if not scores:
+        return []
+    longest = max(scores.values())
+    return [
+        store
+        for store in stores
+        if scores.get(store.id) == longest
+    ]
+
+
+def _normalize_store_match_text(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return re.sub(r"\s+", " ", normalized.casefold()).strip()
+
+
+def _store_phrase_matches(message: str, candidate: str) -> bool:
+    escaped = re.escape(candidate)
+    if candidate[0].isascii() and (
+        candidate[0].isalnum() or candidate[0] in "_-"
+    ):
+        escaped = rf"(?<![a-z0-9_-]){escaped}"
+    if candidate[-1].isascii() and (
+        candidate[-1].isalnum() or candidate[-1] in "_-"
+    ):
+        escaped = rf"{escaped}(?![a-z0-9_-])"
+    return re.search(escaped, message) is not None
 
 
 def _select_store(
@@ -518,6 +626,8 @@ def _select_store(
     explicit = _explicit_store_matches(message, stores)
     if len(explicit) == 1:
         return explicit[0]
+    if explicit:
+        return None
     scoped = [
         stores_by_id[store_id]
         for store_id in stored_scope
@@ -572,10 +682,37 @@ def _start_turn(
                 UserAccountModel.username == owner_username
             )
         )
+        sensitive_values = list(
+            dict.fromkeys(
+                value
+                for value in (
+                    account.display_name if account is not None else "",
+                    *(
+                        contact_value
+                        for store in stores
+                        for contact_value in (
+                            store.contact_name,
+                            store.contact_phone,
+                        )
+                    ),
+                )
+                if isinstance(value, str) and value.strip()
+            )
+        )
+        redaction_secrets = tuple(sensitive_values)
         stored_scope = _json_load(conversation.store_scope_json, [])
         if not isinstance(stored_scope, list):
             stored_scope = []
         selected_store = _select_store(question, stores, stored_scope)
+        safe_question = (
+            _safe_text(
+                question,
+                owner_username=owner_username,
+                secrets=redaction_secrets,
+                max_chars=MAX_PERSISTED_QUESTION_CHARS,
+            )
+            or ""
+        )
         store_scope = [selected_store.id] if selected_store is not None else []
         if selected_store is not None:
             conversation.store_scope_json = _json_dump(store_scope)
@@ -584,7 +721,7 @@ def _start_turn(
         message_row = SalesAnalysisMessageModel(
             conversation_id=conversation.id,
             owner_username=owner_username,
-            question_text=question,
+            question_text=safe_question,
             answer_text="",
             tool_name="",
             tool_arguments_json="[]",
@@ -600,16 +737,42 @@ def _start_turn(
             "stores": [
                 {
                     "id": store.id,
-                    "name": store.store_name,
-                    "code": store.store_code,
+                    "name": _safe_text(
+                        store.store_name,
+                        owner_username=owner_username,
+                        secrets=redaction_secrets,
+                        max_chars=255,
+                    )
+                    or "[敏感信息已省略]",
+                    "code": _safe_text(
+                        store.store_code,
+                        policy="identifier",
+                        owner_username=owner_username,
+                        secrets=redaction_secrets,
+                        max_chars=120,
+                    )
+                    or "[敏感信息已省略]",
                 }
                 for store in stores
             ],
             "selectedStore": (
                 {
                     "id": selected_store.id,
-                    "name": selected_store.store_name,
-                    "code": selected_store.store_code,
+                    "name": _safe_text(
+                        selected_store.store_name,
+                        owner_username=owner_username,
+                        secrets=redaction_secrets,
+                        max_chars=255,
+                    )
+                    or "[敏感信息已省略]",
+                    "code": _safe_text(
+                        selected_store.store_code,
+                        policy="identifier",
+                        owner_username=owner_username,
+                        secrets=redaction_secrets,
+                        max_chars=120,
+                    )
+                    or "[敏感信息已省略]",
                 }
                 if selected_store is not None
                 else None
@@ -621,23 +784,8 @@ def _start_turn(
                 }
                 for row in reversed(history_rows)
             ],
-            "sensitiveValues": list(
-                dict.fromkeys(
-                    value
-                    for value in (
-                        account.display_name if account is not None else "",
-                        *(
-                            contact_value
-                            for store in stores
-                            for contact_value in (
-                                store.contact_name,
-                                store.contact_phone,
-                            )
-                        ),
-                    )
-                    if isinstance(value, str) and value.strip()
-                )
-            ),
+            "question": safe_question,
+            "sensitiveValues": sensitive_values,
         }
 
 
@@ -700,36 +848,51 @@ def _expand_relative_dates(
     return expanded
 
 
-def _sanitize_text(
+def _safe_text(
     value: Any,
     *,
+    policy: str = "public",
     owner_username: str,
     secrets: tuple[str, ...] = (),
-) -> str:
-    text = _sanitize_non_phone_sensitive_text(
-        value,
-        owner_username=owner_username,
-        secrets=secrets,
-    )
-    return _PHONE_CANDIDATE_RE.sub(
-        lambda match: (
-            "[敏感信息已省略]"
-            if 10
-            <= sum(character.isdigit() for character in match.group())
-            <= 15
-            else match.group()
-        ),
-        text,
-    )
-
-
-def _sanitize_non_phone_sensitive_text(
-    value: Any,
-    *,
-    owner_username: str,
-    secrets: tuple[str, ...] = (),
-) -> str:
+    protected_identifiers: tuple[str, ...] = (),
+    max_chars: int | None = None,
+) -> str | None:
     text = str(value or "")
+    if policy == "identifier":
+        if any(
+            secret and secret in text
+            for secret in (owner_username, *secrets)
+        ):
+            return None
+        if (
+            _SENSITIVE_ASSIGNMENT_RE.search(text)
+            or _CHINESE_SENSITIVE_ASSIGNMENT_RE.search(text)
+            or _RAW_ORDER_MARKER_RE.search(text)
+            or _EMAIL_RE.search(text)
+            or _DATABASE_STATEMENT_RE.search(text)
+        ):
+            return None
+        return (
+            _truncate_text(text, max_chars)
+            if max_chars is not None
+            else text
+        )
+
+    protected_values = sorted(
+        {
+            identifier
+            for identifier in protected_identifiers
+            if isinstance(identifier, str) and identifier
+        },
+        key=len,
+        reverse=True,
+    )
+    placeholders: list[tuple[str, str]] = []
+    for index, identifier in enumerate(protected_values):
+        placeholder = f"\uFFF0{index}\uFFF1"
+        text = text.replace(identifier, placeholder)
+        placeholders.append((placeholder, identifier))
+
     for secret in (owner_username, *secrets):
         if secret:
             text = text.replace(secret, "[敏感信息已省略]")
@@ -741,8 +904,24 @@ def _sanitize_non_phone_sensitive_text(
     text = _RAW_ORDER_SEGMENT_RE.sub("[完整订单已省略]", text)
     text = _RAW_ORDER_MARKER_RE.sub("[完整订单已省略]", text)
     text = _EMAIL_RE.sub("[敏感信息已省略]", text)
+    text = _PHONE_CANDIDATE_RE.sub(
+        lambda match: (
+            "[敏感信息已省略]"
+            if 10
+            <= sum(character.isdigit() for character in match.group())
+            <= 15
+            else match.group()
+        ),
+        text,
+    )
     text = _DATABASE_STATEMENT_RE.sub("[数据库语句已省略]", text)
-    return text
+    for placeholder, identifier in placeholders:
+        text = text.replace(placeholder, identifier)
+    return (
+        _truncate_text(text, max_chars)
+        if max_chars is not None
+        else text
+    )
 
 
 _DROP_SCHEMA_VALUE = object()
@@ -787,21 +966,19 @@ def _sanitize_schema_value(
                 sanitized_items.append(sanitized_item)
         return sanitized_items
     if kind == "text":
-        max_chars, sensitive, nullable = schema[1:]
+        max_chars, policy, nullable = schema[1:]
         if value is None and nullable:
             return None
         if not isinstance(value, str):
             return _DROP_SCHEMA_VALUE
-        text = (
-            _sanitize_non_phone_sensitive_text(
-                value,
-                owner_username=owner_username,
-                secrets=secrets,
-            )
-            if sensitive
-            else value
+        text = _safe_text(
+            value,
+            policy=policy,
+            owner_username=owner_username,
+            secrets=secrets,
+            max_chars=max_chars,
         )
-        return text[:max_chars]
+        return text if text is not None else _DROP_SCHEMA_VALUE
     if kind == "integer":
         if isinstance(value, int) and not isinstance(value, bool):
             return value
@@ -840,13 +1017,15 @@ def _sanitize_tool_result(
 
 def _bounded_tool_result_for_model(
     result: dict[str, Any],
+    *,
+    max_chars: int = MAX_MODEL_TOOL_RESULT_CHARS,
 ) -> dict[str, Any]:
     bounded = json.loads(_json_dump(result))
     for key in ("rows", "series"):
         value = bounded.get(key)
         if isinstance(value, list):
             bounded[key] = value[:MAX_MODEL_TOOL_RESULT_ROWS]
-    while len(_json_dump(bounded)) > MAX_MODEL_TOOL_RESULT_CHARS:
+    while len(_json_dump(bounded)) > max_chars:
         candidates = [
             (key, bounded[key])
             for key in ("series", "rows")
@@ -878,7 +1057,12 @@ def _response_message(response: Any) -> Any:
     return _tool_call_field(choices[0], "message")
 
 
-def _normalized_tool_calls(message: Any) -> list[dict[str, Any]]:
+def _normalized_tool_calls(
+    message: Any,
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
+) -> list[dict[str, Any]]:
     raw_calls = _tool_call_field(message, "tool_calls", []) or []
     normalized: list[dict[str, Any]] = []
     for index, raw_call in enumerate(raw_calls, start=1):
@@ -896,12 +1080,19 @@ def _normalized_tool_calls(message: Any) -> list[dict[str, Any]]:
             raise ValueError("分析工具参数格式不正确。")
         if not isinstance(arguments, dict):
             raise ValueError("分析工具参数必须是对象。")
+        raw_id = str(
+            _tool_call_field(raw_call, "id", f"call-{index}")
+            or f"call-{index}"
+        )
+        safe_id = _safe_text(
+            raw_id,
+            owner_username=owner_username,
+            secrets=secrets,
+            max_chars=MAX_TOOL_CALL_ID_CHARS,
+        )
         normalized.append(
             {
-                "id": str(
-                    _tool_call_field(raw_call, "id", f"call-{index}")
-                    or f"call-{index}"
-                ),
+                "id": safe_id or f"call-{index}",
                 "name": name,
                 "arguments": arguments,
             }
@@ -915,7 +1106,10 @@ def _assistant_message_for_history(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "role": "assistant",
-        "content": content,
+        "content": _truncate_text(
+            content,
+            MAX_MODEL_INTERMEDIATE_CONTENT_CHARS,
+        ),
     }
     if tool_calls:
         payload["tool_calls"] = [
@@ -930,6 +1124,87 @@ def _assistant_message_for_history(
             for call in tool_calls
         ]
     return payload
+
+
+def _model_messages_size(messages: list[dict[str, Any]]) -> int:
+    return len(
+        json.dumps(
+            messages,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+def _bounded_messages_for_completion(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    bounded = json.loads(_json_dump(messages))
+    while _model_messages_size(bounded) > MAX_MODEL_MESSAGES_TOTAL_CHARS:
+        reduced = False
+        for message in bounded:
+            if message.get("role") == "tool" and message.get("content") != "{}":
+                message["content"] = "{}"
+                reduced = True
+                break
+        if reduced:
+            continue
+        for message in bounded:
+            if (
+                message.get("role") == "assistant"
+                and message.get("tool_calls")
+                and message.get("content")
+            ):
+                message["content"] = ""
+                reduced = True
+                break
+        if reduced:
+            continue
+        first_tool_index = next(
+            (
+                index
+                for index, message in enumerate(bounded)
+                if message.get("role") == "assistant"
+                and message.get("tool_calls")
+            ),
+            len(bounded),
+        )
+        current_user_index = max(
+            (
+                index
+                for index, message in enumerate(
+                    bounded[:first_tool_index]
+                )
+                if message.get("role") == "user"
+            ),
+            default=0,
+        )
+        if current_user_index > 1:
+            delete_end = (
+                3
+                if current_user_index > 2
+                and bounded[1].get("role") == "user"
+                and bounded[2].get("role") == "assistant"
+                and not bounded[2].get("tool_calls")
+                else 2
+            )
+            del bounded[1:delete_end]
+            continue
+        if len(bounded) > 1 and bounded[1].get("role") == "user":
+            original_content = bounded[1].get("content", "")
+            shortened = _truncate_text(
+                original_content,
+                max(
+                    1,
+                    len(original_content) // 2,
+                ),
+            )
+            if shortened == original_content:
+                break
+            bounded[1]["content"] = shortened
+            continue
+        break
+    return bounded
 
 
 def _prepare_tool_arguments(
@@ -973,6 +1248,7 @@ def _tool_argument_value_is_safe(
     *,
     owner_username: str,
     secrets: tuple[str, ...],
+    field_name: str = "",
 ) -> bool:
     if isinstance(value, dict):
         return all(
@@ -980,8 +1256,9 @@ def _tool_argument_value_is_safe(
                 item,
                 owner_username=owner_username,
                 secrets=secrets,
+                field_name=key,
             )
-            for item in value.values()
+            for key, item in value.items()
         )
     if isinstance(value, list):
         return all(
@@ -989,18 +1266,23 @@ def _tool_argument_value_is_safe(
                 item,
                 owner_username=owner_username,
                 secrets=secrets,
+                field_name=field_name,
             )
             for item in value
         )
     if isinstance(value, str):
-        return (
-            _sanitize_non_phone_sensitive_text(
-                value,
-                owner_username=owner_username,
-                secrets=secrets,
-            )
-            == value
+        policy = (
+            "identifier"
+            if field_name in {"manageNumber", "manageNumbers"}
+            else "public"
         )
+        safe_value = _safe_text(
+            value,
+            policy=policy,
+            owner_username=owner_username,
+            secrets=secrets,
+        )
+        return safe_value is not None and safe_value == value
     return value is None or isinstance(value, (bool, int, float))
 
 
@@ -1054,10 +1336,14 @@ def _persist_message_state(
             raise LookupError("会话消息不存在或无权访问。")
         tool_names = [record["toolName"] for record in tool_records]
         if answer is not None:
-            row.answer_text = _truncate_text(
+            row.answer_text = _safe_text(
                 answer,
-                MAX_PERSISTED_ANSWER_CHARS,
-            )
+                owner_username=owner_username,
+                protected_identifiers=_collect_tool_identifiers(
+                    tool_records
+                ),
+                max_chars=MAX_PERSISTED_ANSWER_CHARS,
+            ) or ""
         row.tool_name = ",".join(tool_names)[:128]
         row.tool_arguments_json = _json_dump(
             [
@@ -1138,14 +1424,30 @@ def _finalize_message(
     )
 
 
-def _clarification_answer(stores: list[dict[str, Any]]) -> str:
+def _clarification_answer(
+    stores: list[dict[str, Any]],
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
+) -> str:
     if not stores:
         return "当前没有可用于销量分析的店铺。"
     options = "；".join(
-        f"{store['name']}（店铺编号 {store['id']}）"
+        (
+            f"{_safe_text(store['name'], owner_username=owner_username, secrets=secrets) or '[敏感信息已省略]'}"
+            f"（店铺编号 {store['id']}）"
+        )
         for store in stores
     )
-    return f"你有多家店铺，请选择一家店铺后再分析：{options}。"
+    return (
+        _safe_text(
+            f"你有多家店铺，请选择一家店铺后再分析：{options}。",
+            owner_username=owner_username,
+            secrets=secrets,
+            max_chars=MAX_PERSISTED_ANSWER_CHARS,
+        )
+        or "你有多家店铺，请选择一家店铺后再分析。"
+    )
 
 
 def _system_prompt(
@@ -1177,21 +1479,17 @@ def _bounded_history_model_messages(
 ) -> list[dict[str, str]]:
     turns: list[list[dict[str, str]]] = []
     for previous in history:
-        question = _truncate_text(
-            _sanitize_text(
-                previous.get("question", ""),
-                owner_username=owner_username,
-                secrets=secrets,
-            ),
-            MAX_MODEL_HISTORY_ENTRY_CHARS,
+        question = _safe_text(
+            previous.get("question", ""),
+            owner_username=owner_username,
+            secrets=secrets,
+            max_chars=MAX_MODEL_HISTORY_ENTRY_CHARS,
         )
-        answer = _truncate_text(
-            _sanitize_text(
-                previous.get("answer", ""),
-                owner_username=owner_username,
-                secrets=secrets,
-            ),
-            MAX_MODEL_HISTORY_ENTRY_CHARS,
+        answer = _safe_text(
+            previous.get("answer", ""),
+            owner_username=owner_username,
+            secrets=secrets,
+            max_chars=MAX_MODEL_HISTORY_ENTRY_CHARS,
         )
         turn: list[dict[str, str]] = []
         if question:
@@ -1206,7 +1504,7 @@ def _bounded_history_model_messages(
     for turn in reversed(turns):
         turn_chars = sum(len(message["content"]) for message in turn)
         if turn_chars > remaining:
-            continue
+            break
         selected_reversed.append(turn)
         remaining -= turn_chars
     selected: list[dict[str, str]] = []
@@ -1226,16 +1524,19 @@ def _model_messages(
 ) -> list[dict[str, Any]]:
     sanitized_store = {
         **selected_store,
-        "name": _sanitize_text(
+        "name": _safe_text(
             selected_store.get("name", ""),
             owner_username=owner_username,
             secrets=secrets,
-        ),
-        "code": _sanitize_text(
+        )
+        or "[敏感信息已省略]",
+        "code": _safe_text(
             selected_store.get("code", ""),
+            policy="identifier",
             owner_username=owner_username,
             secrets=secrets,
-        ),
+        )
+        or "[敏感信息已省略]",
     }
     messages: list[dict[str, Any]] = [
         {
@@ -1254,14 +1555,13 @@ def _model_messages(
     messages.append(
         {
             "role": "user",
-            "content": _truncate_text(
-                _sanitize_text(
-                    expanded_question,
-                    owner_username=owner_username,
-                    secrets=secrets,
-                ),
-                MAX_MODEL_CURRENT_MESSAGE_CHARS,
-            ),
+            "content": _safe_text(
+                expanded_question,
+                owner_username=owner_username,
+                secrets=secrets,
+                max_chars=MAX_MODEL_CURRENT_MESSAGE_CHARS,
+            )
+            or "",
         }
     )
     return messages
@@ -1273,7 +1573,7 @@ def _completion_kwargs(
 ) -> dict[str, Any]:
     return {
         "model": model_configuration["modelName"],
-        "messages": messages,
+        "messages": _bounded_messages_for_completion(messages),
         "tools": SALES_ANALYSIS_TOOLS,
         "tool_choice": "auto",
         "api_key": model_configuration["apiKey"],
@@ -1290,7 +1590,11 @@ def _fallback_answer(
     selected_store: dict[str, Any],
     relative_window: dict[str, str] | None,
     tool_records: list[dict[str, Any]],
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
 ) -> str:
+    protected_identifiers = _collect_tool_identifiers(tool_records)
     statistics_window = _statistics_window(
         relative_window,
         tool_records,
@@ -1316,16 +1620,220 @@ def _fallback_answer(
             )
     if not row_lines:
         row_lines.append("（无返回行）")
-    return "\n".join(
-        [
-            f"店铺：{selected_store['name']}",
-            f"日期：{start_date} 至 {end_date}",
-            f"口径：{EFFECTIVE_SALES_DEFINITION}",
-            f"数据最后更新时间：{updated_at or '暂无'}",
-            f"未决调整数量：{unresolved_count}",
-            "返回表格行：",
-            *row_lines,
-        ]
+    safe_store_name = (
+        _safe_text(
+            selected_store.get("name", ""),
+            owner_username=owner_username,
+            secrets=secrets,
+            max_chars=255,
+        )
+        or "[敏感信息已省略]"
+    )
+    return (
+        _safe_text(
+            "\n".join(
+                [
+                    f"店铺：{safe_store_name}",
+                    f"日期：{start_date} 至 {end_date}",
+                    f"口径：{EFFECTIVE_SALES_DEFINITION}",
+                    f"数据最后更新时间：{updated_at or '暂无'}",
+                    f"未决调整数量：{unresolved_count}",
+                    "返回表格行：",
+                    *row_lines,
+                ]
+            ),
+            owner_username=owner_username,
+            secrets=secrets,
+            protected_identifiers=protected_identifiers,
+            max_chars=MAX_PERSISTED_ANSWER_CHARS,
+        )
+        or ""
+    )
+
+
+def _normalize_numeric_token(value: str) -> str | None:
+    normalized = value.replace(",", "").rstrip("%")
+    try:
+        decimal_value = Decimal(normalized)
+    except InvalidOperation:
+        return None
+    if decimal_value == decimal_value.to_integral_value():
+        return str(int(decimal_value))
+    return format(decimal_value.normalize(), "f")
+
+
+def _numeric_tokens(value: Any) -> set[str]:
+    tokens: set[str] = set()
+    for match in _NUMERIC_TOKEN_RE.finditer(str(value or "")):
+        normalized = _normalize_numeric_token(match.group())
+        if normalized is not None:
+            tokens.add(normalized)
+    return tokens
+
+
+def _grounding_metadata(
+    selected_store: dict[str, Any],
+    relative_window: dict[str, str] | None,
+    tool_records: list[dict[str, Any]],
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
+) -> dict[str, Any]:
+    statistics_window = _statistics_window(
+        relative_window,
+        tool_records,
+    )
+    store_name = str(selected_store.get("name") or "")
+    data_updated_at: str | None = None
+    unresolved_count = 0
+    for record in tool_records:
+        result = record["result"]
+        result_store = result.get("store")
+        if isinstance(result_store, dict) and isinstance(
+            result_store.get("name"),
+            str,
+        ):
+            store_name = result_store["name"]
+        if isinstance(result.get("dataUpdatedAt"), str):
+            data_updated_at = result["dataUpdatedAt"]
+        if isinstance(result.get("unresolvedAdjustmentCount"), int):
+            unresolved_count = max(
+                unresolved_count,
+                result["unresolvedAdjustmentCount"],
+            )
+    safe_store_name = (
+        _safe_text(
+            store_name,
+            owner_username=owner_username,
+            secrets=secrets,
+            max_chars=255,
+        )
+        or "[敏感信息已省略]"
+    )
+    return {
+        "storeName": safe_store_name,
+        "startDate": statistics_window.get("start", "未提供"),
+        "endDate": statistics_window.get("end", "未提供"),
+        "dataUpdatedAt": data_updated_at or "暂无",
+        "unresolvedAdjustmentCount": unresolved_count,
+    }
+
+
+def _answer_numbers_are_grounded(
+    answer: str,
+    metadata: dict[str, Any],
+    tool_records: list[dict[str, Any]],
+) -> bool:
+    allowed = set(ALLOWED_FORMATTING_NUMBERS)
+    allowed.update(
+        _numeric_tokens(
+            _json_dump(
+                [record["result"] for record in tool_records]
+            )
+        )
+    )
+    allowed.update(_numeric_tokens(_json_dump(metadata)))
+    return _numeric_tokens(answer) <= allowed
+
+
+def _append_grounding_footer(
+    answer: str,
+    metadata: dict[str, Any],
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
+    protected_identifiers: tuple[str, ...],
+) -> str:
+    missing_lines: list[str] = []
+    store_name = metadata["storeName"]
+    start_date = metadata["startDate"]
+    end_date = metadata["endDate"]
+    updated_at = metadata["dataUpdatedAt"]
+    unresolved_count = metadata["unresolvedAdjustmentCount"]
+    if store_name not in answer:
+        missing_lines.append(f"店铺：{store_name}")
+    if start_date not in answer or end_date not in answer:
+        missing_lines.append(f"日期：{start_date} 至 {end_date}")
+    if EFFECTIVE_SALES_DEFINITION not in answer:
+        missing_lines.append(f"口径：{EFFECTIVE_SALES_DEFINITION}")
+    if updated_at not in answer:
+        missing_lines.append(f"数据最后更新时间：{updated_at}")
+    if (
+        "未决调整" not in answer
+        or str(unresolved_count) not in answer
+    ):
+        missing_lines.append(f"未决调整数量：{unresolved_count}")
+    combined = (
+        answer
+        if not missing_lines
+        else f"{answer.rstrip()}\n\n" + "\n".join(missing_lines)
+    )
+    return (
+        _safe_text(
+            combined,
+            owner_username=owner_username,
+            secrets=secrets,
+            protected_identifiers=protected_identifiers,
+            max_chars=MAX_PERSISTED_ANSWER_CHARS,
+        )
+        or ""
+    )
+
+
+def _ground_final_answer(
+    content: Any,
+    selected_store: dict[str, Any],
+    relative_window: dict[str, str] | None,
+    tool_records: list[dict[str, Any]],
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
+) -> tuple[str, bool]:
+    protected_identifiers = _collect_tool_identifiers(tool_records)
+    safe_answer = (
+        _safe_text(
+            content,
+            owner_username=owner_username,
+            secrets=secrets,
+            protected_identifiers=protected_identifiers,
+            max_chars=MAX_PERSISTED_ANSWER_CHARS,
+        )
+        or ""
+    ).strip()
+    metadata = _grounding_metadata(
+        selected_store,
+        relative_window,
+        tool_records,
+        owner_username=owner_username,
+        secrets=secrets,
+    )
+    if (
+        not safe_answer
+        or not _answer_numbers_are_grounded(
+            safe_answer,
+            metadata,
+            tool_records,
+        )
+    ):
+        return (
+            _fallback_answer(
+                selected_store,
+                relative_window,
+                tool_records,
+                owner_username=owner_username,
+                secrets=secrets,
+            ),
+            True,
+        )
+    return (
+        _append_grounding_footer(
+            safe_answer,
+            metadata,
+            owner_username=owner_username,
+            secrets=secrets,
+            protected_identifiers=protected_identifiers,
+        ),
+        False,
     )
 
 
@@ -1340,24 +1848,30 @@ def stream_analysis(
         raise ValueError("用户不能为空。")
     if not normalized_message:
         raise ValueError("分析问题不能为空。")
-    persisted_message = _truncate_text(
+    input_message = _truncate_text(
         normalized_message,
-        MAX_PERSISTED_QUESTION_CHARS,
+        MAX_INPUT_MESSAGE_CHARS,
     )
     turn = _start_turn(
         normalized_owner,
         int(conversation_id),
-        persisted_message,
+        input_message,
     )
+    persisted_message = turn["question"]
     message_id = int(turn["messageId"])
     selected_store = turn["selectedStore"]
     relative_window = _relative_date_window(persisted_message)
+    turn_redaction_secrets = tuple(turn["sensitiveValues"])
     tool_records: list[dict[str, Any]] = []
     model_name = ""
     yield {"type": "status", "message": "正在准备销量分析。"}
 
     if selected_store is None:
-        answer = _clarification_answer(turn["stores"])
+        answer = _clarification_answer(
+            turn["stores"],
+            owner_username=normalized_owner,
+            secrets=turn_redaction_secrets,
+        )
         persisted = _finalize_message(
             owner_username=normalized_owner,
             conversation_id=conversation_id,
@@ -1435,13 +1949,19 @@ def stream_analysis(
                 if isinstance(raw_content, str)
                 else ""
             )
-            tool_calls = _normalized_tool_calls(response_message)
+            tool_calls = _normalized_tool_calls(
+                response_message,
+                owner_username=normalized_owner,
+                secrets=redaction_secrets,
+            )
         except Exception:
             if tool_records:
                 fallback_answer = _fallback_answer(
                     selected_store,
                     relative_window,
                     tool_records,
+                    owner_username=normalized_owner,
+                    secrets=redaction_secrets,
                 )
                 persisted = _finalize_message(
                     owner_username=normalized_owner,
@@ -1491,35 +2011,14 @@ def stream_analysis(
                 )
                 yield {"type": "error", "message": answer}
                 return
-            sanitized_answer = _sanitize_text(
+            sanitized_answer, fallback = _ground_final_answer(
                 content,
+                selected_store,
+                relative_window,
+                tool_records,
                 owner_username=normalized_owner,
                 secrets=redaction_secrets,
-            ).strip()
-            if not sanitized_answer:
-                if tool_records:
-                    sanitized_answer = _fallback_answer(
-                        selected_store,
-                        relative_window,
-                        tool_records,
-                    )
-                    fallback = True
-                else:
-                    answer = "模型未返回可用的分析结果。"
-                    _finalize_message(
-                        owner_username=normalized_owner,
-                        conversation_id=conversation_id,
-                        message_id=message_id,
-                        answer=answer,
-                        model_name=model_name,
-                        selected_store_id=selected_store["id"],
-                        relative_window=relative_window,
-                        tool_records=tool_records,
-                    )
-                    yield {"type": "error", "message": answer}
-                    return
-            else:
-                fallback = False
+            )
             persisted = _finalize_message(
                 owner_username=normalized_owner,
                 conversation_id=conversation_id,
@@ -1537,11 +2036,12 @@ def stream_analysis(
 
         messages.append(
             _assistant_message_for_history(
-                _sanitize_text(
+                _safe_text(
                     content,
                     owner_username=normalized_owner,
                     secrets=redaction_secrets,
-                ),
+                )
+                or "",
                 tool_calls,
             )
         )
