@@ -31,7 +31,7 @@ The implementation now:
 - reuses the existing proxy convention via `crawler_request_proxies()`
 - paginates `searchOrder`
 - requests `getOrder` with `version = 7`
-- batches `getOrder` calls with a conservative RMS-safe cap of `100`
+- batches `getOrder` calls with the verified RMS-safe cap of `30`
 - normalizes package item output from `PackageModelList[*].ItemModelList[*]`
 - raises concise `RuntimeError` messages for credential rejection, rate limiting, malformed JSON, missing pagination, and network failure
 - avoids echoing credentials or remote response bodies in raised errors
@@ -222,3 +222,78 @@ Observed results:
 ### Remaining concern
 
 - This pass hardened the mocked HTTP contract and traceback-redaction behavior, but it still did not exercise a live Rakuten RMS response with real credentials.
+
+## Review Fix Pass 2
+
+Date: 2026-07-16
+
+### Findings fixed
+
+1. Moved `SortModelList` into `PaginationRequestModel`.
+   - The payload now uses the verified numeric codes:
+     - `sortColumn = 1`
+     - `sortDirection = 2`
+   - The top-level request body no longer carries `SortModelList`.
+
+2. Tightened the `totalPages = 0` rule.
+   - It is now accepted only on requested page `1` with no prior collected results.
+   - A later zero-page response is treated as malformed and raises instead of discarding already collected order numbers.
+
+3. Kept HTTP status precedence over body messages.
+   - `401` and `403` always map to credential failure first.
+   - `429` always maps to rate limiting first.
+   - `MessageModelList` inspection only applies after those status checks.
+
+4. Reworked fallback line fingerprints.
+   - The fallback fingerprint now excludes mutable `units` and status flags.
+   - It uses structured JSON serialization with sorted keys and stable list ordering.
+   - Fingerprint inputs now include:
+     - `itemId`
+     - `itemNumber`
+     - `manageNumber`
+     - canonical SKU JSON
+     - `price`
+     - `priceTaxIncl`
+     - `packagePosition`
+     - `linePosition`
+
+5. Tightened strict redaction semantics.
+   - Request and JSON parsing failures are now caught, the `except` scope is exited, and then a fresh sanitized `RuntimeError` is raised.
+   - The resulting exception now clears both:
+     - `__cause__`
+     - `__context__`
+   - Tests verify both object fields and formatted traceback output.
+
+### Additional test coverage
+
+This pass added focused assertions for:
+
+1. nested numeric `SortModelList` placement under `PaginationRequestModel`
+2. rejection of `totalPages = 0` after earlier successful page collection
+3. `401` status winning over a body-level rate-limit message
+4. `429` status winning over a body-level credential message
+5. canonical SKU JSON with sorted dict keys and stable list order
+6. fallback fingerprints staying unchanged when only `units` and status flags differ
+7. cleared `__context__` for sanitized request and JSON parse failures
+
+### Verification
+
+Commands executed:
+
+```powershell
+pytest tests/test_rakuten_order_service.py -v
+pytest -q
+python -m compileall app/services/rakuten_order_service.py tests/test_rakuten_order_service.py
+git diff --check -- app/services/rakuten_order_service.py tests/test_rakuten_order_service.py .superpowers/sdd/task-2-report.md
+```
+
+Observed results:
+
+- `pytest tests/test_rakuten_order_service.py -v` -> `17 passed in 0.89s`
+- `pytest -q` -> `245 passed, 2 warnings, 4 subtests passed in 10.21s`
+- compile check exited successfully
+- `git diff --check` exited `0`; only Git's existing LF-to-CRLF working-copy warnings were printed
+
+### Remaining concern
+
+- The stricter classification, canonicalization, and redaction paths were verified through focused mocks and full local regression only. No live RMS response was exercised in this pass.
