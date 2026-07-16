@@ -144,6 +144,27 @@ class RakutenOrderServiceTests(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
         self.assert_redacted_exception(exc_info.exception, "secret-123", "key-456")
 
+    def test_search_order_numbers_rejects_zero_total_pages_with_contradictory_nonempty_list(self) -> None:
+        response = json_response({
+            "orderNumberList": ["1001"],
+            "PaginationResponseModel": {
+                "totalPages": 0,
+                "requestPage": 0,
+            },
+        })
+
+        with patch.object(rakuten_order_service.requests.Session, "post", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "分页响应无效") as exc_info:
+                rakuten_order_service.search_order_numbers(
+                    "secret-123",
+                    "key-456",
+                    datetime(2026, 7, 1, 0, 0, 0),
+                    datetime(2026, 7, 2, 0, 0, 0),
+                    [100],
+                )
+
+        self.assert_redacted_exception(exc_info.exception, "secret-123", "key-456")
+
     def test_search_order_numbers_rejects_stale_response_page_without_looping(self) -> None:
         first_page = json_response({
             "orderNumberList": ["1001"],
@@ -268,7 +289,7 @@ class RakutenOrderServiceTests(unittest.TestCase):
         self.assertEqual(result[1]["packagePosition"], 1)
         self.assertEqual(result[1]["SkuModelList"], [])
 
-    def test_iter_order_items_emits_canonical_fingerprint_when_detail_id_missing(self) -> None:
+    def test_iter_order_items_emits_versioned_digest_fingerprint_when_detail_id_missing(self) -> None:
         order = {
             "orderNumber": "1001",
             "PackageModelList": [
@@ -316,11 +337,11 @@ class RakutenOrderServiceTests(unittest.TestCase):
                     "price": "900",
                     "priceTaxIncl": "990",
                 },
-                "lineFingerprint": '{"canonicalSku":"[{\\"variantId\\":\\"sku-z\\",\\"variantName\\":\\"Blue\\"}]","itemId":"item-id-2","itemNumber":"item-2","linePosition":1,"manageNumber":"manage-2","packagePosition":1,"price":"900","priceTaxIncl":"990"}',
+                "lineFingerprint": "v1:7454ed373337bc237f38bc2c4958d555540aeb8a4fa6850d76c2258217f5f4f0",
             }
         ])
 
-    def test_iter_order_items_fingerprint_ignores_units_and_status_flags(self) -> None:
+    def test_iter_order_items_fingerprint_is_bounded_and_stable_on_non_identity_changes(self) -> None:
         base_order = {
             "orderNumber": "1001",
             "PackageModelList": [
@@ -369,10 +390,84 @@ class RakutenOrderServiceTests(unittest.TestCase):
             base_item["lineFingerprintInputs"]["canonicalSku"],
             '[{"variantA":{"x":1,"y":2},"variantB":["2","1"]}]',
         )
+        self.assertRegex(base_item["lineFingerprint"], r"^v1:[0-9a-f]{64}$")
+        self.assertLessEqual(len(base_item["lineFingerprint"]), 255)
         self.assertEqual(base_item["lineFingerprint"], mutated_item["lineFingerprint"])
         self.assertNotIn("units", base_item["lineFingerprintInputs"])
         self.assertNotIn("deleteItemFlag", base_item["lineFingerprintInputs"])
         self.assertNotIn("restoreInventoryFlag", base_item["lineFingerprintInputs"])
+
+    def test_iter_order_items_fingerprint_changes_for_true_identity_change(self) -> None:
+        first_order = {
+            "orderNumber": "1001",
+            "PackageModelList": [
+                {
+                    "ItemModelList": [
+                        {
+                            "itemId": "item-id-2",
+                            "manageNumber": "manage-2",
+                            "itemNumber": "item-2",
+                            "SkuModelList": [{"variantId": "sku-z", "variantName": "Blue"}],
+                            "units": 3,
+                            "price": 900,
+                            "priceTaxIncl": 990,
+                        }
+                    ]
+                },
+            ],
+        }
+        second_order = {
+            "orderNumber": "1001",
+            "PackageModelList": [
+                {
+                    "ItemModelList": [
+                        {
+                            "itemId": "item-id-2",
+                            "manageNumber": "manage-CHANGED",
+                            "itemNumber": "item-2",
+                            "SkuModelList": [{"variantId": "sku-z", "variantName": "Blue"}],
+                            "units": 3,
+                            "price": 900,
+                            "priceTaxIncl": 990,
+                        }
+                    ]
+                },
+            ],
+        }
+
+        first_item = list(rakuten_order_service.iter_order_items(first_order))[0]
+        second_item = list(rakuten_order_service.iter_order_items(second_order))[0]
+
+        self.assertNotEqual(first_item["lineFingerprint"], second_item["lineFingerprint"])
+
+    def test_iter_order_items_fingerprint_stays_bounded_for_long_sku_payload(self) -> None:
+        long_value = "x" * 5000
+        order = {
+            "orderNumber": "1001",
+            "PackageModelList": [
+                {
+                    "ItemModelList": [
+                        {
+                            "itemId": "item-id-2",
+                            "manageNumber": "manage-2",
+                            "itemNumber": "item-2",
+                            "SkuModelList": [
+                                {"variantId": "sku-z", "variantName": long_value},
+                                {"variantId": "sku-y", "variantMeta": {"long": long_value}},
+                            ],
+                            "units": 3,
+                            "price": 900,
+                            "priceTaxIncl": 990,
+                        }
+                    ]
+                },
+            ],
+        }
+
+        item = list(rakuten_order_service.iter_order_items(order))[0]
+
+        self.assertLessEqual(len(item["lineFingerprint"]), 255)
+        self.assertRegex(item["lineFingerprint"], r"^v1:[0-9a-f]{64}$")
 
     def test_search_order_numbers_http_status_precedence_over_body_messages(self) -> None:
         response = json_response({

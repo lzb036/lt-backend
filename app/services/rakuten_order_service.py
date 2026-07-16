@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import json
 from typing import Any, Iterable, NoReturn
 
@@ -64,9 +65,10 @@ def search_order_numbers(
             if total_pages is None:
                 _raise_sanitized_runtime_error("乐天订单查询分页信息缺失。")
             if total_pages == 0:
-                if expected_page != 1 or order_numbers or response_page not in {0, 1, None}:
+                normalized_page_orders = _normalize_text_list(payload.get("orderNumberList"))
+                if expected_page != 1 or order_numbers or normalized_page_orders or response_page not in {0, 1, None}:
                     _raise_sanitized_runtime_error("乐天订单查询分页响应无效。")
-                return _normalize_text_list(payload.get("orderNumberList"))
+                return []
             if total_pages < expected_page or response_page != expected_page:
                 _raise_sanitized_runtime_error("乐天订单查询分页响应无效。")
 
@@ -159,7 +161,7 @@ def iter_order_items(order: dict[str, Any]) -> Iterable[dict[str, Any]]:
                     "priceTaxIncl": normalize_text(price_tax_incl),
                 }
                 normalized_item["lineFingerprintInputs"] = fingerprint_inputs
-                normalized_item["lineFingerprint"] = _canonical_json(fingerprint_inputs)
+                normalized_item["lineFingerprint"] = _versioned_digest(fingerprint_inputs)
             yield normalized_item
 
 
@@ -301,6 +303,12 @@ def _canonical_json(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _versioned_digest(value: Any) -> str:
+    canonical_text = _canonical_json(value)
+    digest = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
+    return f"v1:{digest}"
 
 
 def _raise_sanitized_runtime_error(message: str) -> NoReturn:

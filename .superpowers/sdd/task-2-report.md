@@ -297,3 +297,54 @@ Observed results:
 ### Remaining concern
 
 - The stricter classification, canonicalization, and redaction paths were verified through focused mocks and full local regression only. No live RMS response was exercised in this pass.
+
+## Review Fix Pass 3
+
+Date: 2026-07-16
+
+### Findings fixed
+
+1. Changed fallback `lineFingerprint` from raw canonical JSON text to a bounded versioned digest.
+   - The format is now `v1:<64hex>`.
+   - The digest is SHA-256 over the canonical immutable JSON inputs.
+   - `lineFingerprintInputs` remains present for diagnostics.
+
+2. Tightened the zero-page empty-result rule again.
+   - `totalPages = 0` is accepted only when:
+     - requested page is `1`
+     - there are no prior collected results
+     - normalized `orderNumberList` is empty
+   - A contradictory non-empty `orderNumberList` now raises a malformed pagination error.
+
+### Additional test coverage
+
+This pass added focused assertions for:
+
+1. `lineFingerprint` using the versioned digest format `v1:<64hex>`
+2. digest length staying at or below `255` even with very large SKU payloads
+3. digest stability across dict-key reordering and stable list ordering where semantics are unchanged
+4. digest changes when true identity fields change
+5. digest remains stable when only `units` or status flags change
+6. `totalPages = 0` plus a non-empty normalized `orderNumberList` raising a malformed pagination error
+
+### Verification
+
+Commands executed:
+
+```powershell
+pytest tests/test_rakuten_order_service.py -v
+pytest -q
+python -m compileall app/services/rakuten_order_service.py tests/test_rakuten_order_service.py
+git diff --check -- app/services/rakuten_order_service.py tests/test_rakuten_order_service.py .superpowers/sdd/task-2-report.md
+```
+
+Observed results:
+
+- `pytest tests/test_rakuten_order_service.py -v` -> `20 passed in 0.88s`
+- `pytest -q` -> `248 passed, 2 warnings, 4 subtests passed in 9.89s`
+- compile check exited successfully
+- `git diff --check` exited `0`; only Git's existing LF-to-CRLF working-copy warnings were printed
+
+### Remaining concern
+
+- The final digest and contradictory-empty-result handling were validated through focused mocks and full local regression only. No live RMS response was exercised in this pass.
