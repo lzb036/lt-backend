@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.secure_storage import decrypt_text
 from app.db.database import session_scope
@@ -21,6 +22,7 @@ from app.services.ai_title_service import (
     litellm_completion,
     resolved_model_name,
 )
+from app.services import sales_analysis_service
 from app.services.sales_analysis_service import (
     SALES_ANALYSIS_TOOLS,
     execute_sales_tool,
@@ -28,7 +30,16 @@ from app.services.sales_analysis_service import (
 
 
 MAX_TOOL_CALLS_PER_TURN = 4
-MAX_HISTORY_MESSAGES = 8
+MAX_PERSISTED_QUESTION_CHARS = 12_000
+MAX_PERSISTED_ANSWER_CHARS = 24_000
+MAX_MODEL_CURRENT_MESSAGE_CHARS = 4_000
+MAX_MODEL_HISTORY_CHARS = 12_000
+MAX_MODEL_HISTORY_ENTRY_CHARS = 2_000
+MAX_HISTORY_ROWS_SCAN = 50
+MAX_HISTORY_SOURCE_CHARS = 4_000
+MAX_MODEL_TOOL_RESULT_CHARS = 16_000
+MAX_MODEL_TOOL_RESULT_ROWS = 40
+TRUNCATION_MARKER = "…[已截断]"
 SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
 DEFAULT_CONVERSATION_TITLE = "新分析"
 EFFECTIVE_SALES_DEFINITION = (
@@ -47,12 +58,6 @@ DATE_SCOPED_TOOLS = set(STORE_SCOPED_TOOLS)
 ALLOWED_TOOL_NAMES = {
     tool["function"]["name"] for tool in SALES_ANALYSIS_TOOLS
 }
-TOOL_ARGUMENT_KEYS = {
-    tool["function"]["name"]: set(
-        tool["function"]["parameters"].get("properties", {})
-    )
-    for tool in SALES_ANALYSIS_TOOLS
-}
 TOOL_LABELS = {
     "list_owned_stores": "店铺列表",
     "get_store_sales_overview": "店铺销量概览",
@@ -64,31 +69,242 @@ TOOL_LABELS = {
     "get_sales_adjustment_summary": "销量调整汇总",
 }
 
-_FORBIDDEN_METADATA_KEY_PARTS = (
-    "apikey",
-    "apibaseurl",
-    "authorization",
-    "credential",
-    "customer",
-    "buyer",
-    "purchaser",
-    "recipient",
-    "contact",
-    "email",
-    "phone",
-    "address",
-    "password",
-    "secret",
-    "token",
-    "owner",
-    "raworder",
-    "rawpayload",
-    "ordernumber",
-    "licensekey",
-    "servicesecret",
-    "sql",
-    "query",
+MAX_STORE_ROWS = 500
+MAX_RANKING_ROWS = 100
+MAX_TREND_ROWS = 366
+MAX_COMPARISON_ROWS = 20
+MAX_COMPARISON_SERIES_ROWS = 7_500
+MAX_SKU_ROWS = 100
+MAX_SLOW_MOVING_ROWS = 100
+MAX_ADJUSTMENT_ROWS = 16
+
+
+def _schema_object(fields: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    return ("object", fields)
+
+
+def _schema_list(
+    item: Any,
+    max_items: int,
+) -> tuple[str, Any, int]:
+    return ("list", item, max_items)
+
+
+def _schema_text(
+    max_chars: int,
+    *,
+    sensitive: bool = False,
+    nullable: bool = False,
+) -> tuple[str, int, bool, bool]:
+    return ("text", max_chars, sensitive, nullable)
+
+
+INTEGER_SCHEMA = ("integer",)
+NUMBER_SCHEMA = ("number", False)
+NULLABLE_NUMBER_SCHEMA = ("number", True)
+BOOLEAN_SCHEMA = ("boolean",)
+STORE_SCHEMA = _schema_object(
+    {
+        "id": INTEGER_SCHEMA,
+        "name": _schema_text(255, sensitive=True),
+    }
 )
+RANGE_SCHEMA = _schema_object(
+    {
+        "start": _schema_text(10),
+        "end": _schema_text(10),
+    }
+)
+COMMON_RESULT_FIELDS = {
+    "store": STORE_SCHEMA,
+    "range": RANGE_SCHEMA,
+    "metric": _schema_text(64),
+    "dataUpdatedAt": _schema_text(40, nullable=True),
+    "unresolvedAdjustmentCount": INTEGER_SCHEMA,
+}
+SALES_TOTAL_FIELDS = {
+    "orderCount": INTEGER_SCHEMA,
+    "orderedUnits": INTEGER_SCHEMA,
+    "effectiveUnits": INTEGER_SCHEMA,
+    "grossSalesAmount": NUMBER_SCHEMA,
+    "effectiveSalesAmount": NUMBER_SCHEMA,
+    "canceledUnits": INTEGER_SCHEMA,
+    "refundedUnits": INTEGER_SCHEMA,
+    "returnedUnits": INTEGER_SCHEMA,
+}
+RANKING_ROW_SCHEMA = _schema_object(
+    {
+        "manageNumber": _schema_text(255, sensitive=True),
+        "itemNumber": _schema_text(255, sensitive=True),
+        "itemName": _schema_text(500, sensitive=True),
+        "skuKey": _schema_text(255, sensitive=True),
+        "orderCount": INTEGER_SCHEMA,
+        "orderedUnits": INTEGER_SCHEMA,
+        "effectiveUnits": INTEGER_SCHEMA,
+        "grossSalesAmount": NUMBER_SCHEMA,
+        "effectiveSalesAmount": NUMBER_SCHEMA,
+        "metricValue": NUMBER_SCHEMA,
+    }
+)
+TREND_ROW_SCHEMA = _schema_object(
+    {
+        "period": _schema_text(10),
+        "orderedUnits": INTEGER_SCHEMA,
+        "effectiveUnits": INTEGER_SCHEMA,
+        "effectiveSalesAmount": NUMBER_SCHEMA,
+    }
+)
+COMPARISON_SUMMARY_ROW_SCHEMA = _schema_object(
+    {
+        "manageNumber": _schema_text(255, sensitive=True),
+        "itemName": _schema_text(500, sensitive=True),
+        "orderedUnits": INTEGER_SCHEMA,
+        "effectiveUnits": INTEGER_SCHEMA,
+        "effectiveSalesAmount": NUMBER_SCHEMA,
+        "adjustmentRate": NUMBER_SCHEMA,
+    }
+)
+COMPARISON_SERIES_ROW_SCHEMA = _schema_object(
+    {
+        "manageNumber": _schema_text(255, sensitive=True),
+        **TREND_ROW_SCHEMA[1],
+    }
+)
+TOOL_RESULT_SCHEMAS = {
+    "list_owned_stores": _schema_object(
+        {
+            "dataUpdatedAt": _schema_text(40, nullable=True),
+            "rows": _schema_list(
+                _schema_object(
+                    {
+                        "id": INTEGER_SCHEMA,
+                        "name": _schema_text(255, sensitive=True),
+                        "code": _schema_text(120, sensitive=True),
+                        "enabled": BOOLEAN_SCHEMA,
+                    }
+                ),
+                MAX_STORE_ROWS,
+            ),
+        }
+    ),
+    "get_store_sales_overview": _schema_object(
+        {
+            **COMMON_RESULT_FIELDS,
+            "rows": _schema_list(
+                _schema_object(SALES_TOTAL_FIELDS),
+                1,
+            ),
+            "comparison": _schema_object(
+                {
+                    "range": RANGE_SCHEMA,
+                    **SALES_TOTAL_FIELDS,
+                    "changes": _schema_object(
+                        {
+                            "orderCount": NULLABLE_NUMBER_SCHEMA,
+                            "effectiveUnits": NULLABLE_NUMBER_SCHEMA,
+                            "effectiveSalesAmount": NULLABLE_NUMBER_SCHEMA,
+                        }
+                    ),
+                }
+            ),
+        }
+    ),
+    "get_product_sales_ranking": _schema_object(
+        {
+            **COMMON_RESULT_FIELDS,
+            "rows": _schema_list(
+                RANKING_ROW_SCHEMA,
+                MAX_RANKING_ROWS,
+            ),
+        }
+    ),
+    "get_product_sales_trend": _schema_object(
+        {
+            **COMMON_RESULT_FIELDS,
+            "manageNumber": _schema_text(255, sensitive=True),
+            "grain": _schema_text(16),
+            "rows": _schema_list(TREND_ROW_SCHEMA, MAX_TREND_ROWS),
+        }
+    ),
+    "compare_product_sales": _schema_object(
+        {
+            **COMMON_RESULT_FIELDS,
+            "grain": _schema_text(16),
+            "rows": _schema_list(
+                COMPARISON_SUMMARY_ROW_SCHEMA,
+                MAX_COMPARISON_ROWS,
+            ),
+            "series": _schema_list(
+                COMPARISON_SERIES_ROW_SCHEMA,
+                MAX_COMPARISON_SERIES_ROWS,
+            ),
+        }
+    ),
+    "get_sku_sales_breakdown": _schema_object(
+        {
+            **COMMON_RESULT_FIELDS,
+            "manageNumber": _schema_text(255, sensitive=True),
+            "rows": _schema_list(
+                _schema_object(
+                    {
+                        "skuKey": _schema_text(255, sensitive=True),
+                        "itemName": _schema_text(500, sensitive=True),
+                        "orderedUnits": INTEGER_SCHEMA,
+                        "effectiveUnits": INTEGER_SCHEMA,
+                        "effectiveSalesAmount": NUMBER_SCHEMA,
+                        "unitShare": NUMBER_SCHEMA,
+                        "salesShare": NUMBER_SCHEMA,
+                    }
+                ),
+                MAX_SKU_ROWS,
+            ),
+        }
+    ),
+    "get_slow_moving_products": _schema_object(
+        {
+            **COMMON_RESULT_FIELDS,
+            "threshold": _schema_object(
+                {
+                    "minListedDays": INTEGER_SCHEMA,
+                    "maxEffectiveUnits": INTEGER_SCHEMA,
+                }
+            ),
+            "rows": _schema_list(
+                _schema_object(
+                    {
+                        "manageNumber": _schema_text(
+                            255,
+                            sensitive=True,
+                        ),
+                        "itemName": _schema_text(500, sensitive=True),
+                        "listedAt": _schema_text(10),
+                        "listedDays": INTEGER_SCHEMA,
+                        "effectiveUnits": INTEGER_SCHEMA,
+                        "effectiveSalesAmount": NUMBER_SCHEMA,
+                    }
+                ),
+                MAX_SLOW_MOVING_ROWS,
+            ),
+        }
+    ),
+    "get_sales_adjustment_summary": _schema_object(
+        {
+            **COMMON_RESULT_FIELDS,
+            "rows": _schema_list(
+                _schema_object(
+                    {
+                        "adjustmentType": _schema_text(64),
+                        "status": _schema_text(64),
+                        "adjustmentCount": INTEGER_SCHEMA,
+                        "units": INTEGER_SCHEMA,
+                        "amount": NUMBER_SCHEMA,
+                    }
+                ),
+                MAX_ADJUSTMENT_ROWS,
+            ),
+        }
+    ),
+}
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(?:"
     r"owner(?:_?username|_?name)?|"
@@ -158,6 +374,15 @@ def _json_dump(value: Any) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _truncate_text(value: Any, max_chars: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= len(TRUNCATION_MARKER):
+        return TRUNCATION_MARKER[:max_chars]
+    return text[: max_chars - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
 
 
 def _timestamp_to_public(value: datetime | None) -> str | None:
@@ -290,6 +515,9 @@ def _select_store(
     stored_scope: list[Any],
 ) -> StoreModel | None:
     stores_by_id = {store.id: store for store in stores}
+    explicit = _explicit_store_matches(message, stores)
+    if len(explicit) == 1:
+        return explicit[0]
     scoped = [
         stores_by_id[store_id]
         for store_id in stored_scope
@@ -297,9 +525,6 @@ def _select_store(
     ]
     if len(scoped) == 1:
         return scoped[0]
-    explicit = _explicit_store_matches(message, stores)
-    if len(explicit) == 1:
-        return explicit[0]
     if len(stores) == 1:
         return stores[0]
     return None
@@ -320,15 +545,26 @@ def _start_turn(
         )
         if conversation is None:
             raise LookupError("会话不存在或无权访问。")
-        history_rows = session.scalars(
-            select(SalesAnalysisMessageModel)
+        history_rows = session.execute(
+            select(
+                func.substr(
+                    SalesAnalysisMessageModel.question_text,
+                    1,
+                    MAX_HISTORY_SOURCE_CHARS,
+                ).label("question_text"),
+                func.substr(
+                    SalesAnalysisMessageModel.answer_text,
+                    1,
+                    MAX_HISTORY_SOURCE_CHARS,
+                ).label("answer_text"),
+            )
             .where(
                 SalesAnalysisMessageModel.conversation_id
                 == conversation_id,
                 SalesAnalysisMessageModel.owner_username == owner_username,
             )
             .order_by(SalesAnalysisMessageModel.id.desc())
-            .limit(MAX_HISTORY_MESSAGES)
+            .limit(MAX_HISTORY_ROWS_SCAN)
         ).all()
         stores = _owned_stores(session, owner_username)
         account = session.scalar(
@@ -470,6 +706,29 @@ def _sanitize_text(
     owner_username: str,
     secrets: tuple[str, ...] = (),
 ) -> str:
+    text = _sanitize_non_phone_sensitive_text(
+        value,
+        owner_username=owner_username,
+        secrets=secrets,
+    )
+    return _PHONE_CANDIDATE_RE.sub(
+        lambda match: (
+            "[敏感信息已省略]"
+            if 10
+            <= sum(character.isdigit() for character in match.group())
+            <= 15
+            else match.group()
+        ),
+        text,
+    )
+
+
+def _sanitize_non_phone_sensitive_text(
+    value: Any,
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...] = (),
+) -> str:
     text = str(value or "")
     for secret in (owner_username, *secrets):
         if secret:
@@ -482,68 +741,128 @@ def _sanitize_text(
     text = _RAW_ORDER_SEGMENT_RE.sub("[完整订单已省略]", text)
     text = _RAW_ORDER_MARKER_RE.sub("[完整订单已省略]", text)
     text = _EMAIL_RE.sub("[敏感信息已省略]", text)
-    text = _PHONE_CANDIDATE_RE.sub(
-        lambda match: (
-            "[敏感信息已省略]"
-            if 10 <= sum(character.isdigit() for character in match.group()) <= 15
-            else match.group()
-        ),
-        text,
-    )
     text = _DATABASE_STATEMENT_RE.sub("[数据库语句已省略]", text)
     return text
 
 
-def _normalized_metadata_key(key: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(key or "").casefold())
+_DROP_SCHEMA_VALUE = object()
 
 
-def _metadata_key_is_allowed(key: Any) -> bool:
-    normalized = _normalized_metadata_key(key)
-    return not any(
-        forbidden in normalized
-        for forbidden in _FORBIDDEN_METADATA_KEY_PARTS
-    )
-
-
-def _sanitize_result_value(
+def _sanitize_schema_value(
     value: Any,
+    schema: Any,
     *,
     owner_username: str,
     secrets: tuple[str, ...],
 ) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): _sanitize_result_value(
-                item,
+    kind = schema[0]
+    if kind == "object":
+        if not isinstance(value, dict):
+            return _DROP_SCHEMA_VALUE
+        sanitized: dict[str, Any] = {}
+        for key, child_schema in schema[1].items():
+            if key not in value:
+                continue
+            child_value = _sanitize_schema_value(
+                value[key],
+                child_schema,
                 owner_username=owner_username,
                 secrets=secrets,
             )
-            for key, item in value.items()
-            if _metadata_key_is_allowed(key)
-        }
-    if isinstance(value, list):
-        return [
-            _sanitize_result_value(
+            if child_value is not _DROP_SCHEMA_VALUE:
+                sanitized[key] = child_value
+        return sanitized
+    if kind == "list":
+        if not isinstance(value, list):
+            return _DROP_SCHEMA_VALUE
+        sanitized_items: list[Any] = []
+        for item in value[: schema[2]]:
+            sanitized_item = _sanitize_schema_value(
                 item,
+                schema[1],
                 owner_username=owner_username,
                 secrets=secrets,
             )
-            for item in value
-        ]
-    if isinstance(value, str):
-        return _sanitize_text(
-            value,
-            owner_username=owner_username,
-            secrets=secrets,
+            if sanitized_item is not _DROP_SCHEMA_VALUE:
+                sanitized_items.append(sanitized_item)
+        return sanitized_items
+    if kind == "text":
+        max_chars, sensitive, nullable = schema[1:]
+        if value is None and nullable:
+            return None
+        if not isinstance(value, str):
+            return _DROP_SCHEMA_VALUE
+        text = (
+            _sanitize_non_phone_sensitive_text(
+                value,
+                owner_username=owner_username,
+                secrets=secrets,
+            )
+            if sensitive
+            else value
         )
-    if value is None or isinstance(value, (bool, int, float)):
+        return text[:max_chars]
+    if kind == "integer":
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return _DROP_SCHEMA_VALUE
+    if kind == "number":
+        if value is None and schema[1]:
+            return None
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ):
+            return value
+        return _DROP_SCHEMA_VALUE
+    if kind == "boolean" and isinstance(value, bool):
         return value
-    return _sanitize_text(
+    return _DROP_SCHEMA_VALUE
+
+
+def _sanitize_tool_result(
+    tool_name: str,
+    value: Any,
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
+) -> dict[str, Any]:
+    schema = TOOL_RESULT_SCHEMAS[tool_name]
+    sanitized = _sanitize_schema_value(
         value,
+        schema,
         owner_username=owner_username,
         secrets=secrets,
     )
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def _bounded_tool_result_for_model(
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    bounded = json.loads(_json_dump(result))
+    for key in ("rows", "series"):
+        value = bounded.get(key)
+        if isinstance(value, list):
+            bounded[key] = value[:MAX_MODEL_TOOL_RESULT_ROWS]
+    while len(_json_dump(bounded)) > MAX_MODEL_TOOL_RESULT_CHARS:
+        candidates = [
+            (key, bounded[key])
+            for key in ("series", "rows")
+            if isinstance(bounded.get(key), list) and bounded[key]
+        ]
+        if not candidates:
+            break
+        _, longest = max(
+            candidates,
+            key=lambda item: (
+                len(item[1]),
+                1 if item[0] == "series" else 0,
+            ),
+        )
+        longest.pop()
+    return bounded
 
 
 def _tool_call_field(value: Any, field: str, default: Any = None) -> Any:
@@ -622,22 +941,27 @@ def _prepare_tool_arguments(
     owner_username: str,
     secrets: tuple[str, ...],
 ) -> dict[str, Any]:
-    allowed_keys = TOOL_ARGUMENT_KEYS.get(tool_name, set())
-    if set(raw_arguments) - allowed_keys:
-        raise ValueError("分析工具参数超出允许范围。")
     arguments = copy_json_value(raw_arguments)
-    if not _tool_argument_value_is_safe(
-        arguments,
-        owner_username=owner_username,
-        secrets=secrets,
-    ):
-        raise ValueError("分析工具参数包含敏感内容。")
     if tool_name in STORE_SCOPED_TOOLS:
         arguments["storeId"] = selected_store_id
     if tool_name in DATE_SCOPED_TOOLS and relative_window is not None:
         arguments["startDate"] = relative_window["start"]
         arguments["endDate"] = relative_window["end"]
-    return arguments
+    argument_model = sales_analysis_service._TOOL_MODELS[tool_name]
+    validated = argument_model.model_validate(arguments)
+    validated_arguments = validated.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude_unset=True,
+    )
+    if not _tool_argument_value_is_safe(
+        validated_arguments,
+        owner_username=owner_username,
+        secrets=secrets,
+    ):
+        raise ValueError("分析工具参数包含敏感内容。")
+    return validated_arguments
 
 
 def copy_json_value(value: Any) -> Any:
@@ -652,13 +976,12 @@ def _tool_argument_value_is_safe(
 ) -> bool:
     if isinstance(value, dict):
         return all(
-            _metadata_key_is_allowed(key)
-            and _tool_argument_value_is_safe(
+            _tool_argument_value_is_safe(
                 item,
                 owner_username=owner_username,
                 secrets=secrets,
             )
-            for key, item in value.items()
+            for item in value.values()
         )
     if isinstance(value, list):
         return all(
@@ -671,7 +994,7 @@ def _tool_argument_value_is_safe(
         )
     if isinstance(value, str):
         return (
-            _sanitize_text(
+            _sanitize_non_phone_sensitive_text(
                 value,
                 owner_username=owner_username,
                 secrets=secrets,
@@ -699,12 +1022,12 @@ def _statistics_window(
     return dict(relative_window or {})
 
 
-def _finalize_message(
+def _persist_message_state(
     *,
     owner_username: str,
     conversation_id: int,
     message_id: int,
-    answer: str,
+    answer: str | None,
     model_name: str,
     selected_store_id: int | None,
     relative_window: dict[str, str] | None,
@@ -730,7 +1053,11 @@ def _finalize_message(
         if row is None or conversation is None:
             raise LookupError("会话消息不存在或无权访问。")
         tool_names = [record["toolName"] for record in tool_records]
-        row.answer_text = answer
+        if answer is not None:
+            row.answer_text = _truncate_text(
+                answer,
+                MAX_PERSISTED_ANSWER_CHARS,
+            )
         row.tool_name = ",".join(tool_names)[:128]
         row.tool_arguments_json = _json_dump(
             [
@@ -764,6 +1091,53 @@ def _finalize_message(
         return _message_to_public(row, fallback=fallback)
 
 
+def _persist_tool_audit(
+    *,
+    owner_username: str,
+    conversation_id: int,
+    message_id: int,
+    model_name: str,
+    selected_store_id: int,
+    relative_window: dict[str, str] | None,
+    tool_records: list[dict[str, Any]],
+) -> None:
+    _persist_message_state(
+        owner_username=owner_username,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        answer=None,
+        model_name=model_name,
+        selected_store_id=selected_store_id,
+        relative_window=relative_window,
+        tool_records=tool_records,
+    )
+
+
+def _finalize_message(
+    *,
+    owner_username: str,
+    conversation_id: int,
+    message_id: int,
+    answer: str,
+    model_name: str,
+    selected_store_id: int | None,
+    relative_window: dict[str, str] | None,
+    tool_records: list[dict[str, Any]],
+    fallback: bool = False,
+) -> dict[str, Any]:
+    return _persist_message_state(
+        owner_username=owner_username,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        answer=answer,
+        model_name=model_name,
+        selected_store_id=selected_store_id,
+        relative_window=relative_window,
+        tool_records=tool_records,
+        fallback=fallback,
+    )
+
+
 def _clarification_answer(stores: list[dict[str, Any]]) -> str:
     if not stores:
         return "当前没有可用于销量分析的店铺。"
@@ -795,6 +1169,52 @@ def _system_prompt(
     )
 
 
+def _bounded_history_model_messages(
+    history: list[dict[str, str]],
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
+) -> list[dict[str, str]]:
+    turns: list[list[dict[str, str]]] = []
+    for previous in history:
+        question = _truncate_text(
+            _sanitize_text(
+                previous.get("question", ""),
+                owner_username=owner_username,
+                secrets=secrets,
+            ),
+            MAX_MODEL_HISTORY_ENTRY_CHARS,
+        )
+        answer = _truncate_text(
+            _sanitize_text(
+                previous.get("answer", ""),
+                owner_username=owner_username,
+                secrets=secrets,
+            ),
+            MAX_MODEL_HISTORY_ENTRY_CHARS,
+        )
+        turn: list[dict[str, str]] = []
+        if question:
+            turn.append({"role": "user", "content": question})
+        if answer:
+            turn.append({"role": "assistant", "content": answer})
+        if turn:
+            turns.append(turn)
+
+    remaining = MAX_MODEL_HISTORY_CHARS
+    selected_reversed: list[list[dict[str, str]]] = []
+    for turn in reversed(turns):
+        turn_chars = sum(len(message["content"]) for message in turn)
+        if turn_chars > remaining:
+            continue
+        selected_reversed.append(turn)
+        remaining -= turn_chars
+    selected: list[dict[str, str]] = []
+    for turn in reversed(selected_reversed):
+        selected.extend(turn)
+    return selected
+
+
 def _model_messages(
     *,
     owner_username: str,
@@ -823,33 +1243,24 @@ def _model_messages(
             "content": _system_prompt(sanitized_store, relative_window),
         }
     ]
-    for previous in history:
-        sanitized_question = _sanitize_text(
-            previous.get("question", ""),
+    messages.extend(
+        _bounded_history_model_messages(
+            history,
             owner_username=owner_username,
             secrets=secrets,
         )
-        sanitized_answer = _sanitize_text(
-            previous.get("answer", ""),
-            owner_username=owner_username,
-            secrets=secrets,
-        )
-        if sanitized_question:
-            messages.append(
-                {"role": "user", "content": sanitized_question}
-            )
-        if sanitized_answer:
-            messages.append(
-                {"role": "assistant", "content": sanitized_answer}
-            )
+    )
     expanded_question = _expand_relative_dates(question, relative_window)
     messages.append(
         {
             "role": "user",
-            "content": _sanitize_text(
-                expanded_question,
-                owner_username=owner_username,
-                secrets=secrets,
+            "content": _truncate_text(
+                _sanitize_text(
+                    expanded_question,
+                    owner_username=owner_username,
+                    secrets=secrets,
+                ),
+                MAX_MODEL_CURRENT_MESSAGE_CHARS,
             ),
         }
     )
@@ -929,14 +1340,18 @@ def stream_analysis(
         raise ValueError("用户不能为空。")
     if not normalized_message:
         raise ValueError("分析问题不能为空。")
+    persisted_message = _truncate_text(
+        normalized_message,
+        MAX_PERSISTED_QUESTION_CHARS,
+    )
     turn = _start_turn(
         normalized_owner,
         int(conversation_id),
-        normalized_message,
+        persisted_message,
     )
     message_id = int(turn["messageId"])
     selected_store = turn["selectedStore"]
-    relative_window = _relative_date_window(normalized_message)
+    relative_window = _relative_date_window(persisted_message)
     tool_records: list[dict[str, Any]] = []
     model_name = ""
     yield {"type": "status", "message": "正在准备销量分析。"}
@@ -953,7 +1368,7 @@ def stream_analysis(
             relative_window=relative_window,
             tool_records=tool_records,
         )
-        yield {"type": "delta", "content": answer}
+        yield {"type": "delta", "content": persisted["answer"]}
         yield {"type": "completed", "message": persisted}
         return
 
@@ -990,7 +1405,7 @@ def stream_analysis(
             if value
         ),
         selected_store=selected_store,
-        question=normalized_message,
+        question=persisted_message,
         history=turn["history"],
         relative_window=relative_window,
     )
@@ -1039,7 +1454,10 @@ def stream_analysis(
                     tool_records=tool_records,
                     fallback=True,
                 )
-                yield {"type": "delta", "content": fallback_answer}
+                yield {
+                    "type": "delta",
+                    "content": persisted["answer"],
+                }
                 yield {"type": "completed", "message": persisted}
                 return
             answer = "AI 分析失败，请稍后重试。"
@@ -1057,6 +1475,22 @@ def stream_analysis(
             return
 
         if not tool_calls:
+            if not tool_records:
+                answer = (
+                    "模型未调用销量分析工具，无法生成可信的销量结论。"
+                )
+                _finalize_message(
+                    owner_username=normalized_owner,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    answer=answer,
+                    model_name=model_name,
+                    selected_store_id=selected_store["id"],
+                    relative_window=relative_window,
+                    tool_records=tool_records,
+                )
+                yield {"type": "error", "message": answer}
+                return
             sanitized_answer = _sanitize_text(
                 content,
                 owner_username=normalized_owner,
@@ -1097,7 +1531,7 @@ def stream_analysis(
                 tool_records=tool_records,
                 fallback=fallback,
             )
-            yield {"type": "delta", "content": sanitized_answer}
+            yield {"type": "delta", "content": persisted["answer"]}
             yield {"type": "completed", "message": persisted}
             return
 
@@ -1194,19 +1628,27 @@ def stream_analysis(
                 )
                 yield {"type": "error", "message": answer}
                 return
-            sanitized_result = _sanitize_result_value(
+            sanitized_result = _sanitize_tool_result(
+                tool_name,
                 raw_result,
                 owner_username=normalized_owner,
                 secrets=redaction_secrets,
             )
-            if not isinstance(sanitized_result, dict):
-                sanitized_result = {}
             record = {
                 "toolName": tool_name,
                 "arguments": arguments,
                 "result": sanitized_result,
             }
             tool_records.append(record)
+            _persist_tool_audit(
+                owner_username=normalized_owner,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                model_name=model_name,
+                selected_store_id=selected_store["id"],
+                relative_window=relative_window,
+                tool_records=tool_records,
+            )
             yield {
                 "type": "tool_result",
                 "toolName": tool_name,
@@ -1218,6 +1660,10 @@ def stream_analysis(
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "name": tool_name,
-                    "content": _json_dump(sanitized_result),
+                    "content": _json_dump(
+                        _bounded_tool_result_for_model(
+                            sanitized_result
+                        )
+                    ),
                 }
             )
