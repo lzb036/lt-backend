@@ -183,3 +183,123 @@ tests/test_sales_models.py::test_ensure_table_layout_adds_safe_defaulted_columns
 ```text
 Compiling 'tests/test_sales_models.py'...
 ```
+
+## Review Fix Pass 2
+
+Date: 2026-07-16
+
+### Findings fixed
+
+1. Added `uq_lt_store_id_owner` and composite store/owner foreign keys for:
+   - `lt_sales_orders`
+   - `lt_product_sales_daily`
+   - `lt_sales_sync_states`
+2. Preserved the existing child composite tenant foreign keys and added SQLite tests proving all root and child cross-owner writes fail.
+3. Replaced compatibility-path silent skips with concise `RuntimeError` failures for:
+   - primary-key mismatch
+   - required columns without a safely addable server default
+   - required-column `NULL` data
+   - duplicate unique-key data
+   - conflicting foreign-key data
+   - constraints that cannot be installed
+4. Added structural inspection and installation for named `UniqueConstraint` and `ForeignKeyConstraint` definitions.
+5. Made MySQL `LONGTEXT` normalization validate, backfill, revalidate, and only then apply `NOT NULL`.
+6. Removed database-level defaults from `LONGTEXT` columns so generated MySQL DDL is `LONGTEXT NOT NULL` without a version-sensitive text default.
+7. Added explicit `return_refund_units` normalization at `SalesOrderItemModel.from_service_payload(...)`.
+   - ordered `5`, refund `2`, return `2`, overlap `2` persists refund `0`, return `2`, effective `3`
+   - ordered `5`, independent refund `2` and return `2`, overlap `0` keeps total deductions `4`, effective `1`
+8. Preserved deduction overflow rejection, unresolved-refund behavior, and child tenant constraints.
+
+### Red evidence
+
+Command:
+
+```powershell
+pytest tests/test_sales_models.py -v
+```
+
+Result before implementation:
+
+```text
+11 failed, 11 passed in 0.87s
+```
+
+The failures covered the missing return-refund input, root-table cross-owner writes, silent compatibility skips, missing composite MySQL DDL, and missing `LONGTEXT` normalization.
+
+Command:
+
+```powershell
+pytest tests/test_sales_models.py::test_mysql_longtext_column_ddl_does_not_require_a_server_default -v
+```
+
+Result before removing the `LONGTEXT` server default:
+
+```text
+1 failed in 0.66s
+```
+
+### Final verification
+
+Command:
+
+```powershell
+pytest tests/test_sales_models.py -v
+```
+
+Result:
+
+```text
+27 passed in 0.74s
+```
+
+Command:
+
+```powershell
+python -m compileall app/db/models.py app/db/database.py tests/test_sales_models.py
+```
+
+Result:
+
+```text
+Compiling 'tests/test_sales_models.py'...
+```
+
+Exit code: `0`
+
+Command:
+
+```powershell
+git diff --check
+```
+
+Result: exit code `0`; only Git's existing LF-to-CRLF working-copy warnings were printed.
+
+Command:
+
+```powershell
+pytest -q
+```
+
+Result:
+
+```text
+214 passed, 2 warnings, 4 subtests passed in 7.86s
+```
+
+The two warnings are the existing FastAPI `on_event` deprecation warnings from `app/main.py`.
+
+### MySQL generated DDL check
+
+Generated definitions:
+
+```text
+ALTER TABLE lt_stores ADD CONSTRAINT uq_lt_store_id_owner UNIQUE (id, owner_username)
+ALTER TABLE lt_sales_orders ADD CONSTRAINT fk_lt_sales_order_store_owner FOREIGN KEY(store_id, owner_username) REFERENCES lt_stores (id, owner_username) ON DELETE CASCADE
+ALTER TABLE lt_product_sales_daily ADD CONSTRAINT fk_lt_product_sales_daily_store_owner FOREIGN KEY(store_id, owner_username) REFERENCES lt_stores (id, owner_username) ON DELETE CASCADE
+ALTER TABLE lt_sales_sync_states ADD CONSTRAINT fk_lt_sales_sync_state_store_owner FOREIGN KEY(store_id, owner_username) REFERENCES lt_stores (id, owner_username) ON DELETE CASCADE
+raw_order_json LONGTEXT NOT NULL
+```
+
+### Remaining concern
+
+The compatibility DDL was tested through SQLite controlled-failure paths and SQLAlchemy's MySQL DDL generation. It was not executed against a live MySQL schema in this task.

@@ -4,10 +4,25 @@ from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import event
-from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import (
+    Column,
+    ForeignKeyConstraint,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    event,
+    inspect,
+    select,
+    text,
+)
+from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.schema import CreateColumn
 
 import app.db.models  # noqa: F401
 import app.db.database as database_module
@@ -19,6 +34,7 @@ from app.db.models import (
     SalesItemAdjustmentModel,
     SalesOrderItemModel,
     SalesOrderModel,
+    SalesSyncStateModel,
     StoreModel,
     UserAccountModel,
 )
@@ -157,6 +173,15 @@ def test_sales_tables_are_created(sqlite_engine):
         "lt_sales_analysis_conversations",
         "lt_sales_analysis_messages",
     } <= names
+
+
+def test_store_exposes_composite_identity_for_tenant_foreign_keys(sqlite_engine):
+    constraints = {
+        constraint["name"]: tuple(constraint["column_names"])
+        for constraint in inspect(sqlite_engine).get_unique_constraints("lt_stores")
+    }
+
+    assert constraints["uq_lt_store_id_owner"] == ("id", "owner_username")
 
 
 def test_sales_order_enforces_store_and_order_number_uniqueness(sqlite_engine):
@@ -386,6 +411,132 @@ def test_sales_order_item_service_constructor_does_not_reduce_effective_units_fo
     assert persisted.effective_amount == Decimal("500")
 
 
+def test_sales_order_item_service_constructor_deducts_return_refund_once():
+    common_payload = {
+        "owner_username": "alice",
+        "store_id": 1,
+        "sales_order_id": 1,
+        "order_number": "1003",
+        "unit_price": Decimal("100.00"),
+        "ordered_units": 5,
+        "latest_units": 5,
+        "canceled_units": 0,
+        "refunded_units": 2,
+        "returned_units": 2,
+        "ordered_at": datetime(2026, 7, 16, 11, 30, 0),
+    }
+
+    same_return_refund = SalesOrderItemModel.from_service_payload(
+        **common_payload,
+        item_detail_id="detail-return-refund",
+        return_refund_units=2,
+    )
+    independent_refund_and_return = SalesOrderItemModel.from_service_payload(
+        **common_payload,
+        item_detail_id="detail-independent",
+        return_refund_units=0,
+    )
+
+    assert same_return_refund.refunded_units == 0
+    assert same_return_refund.returned_units == 2
+    assert same_return_refund.effective_units == 3
+    assert independent_refund_and_return.refunded_units == 2
+    assert independent_refund_and_return.returned_units == 2
+    assert independent_refund_and_return.effective_units == 1
+
+
+def test_sales_order_rejects_cross_owner_store_reference(sqlite_engine):
+    with Session(sqlite_engine, future=True) as session:
+        alice_store, _ = seed_owner_store_and_order(session)
+        session.add(
+            UserAccountModel(
+                username="bob",
+                display_name="Bob",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        session.flush()
+
+        session.add(
+            SalesOrderModel(
+                owner_username="bob",
+                store_id=alice_store.id,
+                order_number="cross-owner-order",
+                order_progress="100",
+                order_status="sent",
+                ordered_at=datetime(2026, 7, 16, 12, 0, 0),
+                total_amount=Decimal("100.00"),
+                currency="JPY",
+                raw_order_json="{}",
+                last_synced_at=datetime(2026, 7, 16, 12, 1, 0),
+            )
+        )
+
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_product_sales_daily_rejects_cross_owner_store_reference(sqlite_engine):
+    with Session(sqlite_engine, future=True) as session:
+        alice_store, _ = seed_owner_store_and_order(session)
+        session.add(
+            UserAccountModel(
+                username="bob",
+                display_name="Bob",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        session.flush()
+
+        session.add(
+            ProductSalesDailyModel(
+                owner_username="bob",
+                store_id=alice_store.id,
+                sales_date=date(2026, 7, 16),
+                manage_number="MN-CROSS",
+                item_number="ITEM-CROSS",
+                sku_key="default",
+                item_name_snapshot="Cross Owner Daily",
+                order_count=1,
+                ordered_units=1,
+                effective_units=1,
+                gross_sales_amount=Decimal("100.00"),
+                effective_sales_amount=Decimal("100.00"),
+            )
+        )
+
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_sales_sync_state_rejects_cross_owner_store_reference(sqlite_engine):
+    with Session(sqlite_engine, future=True) as session:
+        alice_store, _ = seed_owner_store_and_order(session)
+        session.add(
+            UserAccountModel(
+                username="bob",
+                display_name="Bob",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        session.flush()
+
+        session.add(
+            SalesSyncStateModel(
+                owner_username="bob",
+                store_id=alice_store.id,
+                initial_sync_completed=False,
+                sync_status="idle",
+            )
+        )
+
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
 def test_sales_order_item_rejects_cross_owner_or_store_order_reference(sqlite_engine):
     with Session(sqlite_engine, future=True) as session:
         alice_store, alice_order, _ = seed_owner_store_order_item(session)
@@ -517,7 +668,7 @@ def test_sales_analysis_message_rejects_cross_owner_conversation_reference(sqlit
             session.commit()
 
 
-def test_ensure_table_layout_skips_unsafe_non_null_foreign_key_columns_for_partial_populated_table(sqlite_engine):
+def test_ensure_table_layout_fails_for_required_no_default_column(sqlite_engine):
     partial_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     try:
         with partial_engine.begin() as connection:
@@ -541,43 +692,36 @@ def test_ensure_table_layout_skips_unsafe_non_null_foreign_key_columns_for_parti
                 )
             )
 
-            result = database_module._ensure_table_layout(
-                connection,
-                SalesAnalysisMessageModel.__table__,
-            )
-            second_result = database_module._ensure_table_layout(
-                connection,
-                SalesAnalysisMessageModel.__table__,
-            )
-
-        columns = {column["name"] for column in inspect(partial_engine).get_columns("lt_sales_analysis_messages")}
-        with partial_engine.connect() as connection:
-            rows = list(connection.execute(text("SELECT id, owner_username, question_text FROM lt_sales_analysis_messages")))
-
-        assert "answer_text" in columns
-        assert "conversation_id" not in columns
-        assert "created_at" not in columns
-        assert "answer_text" in result["added_columns"]
-        assert result["skipped_columns"]
-        assert "conversation_id" in result["skipped_columns"]
-        assert second_result["added_columns"] == []
-        assert rows == [(1, "alice", "legacy row")]
+            with pytest.raises(
+                RuntimeError,
+                match=r"lt_sales_analysis_messages.*conversation_id.*server default",
+            ):
+                database_module._ensure_table_layout(
+                    connection,
+                    SalesAnalysisMessageModel.__table__,
+                )
     finally:
         partial_engine.dispose()
 
 
-def test_ensure_table_layout_adds_safe_defaulted_columns_to_partial_populated_daily_sales_table(sqlite_engine):
+def test_ensure_table_layout_adds_safe_defaulted_columns_to_partial_populated_table():
+    target_metadata = MetaData()
+    target_table = Table(
+        "lt_compat_safe_columns",
+        target_metadata,
+        Column("id", Integer, primary_key=True),
+        Column("status", String(32), nullable=False, server_default="pending"),
+        Column("attempt_count", Integer, nullable=False, server_default="0"),
+        Column("notes", Text, nullable=True),
+    )
     partial_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     try:
         with partial_engine.begin() as connection:
             connection.execute(
                 text(
                     """
-                    CREATE TABLE lt_product_sales_daily (
-                        id INTEGER PRIMARY KEY,
-                        owner_username VARCHAR(255) NOT NULL,
-                        store_id INTEGER NOT NULL,
-                        sales_date DATE NOT NULL
+                    CREATE TABLE lt_compat_safe_columns (
+                        id INTEGER PRIMARY KEY
                     )
                     """
                 )
@@ -585,31 +729,373 @@ def test_ensure_table_layout_adds_safe_defaulted_columns_to_partial_populated_da
             connection.execute(
                 text(
                     """
-                    INSERT INTO lt_product_sales_daily (id, owner_username, store_id, sales_date)
-                    VALUES (1, 'alice', 10, '2026-07-16')
+                    INSERT INTO lt_compat_safe_columns (id)
+                    VALUES (1)
                     """
                 )
             )
 
             result = database_module._ensure_table_layout(
                 connection,
-                ProductSalesDailyModel.__table__,
+                target_table,
             )
 
-        columns = {column["name"] for column in inspect(partial_engine).get_columns("lt_product_sales_daily")}
+        columns = {
+            column["name"]
+            for column in inspect(partial_engine).get_columns("lt_compat_safe_columns")
+        }
         with partial_engine.connect() as connection:
             row = connection.execute(
                 text(
                     """
-                    SELECT manage_number, sku_key, order_count, effective_units
-                    FROM lt_product_sales_daily
+                    SELECT status, attempt_count, notes
+                    FROM lt_compat_safe_columns
                     WHERE id = 1
                     """
                 )
             ).one()
 
-        assert {"manage_number", "sku_key", "order_count", "effective_units"} <= columns
-        assert row == ("", "", 0, 0)
-        assert "store_id" not in result["skipped_columns"]
+        assert {"status", "attempt_count", "notes"} <= columns
+        assert row == ("pending", 0, None)
+        assert set(result["added_columns"]) == {"status", "attempt_count", "notes"}
     finally:
         partial_engine.dispose()
+
+
+def test_ensure_table_layout_is_idempotent_for_complete_sales_tables(sqlite_engine):
+    tables = (
+        SalesOrderModel.__table__,
+        SalesOrderItemModel.__table__,
+        SalesItemAdjustmentModel.__table__,
+        ProductSalesDailyModel.__table__,
+        SalesSyncStateModel.__table__,
+        SalesAnalysisConversationModel.__table__,
+        SalesAnalysisMessageModel.__table__,
+    )
+
+    with sqlite_engine.begin() as connection:
+        results = [
+            database_module._ensure_table_layout(connection, table)
+            for table in tables
+        ]
+
+    assert all(
+        not result[key]
+        for result in results
+        for key in (
+            "created_table",
+            "added_columns",
+            "skipped_columns",
+            "added_constraints",
+            "added_indexes",
+        )
+    )
+
+
+def test_mysql_timestamp_default_is_safe_to_add_but_sqlite_is_not():
+    created_at = SalesOrderModel.__table__.c.created_at
+
+    assert database_module._has_safe_server_default(created_at, "mysql")
+    assert not database_module._has_safe_server_default(created_at, "sqlite")
+
+
+def test_ensure_table_layout_fails_when_primary_key_is_missing():
+    target_metadata = MetaData()
+    target_table = Table(
+        "lt_compat_missing_pk",
+        target_metadata,
+        Column("id", Integer, primary_key=True),
+        Column("payload", String(32), nullable=False, server_default=""),
+    )
+    partial_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with partial_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE lt_compat_missing_pk (
+                        id INTEGER NOT NULL,
+                        payload VARCHAR(32) NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+            )
+
+            with pytest.raises(RuntimeError, match=r"lt_compat_missing_pk.*primary key"):
+                database_module._ensure_table_layout(connection, target_table)
+    finally:
+        partial_engine.dispose()
+
+
+def test_ensure_table_layout_fails_on_null_required_data_without_backfill():
+    target_metadata = MetaData()
+    target_table = Table(
+        "lt_compat_null_required",
+        target_metadata,
+        Column("id", Integer, primary_key=True),
+        Column("required_value", String(32), nullable=False),
+    )
+    partial_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with partial_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE lt_compat_null_required (
+                        id INTEGER PRIMARY KEY,
+                        required_value VARCHAR(32) NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO lt_compat_null_required (id, required_value)
+                    VALUES (1, NULL)
+                    """
+                )
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match=r"lt_compat_null_required.*required_value.*NULL",
+            ):
+                database_module._ensure_table_layout(connection, target_table)
+    finally:
+        partial_engine.dispose()
+
+
+def test_ensure_table_layout_fails_on_duplicate_unique_constraint_data():
+    target_metadata = MetaData()
+    target_table = Table(
+        "lt_compat_duplicate_unique",
+        target_metadata,
+        Column("id", Integer, primary_key=True),
+        Column("owner_username", String(255), nullable=False),
+        Column("remote_key", String(64), nullable=False),
+        UniqueConstraint(
+            "owner_username",
+            "remote_key",
+            name="uq_lt_compat_duplicate_unique_owner_key",
+        ),
+    )
+    partial_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with partial_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE lt_compat_duplicate_unique (
+                        id INTEGER PRIMARY KEY,
+                        owner_username VARCHAR(255) NOT NULL,
+                        remote_key VARCHAR(64) NOT NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO lt_compat_duplicate_unique (id, owner_username, remote_key)
+                    VALUES
+                        (1, 'alice', 'same'),
+                        (2, 'alice', 'same')
+                    """
+                )
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match=r"lt_compat_duplicate_unique.*uq_lt_compat_duplicate_unique_owner_key.*duplicate",
+            ):
+                database_module._ensure_table_layout(connection, target_table)
+    finally:
+        partial_engine.dispose()
+
+
+def _compat_parent_child_tables() -> tuple[MetaData, Table, Table]:
+    metadata = MetaData()
+    parent = Table(
+        "lt_compat_parent",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("owner_username", String(255), nullable=False),
+        UniqueConstraint(
+            "id",
+            "owner_username",
+            name="uq_lt_compat_parent_id_owner",
+        ),
+    )
+    child = Table(
+        "lt_compat_child",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("parent_id", Integer, nullable=False),
+        Column("owner_username", String(255), nullable=False),
+        ForeignKeyConstraint(
+            ["parent_id", "owner_username"],
+            ["lt_compat_parent.id", "lt_compat_parent.owner_username"],
+            name="fk_lt_compat_child_parent_owner",
+        ),
+    )
+    return metadata, parent, child
+
+
+def test_ensure_table_layout_fails_on_conflicting_foreign_key_data():
+    _, parent, child = _compat_parent_child_tables()
+    partial_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with partial_engine.begin() as connection:
+            parent.create(connection)
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE lt_compat_child (
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER NOT NULL,
+                        owner_username VARCHAR(255) NOT NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                parent.insert().values(id=1, owner_username="alice")
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO lt_compat_child (id, parent_id, owner_username)
+                    VALUES (1, 1, 'bob')
+                    """
+                )
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match=r"lt_compat_child.*fk_lt_compat_child_parent_owner.*conflicting",
+            ):
+                database_module._ensure_table_layout(connection, child)
+    finally:
+        partial_engine.dispose()
+
+
+def test_ensure_table_layout_fails_when_constraint_cannot_be_installed():
+    _, parent, child = _compat_parent_child_tables()
+    partial_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with partial_engine.begin() as connection:
+            parent.create(connection)
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE lt_compat_child (
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER NOT NULL,
+                        owner_username VARCHAR(255) NOT NULL
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                parent.insert().values(id=1, owner_username="alice")
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO lt_compat_child (id, parent_id, owner_username)
+                    VALUES (1, 1, 'alice')
+                    """
+                )
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match=r"lt_compat_child.*fk_lt_compat_child_parent_owner.*cannot install",
+            ):
+                database_module._ensure_table_layout(connection, child)
+    finally:
+        partial_engine.dispose()
+
+
+def test_mysql_root_sales_foreign_key_ddl_is_composite():
+    constraint = next(
+        constraint
+        for constraint in SalesOrderModel.__table__.constraints
+        if constraint.name == "fk_lt_sales_order_store_owner"
+    )
+
+    ddl = database_module._compile_add_constraint(
+        constraint,
+        mysql.dialect(),
+    )
+
+    assert "FOREIGN KEY(store_id, owner_username)" in ddl
+    assert "REFERENCES lt_stores (id, owner_username)" in ddl
+
+
+def test_mysql_longtext_column_ddl_does_not_require_a_server_default():
+    ddl = str(
+        CreateColumn(SalesOrderModel.__table__.c.raw_order_json).compile(
+            dialect=mysql.dialect()
+        )
+    )
+
+    assert "LONGTEXT NOT NULL" in ddl
+    assert "DEFAULT" not in ddl
+
+
+class _FakeResult:
+    def __init__(self, row):
+        self._row = row
+
+    def first(self):
+        return self._row
+
+
+class _RecordingMysqlConnection:
+    def __init__(self):
+        self.dialect = mysql.dialect()
+        self.statements: list[str] = []
+        self.select_count = 0
+
+    def execute(self, statement):
+        compiled = str(
+            statement.compile(
+                dialect=self.dialect,
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+        self.statements.append(compiled)
+        if compiled.lstrip().upper().startswith("SELECT"):
+            self.select_count += 1
+            return _FakeResult((1,) if self.select_count == 1 else None)
+        return _FakeResult(None)
+
+
+def test_longtext_normalization_backfills_nulls_before_not_null_modify():
+    connection = _RecordingMysqlConnection()
+    table = SalesOrderModel.__table__
+    column = table.c.raw_order_json
+
+    database_module._normalize_longtext_column(
+        connection,
+        table,
+        column,
+        {"type": Text(), "nullable": True},
+    )
+
+    update_index = next(
+        index
+        for index, statement in enumerate(connection.statements)
+        if statement.lstrip().upper().startswith("UPDATE")
+    )
+    alter_index = next(
+        index
+        for index, statement in enumerate(connection.statements)
+        if "MODIFY COLUMN" in statement.upper()
+    )
+    assert update_index < alter_index
+    assert connection.select_count == 2
+    assert "raw_order_json='{}'" in connection.statements[update_index]
+    assert "LONGTEXT NOT NULL" in connection.statements[alter_index]

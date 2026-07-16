@@ -101,6 +101,7 @@ class StoreModel(TimestampMixin, Base):
     __tablename__ = "lt_stores"
     __table_args__ = (
         UniqueConstraint("owner_username", "store_code", name="uq_lt_store_owner_code"),
+        UniqueConstraint("id", "owner_username", name="uq_lt_store_id_owner"),
         Index("ix_lt_store_enabled", "enabled"),
         Index("ix_lt_store_owner_enabled", "owner_username", "enabled"),
     )
@@ -400,6 +401,12 @@ def _normalize_decimal(value: Decimal | float | int | str) -> Decimal:
 class SalesOrderModel(TimestampMixin, Base):
     __tablename__ = "lt_sales_orders"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["store_id", "owner_username"],
+            ["lt_stores.id", "lt_stores.owner_username"],
+            ondelete="CASCADE",
+            name="fk_lt_sales_order_store_owner",
+        ),
         UniqueConstraint("store_id", "order_number", name="uq_lt_sales_order_store_order_number"),
         UniqueConstraint("id", "owner_username", "store_id", name="uq_lt_sales_order_id_owner_store"),
         Index("ix_lt_sales_order_owner_store", "owner_username", "store_id"),
@@ -412,7 +419,7 @@ class SalesOrderModel(TimestampMixin, Base):
         ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
         nullable=False,
     )
-    store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
+    store_id: Mapped[int] = mapped_column(Integer, nullable=False)
     order_number: Mapped[str] = mapped_column(String(64), nullable=False)
     order_progress: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
     order_status: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
@@ -426,7 +433,6 @@ class SalesOrderModel(TimestampMixin, Base):
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="{}",
-        server_default="{}",
     )
     last_synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False),
@@ -483,7 +489,6 @@ class SalesOrderItemModel(TimestampMixin, Base):
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="{}",
-        server_default="{}",
     )
     item_name: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="")
     unit_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
@@ -521,21 +526,51 @@ class SalesOrderItemModel(TimestampMixin, Base):
         refunded_units: int,
         returned_units: int,
         unresolved_refunded_units: int = 0,
+        return_refund_units: int = 0,
     ) -> None:
+        SalesOrderItemModel.normalize_deductions(
+            ordered_units=ordered_units,
+            canceled_units=canceled_units,
+            refunded_units=refunded_units,
+            returned_units=returned_units,
+            unresolved_refunded_units=unresolved_refunded_units,
+            return_refund_units=return_refund_units,
+        )
+
+    @staticmethod
+    def normalize_deductions(
+        *,
+        ordered_units: int,
+        canceled_units: int,
+        refunded_units: int,
+        returned_units: int,
+        unresolved_refunded_units: int = 0,
+        return_refund_units: int = 0,
+    ) -> tuple[int, int, int]:
         counts = {
             "ordered_units": ordered_units,
             "canceled_units": canceled_units,
             "refunded_units": refunded_units,
             "returned_units": returned_units,
             "unresolved_refunded_units": unresolved_refunded_units,
+            "return_refund_units": return_refund_units,
         }
         for field_name, value in counts.items():
             if value < 0:
                 raise ValueError(f"{field_name} must be >= 0")
 
-        total_confirmed_deductions = canceled_units + refunded_units + returned_units
+        if return_refund_units > refunded_units or return_refund_units > returned_units:
+            raise ValueError(
+                "return_refund_units cannot exceed refunded_units or returned_units"
+            )
+
+        normalized_refunded_units = refunded_units - return_refund_units
+        total_confirmed_deductions = (
+            canceled_units + normalized_refunded_units + returned_units
+        )
         if total_confirmed_deductions > ordered_units:
             raise ValueError("confirmed deductions cannot exceed ordered_units")
+        return canceled_units, normalized_refunded_units, returned_units
 
     @classmethod
     def from_service_payload(
@@ -559,23 +594,29 @@ class SalesOrderItemModel(TimestampMixin, Base):
         refunded_units: int = 0,
         returned_units: int = 0,
         unresolved_refunded_units: int = 0,
+        return_refund_units: int = 0,
         delete_item_flag: bool = False,
         restore_inventory_flag: bool = False,
         ordered_at: datetime | None = None,
     ) -> SalesOrderItemModel:
-        cls.validate_deductions(
+        (
+            normalized_canceled_units,
+            normalized_refunded_units,
+            normalized_returned_units,
+        ) = cls.normalize_deductions(
             ordered_units=ordered_units,
             canceled_units=canceled_units,
             refunded_units=refunded_units,
             returned_units=returned_units,
             unresolved_refunded_units=unresolved_refunded_units,
+            return_refund_units=return_refund_units,
         )
         normalized_unit_price = _normalize_decimal(unit_price)
         computed_effective_units = cls.calculate_effective_units(
             ordered_units=ordered_units,
-            canceled_units=canceled_units,
-            refunded_units=refunded_units,
-            returned_units=returned_units,
+            canceled_units=normalized_canceled_units,
+            refunded_units=normalized_refunded_units,
+            returned_units=normalized_returned_units,
         )
         return cls(
             owner_username=owner_username,
@@ -592,9 +633,9 @@ class SalesOrderItemModel(TimestampMixin, Base):
             unit_price=normalized_unit_price,
             ordered_units=ordered_units,
             latest_units=ordered_units if latest_units is None else latest_units,
-            canceled_units=canceled_units,
-            refunded_units=refunded_units,
-            returned_units=returned_units,
+            canceled_units=normalized_canceled_units,
+            refunded_units=normalized_refunded_units,
+            returned_units=normalized_returned_units,
             effective_units=computed_effective_units,
             effective_amount=normalized_unit_price * computed_effective_units,
             delete_item_flag=delete_item_flag,
@@ -639,7 +680,6 @@ class SalesItemAdjustmentModel(TimestampMixin, Base):
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="{}",
-        server_default="{}",
     )
 
     sales_order_item: Mapped[SalesOrderItemModel] = relationship(back_populates="adjustments")
@@ -648,6 +688,12 @@ class SalesItemAdjustmentModel(TimestampMixin, Base):
 class ProductSalesDailyModel(TimestampMixin, Base):
     __tablename__ = "lt_product_sales_daily"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["store_id", "owner_username"],
+            ["lt_stores.id", "lt_stores.owner_username"],
+            ondelete="CASCADE",
+            name="fk_lt_product_sales_daily_store_owner",
+        ),
         UniqueConstraint(
             "store_id",
             "sales_date",
@@ -665,7 +711,7 @@ class ProductSalesDailyModel(TimestampMixin, Base):
         ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
         nullable=False,
     )
-    store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
+    store_id: Mapped[int] = mapped_column(Integer, nullable=False)
     sales_date: Mapped[date] = mapped_column(nullable=False)
     manage_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     item_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
@@ -684,13 +730,16 @@ class ProductSalesDailyModel(TimestampMixin, Base):
 class SalesSyncStateModel(TimestampMixin, Base):
     __tablename__ = "lt_sales_sync_states"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["store_id", "owner_username"],
+            ["lt_stores.id", "lt_stores.owner_username"],
+            ondelete="CASCADE",
+            name="fk_lt_sales_sync_state_store_owner",
+        ),
         Index("ix_lt_sales_sync_state_owner_status", "owner_username", "sync_status"),
     )
 
-    store_id: Mapped[int] = mapped_column(
-        ForeignKey("lt_stores.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
+    store_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_username: Mapped[str] = mapped_column(
         String(255),
         ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
@@ -723,7 +772,6 @@ class SalesAnalysisConversationModel(TimestampMixin, Base):
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="[]",
-        server_default="[]",
     )
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
 
@@ -760,39 +808,33 @@ class SalesAnalysisMessageModel(TimestampMixin, Base):
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="",
-        server_default="",
     )
     answer_text: Mapped[str] = mapped_column(
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="",
-        server_default="",
     )
     tool_name: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default="")
     tool_arguments_json: Mapped[str] = mapped_column(
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="{}",
-        server_default="{}",
     )
     result_summary_json: Mapped[str] = mapped_column(
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="{}",
-        server_default="{}",
     )
     model_name: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     store_scope_json: Mapped[str] = mapped_column(
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="[]",
-        server_default="[]",
     )
     statistics_window_json: Mapped[str] = mapped_column(
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="{}",
-        server_default="{}",
     )
 
     conversation: Mapped[SalesAnalysisConversationModel] = relationship(back_populates="messages")

@@ -3,9 +3,21 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import UniqueConstraint, create_engine, inspect, text
+from sqlalchemy import (
+    ForeignKeyConstraint,
+    UniqueConstraint,
+    and_,
+    create_engine,
+    exists,
+    func,
+    inspect,
+    literal,
+    select,
+    text,
+)
 from sqlalchemy.engine import Connection
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.schema import AddConstraint, CreateColumn
 
@@ -33,14 +45,23 @@ def _column_info(connection: Connection, table_name: str) -> dict[str, dict]:
     }
 
 
-def _unique_constraint_names(connection: Connection, table_name: str) -> set[str]:
+def _primary_key_columns(connection: Connection, table_name: str) -> tuple[str, ...]:
     if table_name not in _table_names(connection):
-        return set()
-    return {
-        constraint["name"]
-        for constraint in inspect(connection).get_unique_constraints(table_name)
-        if constraint.get("name")
-    }
+        return ()
+    primary_key = inspect(connection).get_pk_constraint(table_name)
+    return tuple(primary_key.get("constrained_columns") or ())
+
+
+def _unique_constraint_info(connection: Connection, table_name: str) -> list[dict]:
+    if table_name not in _table_names(connection):
+        return []
+    return list(inspect(connection).get_unique_constraints(table_name))
+
+
+def _foreign_key_info(connection: Connection, table_name: str) -> list[dict]:
+    if table_name not in _table_names(connection):
+        return []
+    return list(inspect(connection).get_foreign_keys(table_name))
 
 
 def _index_names(connection: Connection, table_name: str) -> set[str]:
@@ -61,7 +82,13 @@ def _has_safe_server_default(column, dialect_name: str) -> bool:
         return True
     default_sql = str(server_default.arg).strip()
     normalized = default_sql.upper()
-    if dialect_name == "sqlite" and normalized in {"CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"}:
+    if normalized in {
+        "CURRENT_TIMESTAMP",
+        "CURRENT_TIMESTAMP()",
+        "NOW()",
+    }:
+        return dialect_name == "mysql"
+    if dialect_name == "sqlite" and normalized in {"CURRENT_DATE", "CURRENT_TIME"}:
         return False
     if "(" in normalized and not normalized.startswith("("):
         return False
@@ -71,17 +98,336 @@ def _has_safe_server_default(column, dialect_name: str) -> bool:
 def _can_add_column_safely(column, dialect_name: str) -> bool:
     if column.primary_key:
         return False
-    if column.foreign_keys:
-        return False
     if column.nullable:
         return True
     return _has_safe_server_default(column, dialect_name)
 
 
+def _compatibility_error(table_name: str, issue: str) -> RuntimeError:
+    return RuntimeError(f"{table_name}: {issue}")
+
+
+def _column_has_nulls(connection: Connection, table, column) -> bool:
+    statement = select(column).select_from(table).where(column.is_(None)).limit(1)
+    return connection.execute(statement).first() is not None
+
+
+_NO_BACKFILL = object()
+
+
+def _safe_backfill_value(column):
+    for default_clause in (column.server_default, column.default):
+        if default_clause is None:
+            continue
+        value = default_clause.arg
+        if isinstance(value, (str, int, float, bool)):
+            return value
+    return _NO_BACKFILL
+
+
+def _compile_modify_column(table, column, dialect) -> str:
+    compiled_column = str(CreateColumn(column).compile(dialect=dialect))
+    table_name = (
+        _quote_mysql_identifier(table.name)
+        if dialect.name == "mysql"
+        else table.name
+    )
+    return f"ALTER TABLE {table_name} MODIFY COLUMN {compiled_column}"
+
+
+def _normalize_longtext_column(
+    connection: Connection,
+    table,
+    column,
+    current_column: dict,
+) -> bool:
+    compiled_type = str(column.type.compile(dialect=connection.dialect)).strip().lower()
+    if compiled_type != "longtext":
+        return False
+
+    current_type = str(current_column["type"]).strip().lower()
+    needs_type_change = current_type != "longtext"
+    needs_nullability_change = (
+        not column.nullable and current_column.get("nullable") is True
+    )
+    if not needs_type_change and not needs_nullability_change:
+        return False
+
+    if not column.nullable and current_column.get("nullable") is True:
+        if _column_has_nulls(connection, table, column):
+            backfill_value = _safe_backfill_value(column)
+            if backfill_value is _NO_BACKFILL:
+                raise _compatibility_error(
+                    table.name,
+                    f"column {column.name} contains NULL and has no safe backfill",
+                )
+            try:
+                connection.execute(
+                    table.update()
+                    .where(column.is_(None))
+                    .values({column.name: backfill_value})
+                )
+            except SQLAlchemyError as exc:
+                raise _compatibility_error(
+                    table.name,
+                    f"column {column.name} cannot backfill NULL data",
+                ) from exc
+            if _column_has_nulls(connection, table, column):
+                raise _compatibility_error(
+                    table.name,
+                    f"column {column.name} still contains NULL after backfill",
+                )
+
+    if not connection.dialect.supports_alter:
+        raise _compatibility_error(
+            table.name,
+            f"column {column.name} cannot normalize to LONGTEXT on {connection.dialect.name}",
+        )
+
+    try:
+        ddl = _compile_modify_column(table, column, connection.dialect)
+        connection.execute(text(ddl))
+    except SQLAlchemyError as exc:
+        raise _compatibility_error(
+            table.name,
+            f"column {column.name} cannot normalize to LONGTEXT",
+        ) from exc
+    return True
+
+
+def _normalize_required_nullability(
+    connection: Connection,
+    table,
+    column,
+    current_column: dict,
+) -> bool:
+    if (
+        column.primary_key
+        or column.nullable
+        or current_column.get("nullable") is not True
+    ):
+        return False
+    if _column_has_nulls(connection, table, column):
+        raise _compatibility_error(
+            table.name,
+            f"column {column.name} contains NULL required data",
+        )
+    if not connection.dialect.supports_alter or connection.dialect.name != "mysql":
+        raise _compatibility_error(
+            table.name,
+            f"column {column.name} cannot enforce NOT NULL on {connection.dialect.name}",
+        )
+    try:
+        ddl = _compile_modify_column(table, column, connection.dialect)
+        connection.execute(text(ddl))
+    except SQLAlchemyError as exc:
+        raise _compatibility_error(
+            table.name,
+            f"column {column.name} cannot enforce NOT NULL",
+        ) from exc
+    return True
+
+
+def _unique_constraint_matches(existing: dict, constraint: UniqueConstraint) -> bool:
+    return tuple(existing.get("column_names") or ()) == tuple(
+        column.name for column in constraint.columns
+    )
+
+
+def _foreign_key_constraint_matches(
+    existing: dict,
+    constraint: ForeignKeyConstraint,
+) -> bool:
+    elements = list(constraint.elements)
+    referred_table = elements[0].column.table
+    existing_options = existing.get("options") or {}
+    existing_ondelete = str(existing_options.get("ondelete") or "").upper()
+    expected_ondelete = str(constraint.ondelete or "").upper()
+    return (
+        tuple(existing.get("constrained_columns") or ())
+        == tuple(column.name for column in constraint.columns)
+        and existing.get("referred_table") == referred_table.name
+        and tuple(existing.get("referred_columns") or ())
+        == tuple(element.column.name for element in elements)
+        and existing_ondelete == expected_ondelete
+    )
+
+
+def _constraint_is_present(connection: Connection, table, constraint) -> bool:
+    if isinstance(constraint, UniqueConstraint):
+        existing_constraints = _unique_constraint_info(connection, table.name)
+        matcher = _unique_constraint_matches
+    elif isinstance(constraint, ForeignKeyConstraint):
+        existing_constraints = _foreign_key_info(connection, table.name)
+        matcher = _foreign_key_constraint_matches
+    else:
+        return True
+
+    for existing in existing_constraints:
+        if matcher(existing, constraint):
+            return True
+        if constraint.name and existing.get("name") == constraint.name:
+            raise _compatibility_error(
+                table.name,
+                f"constraint {constraint.name} has a conflicting definition",
+            )
+    return False
+
+
+def _validate_unique_constraint_data(
+    connection: Connection,
+    table,
+    constraint: UniqueConstraint,
+) -> None:
+    columns = [table.c[column.name] for column in constraint.columns]
+    statement = (
+        select(literal(1))
+        .select_from(table)
+        .where(and_(*(column.is_not(None) for column in columns)))
+        .group_by(*columns)
+        .having(func.count() > 1)
+        .limit(1)
+    )
+    if connection.execute(statement).first() is not None:
+        raise _compatibility_error(
+            table.name,
+            f"constraint {constraint.name} has duplicate data",
+        )
+
+
+def _parent_key_is_available(
+    connection: Connection,
+    parent_table,
+    referred_columns: tuple[str, ...],
+) -> bool:
+    if _primary_key_columns(connection, parent_table.name) == referred_columns:
+        return True
+    return any(
+        tuple(item.get("column_names") or ()) == referred_columns
+        for item in _unique_constraint_info(connection, parent_table.name)
+    )
+
+
+def _validate_foreign_key_constraint_data(
+    connection: Connection,
+    table,
+    constraint: ForeignKeyConstraint,
+) -> None:
+    elements = list(constraint.elements)
+    parent_table = elements[0].column.table
+    local_columns = tuple(column.name for column in constraint.columns)
+    referred_columns = tuple(element.column.name for element in elements)
+
+    if parent_table.name not in _table_names(connection):
+        raise _compatibility_error(
+            table.name,
+            f"constraint {constraint.name} parent table {parent_table.name} is missing",
+        )
+    parent_columns = set(_column_info(connection, parent_table.name))
+    missing_parent_columns = [
+        column for column in referred_columns if column not in parent_columns
+    ]
+    if missing_parent_columns:
+        raise _compatibility_error(
+            table.name,
+            f"constraint {constraint.name} parent columns missing: {', '.join(missing_parent_columns)}",
+        )
+    if not _parent_key_is_available(connection, parent_table, referred_columns):
+        raise _compatibility_error(
+            table.name,
+            f"constraint {constraint.name} parent key is not unique",
+        )
+
+    child_alias = table.alias("compat_child")
+    parent_alias = parent_table.alias("compat_parent")
+    parent_match = and_(
+        *(
+            parent_alias.c[remote_name] == child_alias.c[local_name]
+            for local_name, remote_name in zip(
+                local_columns,
+                referred_columns,
+                strict=True,
+            )
+        )
+    )
+    child_values_present = and_(
+        *(child_alias.c[column_name].is_not(None) for column_name in local_columns)
+    )
+    statement = (
+        select(literal(1))
+        .select_from(child_alias)
+        .where(
+            child_values_present,
+            ~exists(select(literal(1)).select_from(parent_alias).where(parent_match)),
+        )
+        .limit(1)
+    )
+    if connection.execute(statement).first() is not None:
+        raise _compatibility_error(
+            table.name,
+            f"constraint {constraint.name} has conflicting foreign key data",
+        )
+
+
+def _compile_add_constraint(constraint, dialect) -> str:
+    return str(AddConstraint(constraint).compile(dialect=dialect)).strip()
+
+
+def _ensure_constraint(connection: Connection, table, constraint) -> bool:
+    if _constraint_is_present(connection, table, constraint):
+        return False
+
+    available_columns = set(_column_info(connection, table.name))
+    missing_columns = [
+        column.name
+        for column in constraint.columns
+        if column.name not in available_columns
+    ]
+    if missing_columns:
+        raise _compatibility_error(
+            table.name,
+            f"constraint {constraint.name} columns missing: {', '.join(missing_columns)}",
+        )
+
+    if isinstance(constraint, UniqueConstraint):
+        _validate_unique_constraint_data(connection, table, constraint)
+    elif isinstance(constraint, ForeignKeyConstraint):
+        _validate_foreign_key_constraint_data(connection, table, constraint)
+
+    if not connection.dialect.supports_alter:
+        raise _compatibility_error(
+            table.name,
+            f"constraint {constraint.name} cannot install on {connection.dialect.name}",
+        )
+
+    try:
+        ddl = _compile_add_constraint(constraint, connection.dialect)
+        if not ddl:
+            raise _compatibility_error(
+                table.name,
+                f"constraint {constraint.name} cannot install",
+            )
+        connection.execute(text(ddl))
+    except RuntimeError:
+        raise
+    except SQLAlchemyError as exc:
+        raise _compatibility_error(
+            table.name,
+            f"constraint {constraint.name} cannot install",
+        ) from exc
+    return True
+
+
 def _ensure_table_layout(connection: Connection, table) -> dict[str, list[str]]:
     table_was_missing = table.name not in _table_names(connection)
     if table_was_missing:
-        table.create(bind=connection, checkfirst=True)
+        try:
+            table.create(bind=connection, checkfirst=True)
+        except SQLAlchemyError as exc:
+            raise _compatibility_error(
+                table.name,
+                "table cannot be created with required constraints",
+            ) from exc
         return {
             "created_table": [table.name],
             "added_columns": [],
@@ -91,57 +437,85 @@ def _ensure_table_layout(connection: Connection, table) -> dict[str, list[str]]:
         }
 
     added_columns: list[str] = []
-    skipped_columns: list[str] = []
     dialect_name = connection.dialect.name
+
+    expected_primary_key = tuple(column.name for column in table.primary_key.columns)
+    actual_primary_key = _primary_key_columns(connection, table.name)
+    if actual_primary_key != expected_primary_key:
+        raise _compatibility_error(
+            table.name,
+            "primary key mismatch "
+            f"(expected {expected_primary_key or 'none'}, found {actual_primary_key or 'none'})",
+        )
 
     existing_columns = _column_info(connection, table.name)
     for column in table.columns:
         if column.name in existing_columns:
             continue
         if not _can_add_column_safely(column, dialect_name):
-            skipped_columns.append(column.name)
-            continue
-        compiled_column = str(CreateColumn(column).compile(dialect=connection.dialect))
-        connection.execute(
-            text(
-                f"ALTER TABLE {table.name if dialect_name == 'sqlite' else _quote_mysql_identifier(table.name)} "
-                f"ADD COLUMN {compiled_column}"
+            raise _compatibility_error(
+                table.name,
+                f"required column {column.name} has no safely addable server default",
             )
-        )
+        try:
+            compiled_column = str(
+                CreateColumn(column).compile(dialect=connection.dialect)
+            )
+            connection.execute(
+                text(
+                    f"ALTER TABLE {table.name if dialect_name == 'sqlite' else _quote_mysql_identifier(table.name)} "
+                    f"ADD COLUMN {compiled_column}"
+                )
+            )
+        except SQLAlchemyError as exc:
+            raise _compatibility_error(
+                table.name,
+                f"column {column.name} cannot be added safely",
+            ) from exc
         added_columns.append(column.name)
 
     refreshed_columns = _column_info(connection, table.name)
     for column in table.columns:
-        compiled_type = str(column.type.compile(dialect=connection.dialect)).strip().lower()
         current_column = refreshed_columns.get(column.name)
-        if compiled_type != "longtext" or not current_column or not connection.dialect.supports_alter:
-            continue
-        current_type = str(current_column["type"]).strip().lower()
-        if current_type == "longtext":
-            continue
-        compiled_column = str(CreateColumn(column).compile(dialect=connection.dialect))
-        connection.execute(
-            text(
-                f"ALTER TABLE {_quote_mysql_identifier(table.name)} "
-                f"MODIFY COLUMN {compiled_column}"
+        if not current_column:
+            raise _compatibility_error(
+                table.name,
+                f"column {column.name} is still missing after compatibility update",
             )
+        compiled_type = str(
+            column.type.compile(dialect=connection.dialect)
+        ).strip().lower()
+        if compiled_type == "longtext":
+            _normalize_longtext_column(
+                connection,
+                table,
+                column,
+                current_column,
+            )
+            continue
+        _normalize_required_nullability(
+            connection,
+            table,
+            column,
+            current_column,
         )
 
     added_constraints: list[str] = []
-    if connection.dialect.supports_alter:
-        existing_unique_constraints = _unique_constraint_names(connection, table.name)
-        available_columns = set(_column_info(connection, table.name))
-        for constraint in table.constraints:
-            if not isinstance(constraint, UniqueConstraint) or not constraint.name:
-                continue
-            if constraint.name in existing_unique_constraints:
-                continue
-            if any(column.name not in available_columns for column in constraint.columns):
-                continue
-            compiled_constraint = str(AddConstraint(constraint).compile(dialect=connection.dialect)).strip()
-            if compiled_constraint:
-                connection.execute(text(compiled_constraint))
-                added_constraints.append(constraint.name)
+    required_constraints = [
+        constraint
+        for constraint in table.constraints
+        if isinstance(constraint, (UniqueConstraint, ForeignKeyConstraint))
+        and constraint.name
+    ]
+    required_constraints.sort(
+        key=lambda constraint: (
+            0 if isinstance(constraint, UniqueConstraint) else 1,
+            constraint.name,
+        )
+    )
+    for constraint in required_constraints:
+        if _ensure_constraint(connection, table, constraint):
+            added_constraints.append(constraint.name)
 
     existing_indexes = _index_names(connection, table.name)
     available_columns = set(_column_info(connection, table.name))
@@ -150,14 +524,23 @@ def _ensure_table_layout(connection: Connection, table) -> dict[str, list[str]]:
         if not index.name or index.name in existing_indexes:
             continue
         if any(column.name not in available_columns for column in index.columns):
-            continue
-        index.create(bind=connection, checkfirst=True)
+            raise _compatibility_error(
+                table.name,
+                f"index {index.name} references missing columns",
+            )
+        try:
+            index.create(bind=connection, checkfirst=True)
+        except SQLAlchemyError as exc:
+            raise _compatibility_error(
+                table.name,
+                f"index {index.name} cannot install",
+            ) from exc
         added_indexes.append(index.name)
 
     return {
         "created_table": [],
         "added_columns": added_columns,
-        "skipped_columns": skipped_columns,
+        "skipped_columns": [],
         "added_constraints": added_constraints,
         "added_indexes": added_indexes,
     }
@@ -275,6 +658,16 @@ def ensure_schema_compatibility() -> None:
                     """
                 )
             )
+        store_identity_constraint = next(
+            constraint
+            for constraint in model_module.StoreModel.__table__.constraints
+            if constraint.name == "uq_lt_store_id_owner"
+        )
+        _ensure_constraint(
+            connection,
+            model_module.StoreModel.__table__,
+            store_identity_constraint,
+        )
 
         store_indexes = set(
             connection.execute(
