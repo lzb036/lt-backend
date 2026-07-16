@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -21,7 +21,7 @@ from app.db.models import (
     StoreModel,
     UserAccountModel,
 )
-from app.services import sales_analysis_service
+from app.services import sales_analysis_service, sales_sync_service
 
 
 TOOL_NAMES = [
@@ -475,7 +475,7 @@ def assert_common_metadata(
     assert result["store"] == {"id": store_id, "name": "Alice Shop"}
     assert result["range"] == {"start": "2026-07-14", "end": "2026-07-15"}
     assert result["metric"] == metric
-    assert result["dataUpdatedAt"] == "2026-07-16T14:30:00+08:00"
+    assert result["dataUpdatedAt"] == "2026-07-16T06:30:00+08:00"
     assert result["unresolvedAdjustmentCount"] == 1
 
 
@@ -904,6 +904,120 @@ def test_product_ranking_uses_manage_number_and_distinct_fact_orders(session_fac
     } == {("blue", 2), ("red", 1)}
 
 
+def test_product_ranking_reuses_daily_fallback_key_for_blank_manage_number(
+    session_factory,
+):
+    long_item_number = "I" * 250
+    with session_factory() as session:
+        store = _add_user_and_store(session, "alice", "ranking-fallback")
+        first_order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="FALLBACK-ORDER-1",
+            ordered_at=datetime(2026, 7, 14, 10, 0, 0),
+        )
+        first_item = _add_order_item(
+            session,
+            order=first_order,
+            item_detail_id="fallback-1-blue",
+            manage_number="",
+            item_number=long_item_number,
+            sku_key="blue",
+            item_name="Fallback Product",
+        )
+        _add_order_item(
+            session,
+            order=first_order,
+            item_detail_id="fallback-1-blue-duplicate",
+            manage_number="",
+            item_number=long_item_number,
+            sku_key="blue",
+            item_name="Fallback Product",
+        )
+        second_order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="FALLBACK-ORDER-2",
+            ordered_at=datetime(2026, 7, 15, 10, 0, 0),
+        )
+        _add_order_item(
+            session,
+            order=second_order,
+            item_detail_id="fallback-2-red",
+            manage_number="",
+            item_number=long_item_number,
+            sku_key="red",
+            item_name="Fallback Product",
+        )
+        fallback_key = sales_sync_service._daily_product_key(first_item)
+        assert fallback_key.startswith("v1:item-number:")
+        assert len(fallback_key) <= 255
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 14),
+            manage_number=fallback_key,
+            item_number=long_item_number,
+            sku_key="blue",
+            item_name="Fallback Product",
+            order_count=1,
+            ordered_units=2,
+            effective_units=2,
+            gross_amount="200",
+            effective_amount="200",
+        )
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 15),
+            manage_number=fallback_key,
+            item_number=long_item_number,
+            sku_key="red",
+            item_name="Fallback Product",
+            order_count=1,
+            ordered_units=1,
+            effective_units=1,
+            gross_amount="100",
+            effective_amount="100",
+        )
+        session.commit()
+        store_id = store.id
+
+    product_result = execute(
+        "get_product_sales_ranking",
+        {
+            "storeId": store_id,
+            "startDate": "2026-07-14",
+            "endDate": "2026-07-15",
+            "metric": "orderCount",
+            "limit": 10,
+            "includeSku": False,
+        },
+    )
+    sku_result = execute(
+        "get_product_sales_ranking",
+        {
+            "storeId": store_id,
+            "startDate": "2026-07-14",
+            "endDate": "2026-07-15",
+            "metric": "orderCount",
+            "limit": 10,
+            "includeSku": True,
+        },
+    )
+
+    assert product_result["rows"][0]["manageNumber"] == fallback_key
+    assert product_result["rows"][0]["orderCount"] == 2
+    assert {
+        (row["skuKey"], row["orderCount"])
+        for row in sku_result["rows"]
+    } == {("blue", 1), ("red", 1)}
+
+
 def test_product_trend_supports_day_week_and_month_grains(seeded_sales):
     daily = execute(
         "get_product_sales_trend",
@@ -974,6 +1088,104 @@ def test_product_comparison_returns_summary_and_long_form_series(seeded_sales):
         ("2026-07-15", "MN-A", 3),
         ("2026-07-15", "MN-B", 1),
     }
+
+
+def test_trend_and_comparison_aggregate_high_sku_rows_in_sql(session_factory):
+    with session_factory() as session:
+        store = _add_user_and_store(session, "alice", "high-sku")
+        session.add_all(
+            [
+                ProductSalesDailyModel(
+                    owner_username="alice",
+                    store_id=store.id,
+                    sales_date=date(2026, 7, 14),
+                    manage_number=manage_number,
+                    item_number=f"ITEM-{manage_number}",
+                    sku_key=f"{manage_number}-sku-{index:03d}",
+                    item_name_snapshot=manage_number,
+                    order_count=1,
+                    ordered_units=units,
+                    canceled_units=0,
+                    refunded_units=0,
+                    returned_units=0,
+                    effective_units=units,
+                    gross_sales_amount=Decimal(100 * units),
+                    effective_sales_amount=Decimal(100 * units),
+                    created_at=datetime(2026, 7, 16, 6, 0, 0),
+                    updated_at=datetime(2026, 7, 16, 6, 30, 0),
+                )
+                for manage_number, units in (
+                    ("MN-HIGH", 1),
+                    ("MN-OTHER", 2),
+                )
+                for index in range(120)
+            ]
+        )
+        session.commit()
+        store_id = store.id
+
+    statements: list[str] = []
+    engine = session_factory.kw["bind"]
+
+    def _capture_statement(_, __, statement, ___, ____, _____):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture_statement)
+    try:
+        trend = execute(
+            "get_product_sales_trend",
+            {
+                "storeId": store_id,
+                "manageNumber": "MN-HIGH",
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "grain": "week",
+            },
+        )
+        comparison = execute(
+            "compare_product_sales",
+            {
+                "storeId": store_id,
+                "manageNumbers": ["MN-HIGH", "MN-OTHER"],
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "grain": "month",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture_statement)
+
+    assert trend["rows"] == [
+        {
+            "period": "2026-07-13",
+            "orderedUnits": 120,
+            "effectiveUnits": 120,
+            "effectiveSalesAmount": 12000.0,
+        }
+    ]
+    assert comparison["rows"][0]["effectiveUnits"] == 120
+    assert comparison["rows"][1]["effectiveUnits"] == 240
+    assert {
+        (row["period"], row["manageNumber"], row["effectiveUnits"])
+        for row in comparison["series"]
+    } == {
+        ("2026-07", "MN-HIGH", 120),
+        ("2026-07", "MN-OTHER", 240),
+    }
+    daily_statements = [
+        statement.lower()
+        for statement in statements
+        if "from lt_product_sales_daily" in statement.lower()
+    ]
+    assert sum(
+        "group by" in statement and "sum(" in statement
+        for statement in daily_statements
+    ) >= 3
+    assert all(
+        "lt_product_sales_daily.sku_key" not in statement
+        and "lt_product_sales_daily.id" not in statement
+        for statement in daily_statements
+    )
 
 
 def test_sku_breakdown_returns_units_amounts_and_shares(seeded_sales):
@@ -1211,22 +1423,33 @@ def test_unresolved_adjustments_are_counted_once_per_order_and_include_flags(
     assert "BOB-UNRESOLVED" not in repr(result)
 
 
-def test_data_updated_at_tracks_every_underlying_store_source(session_factory):
-    arguments: dict[str, Any]
+def test_data_updated_at_uses_local_naive_fallback_and_authoritative_sync(
+    session_factory,
+):
     with session_factory() as session:
         store = _add_user_and_store(session, "alice", "updated-sources")
-        store.last_synced_at = datetime(2026, 7, 16, 1, 30, 0)
-        store.updated_at = datetime(2026, 7, 16, 1, 0, 0)
+        order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="LOCAL-FRESHNESS",
+            ordered_at=datetime(2026, 7, 15, 10, 0, 0),
+            updated_at=datetime(2026, 7, 16, 21, 30, 0),
+            updated_at_remote=datetime(2026, 7, 16, 23, 45, 0),
+            last_synced_at=datetime(2026, 7, 16, 21, 15, 0),
+        )
         session.commit()
         store_id = store.id
+        order_id = order.id
+
     arguments = {
         "storeId": store_id,
         "startDate": "2026-07-14",
         "endDate": "2026-07-15",
     }
-    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
-        "2026-07-16T09:30:00+08:00"
-    )
+    order_only = execute("get_store_sales_overview", arguments)
+    assert order_only["rows"][0]["orderCount"] == 1
+    assert order_only["dataUpdatedAt"] == "2026-07-16T21:30:00+08:00"
 
     with session_factory() as session:
         session.add(
@@ -1234,126 +1457,27 @@ def test_data_updated_at_tracks_every_underlying_store_source(session_factory):
                 store_id=store_id,
                 owner_username="alice",
                 initial_sync_completed=True,
-                last_successful_sync_at=datetime(2026, 7, 16, 2, 30, 0),
-                last_remote_updated_at=datetime(2026, 7, 16, 2, 45, 0),
+                last_successful_sync_at=datetime(2026, 7, 16, 20, 0, 0),
+                last_remote_updated_at=datetime(2026, 7, 16, 23, 59, 0),
                 sync_status="idle",
-                created_at=datetime(2026, 7, 16, 2, 0, 0),
-                updated_at=datetime(2026, 7, 16, 2, 0, 0),
+                created_at=datetime(2026, 7, 16, 22, 0, 0),
+                updated_at=datetime(2026, 7, 16, 22, 0, 0),
             )
         )
         session.commit()
     assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
-        "2026-07-16T10:45:00+08:00"
-    )
-
-    with session_factory() as session:
-        _add_product(
-            session,
-            owner_username="alice",
-            store_id=store_id,
-            manage_number="MN-SOURCE",
-            title="Source Product",
-            listed_at=datetime(2026, 1, 1, 0, 0, 0),
-        )
-        product = session.scalars(
-            select(ProductModel).where(
-                ProductModel.store_id == store_id,
-                ProductModel.rakuten_manage_number == "MN-SOURCE",
-            )
-        ).one()
-        product.updated_at = datetime(2026, 7, 16, 3, 0, 0)
-        session.commit()
-    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
-        "2026-07-16T11:00:00+08:00"
-    )
-
-    with session_factory() as session:
-        order = _add_order(
-            session,
-            owner_username="alice",
-            store_id=store_id,
-            order_number="UPDATED-ORDER",
-            ordered_at=datetime(2026, 7, 15, 10, 0, 0),
-            updated_at=datetime(2026, 7, 16, 4, 0, 0),
-            updated_at_remote=datetime(2026, 7, 16, 4, 45, 0),
-            last_synced_at=datetime(2026, 7, 16, 4, 30, 0),
-        )
-        session.commit()
-        order_id = order.id
-    order_only = execute("get_store_sales_overview", arguments)
-    assert order_only["rows"][0]["orderCount"] == 1
-    assert order_only["dataUpdatedAt"] == "2026-07-16T12:45:00+08:00"
-
-    with session_factory() as session:
-        order = session.get(SalesOrderModel, order_id)
-        assert order is not None
-        item = _add_order_item(
-            session,
-            order=order,
-            item_detail_id="updated-item",
-            manage_number="MN-SOURCE",
-            item_number="ITEM-SOURCE",
-            sku_key="blue",
-            item_name="Source Product",
-            updated_at=datetime(2026, 7, 16, 5, 0, 0),
-        )
-        session.commit()
-        item_id = item.id
-    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
-        "2026-07-16T13:00:00+08:00"
-    )
-
-    with session_factory() as session:
-        _add_daily(
-            session,
-            owner_username="alice",
-            store_id=store_id,
-            sales_date=date(2026, 7, 15),
-            manage_number="MN-SOURCE",
-            sku_key="blue",
-            item_name="Source Product",
-            order_count=1,
-            ordered_units=1,
-            effective_units=1,
-            gross_amount="100",
-            effective_amount="100",
-        )
-        daily = session.scalars(
-            select(ProductSalesDailyModel).where(
-                ProductSalesDailyModel.store_id == store_id
-            )
-        ).one()
-        daily.updated_at = datetime(2026, 7, 16, 6, 0, 0)
-        session.commit()
-    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
-        "2026-07-16T14:00:00+08:00"
-    )
-
-    with session_factory() as session:
-        session.add(
-            SalesItemAdjustmentModel(
-                owner_username="alice",
-                store_id=store_id,
-                sales_order_item_id=item_id,
-                adjustment_type="refund",
-                units=0,
-                amount=Decimal("25"),
-                source="updated-source",
-                status="unresolved",
-                reason="source timestamp",
-                remote_updated_at=datetime(2026, 7, 16, 7, 30, 0),
-                raw_payload_json="{}",
-                created_at=datetime(2026, 7, 16, 7, 0, 0),
-                updated_at=datetime(2026, 7, 16, 7, 0, 0),
-            )
-        )
-        session.commit()
-    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
-        "2026-07-16T15:30:00+08:00"
+        "2026-07-16T20:00:00+08:00"
     )
     assert execute("list_owned_stores", {})["dataUpdatedAt"] == (
-        "2026-07-16T15:30:00+08:00"
+        "2026-07-16T20:00:00+08:00"
     )
+    assert order_id > 0
+
+
+def test_iso_updated_at_converts_aware_values_to_shanghai():
+    assert sales_analysis_service._iso_updated_at(
+        datetime(2026, 7, 16, 13, 30, 0, tzinfo=timezone.utc)
+    ) == "2026-07-16T21:30:00+08:00"
 
 
 def test_unknown_tool_is_rejected_without_database_fallback():

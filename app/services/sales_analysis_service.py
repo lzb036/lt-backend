@@ -13,7 +13,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import Integer, cast as sql_cast, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db.database import session_scope
@@ -26,6 +26,7 @@ from app.db.models import (
     SalesSyncStateModel,
     StoreModel,
 )
+from app.services import sales_sync_service
 
 
 MAX_RANGE_DAYS = 366
@@ -287,14 +288,23 @@ def _integer(value: Any) -> int:
 
 def _latest_datetime(*values: datetime | None) -> datetime | None:
     present = [value for value in values if value is not None]
-    return max(present) if present else None
+    return (
+        max(present, key=lambda value: _as_shanghai_datetime(value).timestamp())
+        if present
+        else None
+    )
+
+
+def _as_shanghai_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=SHANGHAI_TIMEZONE)
+    return value.astimezone(SHANGHAI_TIMEZONE)
 
 
 def _iso_updated_at(value: datetime | None) -> str | None:
     if value is None:
         return None
-    normalized = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
-    return normalized.astimezone(SHANGHAI_TIMEZONE).isoformat(timespec="seconds")
+    return _as_shanghai_datetime(value).isoformat(timespec="seconds")
 
 
 def _require_owned_store(
@@ -366,6 +376,15 @@ def _data_updated_at(
     start_date: date,
     end_date: date,
 ) -> datetime | None:
+    last_successful_sync_at = session.scalar(
+        select(func.max(SalesSyncStateModel.last_successful_sync_at)).where(
+            SalesSyncStateModel.owner_username == owner_username,
+            SalesSyncStateModel.store_id == store_id,
+        )
+    )
+    if last_successful_sync_at is not None:
+        return last_successful_sync_at
+
     start_at, end_at = _range_datetimes(start_date, end_date)
     daily_updated_at = session.scalar(
         select(func.max(ProductSalesDailyModel.updated_at)).where(
@@ -380,7 +399,6 @@ def _data_updated_at(
     order_values = session.execute(
         select(
             func.max(SalesOrderModel.updated_at),
-            func.max(SalesOrderModel.updated_at_remote),
             func.max(SalesOrderModel.last_synced_at),
         ).where(
             SalesOrderModel.owner_username == owner_username,
@@ -400,10 +418,7 @@ def _data_updated_at(
         )
     )
     adjustment_values = session.execute(
-        select(
-            func.max(SalesItemAdjustmentModel.updated_at),
-            func.max(SalesItemAdjustmentModel.remote_updated_at),
-        )
+        select(func.max(SalesItemAdjustmentModel.updated_at))
         .join(
             SalesOrderItemModel,
             SalesOrderItemModel.id
@@ -436,11 +451,7 @@ def _data_updated_at(
         )
     ).one()
     sync_values = session.execute(
-        select(
-            func.max(SalesSyncStateModel.updated_at),
-            func.max(SalesSyncStateModel.last_successful_sync_at),
-            func.max(SalesSyncStateModel.last_remote_updated_at),
-        ).where(
+        select(func.max(SalesSyncStateModel.updated_at)).where(
             SalesSyncStateModel.owner_username == owner_username,
             SalesSyncStateModel.store_id == store_id,
         )
@@ -460,6 +471,15 @@ def _owner_data_updated_at(
     session: Session,
     owner_username: str,
 ) -> datetime | None:
+    last_successful_sync_at = session.scalar(
+        select(func.max(SalesSyncStateModel.last_successful_sync_at)).where(
+            SalesSyncStateModel.owner_username == owner_username,
+            SalesSyncStateModel.last_successful_sync_at.is_not(None),
+        )
+    )
+    if last_successful_sync_at is not None:
+        return last_successful_sync_at
+
     store_values = session.execute(
         select(
             func.max(StoreModel.updated_at),
@@ -469,16 +489,13 @@ def _owner_data_updated_at(
         ).where(StoreModel.owner_username == owner_username)
     ).one()
     sync_values = session.execute(
-        select(
-            func.max(SalesSyncStateModel.updated_at),
-            func.max(SalesSyncStateModel.last_successful_sync_at),
-            func.max(SalesSyncStateModel.last_remote_updated_at),
-        ).where(SalesSyncStateModel.owner_username == owner_username)
+        select(func.max(SalesSyncStateModel.updated_at)).where(
+            SalesSyncStateModel.owner_username == owner_username
+        )
     ).one()
     order_values = session.execute(
         select(
             func.max(SalesOrderModel.updated_at),
-            func.max(SalesOrderModel.updated_at_remote),
             func.max(SalesOrderModel.last_synced_at),
         ).where(SalesOrderModel.owner_username == owner_username)
     ).one()
@@ -493,10 +510,9 @@ def _owner_data_updated_at(
         )
     )
     adjustment_values = session.execute(
-        select(
-            func.max(SalesItemAdjustmentModel.updated_at),
-            func.max(SalesItemAdjustmentModel.remote_updated_at),
-        ).where(SalesItemAdjustmentModel.owner_username == owner_username)
+        select(func.max(SalesItemAdjustmentModel.updated_at)).where(
+            SalesItemAdjustmentModel.owner_username == owner_username
+        )
     ).one()
     product_updated_at = session.scalar(
         select(func.max(ProductModel.updated_at)).where(
@@ -752,17 +768,15 @@ def _ranking_rows(
     owner_username: str,
     args: ProductSalesRankingArguments,
 ) -> list[dict[str, Any]]:
-    daily_group_columns = [ProductSalesDailyModel.manage_number]
-    fact_group_columns = [SalesOrderItemModel.manage_number]
-    if args.include_sku:
-        daily_group_columns.append(ProductSalesDailyModel.sku_key)
-        fact_group_columns.append(SalesOrderItemModel.sku_key)
-    fact_order_counts = (
+    fact_order_numbers: dict[tuple[str, str | None], set[str]] = {}
+    fact_rows = session.execute(
         select(
-            *fact_group_columns,
-            func.count(
-                func.distinct(SalesOrderItemModel.order_number)
-            ).label("order_count"),
+            SalesOrderItemModel.manage_number,
+            SalesOrderItemModel.item_number,
+            SalesOrderItemModel.item_id,
+            SalesOrderItemModel.item_detail_id,
+            SalesOrderItemModel.sku_key,
+            SalesOrderItemModel.order_number,
         )
         .where(
             *_order_item_filters(
@@ -772,23 +786,25 @@ def _ranking_rows(
                 args.end_date,
             )
         )
-        .group_by(*fact_group_columns)
-        .subquery()
-    )
-    join_condition = (
-        fact_order_counts.c.manage_number
-        == ProductSalesDailyModel.manage_number
-    )
-    if args.include_sku:
-        join_condition = and_(
-            join_condition,
-            fact_order_counts.c.sku_key
-            == ProductSalesDailyModel.sku_key,
+        .distinct()
+    ).all()
+    for fact_row in fact_rows:
+        product_key = sales_sync_service._daily_product_key(fact_row)
+        count_key = (
+            product_key,
+            fact_row.sku_key if args.include_sku else None,
         )
-    order_count = func.coalesce(
-        fact_order_counts.c.order_count,
-        0,
-    ).label("order_count")
+        fact_order_numbers.setdefault(count_key, set()).add(
+            fact_row.order_number
+        )
+    fact_order_counts = {
+        key: len(order_numbers)
+        for key, order_numbers in fact_order_numbers.items()
+    }
+
+    daily_group_columns = [ProductSalesDailyModel.manage_number]
+    if args.include_sku:
+        daily_group_columns.append(ProductSalesDailyModel.sku_key)
     ordered_units = func.coalesce(
         func.sum(ProductSalesDailyModel.ordered_units),
         0,
@@ -805,13 +821,12 @@ def _ranking_rows(
         func.sum(ProductSalesDailyModel.effective_sales_amount),
         0,
     ).label("effective_sales_amount")
-    metric_expression = {
-        "orderCount": order_count,
+    metric_expressions = {
         "orderedUnits": ordered_units,
         "effectiveUnits": effective_units,
         "grossSalesAmount": gross_sales_amount,
         "effectiveSalesAmount": effective_sales_amount,
-    }[args.metric]
+    }
     selected_columns = [
         ProductSalesDailyModel.manage_number.label("manage_number"),
     ]
@@ -827,7 +842,6 @@ def _ranking_rows(
             func.max(ProductSalesDailyModel.item_name_snapshot).label(
                 "item_name"
             ),
-            order_count,
             ordered_units,
             effective_units,
             gross_sales_amount,
@@ -836,7 +850,6 @@ def _ranking_rows(
     )
     query = (
         select(*selected_columns)
-        .outerjoin(fact_order_counts, join_condition)
         .where(
             *_daily_filters(
                 owner_username,
@@ -845,12 +858,20 @@ def _ranking_rows(
                 args.end_date,
             )
         )
-        .group_by(
-            *daily_group_columns,
-            fact_order_counts.c.order_count,
-        )
-        .order_by(
-            metric_expression.desc(),
+        .group_by(*daily_group_columns)
+    )
+    if args.metric != "orderCount":
+        query = query.order_by(
+            metric_expressions[args.metric].desc(),
+            ProductSalesDailyModel.manage_number.asc(),
+            *(
+                (ProductSalesDailyModel.sku_key.asc(),)
+                if args.include_sku
+                else ()
+            ),
+        ).limit(args.limit)
+    else:
+        query = query.order_by(
             ProductSalesDailyModel.manage_number.asc(),
             *(
                 (ProductSalesDailyModel.sku_key.asc(),)
@@ -858,15 +879,18 @@ def _ranking_rows(
                 else ()
             ),
         )
-        .limit(args.limit)
-    )
+
     rows: list[dict[str, Any]] = []
     for raw in session.execute(query).mappings():
+        count_key = (
+            raw["manage_number"],
+            raw["sku_key"] if args.include_sku else None,
+        )
         row = {
             "manageNumber": raw["manage_number"],
             "itemNumber": raw["item_number"],
             "itemName": raw["item_name"],
-            "orderCount": _integer(raw["order_count"]),
+            "orderCount": fact_order_counts.get(count_key, 0),
             "orderedUnits": _integer(raw["ordered_units"]),
             "effectiveUnits": _integer(raw["effective_units"]),
             "grossSalesAmount": _decimal_number(
@@ -880,6 +904,15 @@ def _ranking_rows(
             row["skuKey"] = raw["sku_key"]
         row["metricValue"] = row[args.metric]
         rows.append(row)
+    if args.metric == "orderCount":
+        rows.sort(
+            key=lambda row: (
+                -row["orderCount"],
+                row["manageNumber"],
+                row.get("skuKey", ""),
+            )
+        )
+        rows = rows[: args.limit]
     return rows
 
 
@@ -911,39 +944,100 @@ def _period_key(value: date, grain: Grain) -> str:
     return monday.isoformat()
 
 
-def _aggregate_trend_rows(
-    rows: list[Any],
+def _period_group_expression(session: Session, grain: Grain) -> Any:
+    sales_date = ProductSalesDailyModel.sales_date
+    if grain == "day":
+        return sales_date
+
+    dialect_name = session.get_bind().dialect.name
+    if grain == "month":
+        if dialect_name == "mysql":
+            return func.date_format(sales_date, "%Y-%m")
+        if dialect_name == "sqlite":
+            return func.strftime("%Y-%m", sales_date)
+        return func.date_trunc("month", sales_date)
+
+    if dialect_name == "mysql":
+        return func.yearweek(sales_date, 3)
+    if dialect_name == "sqlite":
+        weekday = sql_cast(func.strftime("%w", sales_date), Integer)
+        return func.date(
+            sales_date,
+            func.printf("-%d days", (weekday + 6) % 7),
+        )
+    return func.date_trunc("week", sales_date)
+
+
+def _date_value(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def _grouped_trend_rows(
+    session: Session,
+    *,
+    owner_username: str,
+    store_id: int,
+    start_date: date,
+    end_date: date,
+    manage_numbers: list[str],
     grain: Grain,
 ) -> list[dict[str, Any]]:
-    buckets: dict[str, dict[str, int | Decimal]] = {}
-    for row in rows:
-        period = _period_key(row.sales_date, grain)
-        bucket = buckets.setdefault(
-            period,
-            {
-                "orderedUnits": 0,
-                "effectiveUnits": 0,
-                "effectiveSalesAmount": Decimal("0"),
-            },
+    period_expression = _period_group_expression(session, grain)
+    raw_rows = session.execute(
+        select(
+            ProductSalesDailyModel.manage_number.label("manage_number"),
+            func.min(ProductSalesDailyModel.sales_date).label(
+                "sample_date"
+            ),
+            func.coalesce(
+                func.sum(ProductSalesDailyModel.ordered_units),
+                0,
+            ).label("ordered_units"),
+            func.coalesce(
+                func.sum(ProductSalesDailyModel.effective_units),
+                0,
+            ).label("effective_units"),
+            func.coalesce(
+                func.sum(ProductSalesDailyModel.effective_sales_amount),
+                0,
+            ).label("effective_sales_amount"),
         )
-        bucket["orderedUnits"] = int(bucket["orderedUnits"]) + row.ordered_units
-        bucket["effectiveUnits"] = (
-            int(bucket["effectiveUnits"]) + row.effective_units
+        .where(
+            *_daily_filters(
+                owner_username,
+                store_id,
+                start_date,
+                end_date,
+            ),
+            ProductSalesDailyModel.manage_number.in_(manage_numbers),
         )
-        bucket["effectiveSalesAmount"] = (
-            Decimal(bucket["effectiveSalesAmount"])
-            + row.effective_sales_amount
+        .group_by(
+            ProductSalesDailyModel.manage_number,
+            period_expression,
         )
+        .order_by(
+            ProductSalesDailyModel.manage_number.asc(),
+            period_expression.asc(),
+        )
+    ).mappings()
     return [
         {
-            "period": period,
-            "orderedUnits": int(values["orderedUnits"]),
-            "effectiveUnits": int(values["effectiveUnits"]),
+            "manageNumber": raw["manage_number"],
+            "period": _period_key(
+                _date_value(raw["sample_date"]),
+                grain,
+            ),
+            "orderedUnits": _integer(raw["ordered_units"]),
+            "effectiveUnits": _integer(raw["effective_units"]),
             "effectiveSalesAmount": _decimal_number(
-                Decimal(values["effectiveSalesAmount"])
+                raw["effective_sales_amount"]
             ),
         }
-        for period, values in sorted(buckets.items())
+        for raw in raw_rows
     ]
 
 
@@ -954,19 +1048,15 @@ def _product_sales_trend(
 ) -> dict[str, Any]:
     args = cast(ProductSalesTrendArguments, arguments)
     store = _require_owned_store(session, owner_username, args.store_id)
-    daily_rows = session.scalars(
-        select(ProductSalesDailyModel)
-        .where(
-            *_daily_filters(
-                owner_username,
-                store.id,
-                args.start_date,
-                args.end_date,
-            ),
-            ProductSalesDailyModel.manage_number == args.manage_number,
-        )
-        .order_by(ProductSalesDailyModel.sales_date.asc())
-    ).all()
+    grouped_rows = _grouped_trend_rows(
+        session,
+        owner_username=owner_username,
+        store_id=store.id,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        manage_numbers=[args.manage_number],
+        grain=args.grain,
+    )
     result = _result_metadata(
         session,
         owner_username=owner_username,
@@ -977,7 +1067,14 @@ def _product_sales_trend(
     )
     result["manageNumber"] = args.manage_number
     result["grain"] = args.grain
-    result["rows"] = _aggregate_trend_rows(daily_rows, args.grain)
+    result["rows"] = [
+        {
+            key: value
+            for key, value in row.items()
+            if key != "manageNumber"
+        }
+        for row in grouped_rows
+    ]
     return result
 
 
@@ -988,8 +1085,39 @@ def _compare_product_sales(
 ) -> dict[str, Any]:
     args = cast(CompareProductSalesArguments, arguments)
     store = _require_owned_store(session, owner_username, args.store_id)
-    daily_rows = session.scalars(
-        select(ProductSalesDailyModel)
+    summary_rows = session.execute(
+        select(
+            ProductSalesDailyModel.manage_number.label("manage_number"),
+            func.max(ProductSalesDailyModel.item_name_snapshot).label(
+                "item_name"
+            ),
+            func.coalesce(
+                func.sum(ProductSalesDailyModel.ordered_units),
+                0,
+            ).label("ordered_units"),
+            func.coalesce(
+                func.sum(ProductSalesDailyModel.effective_units),
+                0,
+            ).label("effective_units"),
+            func.coalesce(
+                func.sum(ProductSalesDailyModel.effective_sales_amount),
+                0,
+            ).label("effective_sales_amount"),
+            (
+                func.coalesce(
+                    func.sum(ProductSalesDailyModel.canceled_units),
+                    0,
+                )
+                + func.coalesce(
+                    func.sum(ProductSalesDailyModel.refunded_units),
+                    0,
+                )
+                + func.coalesce(
+                    func.sum(ProductSalesDailyModel.returned_units),
+                    0,
+                )
+            ).label("adjusted_units"),
+        )
         .where(
             *_daily_filters(
                 owner_username,
@@ -999,58 +1127,56 @@ def _compare_product_sales(
             ),
             ProductSalesDailyModel.manage_number.in_(args.manage_numbers),
         )
-        .order_by(
-            ProductSalesDailyModel.manage_number.asc(),
-            ProductSalesDailyModel.sales_date.asc(),
-        )
-    ).all()
-    by_product: dict[str, list[ProductSalesDailyModel]] = {
+        .group_by(ProductSalesDailyModel.manage_number)
+    ).mappings()
+    summary_by_product = {
+        raw["manage_number"]: raw for raw in summary_rows
+    }
+    grouped_series = _grouped_trend_rows(
+        session,
+        owner_username=owner_username,
+        store_id=store.id,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        manage_numbers=args.manage_numbers,
+        grain=args.grain,
+    )
+    series_by_product: dict[str, list[dict[str, Any]]] = {
         manage_number: [] for manage_number in args.manage_numbers
     }
-    for row in daily_rows:
-        by_product[row.manage_number].append(row)
+    for row in grouped_series:
+        series_by_product[row["manageNumber"]].append(row)
 
     summaries: list[dict[str, Any]] = []
     series: list[dict[str, Any]] = []
     for manage_number in args.manage_numbers:
-        product_rows = by_product[manage_number]
-        ordered_units = sum(row.ordered_units for row in product_rows)
-        effective_units = sum(row.effective_units for row in product_rows)
-        adjusted_units = sum(
-            row.canceled_units + row.refunded_units + row.returned_units
-            for row in product_rows
+        raw = summary_by_product.get(manage_number)
+        ordered_units = _integer(
+            raw["ordered_units"] if raw is not None else 0
+        )
+        effective_units = _integer(
+            raw["effective_units"] if raw is not None else 0
+        )
+        adjusted_units = _integer(
+            raw["adjusted_units"] if raw is not None else 0
         )
         summaries.append(
             {
                 "manageNumber": manage_number,
-                "itemName": (
-                    product_rows[-1].item_name_snapshot
-                    if product_rows
-                    else ""
-                ),
+                "itemName": raw["item_name"] if raw is not None else "",
                 "orderedUnits": ordered_units,
                 "effectiveUnits": effective_units,
                 "effectiveSalesAmount": _decimal_number(
-                    sum(
-                        (
-                            row.effective_sales_amount
-                            for row in product_rows
-                        ),
-                        Decimal("0"),
-                    )
+                    raw["effective_sales_amount"]
+                    if raw is not None
+                    else 0
                 ),
                 "adjustmentRate": (
                     adjusted_units / ordered_units if ordered_units else 0.0
                 ),
             }
         )
-        for trend_row in _aggregate_trend_rows(product_rows, args.grain):
-            series.append(
-                {
-                    **trend_row,
-                    "manageNumber": manage_number,
-                }
-            )
+        series.extend(series_by_product[manage_number])
     result = _result_metadata(
         session,
         owner_username=owner_username,
