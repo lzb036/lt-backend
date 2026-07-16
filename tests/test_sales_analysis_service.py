@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.database import Base
@@ -17,6 +17,7 @@ from app.db.models import (
     SalesItemAdjustmentModel,
     SalesOrderItemModel,
     SalesOrderModel,
+    SalesSyncStateModel,
     StoreModel,
     UserAccountModel,
 )
@@ -69,6 +70,8 @@ def _add_user_and_store(
             display_name=owner_username.title(),
             password_salt_b64="salt",
             password_hash_b64="hash",
+            created_at=datetime(2026, 7, 16, 4, 0, 0),
+            updated_at=datetime(2026, 7, 16, 4, 0, 0),
         )
     )
     session.flush()
@@ -76,6 +79,8 @@ def _add_user_and_store(
         owner_username=owner_username,
         store_code=store_code,
         store_name=f"{owner_username.title()} Shop",
+        created_at=datetime(2026, 7, 16, 5, 0, 0),
+        updated_at=datetime(2026, 7, 16, 5, 0, 0),
     )
     session.add(store)
     session.flush()
@@ -90,9 +95,9 @@ def _add_product(
     manage_number: str,
     title: str,
     listed_at: datetime,
+    rakuten_listing_status: str = "listed",
 ) -> None:
-    session.add(
-        ProductModel(
+    product = ProductModel(
             owner_username=owner_username,
             store_id=store_id,
             title=title,
@@ -101,10 +106,13 @@ def _add_product(
             rakuten_manage_number=manage_number,
             item_number=f"ITEM-{manage_number}",
             review_status="listed",
-            rakuten_listing_status="listed",
+            rakuten_listing_status=rakuten_listing_status,
             listed_at=listed_at,
-        )
+            created_at=datetime(2026, 7, 16, 5, 0, 0),
+            updated_at=datetime(2026, 7, 16, 5, 10, 0),
     )
+    session.add(product)
+    session.flush()
 
 
 def _add_daily(
@@ -124,14 +132,14 @@ def _add_daily(
     effective_units: int,
     gross_amount: str,
     effective_amount: str,
+    item_number: str | None = None,
 ) -> None:
-    session.add(
-        ProductSalesDailyModel(
+    daily = ProductSalesDailyModel(
             owner_username=owner_username,
             store_id=store_id,
             sales_date=sales_date,
             manage_number=manage_number,
-            item_number=f"ITEM-{manage_number}",
+            item_number=item_number or f"ITEM-{manage_number}",
             sku_key=sku_key,
             item_name_snapshot=item_name,
             order_count=order_count,
@@ -144,8 +152,9 @@ def _add_daily(
             effective_sales_amount=Decimal(effective_amount),
             created_at=datetime(2026, 7, 16, 6, 0, 0),
             updated_at=datetime(2026, 7, 16, 6, 30, 0),
-        )
     )
+    session.add(daily)
+    session.flush()
 
 
 def _add_order_with_adjustments(
@@ -165,6 +174,8 @@ def _add_order_with_adjustments(
         total_amount=Decimal("300"),
         raw_order_json="{}",
         last_synced_at=datetime(2026, 7, 16, 6, 0, 0),
+        created_at=datetime(2026, 7, 16, 5, 20, 0),
+        updated_at=datetime(2026, 7, 16, 5, 20, 0),
     )
     session.add(order)
     session.flush()
@@ -181,6 +192,8 @@ def _add_order_with_adjustments(
         ordered_units=3,
         ordered_at=order.ordered_at,
     )
+    item.created_at = datetime(2026, 7, 16, 5, 30, 0)
+    item.updated_at = datetime(2026, 7, 16, 5, 30, 0)
     session.add(item)
     session.flush()
     session.add_all(
@@ -217,6 +230,73 @@ def _add_order_with_adjustments(
     )
 
 
+def _add_order(
+    session: Session,
+    *,
+    owner_username: str,
+    store_id: int,
+    order_number: str,
+    ordered_at: datetime,
+    has_unresolved_adjustment: bool = False,
+    updated_at: datetime | None = None,
+    updated_at_remote: datetime | None = None,
+    last_synced_at: datetime | None = None,
+) -> SalesOrderModel:
+    source_updated_at = updated_at or datetime(2026, 7, 16, 5, 20, 0)
+    order = SalesOrderModel(
+        owner_username=owner_username,
+        store_id=store_id,
+        order_number=order_number,
+        order_progress="300",
+        order_status="normal",
+        ordered_at=ordered_at,
+        updated_at_remote=updated_at_remote,
+        total_amount=Decimal("300"),
+        has_unresolved_adjustment=has_unresolved_adjustment,
+        raw_order_json="{}",
+        last_synced_at=last_synced_at or source_updated_at,
+        created_at=source_updated_at,
+        updated_at=source_updated_at,
+    )
+    session.add(order)
+    session.flush()
+    return order
+
+
+def _add_order_item(
+    session: Session,
+    *,
+    order: SalesOrderModel,
+    item_detail_id: str,
+    manage_number: str,
+    item_number: str,
+    sku_key: str,
+    item_name: str,
+    ordered_units: int = 1,
+    updated_at: datetime | None = None,
+) -> SalesOrderItemModel:
+    source_updated_at = updated_at or datetime(2026, 7, 16, 5, 30, 0)
+    item = SalesOrderItemModel.from_service_payload(
+        owner_username=order.owner_username,
+        store_id=order.store_id,
+        sales_order_id=order.id,
+        order_number=order.order_number,
+        item_detail_id=item_detail_id,
+        manage_number=manage_number,
+        item_number=item_number,
+        sku_key=sku_key,
+        item_name=item_name,
+        unit_price=Decimal("100"),
+        ordered_units=ordered_units,
+        ordered_at=order.ordered_at,
+    )
+    item.created_at = source_updated_at
+    item.updated_at = source_updated_at
+    session.add(item)
+    session.flush()
+    return item
+
+
 @pytest.fixture()
 def seeded_sales(session_factory):
     with session_factory() as session:
@@ -246,6 +326,15 @@ def seeded_sales(session_factory):
             manage_number="MN-ZERO",
             title="Zero",
             listed_at=datetime(2026, 1, 3, 0, 0, 0),
+        )
+        _add_product(
+            session,
+            owner_username="alice",
+            store_id=alice_store.id,
+            manage_number="MN-UNLISTED",
+            title="Unlisted",
+            listed_at=datetime(2026, 1, 4, 0, 0, 0),
+            rakuten_listing_status="unlisted",
         )
         _add_product(
             session,
@@ -338,6 +427,8 @@ def seeded_sales(session_factory):
                     total_amount=Decimal("200"),
                     raw_order_json="{}",
                     last_synced_at=datetime(2026, 7, 16, 6, 0, 0),
+                    created_at=datetime(2026, 7, 16, 5, 20, 0),
+                    updated_at=datetime(2026, 7, 16, 5, 20, 0),
                 ),
                 SalesOrderModel(
                     owner_username="alice",
@@ -349,6 +440,8 @@ def seeded_sales(session_factory):
                     total_amount=Decimal("50"),
                     raw_order_json="{}",
                     last_synced_at=datetime(2026, 7, 16, 6, 0, 0),
+                    created_at=datetime(2026, 7, 16, 5, 20, 0),
+                    updated_at=datetime(2026, 7, 16, 5, 20, 0),
                 ),
             ]
         )
@@ -392,6 +485,15 @@ def test_registers_exactly_eight_strict_read_only_tools():
         assert tool["type"] == "function"
         parameters = tool["function"]["parameters"]
         assert parameters["additionalProperties"] is False
+    sku_tool = next(
+        tool
+        for tool in sales_analysis_service.SALES_ANALYSIS_TOOLS
+        if tool["function"]["name"] == "get_sku_sales_breakdown"
+    )
+    limit_schema = sku_tool["function"]["parameters"]["properties"]["limit"]
+    assert limit_schema["default"] == 100
+    assert limit_schema["minimum"] == 1
+    assert limit_schema["maximum"] == 100
 
 
 def test_list_owned_stores_only_returns_current_owner(seeded_sales):
@@ -516,6 +618,53 @@ def test_every_store_scoped_tool_rejects_another_owners_store(
             },
         ),
         (
+            "get_sku_sales_breakdown",
+            {
+                "storeId": 1,
+                "manageNumber": "MN-A",
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "limit": 0,
+            },
+        ),
+        (
+            "get_sku_sales_breakdown",
+            {
+                "storeId": 1,
+                "manageNumber": "MN-A",
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "limit": 101,
+            },
+        ),
+        (
+            "get_store_sales_overview",
+            {
+                "storeId": 1,
+                "startDate": "9999-12-31",
+                "endDate": "9999-12-31",
+            },
+        ),
+        (
+            "get_store_sales_overview",
+            {
+                "storeId": 1,
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "compareStartDate": "9999-12-31",
+                "compareEndDate": "9999-12-31",
+            },
+        ),
+        (
+            "get_slow_moving_products",
+            {
+                "storeId": 1,
+                "startDate": "0001-01-01",
+                "endDate": "0001-01-01",
+                "minListedDays": 2,
+            },
+        ),
+        (
             "get_product_sales_trend",
             {
                 "storeId": 1,
@@ -628,6 +777,133 @@ def test_product_ranking_is_chart_ready_and_does_not_leak_other_tenants(seeded_s
     assert "Bob Product" not in repr(result)
 
 
+def test_product_ranking_uses_manage_number_and_distinct_fact_orders(session_factory):
+    with session_factory() as session:
+        store = _add_user_and_store(session, "alice", "ranking-facts")
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 14),
+            manage_number="MN-STABLE",
+            item_number="ITEM-OLD",
+            sku_key="blue",
+            item_name="Stable Product",
+            order_count=1,
+            ordered_units=2,
+            effective_units=2,
+            gross_amount="200",
+            effective_amount="200",
+        )
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 15),
+            manage_number="MN-STABLE",
+            item_number="ITEM-NEW",
+            sku_key="blue",
+            item_name="Stable Product",
+            order_count=1,
+            ordered_units=1,
+            effective_units=1,
+            gross_amount="100",
+            effective_amount="100",
+        )
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 15),
+            manage_number="MN-STABLE",
+            item_number="ITEM-NEW",
+            sku_key="red",
+            item_name="Stable Product",
+            order_count=1,
+            ordered_units=4,
+            effective_units=4,
+            gross_amount="400",
+            effective_amount="400",
+        )
+        first_order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="FACT-ORDER-1",
+            ordered_at=datetime(2026, 7, 14, 10, 0, 0),
+        )
+        _add_order_item(
+            session,
+            order=first_order,
+            item_detail_id="fact-1-blue",
+            manage_number="MN-STABLE",
+            item_number="ITEM-OLD",
+            sku_key="blue",
+            item_name="Stable Product",
+            ordered_units=2,
+        )
+        second_order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="FACT-ORDER-2",
+            ordered_at=datetime(2026, 7, 15, 10, 0, 0),
+        )
+        _add_order_item(
+            session,
+            order=second_order,
+            item_detail_id="fact-2-blue",
+            manage_number="MN-STABLE",
+            item_number="ITEM-NEW",
+            sku_key="blue",
+            item_name="Stable Product",
+        )
+        _add_order_item(
+            session,
+            order=second_order,
+            item_detail_id="fact-2-red",
+            manage_number="MN-STABLE",
+            item_number="ITEM-NEW",
+            sku_key="red",
+            item_name="Stable Product",
+            ordered_units=4,
+        )
+        session.commit()
+        store_id = store.id
+
+    product_result = execute(
+        "get_product_sales_ranking",
+        {
+            "storeId": store_id,
+            "startDate": "2026-07-14",
+            "endDate": "2026-07-15",
+            "metric": "orderCount",
+            "limit": 10,
+            "includeSku": False,
+        },
+    )
+    sku_result = execute(
+        "get_product_sales_ranking",
+        {
+            "storeId": store_id,
+            "startDate": "2026-07-14",
+            "endDate": "2026-07-15",
+            "metric": "orderCount",
+            "limit": 10,
+            "includeSku": True,
+        },
+    )
+
+    assert len(product_result["rows"]) == 1
+    assert product_result["rows"][0]["manageNumber"] == "MN-STABLE"
+    assert product_result["rows"][0]["orderCount"] == 2
+    assert product_result["rows"][0]["metricValue"] == 2
+    assert {
+        (row["skuKey"], row["orderCount"])
+        for row in sku_result["rows"]
+    } == {("blue", 2), ("red", 1)}
+
+
 def test_product_trend_supports_day_week_and_month_grains(seeded_sales):
     daily = execute(
         "get_product_sales_trend",
@@ -719,6 +995,40 @@ def test_sku_breakdown_returns_units_amounts_and_shares(seeded_sales):
     assert result["rows"][0]["salesShare"] == pytest.approx(0.6)
 
 
+def test_sku_breakdown_applies_requested_limit_in_sql(
+    seeded_sales,
+    session_factory,
+):
+    statements: list[str] = []
+    engine = session_factory.kw["bind"]
+
+    def _capture_statement(_, __, statement, ___, ____, _____):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture_statement)
+    try:
+        result = execute(
+            "get_sku_sales_breakdown",
+            {
+                "storeId": seeded_sales["alice_store_id"],
+                "manageNumber": "MN-A",
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "limit": 1,
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture_statement)
+
+    assert len(result["rows"]) == 1
+    assert any(
+        "group by" in statement.lower()
+        and "limit" in statement.lower()
+        and "lt_product_sales_daily" in statement.lower()
+        for statement in statements
+    )
+
+
 def test_slow_movers_include_zero_sales_listed_products(seeded_sales):
     result = execute(
         "get_slow_moving_products",
@@ -737,6 +1047,9 @@ def test_slow_movers_include_zero_sales_listed_products(seeded_sales):
         ("MN-B", 1),
     ]
     assert all(row["listedDays"] >= 30 for row in result["rows"])
+    assert "MN-UNLISTED" not in {
+        row["manageNumber"] for row in result["rows"]
+    }
 
 
 def test_adjustment_summary_reports_confirmed_and_unresolved_rows(seeded_sales):
@@ -770,6 +1083,277 @@ def test_adjustment_summary_reports_confirmed_and_unresolved_rows(seeded_sales):
             "amount": 100.0,
         },
     ]
+
+
+def test_unresolved_adjustments_are_counted_once_per_order_and_include_flags(
+    session_factory,
+):
+    with session_factory() as session:
+        store = _add_user_and_store(session, "alice", "unresolved-orders")
+        item_backed_order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="UNRESOLVED-WITH-ITEMS",
+            ordered_at=datetime(2026, 7, 15, 10, 0, 0),
+            has_unresolved_adjustment=True,
+        )
+        first_item = _add_order_item(
+            session,
+            order=item_backed_order,
+            item_detail_id="unresolved-item-1",
+            manage_number="MN-A",
+            item_number="ITEM-A",
+            sku_key="blue",
+            item_name="Alpha",
+        )
+        second_item = _add_order_item(
+            session,
+            order=item_backed_order,
+            item_detail_id="unresolved-item-2",
+            manage_number="MN-A",
+            item_number="ITEM-A",
+            sku_key="red",
+            item_name="Alpha",
+        )
+        session.add_all(
+            [
+                SalesItemAdjustmentModel(
+                    owner_username="alice",
+                    store_id=store.id,
+                    sales_order_item_id=first_item.id,
+                    adjustment_type="refund",
+                    units=1,
+                    amount=Decimal("25"),
+                    source="test:first",
+                    status="unresolved",
+                    reason="partial refund",
+                    raw_payload_json="{}",
+                    created_at=datetime(2026, 7, 16, 6, 0, 0),
+                    updated_at=datetime(2026, 7, 16, 6, 10, 0),
+                ),
+                SalesItemAdjustmentModel(
+                    owner_username="alice",
+                    store_id=store.id,
+                    sales_order_item_id=first_item.id,
+                    adjustment_type="refund",
+                    units=0,
+                    amount=Decimal("15"),
+                    source="test:second",
+                    status="unresolved",
+                    reason="unattributed amount",
+                    raw_payload_json="{}",
+                    created_at=datetime(2026, 7, 16, 6, 0, 0),
+                    updated_at=datetime(2026, 7, 16, 6, 15, 0),
+                ),
+                SalesItemAdjustmentModel(
+                    owner_username="alice",
+                    store_id=store.id,
+                    sales_order_item_id=second_item.id,
+                    adjustment_type="refund",
+                    units=1,
+                    amount=Decimal("60"),
+                    source="test:third",
+                    status="unresolved",
+                    reason="partial refund",
+                    raw_payload_json="{}",
+                    created_at=datetime(2026, 7, 16, 6, 0, 0),
+                    updated_at=datetime(2026, 7, 16, 6, 20, 0),
+                ),
+            ]
+        )
+        _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="UNRESOLVED-FLAG-ONLY",
+            ordered_at=datetime(2026, 7, 15, 11, 0, 0),
+            has_unresolved_adjustment=True,
+        )
+        bob_store = _add_user_and_store(session, "bob", "bob-unresolved")
+        _add_order(
+            session,
+            owner_username="bob",
+            store_id=bob_store.id,
+            order_number="BOB-UNRESOLVED",
+            ordered_at=datetime(2026, 7, 15, 11, 0, 0),
+            has_unresolved_adjustment=True,
+        )
+        session.commit()
+        store_id = store.id
+
+    result = execute(
+        "get_sales_adjustment_summary",
+        {
+            "storeId": store_id,
+            "startDate": "2026-07-14",
+            "endDate": "2026-07-15",
+        },
+    )
+
+    assert result["unresolvedAdjustmentCount"] == 2
+    assert result["rows"] == [
+        {
+            "adjustmentType": "refund",
+            "status": "unresolved",
+            "adjustmentCount": 1,
+            "units": 2,
+            "amount": 100.0,
+        },
+        {
+            "adjustmentType": "unattributed",
+            "status": "unresolved",
+            "adjustmentCount": 1,
+            "units": 0,
+            "amount": 0.0,
+        },
+    ]
+    assert "BOB-UNRESOLVED" not in repr(result)
+
+
+def test_data_updated_at_tracks_every_underlying_store_source(session_factory):
+    arguments: dict[str, Any]
+    with session_factory() as session:
+        store = _add_user_and_store(session, "alice", "updated-sources")
+        store.last_synced_at = datetime(2026, 7, 16, 1, 30, 0)
+        store.updated_at = datetime(2026, 7, 16, 1, 0, 0)
+        session.commit()
+        store_id = store.id
+    arguments = {
+        "storeId": store_id,
+        "startDate": "2026-07-14",
+        "endDate": "2026-07-15",
+    }
+    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
+        "2026-07-16T09:30:00+08:00"
+    )
+
+    with session_factory() as session:
+        session.add(
+            SalesSyncStateModel(
+                store_id=store_id,
+                owner_username="alice",
+                initial_sync_completed=True,
+                last_successful_sync_at=datetime(2026, 7, 16, 2, 30, 0),
+                last_remote_updated_at=datetime(2026, 7, 16, 2, 45, 0),
+                sync_status="idle",
+                created_at=datetime(2026, 7, 16, 2, 0, 0),
+                updated_at=datetime(2026, 7, 16, 2, 0, 0),
+            )
+        )
+        session.commit()
+    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
+        "2026-07-16T10:45:00+08:00"
+    )
+
+    with session_factory() as session:
+        _add_product(
+            session,
+            owner_username="alice",
+            store_id=store_id,
+            manage_number="MN-SOURCE",
+            title="Source Product",
+            listed_at=datetime(2026, 1, 1, 0, 0, 0),
+        )
+        product = session.scalars(
+            select(ProductModel).where(
+                ProductModel.store_id == store_id,
+                ProductModel.rakuten_manage_number == "MN-SOURCE",
+            )
+        ).one()
+        product.updated_at = datetime(2026, 7, 16, 3, 0, 0)
+        session.commit()
+    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
+        "2026-07-16T11:00:00+08:00"
+    )
+
+    with session_factory() as session:
+        order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store_id,
+            order_number="UPDATED-ORDER",
+            ordered_at=datetime(2026, 7, 15, 10, 0, 0),
+            updated_at=datetime(2026, 7, 16, 4, 0, 0),
+            updated_at_remote=datetime(2026, 7, 16, 4, 45, 0),
+            last_synced_at=datetime(2026, 7, 16, 4, 30, 0),
+        )
+        session.commit()
+        order_id = order.id
+    order_only = execute("get_store_sales_overview", arguments)
+    assert order_only["rows"][0]["orderCount"] == 1
+    assert order_only["dataUpdatedAt"] == "2026-07-16T12:45:00+08:00"
+
+    with session_factory() as session:
+        order = session.get(SalesOrderModel, order_id)
+        assert order is not None
+        item = _add_order_item(
+            session,
+            order=order,
+            item_detail_id="updated-item",
+            manage_number="MN-SOURCE",
+            item_number="ITEM-SOURCE",
+            sku_key="blue",
+            item_name="Source Product",
+            updated_at=datetime(2026, 7, 16, 5, 0, 0),
+        )
+        session.commit()
+        item_id = item.id
+    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
+        "2026-07-16T13:00:00+08:00"
+    )
+
+    with session_factory() as session:
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store_id,
+            sales_date=date(2026, 7, 15),
+            manage_number="MN-SOURCE",
+            sku_key="blue",
+            item_name="Source Product",
+            order_count=1,
+            ordered_units=1,
+            effective_units=1,
+            gross_amount="100",
+            effective_amount="100",
+        )
+        daily = session.scalars(
+            select(ProductSalesDailyModel).where(
+                ProductSalesDailyModel.store_id == store_id
+            )
+        ).one()
+        daily.updated_at = datetime(2026, 7, 16, 6, 0, 0)
+        session.commit()
+    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
+        "2026-07-16T14:00:00+08:00"
+    )
+
+    with session_factory() as session:
+        session.add(
+            SalesItemAdjustmentModel(
+                owner_username="alice",
+                store_id=store_id,
+                sales_order_item_id=item_id,
+                adjustment_type="refund",
+                units=0,
+                amount=Decimal("25"),
+                source="updated-source",
+                status="unresolved",
+                reason="source timestamp",
+                remote_updated_at=datetime(2026, 7, 16, 7, 30, 0),
+                raw_payload_json="{}",
+                created_at=datetime(2026, 7, 16, 7, 0, 0),
+                updated_at=datetime(2026, 7, 16, 7, 0, 0),
+            )
+        )
+        session.commit()
+    assert execute("get_store_sales_overview", arguments)["dataUpdatedAt"] == (
+        "2026-07-16T15:30:00+08:00"
+    )
+    assert execute("list_owned_stores", {})["dataUpdatedAt"] == (
+        "2026-07-16T15:30:00+08:00"
+    )
 
 
 def test_unknown_tool_is_rejected_without_database_fallback():

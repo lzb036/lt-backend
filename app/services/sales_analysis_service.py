@@ -13,7 +13,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import func, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db.database import session_scope
@@ -23,6 +23,7 @@ from app.db.models import (
     SalesItemAdjustmentModel,
     SalesOrderItemModel,
     SalesOrderModel,
+    SalesSyncStateModel,
     StoreModel,
 )
 
@@ -82,6 +83,8 @@ class DateRangeArguments(StrictToolArguments):
     def validate_date_range(self) -> DateRangeArguments:
         if self.start_date > self.end_date:
             raise ValueError("startDate 不能晚于 endDate。")
+        if self.end_date == date.max:
+            raise ValueError("endDate 超出可查询范围。")
         inclusive_days = (self.end_date - self.start_date).days + 1
         if inclusive_days > MAX_RANGE_DAYS:
             raise ValueError(f"时间范围不能超过 {MAX_RANGE_DAYS} 天。")
@@ -116,6 +119,8 @@ class StoreSalesOverviewArguments(StoreDateRangeArguments):
                 raise ValueError(
                     "compareStartDate 不能晚于 compareEndDate。"
                 )
+            if self.compare_end_date == date.max:
+                raise ValueError("compareEndDate 超出可查询范围。")
             inclusive_days = (
                 self.compare_end_date - self.compare_start_date
             ).days + 1
@@ -155,6 +160,12 @@ class CompareProductSalesArguments(StoreDateRangeArguments):
 
 class SkuSalesBreakdownArguments(StoreDateRangeArguments):
     manage_number: ManageNumber = Field(alias="manageNumber")
+    limit: int = Field(
+        default=MAX_RANKING_LIMIT,
+        strict=True,
+        ge=1,
+        le=MAX_RANKING_LIMIT,
+    )
 
 
 class SlowMovingProductsArguments(StoreDateRangeArguments):
@@ -173,6 +184,12 @@ class SlowMovingProductsArguments(StoreDateRangeArguments):
         le=1_000_000,
     )
     limit: int = Field(default=20, strict=True, ge=1, le=MAX_RANKING_LIMIT)
+
+    @model_validator(mode="after")
+    def validate_listed_cutoff(self) -> SlowMovingProductsArguments:
+        if self.end_date.toordinal() < self.min_listed_days:
+            raise ValueError("endDate 与 minListedDays 超出可查询范围。")
+        return self
 
 
 class SalesAdjustmentSummaryArguments(StoreDateRangeArguments):
@@ -268,6 +285,11 @@ def _integer(value: Any) -> int:
     return int(value or 0)
 
 
+def _latest_datetime(*values: datetime | None) -> datetime | None:
+    present = [value for value in values if value is not None]
+    return max(present) if present else None
+
+
 def _iso_updated_at(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -322,6 +344,21 @@ def _item_adjustment_filters(
     )
 
 
+def _order_item_filters(
+    owner_username: str,
+    store_id: int,
+    start_date: date,
+    end_date: date,
+) -> tuple[Any, ...]:
+    start_at, end_at = _range_datetimes(start_date, end_date)
+    return (
+        SalesOrderItemModel.owner_username == owner_username,
+        SalesOrderItemModel.store_id == store_id,
+        SalesOrderItemModel.ordered_at >= start_at,
+        SalesOrderItemModel.ordered_at < end_at,
+    )
+
+
 def _data_updated_at(
     session: Session,
     owner_username: str,
@@ -329,6 +366,7 @@ def _data_updated_at(
     start_date: date,
     end_date: date,
 ) -> datetime | None:
+    start_at, end_at = _range_datetimes(start_date, end_date)
     daily_updated_at = session.scalar(
         select(func.max(ProductSalesDailyModel.updated_at)).where(
             *_daily_filters(
@@ -339,8 +377,33 @@ def _data_updated_at(
             )
         )
     )
-    adjustment_updated_at = session.scalar(
-        select(func.max(SalesItemAdjustmentModel.updated_at))
+    order_values = session.execute(
+        select(
+            func.max(SalesOrderModel.updated_at),
+            func.max(SalesOrderModel.updated_at_remote),
+            func.max(SalesOrderModel.last_synced_at),
+        ).where(
+            SalesOrderModel.owner_username == owner_username,
+            SalesOrderModel.store_id == store_id,
+            SalesOrderModel.ordered_at >= start_at,
+            SalesOrderModel.ordered_at < end_at,
+        )
+    ).one()
+    item_updated_at = session.scalar(
+        select(func.max(SalesOrderItemModel.updated_at)).where(
+            *_order_item_filters(
+                owner_username,
+                store_id,
+                start_date,
+                end_date,
+            )
+        )
+    )
+    adjustment_values = session.execute(
+        select(
+            func.max(SalesItemAdjustmentModel.updated_at),
+            func.max(SalesItemAdjustmentModel.remote_updated_at),
+        )
         .join(
             SalesOrderItemModel,
             SalesOrderItemModel.id
@@ -354,13 +417,142 @@ def _data_updated_at(
                 end_date,
             )
         )
+    ).one()
+    product_updated_at = session.scalar(
+        select(func.max(ProductModel.updated_at)).where(
+            ProductModel.owner_username == owner_username,
+            ProductModel.store_id == store_id,
+        )
     )
-    values = [
-        value
-        for value in (daily_updated_at, adjustment_updated_at)
-        if value is not None
-    ]
-    return max(values) if values else None
+    store_values = session.execute(
+        select(
+            func.max(StoreModel.updated_at),
+            func.max(StoreModel.last_checked_at),
+            func.max(StoreModel.last_product_synced_at),
+            func.max(StoreModel.last_synced_at),
+        ).where(
+            StoreModel.owner_username == owner_username,
+            StoreModel.id == store_id,
+        )
+    ).one()
+    sync_values = session.execute(
+        select(
+            func.max(SalesSyncStateModel.updated_at),
+            func.max(SalesSyncStateModel.last_successful_sync_at),
+            func.max(SalesSyncStateModel.last_remote_updated_at),
+        ).where(
+            SalesSyncStateModel.owner_username == owner_username,
+            SalesSyncStateModel.store_id == store_id,
+        )
+    ).one()
+    return _latest_datetime(
+        daily_updated_at,
+        *order_values,
+        item_updated_at,
+        *adjustment_values,
+        product_updated_at,
+        *store_values,
+        *sync_values,
+    )
+
+
+def _owner_data_updated_at(
+    session: Session,
+    owner_username: str,
+) -> datetime | None:
+    store_values = session.execute(
+        select(
+            func.max(StoreModel.updated_at),
+            func.max(StoreModel.last_checked_at),
+            func.max(StoreModel.last_product_synced_at),
+            func.max(StoreModel.last_synced_at),
+        ).where(StoreModel.owner_username == owner_username)
+    ).one()
+    sync_values = session.execute(
+        select(
+            func.max(SalesSyncStateModel.updated_at),
+            func.max(SalesSyncStateModel.last_successful_sync_at),
+            func.max(SalesSyncStateModel.last_remote_updated_at),
+        ).where(SalesSyncStateModel.owner_username == owner_username)
+    ).one()
+    order_values = session.execute(
+        select(
+            func.max(SalesOrderModel.updated_at),
+            func.max(SalesOrderModel.updated_at_remote),
+            func.max(SalesOrderModel.last_synced_at),
+        ).where(SalesOrderModel.owner_username == owner_username)
+    ).one()
+    item_updated_at = session.scalar(
+        select(func.max(SalesOrderItemModel.updated_at)).where(
+            SalesOrderItemModel.owner_username == owner_username
+        )
+    )
+    daily_updated_at = session.scalar(
+        select(func.max(ProductSalesDailyModel.updated_at)).where(
+            ProductSalesDailyModel.owner_username == owner_username
+        )
+    )
+    adjustment_values = session.execute(
+        select(
+            func.max(SalesItemAdjustmentModel.updated_at),
+            func.max(SalesItemAdjustmentModel.remote_updated_at),
+        ).where(SalesItemAdjustmentModel.owner_username == owner_username)
+    ).one()
+    product_updated_at = session.scalar(
+        select(func.max(ProductModel.updated_at)).where(
+            ProductModel.owner_username == owner_username
+        )
+    )
+    return _latest_datetime(
+        *store_values,
+        *sync_values,
+        *order_values,
+        item_updated_at,
+        daily_updated_at,
+        *adjustment_values,
+        product_updated_at,
+    )
+
+
+def _unresolved_adjustment_exists(
+    owner_username: str,
+    store_id: int,
+) -> Any:
+    return exists(
+        select(SalesItemAdjustmentModel.id)
+        .join(
+            SalesOrderItemModel,
+            SalesOrderItemModel.id
+            == SalesItemAdjustmentModel.sales_order_item_id,
+        )
+        .where(
+            SalesOrderItemModel.sales_order_id == SalesOrderModel.id,
+            SalesOrderItemModel.owner_username == owner_username,
+            SalesOrderItemModel.store_id == store_id,
+            SalesItemAdjustmentModel.owner_username == owner_username,
+            SalesItemAdjustmentModel.store_id == store_id,
+            SalesItemAdjustmentModel.status == "unresolved",
+        )
+    )
+
+
+def _unresolved_order_filters(
+    owner_username: str,
+    store_id: int,
+    start_date: date,
+    end_date: date,
+) -> tuple[Any, ...]:
+    start_at, end_at = _range_datetimes(start_date, end_date)
+    return (
+        SalesOrderModel.owner_username == owner_username,
+        SalesOrderModel.store_id == store_id,
+        SalesOrderModel.ordered_at >= start_at,
+        SalesOrderModel.ordered_at < end_at,
+        or_(
+            SalesOrderModel.has_unresolved_adjustment.is_(True),
+            _unresolved_adjustment_exists(owner_username, store_id),
+        ),
+    )
 
 
 def _unresolved_adjustment_count(
@@ -372,20 +564,14 @@ def _unresolved_adjustment_count(
 ) -> int:
     return _integer(
         session.scalar(
-            select(func.count(SalesItemAdjustmentModel.id))
-            .join(
-                SalesOrderItemModel,
-                SalesOrderItemModel.id
-                == SalesItemAdjustmentModel.sales_order_item_id,
-            )
+            select(func.count(SalesOrderModel.id))
             .where(
-                *_item_adjustment_filters(
+                *_unresolved_order_filters(
                     owner_username,
                     store_id,
                     start_date,
                     end_date,
-                ),
-                SalesItemAdjustmentModel.status == "unresolved",
+                )
             )
         )
     )
@@ -496,13 +682,10 @@ def _list_owned_stores(
         .where(StoreModel.owner_username == owner_username)
         .order_by(StoreModel.id.asc())
     ).all()
-    data_updated_at = session.scalar(
-        select(func.max(ProductSalesDailyModel.updated_at)).where(
-            ProductSalesDailyModel.owner_username == owner_username
-        )
-    )
     return {
-        "dataUpdatedAt": _iso_updated_at(data_updated_at),
+        "dataUpdatedAt": _iso_updated_at(
+            _owner_data_updated_at(session, owner_username)
+        ),
         "rows": [
             {
                 "id": store.id,
@@ -569,14 +752,41 @@ def _ranking_rows(
     owner_username: str,
     args: ProductSalesRankingArguments,
 ) -> list[dict[str, Any]]:
-    group_columns = [
-        ProductSalesDailyModel.manage_number,
-        ProductSalesDailyModel.item_number,
-    ]
+    daily_group_columns = [ProductSalesDailyModel.manage_number]
+    fact_group_columns = [SalesOrderItemModel.manage_number]
     if args.include_sku:
-        group_columns.append(ProductSalesDailyModel.sku_key)
+        daily_group_columns.append(ProductSalesDailyModel.sku_key)
+        fact_group_columns.append(SalesOrderItemModel.sku_key)
+    fact_order_counts = (
+        select(
+            *fact_group_columns,
+            func.count(
+                func.distinct(SalesOrderItemModel.order_number)
+            ).label("order_count"),
+        )
+        .where(
+            *_order_item_filters(
+                owner_username,
+                args.store_id,
+                args.start_date,
+                args.end_date,
+            )
+        )
+        .group_by(*fact_group_columns)
+        .subquery()
+    )
+    join_condition = (
+        fact_order_counts.c.manage_number
+        == ProductSalesDailyModel.manage_number
+    )
+    if args.include_sku:
+        join_condition = and_(
+            join_condition,
+            fact_order_counts.c.sku_key
+            == ProductSalesDailyModel.sku_key,
+        )
     order_count = func.coalesce(
-        func.sum(ProductSalesDailyModel.order_count),
+        fact_order_counts.c.order_count,
         0,
     ).label("order_count")
     ordered_units = func.coalesce(
@@ -602,16 +812,31 @@ def _ranking_rows(
         "grossSalesAmount": gross_sales_amount,
         "effectiveSalesAmount": effective_sales_amount,
     }[args.metric]
-    query = (
-        select(
-            *group_columns,
-            func.max(ProductSalesDailyModel.item_name_snapshot),
+    selected_columns = [
+        ProductSalesDailyModel.manage_number.label("manage_number"),
+    ]
+    if args.include_sku:
+        selected_columns.append(
+            ProductSalesDailyModel.sku_key.label("sku_key")
+        )
+    selected_columns.extend(
+        [
+            func.max(ProductSalesDailyModel.item_number).label(
+                "item_number"
+            ),
+            func.max(ProductSalesDailyModel.item_name_snapshot).label(
+                "item_name"
+            ),
             order_count,
             ordered_units,
             effective_units,
             gross_sales_amount,
             effective_sales_amount,
-        )
+        ]
+    )
+    query = (
+        select(*selected_columns)
+        .outerjoin(fact_order_counts, join_condition)
         .where(
             *_daily_filters(
                 owner_username,
@@ -620,7 +845,10 @@ def _ranking_rows(
                 args.end_date,
             )
         )
-        .group_by(*group_columns)
+        .group_by(
+            *daily_group_columns,
+            fact_order_counts.c.order_count,
+        )
         .order_by(
             metric_expression.desc(),
             ProductSalesDailyModel.manage_number.asc(),
@@ -633,20 +861,23 @@ def _ranking_rows(
         .limit(args.limit)
     )
     rows: list[dict[str, Any]] = []
-    for raw in session.execute(query):
-        offset = 3 if args.include_sku else 2
+    for raw in session.execute(query).mappings():
         row = {
-            "manageNumber": raw[0],
-            "itemNumber": raw[1],
-            "itemName": raw[offset],
-            "orderCount": _integer(raw[offset + 1]),
-            "orderedUnits": _integer(raw[offset + 2]),
-            "effectiveUnits": _integer(raw[offset + 3]),
-            "grossSalesAmount": _decimal_number(raw[offset + 4]),
-            "effectiveSalesAmount": _decimal_number(raw[offset + 5]),
+            "manageNumber": raw["manage_number"],
+            "itemNumber": raw["item_number"],
+            "itemName": raw["item_name"],
+            "orderCount": _integer(raw["order_count"]),
+            "orderedUnits": _integer(raw["ordered_units"]),
+            "effectiveUnits": _integer(raw["effective_units"]),
+            "grossSalesAmount": _decimal_number(
+                raw["gross_sales_amount"]
+            ),
+            "effectiveSalesAmount": _decimal_number(
+                raw["effective_sales_amount"]
+            ),
         }
         if args.include_sku:
-            row["skuKey"] = raw[2]
+            row["skuKey"] = raw["sku_key"]
         row["metricValue"] = row[args.metric]
         rows.append(row)
     return rows
@@ -841,30 +1072,52 @@ def _sku_sales_breakdown(
 ) -> dict[str, Any]:
     args = cast(SkuSalesBreakdownArguments, arguments)
     store = _require_owned_store(session, owner_username, args.store_id)
+    filters = (
+        *_daily_filters(
+            owner_username,
+            store.id,
+            args.start_date,
+            args.end_date,
+        ),
+        ProductSalesDailyModel.manage_number == args.manage_number,
+    )
+    totals = session.execute(
+        select(
+            func.coalesce(
+                func.sum(ProductSalesDailyModel.effective_units),
+                0,
+            ),
+            func.coalesce(
+                func.sum(ProductSalesDailyModel.effective_sales_amount),
+                0,
+            ),
+        ).where(*filters)
+    ).one()
+    effective_units = func.coalesce(
+        func.sum(ProductSalesDailyModel.effective_units),
+        0,
+    ).label("effective_units")
     raw_rows = session.execute(
         select(
             ProductSalesDailyModel.sku_key,
             func.max(ProductSalesDailyModel.item_name_snapshot),
             func.coalesce(func.sum(ProductSalesDailyModel.ordered_units), 0),
-            func.coalesce(func.sum(ProductSalesDailyModel.effective_units), 0),
+            effective_units,
             func.coalesce(
                 func.sum(ProductSalesDailyModel.effective_sales_amount),
                 0,
             ),
         )
-        .where(
-            *_daily_filters(
-                owner_username,
-                store.id,
-                args.start_date,
-                args.end_date,
-            ),
-            ProductSalesDailyModel.manage_number == args.manage_number,
-        )
+        .where(*filters)
         .group_by(ProductSalesDailyModel.sku_key)
+        .order_by(
+            effective_units.desc(),
+            ProductSalesDailyModel.sku_key.asc(),
+        )
+        .limit(args.limit)
     ).all()
-    total_units = sum(_integer(row[3]) for row in raw_rows)
-    total_sales = sum((_decimal_number(row[4]) for row in raw_rows), 0.0)
+    total_units = _integer(totals[0])
+    total_sales = _decimal_number(totals[1])
     rows = [
         {
             "skuKey": raw[0],
@@ -883,7 +1136,6 @@ def _sku_sales_breakdown(
         }
         for raw in raw_rows
     ]
-    rows.sort(key=lambda row: (-row["effectiveUnits"], row["skuKey"]))
     result = _result_metadata(
         session,
         owner_username=owner_username,
@@ -947,6 +1199,7 @@ def _slow_moving_products(
             ProductModel.owner_username == owner_username,
             ProductModel.store_id == store.id,
             ProductModel.review_status == "listed",
+            ProductModel.rakuten_listing_status != "unlisted",
             ProductModel.rakuten_manage_number.is_not(None),
             ProductModel.rakuten_manage_number != "",
             ProductModel.listed_at.is_not(None),
@@ -999,7 +1252,9 @@ def _sales_adjustment_summary(
         select(
             SalesItemAdjustmentModel.adjustment_type,
             SalesItemAdjustmentModel.status,
-            func.count(SalesItemAdjustmentModel.id),
+            func.count(
+                func.distinct(SalesOrderItemModel.order_number)
+            ),
             func.coalesce(func.sum(SalesItemAdjustmentModel.units), 0),
             func.coalesce(func.sum(SalesItemAdjustmentModel.amount), 0),
         )
@@ -1028,6 +1283,23 @@ def _sales_adjustment_summary(
             SalesItemAdjustmentModel.status.asc(),
         )
     ).all()
+    start_at, end_at = _range_datetimes(args.start_date, args.end_date)
+    unresolved_exists = _unresolved_adjustment_exists(
+        owner_username,
+        store.id,
+    )
+    unattributed_unresolved_count = _integer(
+        session.scalar(
+            select(func.count(SalesOrderModel.id)).where(
+                SalesOrderModel.owner_username == owner_username,
+                SalesOrderModel.store_id == store.id,
+                SalesOrderModel.ordered_at >= start_at,
+                SalesOrderModel.ordered_at < end_at,
+                SalesOrderModel.has_unresolved_adjustment.is_(True),
+                ~unresolved_exists,
+            )
+        )
+    )
     result = _result_metadata(
         session,
         owner_username=owner_username,
@@ -1036,7 +1308,7 @@ def _sales_adjustment_summary(
         end_date=args.end_date,
         metric="adjustmentUnits",
     )
-    result["rows"] = [
+    rows = [
         {
             "adjustmentType": row[0],
             "status": row[1],
@@ -1046,6 +1318,17 @@ def _sales_adjustment_summary(
         }
         for row in raw_rows
     ]
+    if unattributed_unresolved_count:
+        rows.append(
+            {
+                "adjustmentType": "unattributed",
+                "status": "unresolved",
+                "adjustmentCount": unattributed_unresolved_count,
+                "units": 0,
+                "amount": 0.0,
+            }
+        )
+    result["rows"] = rows
     return result
 
 
