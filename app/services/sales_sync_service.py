@@ -30,6 +30,7 @@ INCREMENTAL_RECHECK_DAYS = 7
 INCOMPLETE_ADJUSTED_RECHECK_DAYS = 30
 COMPLETED_RECHECK_MAX_DAYS = 90
 COMPLETED_RECHECK_INTERVAL = timedelta(days=1)
+DAILY_PRODUCT_KEY_MAX_LENGTH = 255
 RAKUTEN_ORDER_STATUSES = [100, 200, 300, 400, 500, 600, 700, 800, 900]
 SNAPSHOT_ADJUSTMENT_SOURCE_PREFIX = "sales_sync:"
 SALES_SYNC_LEASE_TIMEOUT = timedelta(minutes=10)
@@ -263,6 +264,7 @@ def sync_owned_store(
 ) -> dict[str, Any]:
     normalized_owner = _text(owner_username)
     normalized_store_id = int(store_id)
+    normalized_initial_days = max(1, int(initial_days))
     lease_status = _new_lease_status()
     acquired_at = _now()
 
@@ -307,6 +309,7 @@ def sync_owned_store(
             )
             if state is None:
                 raise RuntimeError("店铺销量同步状态不存在。")
+            initial_sync_completed = bool(state.initial_sync_completed)
             encrypted_service_secret = (
                 store.rakuten_service_secret_encrypted
             )
@@ -325,7 +328,12 @@ def sync_owned_store(
             return _sync_state_payload(state, already_running=True)
 
     now = _now()
-    start_at = now - timedelta(days=INCREMENTAL_RECHECK_DAYS)
+    search_days = (
+        INCREMENTAL_RECHECK_DAYS
+        if initial_sync_completed
+        else normalized_initial_days
+    )
+    start_at = now - timedelta(days=search_days)
 
     try:
         with _PeriodicLeaseHeartbeat(
@@ -346,13 +354,15 @@ def sync_owned_store(
                 )
             )
             heartbeat.raise_if_failed()
-            with session_scope() as session:
-                local_order_numbers = _local_recheck_order_numbers(
-                    session,
-                    owner_username=normalized_owner,
-                    store_id=normalized_store_id,
-                    now=now,
-                )
+            local_order_numbers: list[str] = []
+            if initial_sync_completed:
+                with session_scope() as session:
+                    local_order_numbers = _local_recheck_order_numbers(
+                        session,
+                        owner_username=normalized_owner,
+                        store_id=normalized_store_id,
+                        now=now,
+                    )
             order_numbers = _dedupe_order_numbers(
                 recent_order_numbers,
                 local_order_numbers,
@@ -1132,6 +1142,15 @@ def _reconcile_order_snapshot(
     )
     unresolved = unresolved_refund or unresolved_return
     seen_item_ids: set[str] = set()
+    unresolved_trace_item = None
+    if not prepared_items and unresolved and existing_items:
+        unresolved_trace_item = min(
+            existing_items.values(),
+            key=lambda item: (
+                item.id if item.id is not None else 0,
+                item.item_detail_id,
+            ),
+        )
 
     for prepared in prepared_items:
         position = prepared.position
@@ -1251,6 +1270,33 @@ def _reconcile_order_snapshot(
             return_units=missing_return_units,
             return_refund=full_refund and full_return,
         )
+        unresolved_refund_amount = Decimal("0")
+        unresolved_return_amount = Decimal("0")
+        raw_payload: dict[str, Any] = {
+            "missingFromLatestSnapshot": True,
+        }
+        if item is unresolved_trace_item:
+            derivation = replace(
+                derivation,
+                unresolved_refund_units=residual_refund_units,
+                unresolved_return_units=residual_return_units,
+                has_unresolved_refund=unresolved_refund,
+                has_unresolved_return=unresolved_return,
+            )
+            unresolved_refund_amount = residual_refund_amount
+            unresolved_return_amount = residual_return_amount
+            raw_payload["orderLevelUnresolvedTrace"] = {
+                key: payload.get(key)
+                for key in (
+                    "partialRefund",
+                    "hasPartialRefund",
+                    "unresolvedRefund",
+                    "partialReturn",
+                    "hasPartialReturn",
+                    "unresolvedReturn",
+                )
+                if key in payload
+            }
         item.latest_units = 0
         item.canceled_units = derivation.canceled_units
         item.refunded_units = derivation.refunded_units
@@ -1262,10 +1308,10 @@ def _reconcile_order_snapshot(
             session,
             item,
             derivation,
-            raw_payload={"missingFromLatestSnapshot": True},
+            raw_payload=raw_payload,
             remote_updated_at=remote_updated_at,
-            unresolved_refund_amount=Decimal("0"),
-            unresolved_return_amount=Decimal("0"),
+            unresolved_refund_amount=unresolved_refund_amount,
+            unresolved_return_amount=unresolved_return_amount,
         )
 
     order.has_unresolved_adjustment = unresolved
@@ -1438,6 +1484,10 @@ def _validated_order_item_pairs(
         for item in items:
             if not isinstance(item, dict):
                 raise IncompleteSnapshotError("订单商品格式无效。")
+            if not _has_valid_item_units(item):
+                raise IncompleteSnapshotError(
+                    "订单商品数量缺失或格式无效。"
+                )
             raw_items.append(item)
 
     normalized_items = list(rakuten_order_service.iter_order_items(order))
@@ -1447,8 +1497,6 @@ def _validated_order_item_pairs(
     for normalized_item, raw_item in item_pairs:
         if not _has_item_identity(normalized_item):
             raise IncompleteSnapshotError("订单商品标识缺失。")
-        if not _has_valid_item_units(raw_item):
-            raise IncompleteSnapshotError("订单商品数量缺失或格式无效。")
     return item_pairs
 
 
@@ -1616,7 +1664,7 @@ def _has_valid_item_units(payload: dict[str, Any]) -> bool:
     try:
         parsed_units = int(value)
         exact_units = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
+    except (InvalidOperation, OverflowError, TypeError, ValueError):
         return False
     return (
         exact_units.is_finite()
@@ -1638,11 +1686,25 @@ def _daily_product_key(item: SalesOrderItemModel) -> str:
         return manage_number
     item_number = _text(item.item_number)
     if item_number:
-        return f"item-number:{item_number}"
+        return _bounded_fallback_product_key(
+            "item-number",
+            item_number,
+        )
     item_id = _text(item.item_id)
     if item_id:
-        return f"item-id:{item_id}"
-    return f"item-detail:{_text(item.item_detail_id)}"
+        return _bounded_fallback_product_key("item-id", item_id)
+    return _bounded_fallback_product_key(
+        "item-detail",
+        _text(item.item_detail_id),
+    )
+
+
+def _bounded_fallback_product_key(prefix: str, value: str) -> str:
+    readable = f"{prefix}:{value}"
+    if len(readable) <= DAILY_PRODUCT_KEY_MAX_LENGTH:
+        return readable
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"v1:{prefix}:{digest}"
 
 
 def _snapshot_item_detail_id(
@@ -1720,7 +1782,7 @@ def _first_decimal(
             continue
         try:
             parsed = Decimal(str(value))
-        except (InvalidOperation, TypeError, ValueError):
+        except (InvalidOperation, OverflowError, TypeError, ValueError):
             continue
         if parsed.is_finite() and parsed >= 0:
             return parsed
@@ -1782,7 +1844,7 @@ def _non_negative_int_or_none(value: Any) -> int | None:
     try:
         parsed = int(value)
         exact = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
+    except (InvalidOperation, OverflowError, TypeError, ValueError):
         return None
     if (
         not exact.is_finite()
@@ -1796,7 +1858,7 @@ def _non_negative_int_or_none(value: Any) -> int | None:
 def _non_negative_int(value: Any) -> int:
     try:
         return max(0, int(value))
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return 0
 
 

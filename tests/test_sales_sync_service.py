@@ -929,7 +929,93 @@ def test_credential_decryption_failure_marks_current_lease_error(
     assert state.last_error == "销量同步失败，请稍后重试。"
 
 
-def test_sync_recheck_policy_combines_recent_incomplete_adjusted_and_due(
+def test_initial_sync_searches_default_90_days_without_local_rechecks(
+    monkeypatch,
+    session_factory,
+):
+    now = datetime(2026, 7, 16, 12, 0, 0)
+    with session_factory() as session:
+        store = seed_store(session)
+        session.add(
+            SalesOrderModel(
+                owner_username="alice",
+                store_id=store.id,
+                order_number="LOCAL-INCOMPLETE-20",
+                order_progress="300",
+                order_status="normal",
+                ordered_at=now - timedelta(days=20),
+                updated_at_remote=now - timedelta(days=20),
+                raw_order_json="{}",
+                last_synced_at=now - timedelta(hours=1),
+            )
+        )
+        store_id = store.id
+        session.commit()
+
+    search_call: dict[str, object] = {}
+    requested_order_numbers: list[str] = []
+
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def fake_search(
+        _secret,
+        _key,
+        start_at,
+        end_at,
+        statuses,
+    ):
+        search_call.update(
+            {
+                "startAt": start_at,
+                "endAt": end_at,
+                "statuses": statuses,
+            }
+        )
+        return ["FIRST-REMOTE"]
+
+    def fake_get(_secret, _key, order_numbers):
+        requested_order_numbers.extend(order_numbers)
+        return []
+
+    monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(sales_sync_service, "decrypt_text", lambda value: value)
+    monkeypatch.setattr(sales_sync_service, "_now", lambda: now)
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "search_order_numbers",
+        fake_search,
+    )
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "get_orders",
+        fake_get,
+    )
+
+    result = sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        state = session.get(SalesSyncStateModel, store_id)
+
+    assert result["status"] == "completed"
+    assert search_call["startAt"] == now - timedelta(days=90)
+    assert search_call["endAt"] == now
+    assert search_call["statuses"] == sales_sync_service.RAKUTEN_ORDER_STATUSES
+    assert requested_order_numbers == ["FIRST-REMOTE"]
+    assert state is not None
+    assert state.initial_sync_completed is True
+
+
+def test_later_sync_searches_7_days_and_adds_local_recheck_candidates(
     monkeypatch,
     session_factory,
 ):
@@ -963,6 +1049,14 @@ def test_sync_recheck_policy_combines_recent_incomplete_adjusted_and_due(
 
     with session_factory() as session:
         store = seed_store(session)
+        session.add(
+            SalesSyncStateModel(
+                owner_username="alice",
+                store_id=store.id,
+                initial_sync_completed=True,
+                sync_status="idle",
+            )
+        )
         add_order(
             session,
             store,
@@ -1567,6 +1661,12 @@ def test_completed_empty_snapshot_is_skipped_without_canceling_lines(
             "units": "5.0",
         },
         {
+            "itemDetailId": "detail-1",
+            "itemId": "item-1",
+            "manageNumber": "MN-1",
+            "units": float("inf"),
+        },
+        {
             "units": 5,
         },
     ],
@@ -2087,6 +2187,68 @@ def test_terminal_empty_full_refund_uses_refund_fallback_for_existing_lines(
     assert adjustment.status == "confirmed"
 
 
+@pytest.mark.parametrize(
+    ("terminal_overrides", "adjustment_type"),
+    [
+        (
+            {
+                "isFullRefund": True,
+                "partialRefund": True,
+                "orderStatus": "refunded",
+            },
+            "refund",
+        ),
+        (
+            {
+                "isFullReturn": True,
+                "unresolvedReturn": True,
+                "orderStatus": "returned",
+            },
+            "return",
+        ),
+    ],
+)
+def test_empty_terminal_partial_flags_persist_item_unresolved_trace(
+    monkeypatch,
+    session_factory,
+    terminal_overrides,
+    adjustment_type,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshots = [order_snapshot()]
+    patch_local_sync_dependencies(monkeypatch, session_factory, snapshots)
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    snapshots[0] = order_snapshot(
+        order_overrides={
+            **terminal_overrides,
+            "updateDatetime": "2026-07-15T10:10:00",
+        }
+    )
+    snapshots[0]["PackageModelList"] = []
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        order = session.scalars(select(SalesOrderModel)).one()
+        item = session.scalars(select(SalesOrderItemModel)).one()
+        unresolved_rows = session.scalars(
+            select(SalesItemAdjustmentModel).where(
+                SalesItemAdjustmentModel.status == "unresolved"
+            )
+        ).all()
+
+    assert order.has_unresolved_adjustment is True
+    assert len(unresolved_rows) == 1
+    assert unresolved_rows[0].sales_order_item_id == item.id
+    assert unresolved_rows[0].adjustment_type == adjustment_type
+    assert unresolved_rows[0].units == 0
+    assert unresolved_rows[0].amount == Decimal("0")
+
+
 def test_sync_rebuilds_multi_order_multi_sku_daily_aggregates(
     monkeypatch,
     session_factory,
@@ -2215,6 +2377,161 @@ def test_daily_aggregation_separates_blank_manage_number_products(
         ("item-number:ITEM-A", 2, 1),
         ("item-number:ITEM-B", 3, 1),
     }
+
+
+def test_daily_fallback_keys_bound_and_distinguish_255_char_identifiers(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    item_number_a = "A" * 255
+    item_number_b = ("A" * 254) + "B"
+    item_id_c = "C" * 255
+    snapshots = [
+        order_snapshot(
+            order_number="ORDER-LONG-A",
+            item_overrides={
+                "itemDetailId": "detail-long-a",
+                "manageNumber": "",
+                "itemNumber": item_number_a,
+                "itemId": "item-a",
+                "SkuModelList": [{"variantId": "same-sku"}],
+            },
+        ),
+        order_snapshot(
+            order_number="ORDER-LONG-B",
+            item_overrides={
+                "itemDetailId": "detail-long-b",
+                "manageNumber": "",
+                "itemNumber": item_number_b,
+                "itemId": "item-b",
+                "SkuModelList": [{"variantId": "same-sku"}],
+            },
+        ),
+        order_snapshot(
+            order_number="ORDER-LONG-C",
+            item_overrides={
+                "itemDetailId": "detail-long-c",
+                "manageNumber": "",
+                "itemNumber": "",
+                "itemId": item_id_c,
+                "SkuModelList": [{"variantId": "same-sku"}],
+            },
+        ),
+    ]
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        snapshots,
+    )
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        rows = session.scalars(select(ProductSalesDailyModel)).all()
+        items = session.scalars(
+            select(SalesOrderItemModel).order_by(
+                SalesOrderItemModel.order_number.asc()
+            )
+        ).all()
+
+    product_keys = {row.manage_number for row in rows}
+    assert len(rows) == 3
+    assert len(product_keys) == 3
+    assert all(len(product_key) <= 255 for product_key in product_keys)
+    assert sum(
+        product_key.startswith("v1:item-number:")
+        for product_key in product_keys
+    ) == 2
+    assert sum(
+        product_key.startswith("v1:item-id:")
+        for product_key in product_keys
+    ) == 1
+    assert [item.item_number for item in items] == [
+        item_number_a,
+        item_number_b,
+        "",
+    ]
+    assert items[2].item_id == item_id_c
+
+
+def test_numeric_aliases_skip_overflow_and_non_finite_values_end_to_end(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshot = order_snapshot(
+        item_overrides={
+            "refundedUnits": float("inf"),
+            "refundUnits": 2,
+            "refundedAmount": Decimal("NaN"),
+            "refundAmount": 200,
+        },
+        order_overrides={
+            "partialRefund": True,
+            "totalRefundUnits": Decimal("Infinity"),
+            "refundedUnits": float("nan"),
+            "refundUnits": 3,
+            "totalRefundAmount": Decimal("Infinity"),
+            "refundedAmount": Decimal("NaN"),
+            "refundAmount": 300,
+        },
+    )
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        [snapshot],
+    )
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        item = session.scalars(select(SalesOrderItemModel)).one()
+        adjustments = session.scalars(
+            select(SalesItemAdjustmentModel).order_by(
+                SalesItemAdjustmentModel.status.asc()
+            )
+        ).all()
+
+    assert item.refunded_units == 2
+    assert {
+        (row.status, row.units, row.amount)
+        for row in adjustments
+    } == {
+        ("confirmed", 2, Decimal("200")),
+        ("unresolved", 1, Decimal("100")),
+    }
+
+
+def test_numeric_aliases_catch_overflow_error_and_try_later_alias():
+    class OverflowingNumber:
+        def __int__(self):
+            raise OverflowError
+
+        def __str__(self):
+            raise OverflowError
+
+    payload = {
+        "overflow": OverflowingNumber(),
+        "valid": 125,
+    }
+
+    assert sales_sync_service._first_int(
+        payload,
+        ("overflow", "valid"),
+    ) == 125
+    assert sales_sync_service._first_decimal(
+        payload,
+        ("overflow", "valid"),
+    ) == Decimal("125")
 
 
 def test_rebuild_daily_sales_replaces_range_without_committing(

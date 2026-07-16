@@ -261,11 +261,11 @@ The final Task 3 review findings were implemented without changing files outside
 
 - Daily aggregation uses `manageNumber`, then prefixed `item-number:`, then prefixed `item-id:` as the deterministic product key, with an `item-detail:` last-resort safeguard.
 - Products with blank `manageNumber` no longer merge solely because they share a SKU.
-- Every sync performs a seven-day remote search.
+- The first sync performs a remote search using `initial_days` (default 90); later syncs use a seven-day remote search.
 - Local candidates add incomplete/adjusted orders from the last 30 days.
 - Completed orders up to 90 days old are added only when their stored sync/update timestamp is at least one day old.
 - Remote and local order numbers are normalized and order-preserving deduplicated before `getOrder`.
-- The legacy `initial_days` argument remains interface-compatible but no longer changes the approved 7/30/90-day policy.
+- `initial_days` controls only the first synchronization window. Later synchronization uses the approved 7/30/90-day incremental policy.
 
 ### Additional Red-Green Evidence
 
@@ -346,3 +346,98 @@ Result: exit code `0`.
 
 - Real multi-connection MySQL contention is not available in the local test environment; MySQL behavior is covered through dialect compilation, fresh-transaction boundaries, current-read SQL, rowcount mocks, and token tests.
 - Rakuten adjustment aliases remain based on the approved snapshot contract rather than a live sanitized production version-7 payload.
+
+## Final Four Findings
+
+The final four Task 3 findings were implemented in the same owned service, test, and report files.
+
+### Initial And Incremental Windows
+
+- `initial_sync_completed=False` now searches exactly `initial_days`; the default first-run window is 90 days.
+- The initial run does not append local 30/90-day candidates because the full initial remote window is authoritative for discovery.
+- After the first successful synchronization sets `initial_sync_completed=True`, later runs search seven remote days and append the existing local 30/90-day recheck candidates.
+- Exact first-run and later-run tests assert both the search timestamps and the final deduplicated `getOrder` list.
+
+### Empty Terminal Unresolved Traces
+
+- Allowed empty cancellation/full-refund/full-return snapshots still preserve explicit partial/unresolved flags.
+- When an existing item is available, one deterministic existing item receives the active unresolved adjustment marker and any residual units/amounts.
+- The marker raw payload includes `orderLevelUnresolvedTrace` with the source order-level flags.
+- When no item exists, `SalesOrderModel.has_unresolved_adjustment` plus the persisted `raw_order_json` is the compatible order-level trace mechanism because adjustment rows require an item foreign key.
+- New tests verify the order flag and active unresolved row agree for empty full-refund and full-return snapshots.
+
+### Bounded Daily Product Keys
+
+- Readable fallback keys remain unchanged while their total length is at most 255 characters.
+- Longer fallback identifiers use `v1:<identifier-type>:<sha256>` so keys remain deterministic, versioned, bounded, and distinct.
+- Original `item_number` and `item_id` values remain unchanged on `SalesOrderItemModel` for diagnosis.
+- Tests use distinct 255-character item numbers and item IDs and verify three distinct daily rows with keys no longer than 255.
+
+### Numeric Alias Hardening
+
+- Integer and decimal alias parsers now catch `OverflowError`.
+- Positive/negative infinity and NaN are rejected as non-finite and parsing continues to later aliases.
+- Raw item quantities are validated before Task 2 normalization, preventing infinite quantities from escaping as an exception.
+- End-to-end and direct parser tests cover infinity, NaN, explicit overflow exceptions, and later valid aliases.
+
+### Red-Green Evidence
+
+The first-run, empty-trace, bounded-key, and numeric-alias regressions initially produced:
+
+```text
+6 failed, 1 passed, 65 deselected in 3.01s
+```
+
+The pre-normalization infinite item quantity regression initially produced:
+
+```text
+1 failed, 4 passed in 2.70s
+```
+
+### Final Verification
+
+Focused:
+
+```powershell
+pytest tests/test_sales_sync_service.py -q
+```
+
+```text
+73 passed in 5.28s
+```
+
+Full:
+
+```powershell
+pytest -q
+```
+
+```text
+321 passed, 2 warnings, 4 subtests passed in 11.53s
+```
+
+The warnings remain the existing FastAPI `on_event` deprecations from `app/main.py`.
+
+Compilation:
+
+```powershell
+python -m compileall app tests/test_sales_sync_service.py
+```
+
+Result: exit code `0`.
+
+Diff validation:
+
+```powershell
+git diff --check
+```
+
+Result: exit code `0`.
+
+### Final Self-Review
+
+- Confirmed first-run and later-run search policies are selected from the committed sync-state row acquired with the lease.
+- Confirmed active unresolved order flags have an item adjustment trace whenever an existing item makes that possible.
+- Confirmed all generated fallback keys fit the `String(255)` model column.
+- Confirmed numeric overflow/non-finite values cannot cancel lines or stop alias fallback.
+- Confirmed no frontend/backend process, UI, browser, or live Rakuten request was started.
