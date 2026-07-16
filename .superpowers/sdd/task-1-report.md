@@ -491,3 +491,95 @@ The warnings remain the existing FastAPI `on_event` deprecation warnings from `a
 ### Remaining concern
 
 The referential-action and index-option comparisons were verified through SQLite reflection, synthetic MySQL reflection dictionaries, and focused tests. No live MySQL migration was run in this task.
+
+## Review Fix Pass 5
+
+Date: 2026-07-16
+
+### Findings fixed
+
+1. MySQL/InnoDB foreign-key action normalization now treats these as equivalent:
+   - omitted action
+   - `NO ACTION`
+   - `RESTRICT`
+2. `CASCADE` and `SET NULL` remain distinct from the default/restrict action group.
+3. Added MySQL-reflection-shaped tests proving:
+   - reflected `RESTRICT` satisfies a model constraint with an omitted action
+   - reflected `CASCADE` conflicts with a model constraint with an omitted action
+4. Index dialect-option validation now follows SQLAlchemy 2.0.41 MySQL reflection output.
+5. MySQL index comparison validates the options that `Inspector.get_indexes()` can return:
+   - `mysql_length`
+   - `mysql_prefix`
+   - `mysql_with_parser`
+6. `mysql_using` is no longer required because SQLAlchemy 2.0.41's MySQL inspector does not reflect it.
+7. Ordered index columns, uniqueness, wrong-column detection, and same-name conflict detection remain enforced.
+
+### Red evidence
+
+Command:
+
+```powershell
+pytest tests/test_sales_models.py -v
+```
+
+Result before implementation:
+
+```text
+3 failed, 38 passed in 0.92s
+```
+
+The failures covered `RESTRICT` versus omitted-action equivalence, the default-action compatibility case, and the real MySQL index reflection shape without `mysql_using`.
+
+### Final verification
+
+Command:
+
+```powershell
+pytest tests/test_sales_models.py -v
+```
+
+Result:
+
+```text
+41 passed in 0.77s
+```
+
+Command:
+
+```powershell
+python -m compileall app/db/models.py app/db/database.py tests/test_sales_models.py
+```
+
+Result:
+
+```text
+Compiling 'tests/test_sales_models.py'...
+```
+
+Exit code: `0`
+
+Command:
+
+```powershell
+git diff --check
+```
+
+Result: exit code `0`; only Git's existing LF-to-CRLF working-copy warnings were printed.
+
+Command:
+
+```powershell
+pytest -q
+```
+
+Result:
+
+```text
+228 passed, 2 warnings, 4 subtests passed in 11.37s
+```
+
+The warnings remain the existing FastAPI `on_event` deprecation warnings from `app/main.py`.
+
+### Remaining concern
+
+The behavior is aligned with SQLAlchemy 2.0.41's MySQL inspector implementation and tested with inspector-shaped dictionaries, but no live MySQL reflection or migration was run in this task.

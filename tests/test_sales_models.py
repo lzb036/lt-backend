@@ -1071,6 +1071,122 @@ def test_complete_legacy_conversation_missing_owner_fk_fails_clearly():
         legacy_engine.dispose()
 
 
+def _compat_default_action_foreign_key_tables() -> tuple[Table, Table]:
+    metadata = MetaData()
+    parent = Table(
+        "lt_compat_default_action_parent",
+        metadata,
+        Column("id", Integer, primary_key=True),
+    )
+    child = Table(
+        "lt_compat_default_action_child",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("parent_id", Integer, nullable=False),
+        ForeignKeyConstraint(
+            ["parent_id"],
+            ["lt_compat_default_action_parent.id"],
+            name="fk_lt_compat_default_action_child_parent",
+        ),
+    )
+    return parent, child
+
+
+def _reflected_default_action_foreign_key(
+    action: str | None,
+) -> dict:
+    return {
+        "name": "fk_legacy_default_action_child_parent",
+        "constrained_columns": ["parent_id"],
+        "referred_schema": None,
+        "referred_table": "lt_compat_default_action_parent",
+        "referred_columns": ["id"],
+        "options": {"ondelete": action} if action else {},
+    }
+
+
+def test_foreign_key_restrict_matches_required_omitted_action(monkeypatch):
+    assert {
+        database_module._normalize_referential_action(None),
+        database_module._normalize_referential_action("NO ACTION"),
+        database_module._normalize_referential_action("RESTRICT"),
+    } == {"RESTRICT"}
+
+    _, child = _compat_default_action_foreign_key_tables()
+    constraint = next(
+        constraint
+        for constraint in child.constraints
+        if constraint.name
+        == "fk_lt_compat_default_action_child_parent"
+    )
+    for action in (None, "NO ACTION", "RESTRICT"):
+        assert database_module._foreign_key_constraint_matches(
+            _reflected_default_action_foreign_key(action),
+            constraint,
+        )
+
+    monkeypatch.setattr(
+        database_module,
+        "_foreign_key_info",
+        lambda connection, table_name: [
+            _reflected_default_action_foreign_key("RESTRICT")
+        ],
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with engine.connect() as connection:
+            assert database_module._constraint_is_present(
+                connection,
+                child,
+                constraint,
+            )
+    finally:
+        engine.dispose()
+
+
+def test_foreign_key_cascade_conflicts_with_required_omitted_action(
+    monkeypatch,
+):
+    _, child = _compat_default_action_foreign_key_tables()
+    constraint = next(
+        constraint
+        for constraint in child.constraints
+        if constraint.name
+        == "fk_lt_compat_default_action_child_parent"
+    )
+    reflected_cascade = _reflected_default_action_foreign_key(
+        "CASCADE"
+    )
+    assert not database_module._foreign_key_constraint_matches(
+        reflected_cascade,
+        constraint,
+    )
+    monkeypatch.setattr(
+        database_module,
+        "_foreign_key_info",
+        lambda connection, table_name: [reflected_cascade],
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with engine.connect() as connection:
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    r"lt_compat_default_action_child.*"
+                    r"fk_lt_compat_default_action_child_parent.*"
+                    r"fk_legacy_default_action_child_parent.*"
+                    r"referential action"
+                ),
+            ):
+                database_module._constraint_is_present(
+                    connection,
+                    child,
+                    constraint,
+                )
+    finally:
+        engine.dispose()
+
+
 def test_complete_legacy_order_item_missing_order_number_fk_fails_clearly():
     legacy_metadata = MetaData()
     for table in (
@@ -1227,7 +1343,7 @@ def test_ensure_table_layout_fails_for_named_index_with_wrong_uniqueness():
         legacy_engine.dispose()
 
 
-def test_index_definition_matching_includes_mysql_dialect_options():
+def test_index_definition_matching_uses_mysql_reflected_options_only():
     target_metadata = MetaData()
     target_table = Table(
         "lt_compat_mysql_index_options",
@@ -1238,7 +1354,7 @@ def test_index_definition_matching_includes_mysql_dialect_options():
         "ix_lt_compat_mysql_index_options_code",
         target_table.c.code,
         mysql_length=32,
-        mysql_using="btree",
+        mysql_using="hash",
     )
     exact_existing = {
         "name": target_index.name,
@@ -1246,14 +1362,12 @@ def test_index_definition_matching_includes_mysql_dialect_options():
         "unique": False,
         "dialect_options": {
             "mysql_length": {"code": 32},
-            "mysql_using": "btree",
         },
     }
     wrong_existing = {
         **exact_existing,
         "dialect_options": {
             "mysql_length": {"code": 16},
-            "mysql_using": "btree",
         },
     }
 

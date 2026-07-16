@@ -235,7 +235,10 @@ def _unique_constraint_matches(existing: dict, constraint: UniqueConstraint) -> 
 
 
 def _normalize_referential_action(value) -> str:
-    return str(value or "NO ACTION").strip().upper().replace("_", " ")
+    normalized = str(value or "NO ACTION").strip().upper().replace("_", " ")
+    if normalized in {"NO ACTION", "RESTRICT"}:
+        return "RESTRICT"
+    return normalized
 
 
 def _foreign_key_structure_matches(
@@ -379,6 +382,36 @@ def _meaningful_index_options(options: dict, dialect_name: str) -> dict:
     return normalized
 
 
+_REFLECTED_INDEX_DIALECT_OPTIONS = {
+    "mysql": frozenset(
+        {
+            "mysql_length",
+            "mysql_prefix",
+            "mysql_with_parser",
+        }
+    ),
+    "mariadb": frozenset(
+        {
+            "mariadb_length",
+            "mariadb_prefix",
+            "mariadb_with_parser",
+        }
+    ),
+}
+
+
+def _reflectable_index_options(options: dict, dialect_name: str) -> dict:
+    normalized = _meaningful_index_options(options, dialect_name)
+    reflected_keys = _REFLECTED_INDEX_DIALECT_OPTIONS.get(dialect_name)
+    if reflected_keys is None:
+        return normalized
+    return {
+        key: value
+        for key, value in normalized.items()
+        if key in reflected_keys
+    }
+
+
 def _expected_index_dialect_options(index, dialect_name: str) -> dict:
     prefix = f"{dialect_name}_"
     options = {
@@ -393,14 +426,14 @@ def _expected_index_dialect_options(index, dialect_name: str) -> dict:
             column.name: length_value
             for column in index.columns
         }
-    return _meaningful_index_options(
+    return _reflectable_index_options(
         options,
         dialect_name,
     )
 
 
 def _existing_index_dialect_options(existing: dict, dialect_name: str) -> dict:
-    return _meaningful_index_options(
+    return _reflectable_index_options(
         existing.get("dialect_options") or {},
         dialect_name,
     )
