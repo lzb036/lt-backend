@@ -727,6 +727,76 @@ def test_background_stream_rejects_when_producer_slots_are_full(
     ]
 
 
+def test_background_stream_enforces_per_owner_fairness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = Event()
+    first_started = Event()
+    monkeypatch.setattr(
+        crawler_service,
+        "SALES_ANALYSIS_STREAM_OWNER_ACTIVE",
+        {},
+        raising=False,
+    )
+
+    def owner_stream(
+        owner: str,
+        _conversation_id: int,
+        _message: str,
+        *,
+        is_cancelled,
+    ) -> Iterator[dict[str, Any]]:
+        if owner == "owner-a":
+            first_started.set()
+            release.wait(timeout=2)
+            if is_cancelled():
+                return
+        yield {"type": "completed", "message": {"owner": owner}}
+
+    monkeypatch.setattr(
+        sales_ai_service,
+        "stream_analysis",
+        owner_stream,
+    )
+    first = crawler_service.stream_sales_analysis(
+        "owner-a",
+        11,
+        "分析近期销量",
+        heartbeat_interval=0.01,
+    )
+
+    assert next(first)["heartbeat"] is True
+    assert first_started.wait(timeout=1)
+    assert list(
+        crawler_service.stream_sales_analysis(
+            "owner-a",
+            12,
+            "同一用户的第二个请求",
+            heartbeat_interval=0.01,
+        )
+    ) == [
+        {
+            "type": "error",
+            "message": "当前用户已有销量分析正在进行，请稍后重试。",
+        }
+    ]
+    other_owner_events = list(
+        crawler_service.stream_sales_analysis(
+            "owner-b",
+            13,
+            "其他用户请求",
+            heartbeat_interval=0.01,
+        )
+    )
+    assert other_owner_events[-1]["type"] == "completed"
+
+    release.set()
+    assert next(first)["type"] == "completed"
+    first.close()
+    assert crawler_service.SALES_ANALYSIS_STREAM_MAX_PER_OWNER == 1
+    assert crawler_service.SALES_ANALYSIS_STREAM_OWNER_ACTIVE == {}
+
+
 def test_cancelled_pending_producer_releases_stream_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1169,6 +1239,7 @@ def test_history_response_has_per_message_and_total_byte_bounds(
 
 def test_sales_sync_due_threshold_and_active_states() -> None:
     now = datetime(2026, 7, 16, 12, 0, 0)
+    stale_at = now - sales_sync_service.SALES_SYNC_LEASE_TIMEOUT
 
     assert crawler_service.sales_analysis_sync_is_due(
         None,
@@ -1201,13 +1272,19 @@ def test_sales_sync_due_threshold_and_active_states() -> None:
         now - timedelta(hours=1),
         "queued",
         now=now,
-        state_updated_at=now - timedelta(minutes=11),
+        state_updated_at=stale_at + timedelta(seconds=1),
     )
     assert not crawler_service.sales_analysis_sync_is_due(
         now - timedelta(hours=1),
         "running:stale-lease",
         now=now,
-        state_updated_at=now - timedelta(minutes=11),
+        state_updated_at=stale_at,
+    )
+    assert crawler_service.sales_analysis_sync_is_due(
+        now - timedelta(hours=1),
+        "queued",
+        now=now,
+        state_updated_at=stale_at - timedelta(seconds=1),
     )
 
 
@@ -1285,6 +1362,60 @@ def test_due_sales_sync_candidates_respect_global_active_capacity(
         ("capacity-owner", store.id)
         for store in due_stores[:15]
     ]
+
+
+def test_twenty_stale_active_rows_do_not_block_scheduled_recovery(
+    sales_session_factory,
+) -> None:
+    now = datetime(2026, 7, 16, 12, 0, 0)
+    stale_at = (
+        now
+        - sales_sync_service.SALES_SYNC_LEASE_TIMEOUT
+        - timedelta(seconds=1)
+    )
+    with sales_session_factory() as session:
+        _add_user(session, "stale-capacity-owner")
+        due_store = _add_store(
+            session,
+            "stale-capacity-owner",
+            "due-first",
+        )
+        stale_stores = [
+            _add_store(
+                session,
+                "stale-capacity-owner",
+                f"stale-{index:02d}",
+            )
+            for index in range(20)
+        ]
+        session.add_all(
+            [
+                SalesSyncStateModel(
+                    owner_username="stale-capacity-owner",
+                    store_id=store.id,
+                    sync_status=(
+                        "queued"
+                        if index % 2 == 0
+                        else f"running:stale-{index}"
+                    ),
+                    created_at=stale_at,
+                    updated_at=stale_at,
+                )
+                for index, store in enumerate(stale_stores)
+            ]
+        )
+        session.commit()
+
+    candidates = crawler_service.sales_analysis_sync_due_candidates(now)
+
+    assert len(candidates) == crawler_service.SALES_ANALYSIS_SYNC_BATCH_SIZE
+    assert candidates[0] == (
+        "stale-capacity-owner",
+        due_store.id,
+    )
+    assert {
+        store_id for _owner, store_id in candidates[1:]
+    } <= {store.id for store in stale_stores}
 
 
 def test_due_sales_sync_sql_filters_credentials_active_and_error_cooldown(
@@ -1390,6 +1521,8 @@ def test_due_sales_sync_sql_filters_credentials_active_and_error_cooldown(
         ("filter-owner", due_no_state.id),
         ("filter-owner", due_idle.id),
         ("filter-owner", error_cooled.id),
+        ("filter-owner", queued.id),
+        ("filter-owner", running.id),
     ]
 
 
@@ -1510,6 +1643,80 @@ def test_manual_sales_sync_locks_state_before_queue_decision() -> None:
     )
 
     assert ".with_for_update()" in source
+
+
+def test_manual_sales_sync_recovers_stale_running_state(
+    monkeypatch: pytest.MonkeyPatch,
+    sales_session_factory,
+) -> None:
+    now = datetime(2026, 7, 16, 12, 0, 0)
+    stale_at = (
+        now
+        - sales_sync_service.SALES_SYNC_LEASE_TIMEOUT
+        - timedelta(seconds=1)
+    )
+    with sales_session_factory() as session:
+        _add_user(session, "manual-recovery-owner")
+        store = _add_store(
+            session,
+            "manual-recovery-owner",
+            "manual-recovery",
+        )
+        session.add(
+            SalesSyncStateModel(
+                owner_username="manual-recovery-owner",
+                store_id=store.id,
+                sync_status="running:stale-owner",
+                created_at=stale_at,
+                updated_at=stale_at,
+            )
+        )
+        session.commit()
+        store_id = store.id
+
+    dispatched: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_sales_analysis_sync_task",
+        lambda owner, target_store_id: dispatched.append(
+            (owner, target_store_id)
+        ),
+    )
+
+    result = crawler_service.queue_sales_analysis_sync(
+        "manual-recovery-owner",
+        store_id,
+    )
+
+    with sales_session_factory() as session:
+        state = session.get(SalesSyncStateModel, store_id)
+    assert result["status"] == "queued"
+    assert result["alreadyRunning"] is False
+    assert dispatched == [("manual-recovery-owner", store_id)]
+    assert state is not None
+    assert state.sync_status == "queued"
+
+
+def test_sales_sync_state_timestamps_have_explicit_shanghai_offset() -> None:
+    payload = crawler_service._sales_analysis_sync_state_to_public(
+        SimpleNamespace(
+            store_id=7,
+            sync_status="idle",
+            initial_sync_completed=True,
+            progress_current=0,
+            progress_total=0,
+            last_successful_sync_at=datetime(2026, 7, 16, 12, 0, 0),
+            last_remote_updated_at=datetime(2026, 7, 16, 11, 30, 0),
+            last_error="",
+        )
+    )
+
+    assert payload["lastSuccessfulSyncAt"] == (
+        "2026-07-16T12:00:00+08:00"
+    )
+    assert payload["lastRemoteUpdatedAt"] == (
+        "2026-07-16T11:30:00+08:00"
+    )
 
 
 def test_scheduled_sales_sync_continues_after_one_store_fails(

@@ -21,7 +21,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects import mysql
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateColumn
 
@@ -1654,6 +1654,164 @@ def test_mysql_longtext_column_ddl_does_not_require_a_server_default():
 
     assert "LONGTEXT NOT NULL" in ddl
     assert "DEFAULT" not in ddl
+
+
+def _legacy_store_schema_engine():
+    legacy_engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        future=True,
+    )
+
+    @event.listens_for(legacy_engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE lt_user_accounts (
+                    username VARCHAR(255) PRIMARY KEY
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE lt_stores (
+                    id INTEGER PRIMARY KEY,
+                    owner_username VARCHAR(255) NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO lt_user_accounts (username)
+                VALUES ('alice')
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO lt_stores (id, owner_username)
+                VALUES (1, 'alice')
+                """
+            )
+        )
+    return legacy_engine
+
+
+def test_existing_store_schema_needs_parent_preflight_before_sales_child_use():
+    without_preflight = _legacy_store_schema_engine()
+    try:
+        with pytest.raises(OperationalError, match="foreign key mismatch"):
+            with without_preflight.begin() as connection:
+                SalesSyncStateModel.__table__.create(connection)
+                connection.execute(
+                    SalesSyncStateModel.__table__.insert().values(
+                        store_id=1,
+                        owner_username="alice",
+                    )
+                )
+    finally:
+        without_preflight.dispose()
+
+    with_preflight = _legacy_store_schema_engine()
+    try:
+        database_module.ensure_sales_parent_keys_before_create_all(
+            with_preflight
+        )
+        with with_preflight.begin() as connection:
+            SalesSyncStateModel.__table__.create(connection)
+            connection.execute(
+                SalesSyncStateModel.__table__.insert().values(
+                    store_id=1,
+                    owner_username="alice",
+                )
+            )
+        with Session(with_preflight) as session:
+            state = session.get(SalesSyncStateModel, 1)
+        assert state is not None
+        assert state.owner_username == "alice"
+    finally:
+        with_preflight.dispose()
+
+
+def test_init_database_preflights_sales_parent_before_create_all(
+    monkeypatch,
+):
+    from app.services import (
+        crawler_service,
+        sensitive_word_service,
+        user_service,
+    )
+
+    events: list[str] = []
+
+    class _Session:
+        def commit(self):
+            events.append("seed")
+
+        def rollback(self):
+            raise AssertionError("rollback must not be needed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        database_module.settings,
+        "database_auto_create",
+        False,
+    )
+    monkeypatch.setattr(
+        database_module,
+        "ensure_sales_parent_keys_before_create_all",
+        lambda *_args, **_kwargs: events.append("parent-preflight"),
+    )
+    monkeypatch.setattr(
+        database_module.Base.metadata,
+        "create_all",
+        lambda **_kwargs: events.append("create-all"),
+    )
+    monkeypatch.setattr(
+        database_module,
+        "ensure_schema_compatibility",
+        lambda: events.append("compatibility"),
+    )
+    monkeypatch.setattr(
+        user_service,
+        "ensure_initial_superadmin",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "ensure_default_roles",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        sensitive_word_service,
+        "seed_default_sensitive_words",
+        lambda _session: None,
+    )
+    monkeypatch.setattr(
+        database_module,
+        "SessionLocal",
+        _Session,
+    )
+
+    database_module.init_database()
+
+    assert events[:3] == [
+        "parent-preflight",
+        "create-all",
+        "compatibility",
+    ]
 
 
 class _FakeResult:

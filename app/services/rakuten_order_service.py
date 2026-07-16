@@ -110,7 +110,9 @@ def get_orders(service_secret: str, license_key: str, order_numbers: list[str]) 
             order_models = payload.get("OrderModelList")
             if not isinstance(order_models, list):
                 _raise_sanitized_runtime_error("乐天订单详情读取返回格式无法解析。")
-            orders.extend(order for order in order_models if isinstance(order, dict))
+            if any(not isinstance(order, dict) for order in order_models):
+                _raise_sanitized_runtime_error("乐天订单详情读取返回格式无法解析。")
+            orders.extend(order_models)
         return orders
     finally:
         session.close()
@@ -127,7 +129,8 @@ def iter_order_items(order: dict[str, Any]) -> Iterable[dict[str, Any]]:
         item_models = package.get("ItemModelList")
         if not isinstance(item_models, list):
             continue
-        for line_position, item in enumerate(item_models, start=1):
+        identity_occurrences: dict[str, int] = {}
+        for item in item_models:
             if not isinstance(item, dict):
                 continue
             normalized_sku_models = item.get("SkuModelList") if isinstance(item.get("SkuModelList"), list) else []
@@ -150,16 +153,27 @@ def iter_order_items(order: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 "restoreInventoryFlag": _to_bool(item.get("restoreInventoryFlag")),
             }
             if not item_detail_id:
-                fingerprint_inputs = {
+                canonical_identity = {
                     "canonicalSku": _canonical_json(normalized_sku_models),
                     "itemId": item_id,
                     "itemNumber": normalized_item["itemNumber"],
-                    "linePosition": line_position,
                     "manageNumber": normalized_item["manageNumber"],
-                    "packagePosition": package_position,
                     "price": normalize_text(price),
                     "priceTaxIncl": normalize_text(price_tax_incl),
                 }
+                identity_key = _canonical_json(canonical_identity)
+                occurrence_index = (
+                    identity_occurrences.get(identity_key, 0) + 1
+                )
+                identity_occurrences[identity_key] = occurrence_index
+                fingerprint_inputs = {
+                    "canonicalIdentity": canonical_identity,
+                    "packagePosition": package_position,
+                    "occurrenceIndex": occurrence_index,
+                }
+                normalized_item["identityOccurrenceIndex"] = (
+                    occurrence_index
+                )
                 normalized_item["lineFingerprintInputs"] = fingerprint_inputs
                 normalized_item["lineFingerprint"] = _versioned_digest(fingerprint_inputs)
             yield normalized_item

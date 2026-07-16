@@ -246,6 +246,31 @@ class RakutenOrderServiceTests(unittest.TestCase):
             self.assertEqual(call.kwargs["json"]["version"], 7)
             self.assertEqual(call.kwargs["timeout"], settings.crawler_timeout_seconds)
 
+    def test_get_orders_rejects_non_object_order_details(self) -> None:
+        response = json_response(
+            {
+                "OrderModelList": [
+                    {"orderNumber": "1001"},
+                    "malformed-order-detail",
+                ]
+            }
+        )
+
+        with patch.object(
+            rakuten_order_service.requests.Session,
+            "post",
+            return_value=response,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "乐天订单详情读取返回格式无法解析",
+            ):
+                rakuten_order_service.get_orders(
+                    "secret-123",
+                    "key-456",
+                    ["1001"],
+                )
+
     def test_iter_order_items_keeps_item_detail_id_and_item_id_separate(self) -> None:
         order = {
             "orderNumber": "1001",
@@ -313,33 +338,28 @@ class RakutenOrderServiceTests(unittest.TestCase):
 
         result = list(rakuten_order_service.iter_order_items(order))
 
-        self.assertEqual(result, [
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["orderNumber"], "1001")
+        self.assertEqual(result[0]["packagePosition"], 1)
+        self.assertEqual(result[0]["itemDetailId"], "")
+        self.assertEqual(result[0]["itemId"], "item-id-2")
+        self.assertEqual(
+            result[0]["lineFingerprintInputs"],
             {
-                "orderNumber": "1001",
-                "packagePosition": 1,
-                "itemDetailId": "",
-                "itemId": "item-id-2",
-                "manageNumber": "manage-2",
-                "itemNumber": "item-2",
-                "SkuModelList": [{"variantName": "Blue", "variantId": "sku-z"}],
-                "units": 3,
-                "price": 900,
-                "priceTaxIncl": 990,
-                "deleteItemFlag": True,
-                "restoreInventoryFlag": False,
-                "lineFingerprintInputs": {
+                "canonicalIdentity": {
                     "canonicalSku": '[{"variantId":"sku-z","variantName":"Blue"}]',
                     "itemId": "item-id-2",
                     "itemNumber": "item-2",
-                    "linePosition": 1,
                     "manageNumber": "manage-2",
-                    "packagePosition": 1,
                     "price": "900",
                     "priceTaxIncl": "990",
                 },
-                "lineFingerprint": "v1:7454ed373337bc237f38bc2c4958d555540aeb8a4fa6850d76c2258217f5f4f0",
-            }
-        ])
+                "occurrenceIndex": 1,
+                "packagePosition": 1,
+            },
+        )
+        self.assertEqual(result[0]["identityOccurrenceIndex"], 1)
+        self.assertRegex(result[0]["lineFingerprint"], r"^v1:[0-9a-f]{64}$")
 
     def test_iter_order_items_fingerprint_is_bounded_and_stable_on_non_identity_changes(self) -> None:
         base_order = {
@@ -387,7 +407,9 @@ class RakutenOrderServiceTests(unittest.TestCase):
         mutated_item = list(rakuten_order_service.iter_order_items(mutated_order))[0]
 
         self.assertEqual(
-            base_item["lineFingerprintInputs"]["canonicalSku"],
+            base_item["lineFingerprintInputs"]["canonicalIdentity"][
+                "canonicalSku"
+            ],
             '[{"variantA":{"x":1,"y":2},"variantB":["2","1"]}]',
         )
         self.assertRegex(base_item["lineFingerprint"], r"^v1:[0-9a-f]{64}$")
@@ -439,6 +461,97 @@ class RakutenOrderServiceTests(unittest.TestCase):
         second_item = list(rakuten_order_service.iter_order_items(second_order))[0]
 
         self.assertNotEqual(first_item["lineFingerprint"], second_item["lineFingerprint"])
+
+    def test_iter_order_items_fingerprint_is_stable_when_different_lines_reorder(
+        self,
+    ) -> None:
+        first_order = {
+            "orderNumber": "1001",
+            "PackageModelList": [
+                {
+                    "ItemModelList": [
+                        {
+                            "itemId": "item-a",
+                            "manageNumber": "MN-A",
+                            "itemNumber": "ITEM-A",
+                            "SkuModelList": [{"variantId": "blue"}],
+                            "units": 1,
+                            "price": 100,
+                        },
+                        {
+                            "itemId": "item-b",
+                            "manageNumber": "MN-B",
+                            "itemNumber": "ITEM-B",
+                            "SkuModelList": [{"variantId": "red"}],
+                            "units": 2,
+                            "price": 200,
+                        },
+                    ]
+                }
+            ],
+        }
+        reordered = {
+            **first_order,
+            "PackageModelList": [
+                {
+                    "ItemModelList": list(
+                        reversed(
+                            first_order["PackageModelList"][0][
+                                "ItemModelList"
+                            ]
+                        )
+                    )
+                }
+            ],
+        }
+
+        first = {
+            row["itemNumber"]: row["lineFingerprint"]
+            for row in rakuten_order_service.iter_order_items(first_order)
+        }
+        second = {
+            row["itemNumber"]: row["lineFingerprint"]
+            for row in rakuten_order_service.iter_order_items(reordered)
+        }
+
+        self.assertEqual(first, second)
+
+    def test_iter_order_items_uses_occurrence_index_for_identical_lines(
+        self,
+    ) -> None:
+        identical = {
+            "itemId": "item-a",
+            "manageNumber": "MN-A",
+            "itemNumber": "ITEM-A",
+            "SkuModelList": [{"variantId": "blue"}],
+            "units": 1,
+            "price": 100,
+        }
+        order = {
+            "orderNumber": "1001",
+            "PackageModelList": [
+                {
+                    "ItemModelList": [
+                        dict(identical),
+                        dict(identical),
+                    ]
+                }
+            ],
+        }
+
+        rows = list(rakuten_order_service.iter_order_items(order))
+
+        self.assertEqual(
+            [row["identityOccurrenceIndex"] for row in rows],
+            [1, 2],
+        )
+        self.assertEqual(len({row["lineFingerprint"] for row in rows}), 2)
+        self.assertTrue(
+            all(
+                "linePosition" not in row["lineFingerprintInputs"]
+                for row in rows
+            )
+        )
 
     def test_iter_order_items_fingerprint_stays_bounded_for_long_sku_payload(self) -> None:
         long_value = "x" * 5000

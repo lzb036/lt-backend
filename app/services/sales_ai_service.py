@@ -5,7 +5,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Iterator
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any, Callable
 
 from sqlalchemy import func, select
@@ -27,6 +27,10 @@ from app.services import sales_analysis_service
 from app.services.sales_analysis_service import (
     SALES_ANALYSIS_TOOLS,
     execute_sales_tool,
+)
+from app.services.sales_time import (
+    SALES_TIMEZONE as SHANGHAI_TIMEZONE,
+    sales_now_naive,
 )
 
 
@@ -56,10 +60,12 @@ MAX_MODEL_MESSAGES_TOTAL_CHARS = 64_000
 TRUNCATION_MARKER = "...[已截断]"
 SENSITIVE_FRAGMENT_MARKER = "[敏感片段已省略]"
 CANONICAL_FOOTER_MARKER = "【分析依据】"
-SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
 DEFAULT_CONVERSATION_TITLE = "新分析"
 EFFECTIVE_SALES_DEFINITION = (
     "有效销量 = 下单数量 - 取消数量 - 退款数量 - 退货数量"
+)
+EFFECTIVE_SALES_AMOUNT_DEFINITION = (
+    sales_analysis_service.EFFECTIVE_SALES_AMOUNT_DEFINITION
 )
 STORE_SCOPED_TOOLS = {
     "get_store_sales_overview",
@@ -143,6 +149,9 @@ COMMON_RESULT_FIELDS = {
     "metric": _schema_text(64),
     "dataUpdatedAt": _schema_text(40, nullable=True),
     "unresolvedAdjustmentCount": INTEGER_SCHEMA,
+    "initialSyncCompleted": BOOLEAN_SCHEMA,
+    "dataIncomplete": BOOLEAN_SCHEMA,
+    "effectiveSalesAmountDefinition": _schema_text(300),
 }
 SALES_TOTAL_FIELDS = {
     "orderCount": INTEGER_SCHEMA,
@@ -196,6 +205,9 @@ TOOL_RESULT_SCHEMAS = {
     "list_owned_stores": _schema_object(
         {
             "dataUpdatedAt": _schema_text(40, nullable=True),
+            "initialSyncCompleted": BOOLEAN_SCHEMA,
+            "dataIncomplete": BOOLEAN_SCHEMA,
+            "effectiveSalesAmountDefinition": _schema_text(300),
             "rows": _schema_list(
                 _schema_object(
                     {
@@ -203,6 +215,8 @@ TOOL_RESULT_SCHEMAS = {
                         "name": _schema_text(255),
                         "code": _schema_text(120, policy="identifier"),
                         "enabled": BOOLEAN_SCHEMA,
+                        "initialSyncCompleted": BOOLEAN_SCHEMA,
+                        "dataIncomplete": BOOLEAN_SCHEMA,
                     }
                 ),
                 MAX_STORE_ROWS,
@@ -467,20 +481,12 @@ _DATABASE_STATEMENT_RE = re.compile(
     r"(?is)\b(?:select|insert|update|delete|drop|alter|create|replace|"
     r"truncate|merge|pragma)\b.*?(?=(?:[,;；\n]|$))"
 )
-_NUMERIC_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_])"
-    r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)"
-    r"(?:[eE][+-]?\d+)?%?"
-    r"(?![A-Za-z0-9_])"
-)
-
-
 def _current_shanghai_date() -> date:
     return datetime.now(SHANGHAI_TIMEZONE).date()
 
 
 def _now_local_naive() -> datetime:
-    return datetime.now(SHANGHAI_TIMEZONE).replace(tzinfo=None)
+    return sales_now_naive()
 
 
 def _json_load(value: str, default: Any) -> Any:
@@ -1856,7 +1862,9 @@ def _system_prompt(
         f"当前上海日期为 {_current_shanghai_date().isoformat()}。"
         f"{date_rule}"
         f"“销量”默认指有效销量，定义为：{EFFECTIVE_SALES_DEFINITION}。"
-        "回答必须显示店铺、具体起止日期、有效销量口径、数据最后更新时间和未决调整数量。"
+        f"effectiveSalesAmount 的口径为：{EFFECTIVE_SALES_AMOUNT_DEFINITION}"
+        "回答必须显示店铺、具体起止日期、有效销量口径、数据最后更新时间、"
+        "初始同步完整性和未决调整数量。"
     )
 
 
@@ -2007,6 +2015,38 @@ def _fallback_answer(
     )
 
 
+def _deterministic_answer(
+    selected_store: dict[str, Any],
+    relative_window: dict[str, str] | None,
+    tool_records: list[dict[str, Any]],
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
+) -> str:
+    protected_identifiers = _collect_tool_identifiers(tool_records)
+    metadata = _grounding_metadata(
+        selected_store,
+        relative_window,
+        tool_records,
+        owner_username=owner_username,
+        secrets=secrets,
+    )
+    footer = _canonical_footer(
+        metadata,
+        tool_records,
+        owner_username=owner_username,
+        secrets=secrets,
+        protected_identifiers=protected_identifiers,
+    )
+    return _compose_answer_with_footer(
+        "以下为后端生成的受控结果。",
+        footer,
+        owner_username=owner_username,
+        secrets=secrets,
+        protected_identifiers=protected_identifiers,
+    )
+
+
 def _grounding_metadata(
     selected_store: dict[str, Any],
     relative_window: dict[str, str] | None,
@@ -2022,6 +2062,9 @@ def _grounding_metadata(
     store_name = str(selected_store.get("name") or "")
     data_updated_at: str | None = None
     unresolved_count = 0
+    initial_sync_values: list[bool] = []
+    data_incomplete_values: list[bool] = []
+    amount_definition = EFFECTIVE_SALES_AMOUNT_DEFINITION
     for record in tool_records:
         result = record["result"]
         result_store = result.get("store")
@@ -2037,6 +2080,21 @@ def _grounding_metadata(
                 unresolved_count,
                 result["unresolvedAdjustmentCount"],
             )
+        if isinstance(result.get("initialSyncCompleted"), bool):
+            initial_sync_values.append(
+                result["initialSyncCompleted"]
+            )
+        if isinstance(result.get("dataIncomplete"), bool):
+            data_incomplete_values.append(
+                result["dataIncomplete"]
+            )
+        if isinstance(
+            result.get("effectiveSalesAmountDefinition"),
+            str,
+        ):
+            amount_definition = result[
+                "effectiveSalesAmountDefinition"
+            ]
     safe_store_name = (
         _safe_text(
             store_name,
@@ -2052,6 +2110,15 @@ def _grounding_metadata(
         "endDate": statistics_window.get("end", "未提供"),
         "dataUpdatedAt": data_updated_at or "暂无",
         "unresolvedAdjustmentCount": unresolved_count,
+        "initialSyncCompleted": (
+            bool(initial_sync_values)
+            and all(initial_sync_values)
+        ),
+        "dataIncomplete": (
+            any(data_incomplete_values)
+            or not initial_sync_values
+        ),
+        "effectiveSalesAmountDefinition": amount_definition,
     }
 
 
@@ -2090,6 +2157,18 @@ def _canonical_footer(
                 (
                     "unresolvedAdjustmentCount: "
                     f"{metadata['unresolvedAdjustmentCount']}"
+                ),
+                (
+                    "initialSyncCompleted: "
+                    f"{_json_dump(metadata['initialSyncCompleted'])}"
+                ),
+                (
+                    "dataIncomplete: "
+                    f"{_json_dump(metadata['dataIncomplete'])}"
+                ),
+                (
+                    "effectiveSalesAmountDefinition: "
+                    f"{metadata['effectiveSalesAmountDefinition']}"
                 ),
                 f"rows: {_json_dump(row_groups)}",
             ]
@@ -2163,56 +2242,14 @@ def _ground_final_answer(
     owner_username: str,
     secrets: tuple[str, ...],
 ) -> tuple[str, bool]:
-    protected_identifiers = _collect_tool_identifiers(tool_records)
-    normalized_content = unicodedata.normalize(
-        "NFKC",
-        str(content or ""),
-    )
-    safe_answer = (
-        _safe_text(
-            normalized_content,
-            owner_username=owner_username,
-            secrets=secrets,
-            protected_identifiers=protected_identifiers,
-            max_chars=MAX_PERSISTED_ANSWER_CHARS,
-        )
-        or ""
-    ).strip()
-    metadata = _grounding_metadata(
-        selected_store,
-        relative_window,
-        tool_records,
-        owner_username=owner_username,
-        secrets=secrets,
-    )
-    if (
-        not safe_answer
-        or _NUMERIC_TOKEN_RE.search(normalized_content)
-    ):
-        return (
-            _fallback_answer(
-                selected_store,
-                relative_window,
-                tool_records,
-                owner_username=owner_username,
-                secrets=secrets,
-            ),
-            True,
-        )
-    footer = _canonical_footer(
-        metadata,
-        tool_records,
-        owner_username=owner_username,
-        secrets=secrets,
-        protected_identifiers=protected_identifiers,
-    )
+    del content
     return (
-        _compose_answer_with_footer(
-            safe_answer,
-            footer,
+        _deterministic_answer(
+            selected_store,
+            relative_window,
+            tool_records,
             owner_username=owner_username,
             secrets=secrets,
-            protected_identifiers=protected_identifiers,
         ),
         False,
     )

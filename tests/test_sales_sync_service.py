@@ -985,7 +985,10 @@ def test_initial_sync_searches_default_90_days_without_local_rechecks(
 
     def fake_get(_secret, _key, order_numbers):
         requested_order_numbers.extend(order_numbers)
-        return []
+        return [
+            order_snapshot(order_number=order_number)
+            for order_number in order_numbers
+        ]
 
     monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
     monkeypatch.setattr(sales_sync_service, "decrypt_text", lambda value: value)
@@ -1013,6 +1016,158 @@ def test_initial_sync_searches_default_90_days_without_local_rechecks(
     assert requested_order_numbers == ["FIRST-REMOTE"]
     assert state is not None
     assert state.initial_sync_completed is True
+
+
+def test_initial_sync_missing_order_detail_preserves_full_retry_window(
+    monkeypatch,
+    session_factory,
+):
+    now = datetime(2026, 7, 16, 12, 0, 0)
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    search_starts: list[datetime] = []
+    get_calls = 0
+
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def fake_search(
+        _secret,
+        _key,
+        start_at,
+        _end_at,
+        _statuses,
+    ):
+        search_starts.append(start_at)
+        return ["DAY-45-ORDER"]
+
+    def fake_get(_secret, _key, _order_numbers):
+        nonlocal get_calls
+        get_calls += 1
+        if get_calls == 1:
+            return []
+        return [order_snapshot(order_number="DAY-45-ORDER")]
+
+    monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(sales_sync_service, "decrypt_text", lambda value: value)
+    monkeypatch.setattr(sales_sync_service, "_now", lambda: now)
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "search_order_numbers",
+        fake_search,
+    )
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "get_orders",
+        fake_get,
+    )
+
+    with pytest.raises(RuntimeError, match="订单详情不完整"):
+        sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        failed_state = session.get(SalesSyncStateModel, store_id)
+    assert failed_state is not None
+    assert failed_state.initial_sync_completed is False
+    assert failed_state.sync_status == "error"
+
+    result = sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        completed_state = session.get(SalesSyncStateModel, store_id)
+    assert result["status"] == "completed"
+    assert completed_state is not None
+    assert completed_state.initial_sync_completed is True
+    assert search_starts == [
+        now - timedelta(days=90),
+        now - timedelta(days=90),
+    ]
+
+
+@pytest.mark.parametrize(
+    "returned_orders",
+    [
+        [
+            {
+                "orderDatetime": "2026-07-15T10:00:00",
+                "updateDatetime": "2026-07-15T10:05:00",
+                "PackageModelList": [],
+            }
+        ],
+        [order_snapshot(order_number="UNEXPECTED-ORDER")],
+        [
+            order_snapshot(
+                order_number="EXPECTED-ORDER",
+                order_overrides={
+                    "PackageModelList": [
+                        {"ItemModelList": ["malformed-item"]}
+                    ]
+                },
+            )
+        ],
+    ],
+)
+def test_initial_sync_malformed_order_detail_does_not_mark_complete(
+    monkeypatch,
+    session_factory,
+    returned_orders,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(sales_sync_service, "decrypt_text", lambda value: value)
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "search_order_numbers",
+        lambda *_args, **_kwargs: ["EXPECTED-ORDER"],
+    )
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "get_orders",
+        lambda *_args, **_kwargs: returned_orders,
+    )
+
+    with pytest.raises(RuntimeError, match="订单详情不完整"):
+        sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        state = session.get(SalesSyncStateModel, store_id)
+        orders = session.scalars(
+            select(SalesOrderModel).where(
+                SalesOrderModel.store_id == store_id
+            )
+        ).all()
+    assert state is not None
+    assert state.initial_sync_completed is False
+    assert state.sync_status == "error"
+    assert orders == []
 
 
 def test_later_sync_searches_7_days_and_adds_local_recheck_candidates(
@@ -1182,7 +1337,10 @@ def test_later_sync_searches_7_days_and_adds_local_recheck_candidates(
 
     def fake_get(_secret, _key, order_numbers):
         requested_order_numbers.extend(order_numbers)
-        return []
+        return [
+            order_snapshot(order_number=order_number)
+            for order_number in order_numbers
+        ]
 
     monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
     monkeypatch.setattr(sales_sync_service, "decrypt_text", lambda value: value)
@@ -1256,6 +1414,127 @@ def test_syncing_same_snapshot_twice_is_idempotent(
     assert daily.refunded_units == 2
     assert daily.effective_units == 3
     assert daily.order_count == 1
+
+
+def test_fallback_line_ids_survive_reordering_of_different_lines(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    line_a = {
+        "itemDetailId": "",
+        "itemId": "item-a",
+        "manageNumber": "MN-A",
+        "itemNumber": "ITEM-A",
+        "itemName": "Item A",
+        "SkuModelList": [{"variantId": "blue"}],
+        "units": 1,
+        "price": 100,
+    }
+    line_b = {
+        "itemDetailId": "",
+        "itemId": "item-b",
+        "manageNumber": "MN-B",
+        "itemNumber": "ITEM-B",
+        "itemName": "Item B",
+        "SkuModelList": [{"variantId": "red"}],
+        "units": 1,
+        "price": 200,
+    }
+    snapshots = [
+        order_snapshot(
+            order_number="REORDER-1",
+            order_overrides={
+                "updateDatetime": "2026-07-15T10:05:00",
+                "PackageModelList": [
+                    {"ItemModelList": [line_a, line_b]}
+                ],
+            },
+        )
+    ]
+    patch_local_sync_dependencies(monkeypatch, session_factory, snapshots)
+
+    sales_sync_service.sync_owned_store("alice", store_id)
+    with session_factory() as session:
+        first_ids = {
+            item.item_number: item.item_detail_id
+            for item in session.scalars(
+                select(SalesOrderItemModel).where(
+                    SalesOrderItemModel.store_id == store_id
+                )
+            ).all()
+        }
+
+    snapshots[0] = order_snapshot(
+        order_number="REORDER-1",
+        order_overrides={
+            "updateDatetime": "2026-07-15T10:06:00",
+            "PackageModelList": [
+                {"ItemModelList": [line_b, line_a]}
+            ],
+        },
+    )
+    sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        items = session.scalars(
+            select(SalesOrderItemModel).where(
+                SalesOrderItemModel.store_id == store_id
+            )
+        ).all()
+        second_ids = {
+            item.item_number: item.item_detail_id
+            for item in items
+        }
+
+    assert len(items) == 2
+    assert second_ids == first_ids
+
+
+def test_aware_rakuten_timestamp_uses_shanghai_sales_day(
+    monkeypatch,
+    session_factory,
+):
+    now = datetime(2026, 7, 16, 12, 0, 0)
+    with session_factory() as session:
+        store = seed_store(session)
+        store_id = store.id
+        session.commit()
+
+    snapshot = order_snapshot(
+        order_number="TIMEZONE-1",
+        order_overrides={
+            "orderDatetime": "2026-07-16T00:30:00+09:00",
+            "updateDatetime": "2026-07-16T00:35:00+09:00",
+        },
+    )
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        [snapshot],
+    )
+    monkeypatch.setattr(sales_sync_service, "_now", lambda: now)
+
+    result = sales_sync_service.sync_owned_store("alice", store_id)
+
+    with session_factory() as session:
+        order = session.scalars(select(SalesOrderModel)).one()
+        item = session.scalars(select(SalesOrderItemModel)).one()
+        daily = session.scalars(select(ProductSalesDailyModel)).one()
+
+    assert order.ordered_at == datetime(2026, 7, 15, 23, 30, 0)
+    assert item.ordered_at == datetime(2026, 7, 15, 23, 30, 0)
+    assert daily.sales_date == date(2026, 7, 15)
+    assert result["lastRemoteUpdatedAt"] == (
+        "2026-07-15T23:35:00+08:00"
+    )
+    assert result["lastSuccessfulSyncAt"] == (
+        "2026-07-16T12:00:00+08:00"
+    )
 
 
 def test_newer_snapshot_is_not_overwritten_by_older_snapshot(
@@ -1362,7 +1641,7 @@ def test_equivalent_offset_timestamp_keeps_first_accepted_snapshot(
         item = session.scalars(select(SalesOrderItemModel)).one()
         adjustment = session.scalars(select(SalesItemAdjustmentModel)).one()
 
-    assert order.updated_at_remote == datetime(2026, 7, 15, 1, 10, 0)
+    assert order.updated_at_remote == datetime(2026, 7, 15, 9, 10, 0)
     assert item.refunded_units == 2
     assert item.effective_units == 3
     assert adjustment.status == "confirmed"
@@ -1420,16 +1699,23 @@ def test_snapshot_without_remote_version_does_not_overwrite_versioned_order(
 
     snapshots[0] = order_snapshot()
     snapshots[0].pop("updateDatetime")
-    result = sales_sync_service.sync_owned_store("alice", store_id)
+    with pytest.raises(
+        sales_sync_service.SalesSyncIncompleteError,
+        match="订单详情不完整",
+    ):
+        sales_sync_service.sync_owned_store("alice", store_id)
 
     with session_factory() as session:
         order = session.scalars(select(SalesOrderModel)).one()
         item = session.scalars(select(SalesOrderItemModel)).one()
+        state = session.get(SalesSyncStateModel, store_id)
 
-    assert result["incompleteOrderCount"] == 1
     assert order.updated_at_remote == datetime(2026, 7, 15, 10, 10, 0)
     assert item.refunded_units == 2
     assert item.effective_units == 3
+    assert state is not None
+    assert state.initial_sync_completed is True
+    assert state.sync_status == "error"
 
 
 def test_newer_quantity_reduction_preserves_first_ordered_units(
@@ -1545,7 +1831,7 @@ def test_canceled_order_with_well_formed_empty_items_cancels_existing_lines(
         [{"missingItemModelList": True}],
     ],
 )
-def test_incomplete_snapshot_is_skipped_without_canceling_existing_lines(
+def test_incomplete_snapshot_fails_without_canceling_existing_lines(
     monkeypatch,
     session_factory,
     malformed_packages,
@@ -1566,18 +1852,21 @@ def test_incomplete_snapshot_is_skipped_without_canceling_existing_lines(
         snapshots[0].pop("PackageModelList")
     else:
         snapshots[0]["PackageModelList"] = malformed_packages
-    result = sales_sync_service.sync_owned_store("alice", store_id)
+    with pytest.raises(
+        sales_sync_service.SalesSyncIncompleteError,
+        match="订单详情不完整",
+    ):
+        sales_sync_service.sync_owned_store("alice", store_id)
 
     with session_factory() as session:
         item = session.scalars(select(SalesOrderItemModel)).one()
 
-    assert result["incompleteOrderCount"] == 1
     assert item.latest_units == 5
     assert item.canceled_units == 0
     assert item.effective_units == 5
 
 
-def test_nonterminal_empty_snapshot_is_skipped_without_canceling_lines(
+def test_nonterminal_empty_snapshot_fails_without_canceling_lines(
     monkeypatch,
     session_factory,
 ):
@@ -1598,17 +1887,20 @@ def test_nonterminal_empty_snapshot_is_skipped_without_canceling_lines(
         }
     )
     snapshots[0]["PackageModelList"] = []
-    result = sales_sync_service.sync_owned_store("alice", store_id)
+    with pytest.raises(
+        sales_sync_service.SalesSyncIncompleteError,
+        match="订单详情不完整",
+    ):
+        sales_sync_service.sync_owned_store("alice", store_id)
 
     with session_factory() as session:
         item = session.scalars(select(SalesOrderItemModel)).one()
 
-    assert result["incompleteOrderCount"] == 1
     assert item.latest_units == 5
     assert item.canceled_units == 0
 
 
-def test_completed_empty_snapshot_is_skipped_without_canceling_lines(
+def test_completed_empty_snapshot_fails_without_canceling_lines(
     monkeypatch,
     session_factory,
 ):
@@ -1629,12 +1921,15 @@ def test_completed_empty_snapshot_is_skipped_without_canceling_lines(
         }
     )
     snapshots[0]["PackageModelList"] = []
-    result = sales_sync_service.sync_owned_store("alice", store_id)
+    with pytest.raises(
+        sales_sync_service.SalesSyncIncompleteError,
+        match="订单详情不完整",
+    ):
+        sales_sync_service.sync_owned_store("alice", store_id)
 
     with session_factory() as session:
         item = session.scalars(select(SalesOrderItemModel)).one()
 
-    assert result["incompleteOrderCount"] == 1
     assert item.latest_units == 5
     assert item.canceled_units == 0
     assert item.effective_units == 5
@@ -1671,7 +1966,7 @@ def test_completed_empty_snapshot_is_skipped_without_canceling_lines(
         },
     ],
 )
-def test_incomplete_item_record_is_skipped_without_canceling_lines(
+def test_incomplete_item_record_fails_without_canceling_lines(
     monkeypatch,
     session_factory,
     malformed_item,
@@ -1691,7 +1986,11 @@ def test_incomplete_item_record_is_skipped_without_canceling_lines(
     snapshots[0]["PackageModelList"] = [
         {"ItemModelList": [malformed_item]}
     ]
-    result = sales_sync_service.sync_owned_store("alice", store_id)
+    with pytest.raises(
+        sales_sync_service.SalesSyncIncompleteError,
+        match="订单详情不完整",
+    ):
+        sales_sync_service.sync_owned_store("alice", store_id)
 
     with session_factory() as session:
         items = session.scalars(
@@ -1700,7 +1999,6 @@ def test_incomplete_item_record_is_skipped_without_canceling_lines(
             )
         ).all()
 
-    assert result["incompleteOrderCount"] == 1
     assert len(items) == 1
     assert items[0].item_detail_id == "detail-1"
     assert items[0].latest_units == 5

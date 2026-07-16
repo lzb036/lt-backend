@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -24,6 +24,11 @@ from app.db.models import (
     StoreModel,
 )
 from app.services import rakuten_order_service
+from app.services.sales_time import (
+    iso_sales_datetime,
+    sales_now_naive,
+    to_sales_local_naive,
+)
 
 
 INCREMENTAL_RECHECK_DAYS = 7
@@ -76,6 +81,10 @@ class PreparedItemSnapshot:
 
 
 class IncompleteSnapshotError(ValueError):
+    pass
+
+
+class SalesSyncIncompleteError(RuntimeError):
     pass
 
 
@@ -391,8 +400,9 @@ def sync_owned_store(
                 license_key,
                 order_numbers,
             )
+            _require_complete_order_details(order_numbers, orders)
             heartbeat.raise_if_failed()
-            heartbeat.set_progress(0, len(orders))
+            heartbeat.set_progress(0, len(order_numbers))
             heartbeat.pulse()
 
             with session_scope() as session:
@@ -447,6 +457,10 @@ def sync_owned_store(
                             last_remote_updated_at = remote_updated_at
                     heartbeat.set_progress(index, len(orders))
 
+                if incomplete_order_count:
+                    raise SalesSyncIncompleteError(
+                        "订单详情不完整，本次销量同步未完成，请重试。"
+                    )
                 heartbeat.raise_if_failed()
                 if affected_dates:
                     rebuild_daily_sales(
@@ -525,7 +539,7 @@ def sync_owned_store(
 
 
 def _now() -> datetime:
-    return datetime.now()
+    return sales_now_naive()
 
 
 def _new_lease_status() -> str:
@@ -720,6 +734,38 @@ def _dedupe_order_numbers(
             seen.add(order_number)
             result.append(order_number)
     return result
+
+
+def _require_complete_order_details(
+    requested_order_numbers: Iterable[Any],
+    orders: Iterable[Any],
+) -> None:
+    requested = {
+        order_number
+        for order_number in (
+            _text(value)
+            for value in requested_order_numbers
+        )
+        if order_number
+    }
+    returned: set[str] = set()
+    malformed = False
+    for order in orders:
+        if not isinstance(order, dict):
+            malformed = True
+            continue
+        order_number = _first_text(order, ("orderNumber",))
+        if not order_number:
+            malformed = True
+            continue
+        if order_number not in requested:
+            malformed = True
+            continue
+        returned.add(order_number)
+    if malformed or returned != requested:
+        raise SalesSyncIncompleteError(
+            "订单详情不完整，本次销量同步未完成，请重试。"
+        )
 
 
 def _acquire_sync_lease(
@@ -1029,7 +1075,6 @@ def _reconcile_order_snapshot(
         item_detail_id = _snapshot_item_detail_id(
             order_number,
             normalized_item,
-            position,
         )
         current_units = _non_negative_int(normalized_item.get("units"))
         item = existing_items.get(item_detail_id)
@@ -1727,7 +1772,6 @@ def _bounded_fallback_product_key(prefix: str, value: str) -> str:
 def _snapshot_item_detail_id(
     order_number: str,
     normalized_item: dict[str, Any],
-    position: int,
 ) -> str:
     item_detail_id = _text(normalized_item.get("itemDetailId"))
     if item_detail_id:
@@ -1738,22 +1782,36 @@ def _snapshot_item_detail_id(
     return _fallback_line_id(
         order_number,
         normalized_item,
-        position,
     )
 
 
 def _fallback_line_id(
     order_number: str,
     normalized_item: dict[str, Any],
-    position: int,
 ) -> str:
-    source = {
-        "orderNumber": order_number,
-        "position": position,
+    canonical_identity = {
         "itemId": _text(normalized_item.get("itemId")),
         "itemNumber": _text(normalized_item.get("itemNumber")),
         "manageNumber": _text(normalized_item.get("manageNumber")),
+        "price": _text(normalized_item.get("price")),
+        "priceTaxIncl": _text(normalized_item.get("priceTaxIncl")),
         "sku": normalized_item.get("SkuModelList"),
+    }
+    source = {
+        "orderNumber": order_number,
+        "canonicalIdentity": canonical_identity,
+        "packagePosition": max(
+            1,
+            _non_negative_int(
+                normalized_item.get("packagePosition")
+            ),
+        ),
+        "occurrenceIndex": max(
+            1,
+            _non_negative_int(
+                normalized_item.get("identityOccurrenceIndex")
+            ),
+        ),
     }
     digest = hashlib.sha256(_json(source).encode("utf-8")).hexdigest()
     return f"v1:{digest}"
@@ -1829,7 +1887,7 @@ def _first_datetime(
 
 def _datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
-        return _utc_naive(value)
+        return to_sales_local_naive(value)
     text = _text(value)
     if not text:
         return None
@@ -1841,16 +1899,10 @@ def _datetime(value: Any) -> datetime | None:
     ):
         try:
             parsed = parser(normalized)
-            return _utc_naive(parsed)
+            return to_sales_local_naive(parsed)
         except ValueError:
             continue
     return None
-
-
-def _utc_naive(value: datetime) -> datetime:
-    if value.tzinfo is not None and value.utcoffset() is not None:
-        return value.astimezone(timezone.utc).replace(tzinfo=None)
-    return value.replace(tzinfo=None)
 
 
 def _non_negative_int_or_none(value: Any) -> int | None:
@@ -1921,4 +1973,4 @@ def _json(value: Any) -> str:
 
 
 def _iso(value: datetime | None) -> str:
-    return value.isoformat() if value is not None else ""
+    return str(iso_sales_datetime(value, empty="") or "")

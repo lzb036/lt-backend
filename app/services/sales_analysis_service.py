@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal, cast
 
@@ -13,7 +13,15 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import Integer, cast as sql_cast, exists, func, or_, select
+from sqlalchemy import (
+    Integer,
+    and_,
+    cast as sql_cast,
+    exists,
+    func,
+    or_,
+    select,
+)
 from sqlalchemy.orm import Session
 
 from app.db.database import session_scope
@@ -27,12 +35,21 @@ from app.db.models import (
     StoreModel,
 )
 from app.services import sales_sync_service
+from app.services.sales_time import (
+    as_sales_datetime,
+    iso_sales_datetime,
+)
 
 
 MAX_RANGE_DAYS = 366
 MAX_RANKING_LIMIT = 100
 MAX_COMPARISON_PRODUCTS = 20
-SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
+MAX_RANKING_FACT_ROWS = 50_000
+EFFECTIVE_SALES_AMOUNT_DEFINITION = (
+    "估算商品金额：按商品行单价 × 有效销量计算；"
+    "未分摊优惠券、折扣或税额，存在口径差异，"
+    "不代表权威净收入。"
+)
 
 ManageNumber = Annotated[
     str,
@@ -235,7 +252,7 @@ SALES_ANALYSIS_TOOLS = [
     ),
     _tool_definition(
         "get_store_sales_overview",
-        "返回一个自有店铺在具体日期范围内的销量、销售额和调整概览。",
+        "返回一个自有店铺在具体日期范围内的销量、估算商品金额和调整概览。",
         StoreSalesOverviewArguments,
     ),
     _tool_definition(
@@ -245,17 +262,17 @@ SALES_ANALYSIS_TOOLS = [
     ),
     _tool_definition(
         "get_product_sales_trend",
-        "返回一个商品按日、周或月聚合的有效销量和有效销售额趋势。",
+        "返回一个商品按日、周或月聚合的有效销量和估算商品金额趋势。",
         ProductSalesTrendArguments,
     ),
     _tool_definition(
         "compare_product_sales",
-        "比较 2 至 20 个商品的销量、销售额、调整率和趋势。",
+        "比较 2 至 20 个商品的销量、估算商品金额、调整率和趋势。",
         CompareProductSalesArguments,
     ),
     _tool_definition(
         "get_sku_sales_breakdown",
-        "返回一个商品在具体日期范围内的 SKU 销量、销售额和占比。",
+        "返回一个商品在具体日期范围内的 SKU 销量、估算商品金额和占比。",
         SkuSalesBreakdownArguments,
     ),
     _tool_definition(
@@ -296,15 +313,11 @@ def _latest_datetime(*values: datetime | None) -> datetime | None:
 
 
 def _as_shanghai_datetime(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=SHANGHAI_TIMEZONE)
-    return value.astimezone(SHANGHAI_TIMEZONE)
+    return as_sales_datetime(value)
 
 
 def _iso_updated_at(value: datetime | None) -> str | None:
-    if value is None:
-        return None
-    return _as_shanghai_datetime(value).isoformat(timespec="seconds")
+    return iso_sales_datetime(value)
 
 
 def _require_owned_store(
@@ -593,6 +606,24 @@ def _unresolved_adjustment_count(
     )
 
 
+def _initial_sync_completed(
+    session: Session,
+    owner_username: str,
+    store_id: int,
+) -> bool:
+    return bool(
+        session.scalar(
+            select(
+                SalesSyncStateModel.initial_sync_completed
+            ).where(
+                SalesSyncStateModel.owner_username
+                == owner_username,
+                SalesSyncStateModel.store_id == store_id,
+            )
+        )
+    )
+
+
 def _result_metadata(
     session: Session,
     *,
@@ -602,6 +633,18 @@ def _result_metadata(
     end_date: date,
     metric: str,
 ) -> dict[str, Any]:
+    unresolved_count = _unresolved_adjustment_count(
+        session,
+        owner_username,
+        store.id,
+        start_date,
+        end_date,
+    )
+    initial_sync_completed = _initial_sync_completed(
+        session,
+        owner_username,
+        store.id,
+    )
     return {
         "store": {"id": store.id, "name": store.store_name},
         "range": {
@@ -618,12 +661,11 @@ def _result_metadata(
                 end_date,
             )
         ),
-        "unresolvedAdjustmentCount": _unresolved_adjustment_count(
-            session,
-            owner_username,
-            store.id,
-            start_date,
-            end_date,
+        "unresolvedAdjustmentCount": unresolved_count,
+        "initialSyncCompleted": initial_sync_completed,
+        "dataIncomplete": not initial_sync_completed,
+        "effectiveSalesAmountDefinition": (
+            EFFECTIVE_SALES_AMOUNT_DEFINITION
         ),
     }
 
@@ -693,14 +735,37 @@ def _list_owned_stores(
     owner_username: str,
     _: StrictToolArguments,
 ) -> dict[str, Any]:
-    stores = session.scalars(
-        select(StoreModel)
+    store_rows = session.execute(
+        select(
+            StoreModel,
+            SalesSyncStateModel.initial_sync_completed,
+        )
+        .outerjoin(
+            SalesSyncStateModel,
+            and_(
+                SalesSyncStateModel.store_id == StoreModel.id,
+                SalesSyncStateModel.owner_username
+                == StoreModel.owner_username,
+            ),
+        )
         .where(StoreModel.owner_username == owner_username)
         .order_by(StoreModel.id.asc())
     ).all()
+    completion_flags = [
+        bool(initial_sync_completed)
+        for _store, initial_sync_completed in store_rows
+    ]
+    all_completed = bool(completion_flags) and all(
+        completion_flags
+    )
     return {
         "dataUpdatedAt": _iso_updated_at(
             _owner_data_updated_at(session, owner_username)
+        ),
+        "initialSyncCompleted": all_completed,
+        "dataIncomplete": bool(completion_flags) and not all_completed,
+        "effectiveSalesAmountDefinition": (
+            EFFECTIVE_SALES_AMOUNT_DEFINITION
         ),
         "rows": [
             {
@@ -708,8 +773,14 @@ def _list_owned_stores(
                 "name": store.store_name,
                 "code": store.store_code,
                 "enabled": bool(store.enabled),
+                "initialSyncCompleted": bool(
+                    initial_sync_completed
+                ),
+                "dataIncomplete": not bool(
+                    initial_sync_completed
+                ),
             }
-            for store in stores
+            for store, initial_sync_completed in store_rows
         ],
     }
 
@@ -763,45 +834,10 @@ def _store_sales_overview(
     return result
 
 
-def _ranking_rows(
-    session: Session,
+def _ranking_daily_query_parts(
     owner_username: str,
     args: ProductSalesRankingArguments,
-) -> list[dict[str, Any]]:
-    fact_order_numbers: dict[tuple[str, str | None], set[str]] = {}
-    fact_rows = session.execute(
-        select(
-            SalesOrderItemModel.manage_number,
-            SalesOrderItemModel.item_number,
-            SalesOrderItemModel.item_id,
-            SalesOrderItemModel.item_detail_id,
-            SalesOrderItemModel.sku_key,
-            SalesOrderItemModel.order_number,
-        )
-        .where(
-            *_order_item_filters(
-                owner_username,
-                args.store_id,
-                args.start_date,
-                args.end_date,
-            )
-        )
-        .distinct()
-    ).all()
-    for fact_row in fact_rows:
-        product_key = sales_sync_service._daily_product_key(fact_row)
-        count_key = (
-            product_key,
-            fact_row.sku_key if args.include_sku else None,
-        )
-        fact_order_numbers.setdefault(count_key, set()).add(
-            fact_row.order_number
-        )
-    fact_order_counts = {
-        key: len(order_numbers)
-        for key, order_numbers in fact_order_numbers.items()
-    }
-
+) -> tuple[Any, dict[str, Any]]:
     daily_group_columns = [ProductSalesDailyModel.manage_number]
     if args.include_sku:
         daily_group_columns.append(ProductSalesDailyModel.sku_key)
@@ -848,7 +884,7 @@ def _ranking_rows(
             effective_sales_amount,
         ]
     )
-    query = (
+    return (
         select(*selected_columns)
         .where(
             *_daily_filters(
@@ -858,30 +894,154 @@ def _ranking_rows(
                 args.end_date,
             )
         )
-        .group_by(*daily_group_columns)
+        .group_by(*daily_group_columns),
+        metric_expressions,
     )
-    if args.metric != "orderCount":
-        query = query.order_by(
-            metric_expressions[args.metric].desc(),
-            ProductSalesDailyModel.manage_number.asc(),
-            *(
-                (ProductSalesDailyModel.sku_key.asc(),)
-                if args.include_sku
-                else ()
-            ),
-        ).limit(args.limit)
-    else:
-        query = query.order_by(
-            ProductSalesDailyModel.manage_number.asc(),
-            *(
-                (ProductSalesDailyModel.sku_key.asc(),)
-                if args.include_sku
-                else ()
-            ),
-        )
 
+
+def _ranking_fact_identity_filter(
+    product_key: str,
+    item_number: str,
+) -> Any:
+    blank_manage = (
+        func.trim(SalesOrderItemModel.manage_number) == ""
+    )
+    if (
+        item_number
+        and product_key
+        == sales_sync_service._bounded_fallback_product_key(
+            "item-number",
+            item_number,
+        )
+    ):
+        return and_(
+            blank_manage,
+            SalesOrderItemModel.item_number == item_number,
+        )
+    if product_key.startswith("item-id:"):
+        return and_(
+            blank_manage,
+            func.trim(SalesOrderItemModel.item_number) == "",
+            SalesOrderItemModel.item_id
+            == product_key.removeprefix("item-id:"),
+        )
+    if product_key.startswith("item-detail:"):
+        return and_(
+            blank_manage,
+            func.trim(SalesOrderItemModel.item_number) == "",
+            func.trim(SalesOrderItemModel.item_id) == "",
+            SalesOrderItemModel.item_detail_id
+            == product_key.removeprefix("item-detail:"),
+        )
+    if product_key.startswith(
+        ("v1:item-id:", "v1:item-detail:")
+    ):
+        return and_(
+            blank_manage,
+            func.trim(SalesOrderItemModel.item_number) == "",
+        )
+    return SalesOrderItemModel.manage_number == product_key
+
+
+def _bounded_ranking_fact_rows(
+    session: Session,
+    owner_username: str,
+    args: ProductSalesRankingArguments,
+    candidate_rows: list[dict[str, Any]] | None = None,
+) -> list[Any]:
+    query = select(
+        SalesOrderItemModel.manage_number,
+        SalesOrderItemModel.item_number,
+        SalesOrderItemModel.item_id,
+        SalesOrderItemModel.item_detail_id,
+        SalesOrderItemModel.sku_key,
+        SalesOrderItemModel.order_number,
+    ).where(
+        *_order_item_filters(
+            owner_username,
+            args.store_id,
+            args.start_date,
+            args.end_date,
+        )
+    )
+    if candidate_rows is not None:
+        if not candidate_rows:
+            return []
+        candidate_filters = []
+        for candidate in candidate_rows:
+            identity_filter = _ranking_fact_identity_filter(
+                str(candidate["manage_number"] or ""),
+                str(candidate["item_number"] or ""),
+            )
+            if args.include_sku:
+                identity_filter = and_(
+                    identity_filter,
+                    SalesOrderItemModel.sku_key
+                    == str(candidate["sku_key"] or ""),
+                )
+            candidate_filters.append(identity_filter)
+        query = query.where(or_(*candidate_filters))
+    rows = session.execute(
+        query.distinct().limit(MAX_RANKING_FACT_ROWS + 1)
+    ).all()
+    if len(rows) > MAX_RANKING_FACT_ROWS:
+        raise ValueError(
+            "订单数排行数据量过大，请缩小日期范围后重试。"
+        )
+    return rows
+
+
+def _ranking_fact_order_counts(
+    fact_rows: list[Any],
+    *,
+    include_sku: bool,
+) -> dict[tuple[str, str | None], int]:
+    order_numbers: dict[tuple[str, str | None], set[str]] = {}
+    for fact_row in fact_rows:
+        product_key = sales_sync_service._daily_product_key(
+            fact_row
+        )
+        count_key = (
+            product_key,
+            fact_row.sku_key if include_sku else None,
+        )
+        order_numbers.setdefault(count_key, set()).add(
+            fact_row.order_number
+        )
+    return {
+        key: len(values)
+        for key, values in order_numbers.items()
+    }
+
+
+def _ranking_daily_candidate_filter(
+    candidate_keys: list[tuple[str, str | None]],
+    *,
+    include_sku: bool,
+) -> Any:
+    if include_sku:
+        return or_(
+            *(
+                and_(
+                    ProductSalesDailyModel.manage_number
+                    == manage_number,
+                    ProductSalesDailyModel.sku_key == str(sku_key or ""),
+                )
+                for manage_number, sku_key in candidate_keys
+            )
+        )
+    return ProductSalesDailyModel.manage_number.in_(
+        [manage_number for manage_number, _sku_key in candidate_keys]
+    )
+
+
+def _ranking_public_rows(
+    daily_rows: list[dict[str, Any]],
+    fact_order_counts: dict[tuple[str, str | None], int],
+    args: ProductSalesRankingArguments,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for raw in session.execute(query).mappings():
+    for raw in daily_rows:
         count_key = (
             raw["manage_number"],
             raw["sku_key"] if args.include_sku else None,
@@ -904,6 +1064,89 @@ def _ranking_rows(
             row["skuKey"] = raw["sku_key"]
         row["metricValue"] = row[args.metric]
         rows.append(row)
+    return rows
+
+
+def _ranking_rows(
+    session: Session,
+    owner_username: str,
+    args: ProductSalesRankingArguments,
+) -> list[dict[str, Any]]:
+    daily_query, metric_expressions = _ranking_daily_query_parts(
+        owner_username,
+        args
+    )
+    if args.metric != "orderCount":
+        daily_rows = list(
+            session.execute(
+                daily_query.order_by(
+                    metric_expressions[args.metric].desc(),
+                    ProductSalesDailyModel.manage_number.asc(),
+                    *(
+                        (ProductSalesDailyModel.sku_key.asc(),)
+                        if args.include_sku
+                        else ()
+                    ),
+                ).limit(args.limit)
+            ).mappings()
+        )
+        fact_order_counts = _ranking_fact_order_counts(
+            _bounded_ranking_fact_rows(
+                session,
+                owner_username,
+                args,
+                daily_rows,
+            ),
+            include_sku=args.include_sku,
+        )
+        return _ranking_public_rows(
+            daily_rows,
+            fact_order_counts,
+            args,
+        )
+
+    fact_order_counts = _ranking_fact_order_counts(
+        _bounded_ranking_fact_rows(
+            session,
+            owner_username,
+            args,
+        ),
+        include_sku=args.include_sku,
+    )
+    candidate_keys = sorted(
+        fact_order_counts,
+        key=lambda key: (
+            -fact_order_counts[key],
+            key[0],
+            str(key[1] or ""),
+        ),
+    )[: args.limit]
+    if not candidate_keys:
+        return []
+    daily_rows = list(
+        session.execute(
+            daily_query.where(
+                _ranking_daily_candidate_filter(
+                    candidate_keys,
+                    include_sku=args.include_sku,
+                )
+            )
+            .order_by(
+                ProductSalesDailyModel.manage_number.asc(),
+                *(
+                    (ProductSalesDailyModel.sku_key.asc(),)
+                    if args.include_sku
+                    else ()
+                ),
+            )
+            .limit(len(candidate_keys))
+        ).mappings()
+    )
+    rows = _ranking_public_rows(
+        daily_rows,
+        fact_order_counts,
+        args,
+    )
     if args.metric == "orderCount":
         rows.sort(
             key=lambda row: (
@@ -912,7 +1155,6 @@ def _ranking_rows(
                 row.get("skuKey", ""),
             )
         )
-        rows = rows[: args.limit]
     return rows
 
 

@@ -65,6 +65,10 @@ from app.services.product_image_storage import (
     product_image_storage,
 )
 from app.services.sensitive_word_service import active_sensitive_words, sanitize_product_payload
+from app.services.sales_time import (
+    iso_sales_datetime,
+    sales_now_naive,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +490,7 @@ SALES_ANALYSIS_SYNC_LOCAL_SLOTS = threading.BoundedSemaphore(
     SALES_ANALYSIS_SYNC_LOCAL_MAX_PENDING
 )
 SALES_ANALYSIS_STREAM_MAX_WORKERS = 4
+SALES_ANALYSIS_STREAM_MAX_PER_OWNER = 1
 SALES_ANALYSIS_STREAM_QUEUE_SIZE = 32
 SALES_ANALYSIS_STREAM_HEARTBEAT_SECONDS = 5.0
 SALES_ANALYSIS_STREAM_EXECUTOR = ThreadPoolExecutor(
@@ -495,6 +500,8 @@ SALES_ANALYSIS_STREAM_EXECUTOR = ThreadPoolExecutor(
 SALES_ANALYSIS_STREAM_SLOTS = threading.BoundedSemaphore(
     SALES_ANALYSIS_STREAM_MAX_WORKERS
 )
+SALES_ANALYSIS_STREAM_OWNER_LOCK = threading.Lock()
+SALES_ANALYSIS_STREAM_OWNER_ACTIVE: dict[str, int] = {}
 sales_sync_service: Any | None = None
 
 
@@ -9436,28 +9443,47 @@ def _sales_analysis_sync_state_to_public(
         "initialSyncCompleted": bool(state.initial_sync_completed),
         "progressCurrent": int(state.progress_current or 0),
         "progressTotal": int(state.progress_total or 0),
-        "lastSuccessfulSyncAt": (
-            state.last_successful_sync_at.isoformat(timespec="seconds")
-            if state.last_successful_sync_at is not None
-            else None
+        "lastSuccessfulSyncAt": iso_sales_datetime(
+            state.last_successful_sync_at
         ),
-        "lastRemoteUpdatedAt": (
-            state.last_remote_updated_at.isoformat(timespec="seconds")
-            if state.last_remote_updated_at is not None
-            else None
+        "lastRemoteUpdatedAt": iso_sales_datetime(
+            state.last_remote_updated_at
         ),
         "lastError": str(state.last_error or ""),
     }
 
 
+def _sales_analysis_sync_active_timeout() -> timedelta:
+    sync_service = _loaded_sales_sync_service()
+    timeout = getattr(
+        sync_service,
+        "SALES_SYNC_LEASE_TIMEOUT",
+        timedelta(minutes=10),
+    )
+    return (
+        timeout
+        if isinstance(timeout, timedelta)
+        else timedelta(minutes=10)
+    )
+
+
 def _sales_analysis_sync_status_is_active(
     sync_status: str | None,
-    _state_updated_at: datetime | None,
+    state_updated_at: datetime | None,
+    *,
+    now: datetime | None = None,
 ) -> bool:
     normalized_status = str(sync_status or "")
-    return (
+    if not (
         normalized_status == "queued"
         or normalized_status.startswith("running")
+    ):
+        return False
+    if state_updated_at is None:
+        return False
+    current = now or sales_now_naive()
+    return state_updated_at >= (
+        current - _sales_analysis_sync_active_timeout()
     )
 
 
@@ -9508,6 +9534,7 @@ def get_sales_analysis_sync_state(
             already_running=_sales_analysis_sync_status_is_active(
                 state.sync_status,
                 state.updated_at,
+                now=sales_now_naive(),
             ),
         )
 
@@ -9550,7 +9577,7 @@ def run_sales_analysis_sync_task(
                 )
             )
             if state is not None:
-                failed_at = datetime.now()
+                failed_at = sales_now_naive()
                 state.sync_status = "error"
                 state.last_error = "销量同步失败，请稍后重试。"
                 state.updated_at = failed_at
@@ -9625,9 +9652,11 @@ def queue_sales_analysis_sync(
         )
         if state is None:
             raise RuntimeError("店铺销量同步状态不存在。")
+        queue_decision_at = sales_now_naive()
         active = _sales_analysis_sync_status_is_active(
             state.sync_status,
             state.updated_at,
+            now=queue_decision_at,
         )
         if active:
             return _sales_analysis_sync_state_to_public(
@@ -9638,6 +9667,7 @@ def queue_sales_analysis_sync(
         state.progress_current = 0
         state.progress_total = 0
         state.last_error = None
+        state.updated_at = queue_decision_at
         queued_task = _sales_analysis_sync_state_to_public(state)
 
     try:
@@ -9655,7 +9685,7 @@ def queue_sales_analysis_sync(
                 )
             )
             if state is not None:
-                failed_at = datetime.now()
+                failed_at = sales_now_naive()
                 state.sync_status = "error"
                 state.last_error = "销量同步任务投递失败，请稍后重试。"
                 state.updated_at = failed_at
@@ -9723,6 +9753,45 @@ def list_sales_analysis_messages(
     )
 
 
+def _acquire_sales_analysis_owner_slot(
+    owner_username: str,
+) -> bool:
+    with SALES_ANALYSIS_STREAM_OWNER_LOCK:
+        active = int(
+            SALES_ANALYSIS_STREAM_OWNER_ACTIVE.get(
+                owner_username,
+                0,
+            )
+        )
+        if active >= SALES_ANALYSIS_STREAM_MAX_PER_OWNER:
+            return False
+        SALES_ANALYSIS_STREAM_OWNER_ACTIVE[owner_username] = (
+            active + 1
+        )
+        return True
+
+
+def _release_sales_analysis_owner_slot(
+    owner_username: str,
+) -> None:
+    with SALES_ANALYSIS_STREAM_OWNER_LOCK:
+        active = int(
+            SALES_ANALYSIS_STREAM_OWNER_ACTIVE.get(
+                owner_username,
+                0,
+            )
+        )
+        if active <= 1:
+            SALES_ANALYSIS_STREAM_OWNER_ACTIVE.pop(
+                owner_username,
+                None,
+            )
+        else:
+            SALES_ANALYSIS_STREAM_OWNER_ACTIVE[owner_username] = (
+                active - 1
+            )
+
+
 def stream_sales_analysis(
     owner_username: str,
     conversation_id: int,
@@ -9738,12 +9807,32 @@ def stream_sales_analysis(
     wait_seconds = max(0.01, float(heartbeat_interval))
 
     def events():
+        if not _acquire_sales_analysis_owner_slot(
+            normalized_owner
+        ):
+            yield {
+                "type": "error",
+                "message": "当前用户已有销量分析正在进行，请稍后重试。",
+            }
+            return
         if not SALES_ANALYSIS_STREAM_SLOTS.acquire(blocking=False):
+            _release_sales_analysis_owner_slot(normalized_owner)
             yield {
                 "type": "error",
                 "message": "当前销量分析任务较多，请稍后重试。",
             }
             return
+        release_lock = threading.Lock()
+        slots_released = False
+
+        def release_slots() -> None:
+            nonlocal slots_released
+            with release_lock:
+                if slots_released:
+                    return
+                slots_released = True
+            SALES_ANALYSIS_STREAM_SLOTS.release()
+            _release_sales_analysis_owner_slot(normalized_owner)
 
         event_queue: Queue[tuple[str, Any]] = Queue(
             maxsize=SALES_ANALYSIS_STREAM_QUEUE_SIZE
@@ -9786,12 +9875,12 @@ def stream_sales_analysis(
                     close()
                 if not cancellation.is_set():
                     enqueue("done")
-                SALES_ANALYSIS_STREAM_SLOTS.release()
+                release_slots()
 
         try:
             future = SALES_ANALYSIS_STREAM_EXECUTOR.submit(produce)
         except Exception:
-            SALES_ANALYSIS_STREAM_SLOTS.release()
+            release_slots()
             yield {
                 "type": "error",
                 "message": "销量分析任务启动失败，请稍后重试。",
@@ -9799,7 +9888,7 @@ def stream_sales_analysis(
             return
         future.add_done_callback(
             lambda completed: (
-                SALES_ANALYSIS_STREAM_SLOTS.release()
+                release_slots()
                 if completed.cancelled()
                 else None
             )
@@ -9843,10 +9932,11 @@ def sales_analysis_sync_is_due(
     now: datetime | None = None,
     state_updated_at: datetime | None = None,
 ) -> bool:
-    current = now or datetime.now()
+    current = now or sales_now_naive()
     if _sales_analysis_sync_status_is_active(
         sync_status,
         state_updated_at,
+        now=current,
     ):
         return False
     if _sales_analysis_sync_error_is_cooling_down(
@@ -9866,6 +9956,9 @@ def sales_analysis_sync_due_candidates(
     now: datetime,
 ) -> list[tuple[str, int]]:
     cutoff = now - SALES_ANALYSIS_SYNC_INTERVAL
+    active_after = (
+        now - _sales_analysis_sync_active_timeout()
+    )
     failed_before = (
         now - SALES_ANALYSIS_SYNC_FAILURE_COOLDOWN
     )
@@ -9873,9 +9966,14 @@ def sales_analysis_sync_due_candidates(
         active_count = int(
             session.scalar(
                 select(func.count()).where(
-                    or_(
-                        SalesSyncStateModel.sync_status == "queued",
-                        SalesSyncStateModel.sync_status.like("running%"),
+                    and_(
+                        or_(
+                            SalesSyncStateModel.sync_status == "queued",
+                            SalesSyncStateModel.sync_status.like(
+                                "running%"
+                            ),
+                        ),
+                        SalesSyncStateModel.updated_at >= active_after,
                     )
                 )
             )
@@ -9921,9 +10019,13 @@ def sales_analysis_sync_due_candidates(
                 ),
                 or_(
                     SalesSyncStateModel.sync_status.is_(None),
+                    SalesSyncStateModel.updated_at < active_after,
                     and_(
-                        SalesSyncStateModel.sync_status != "queued",
-                        SalesSyncStateModel.sync_status.not_like("running%"),
+                        SalesSyncStateModel.sync_status
+                        != "queued",
+                        SalesSyncStateModel.sync_status.not_like(
+                            "running%"
+                        ),
                     ),
                 ),
                 or_(
@@ -9947,7 +10049,7 @@ def run_due_sales_analysis_syncs_once() -> int:
     try:
         queued_count = 0
         for owner_username, store_id in sales_analysis_sync_due_candidates(
-            datetime.now()
+            sales_now_naive()
         ):
             try:
                 queue_sales_analysis_sync(owner_username, store_id)

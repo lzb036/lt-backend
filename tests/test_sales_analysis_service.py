@@ -477,6 +477,11 @@ def assert_common_metadata(
     assert result["metric"] == metric
     assert result["dataUpdatedAt"] == "2026-07-16T06:30:00+08:00"
     assert result["unresolvedAdjustmentCount"] == 1
+    assert result["initialSyncCompleted"] is False
+    assert result["dataIncomplete"] is True
+    assert result["effectiveSalesAmountDefinition"] == (
+        sales_analysis_service.EFFECTIVE_SALES_AMOUNT_DEFINITION
+    )
 
 
 def test_registers_exactly_eight_strict_read_only_tools():
@@ -505,8 +510,15 @@ def test_list_owned_stores_only_returns_current_owner(seeded_sales):
             "name": "Alice Shop",
             "code": "alice-shop",
             "enabled": True,
+            "initialSyncCompleted": False,
+            "dataIncomplete": True,
         }
     ]
+    assert result["initialSyncCompleted"] is False
+    assert result["dataIncomplete"] is True
+    assert result["effectiveSalesAmountDefinition"] == (
+        sales_analysis_service.EFFECTIVE_SALES_AMOUNT_DEFINITION
+    )
     assert "bob" not in repr(result).lower()
 
 
@@ -579,6 +591,117 @@ def test_every_store_scoped_tool_rejects_another_owners_store(
             tool_name,
             {"storeId": seeded_sales["bob_store_id"], **arguments},
         )
+
+
+def test_every_store_scoped_result_has_completeness_and_amount_metadata(
+    seeded_sales,
+):
+    store_id = seeded_sales["alice_store_id"]
+    calls = [
+        (
+            "get_store_sales_overview",
+            {
+                "storeId": store_id,
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+            },
+        ),
+        (
+            "get_product_sales_ranking",
+            {
+                "storeId": store_id,
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "metric": "effectiveUnits",
+                "limit": 10,
+                "includeSku": False,
+            },
+        ),
+        (
+            "get_product_sales_trend",
+            {
+                "storeId": store_id,
+                "manageNumber": "MN-A",
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "grain": "day",
+            },
+        ),
+        (
+            "compare_product_sales",
+            {
+                "storeId": store_id,
+                "manageNumbers": ["MN-A", "MN-B"],
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "grain": "day",
+            },
+        ),
+        (
+            "get_sku_sales_breakdown",
+            {
+                "storeId": store_id,
+                "manageNumber": "MN-A",
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+            },
+        ),
+        (
+            "get_slow_moving_products",
+            {
+                "storeId": store_id,
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+                "minListedDays": 30,
+                "maxEffectiveUnits": 1,
+                "limit": 10,
+            },
+        ),
+        (
+            "get_sales_adjustment_summary",
+            {
+                "storeId": store_id,
+                "startDate": "2026-07-14",
+                "endDate": "2026-07-15",
+            },
+        ),
+    ]
+
+    for tool_name, arguments in calls:
+        result = execute(tool_name, arguments)
+        assert result["initialSyncCompleted"] is False
+        assert result["dataIncomplete"] is True
+        assert result["effectiveSalesAmountDefinition"] == (
+            sales_analysis_service.EFFECTIVE_SALES_AMOUNT_DEFINITION
+        )
+
+
+def test_completed_initial_sync_clears_data_incomplete(
+    seeded_sales,
+    session_factory,
+):
+    with session_factory() as session:
+        session.add(
+            SalesSyncStateModel(
+                owner_username="alice",
+                store_id=seeded_sales["alice_store_id"],
+                initial_sync_completed=True,
+                sync_status="idle",
+            )
+        )
+        session.commit()
+
+    result = execute(
+        "get_store_sales_overview",
+        {
+            "storeId": seeded_sales["alice_store_id"],
+            "startDate": "2026-07-14",
+            "endDate": "2026-07-15",
+        },
+    )
+
+    assert result["initialSyncCompleted"] is True
+    assert result["dataIncomplete"] is False
 
 
 @pytest.mark.parametrize(
@@ -1016,6 +1139,195 @@ def test_product_ranking_reuses_daily_fallback_key_for_blank_manage_number(
         (row["skuKey"], row["orderCount"])
         for row in sku_result["rows"]
     } == {("blue", 1), ("red", 1)}
+
+
+def test_non_order_ranking_counts_only_top_candidate_fact_keys(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = _add_user_and_store(
+            session,
+            "alice",
+            "bounded-ranking",
+        )
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 15),
+            manage_number="MN-TOP",
+            sku_key="",
+            item_name="Top",
+            order_count=1,
+            ordered_units=100,
+            effective_units=100,
+            gross_amount="10000",
+            effective_amount="10000",
+        )
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 15),
+            manage_number="MN-OUTSIDE",
+            sku_key="",
+            item_name="Outside",
+            order_count=1,
+            ordered_units=1,
+            effective_units=1,
+            gross_amount="100",
+            effective_amount="100",
+        )
+        top_order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="TOP-ORDER",
+            ordered_at=datetime(2026, 7, 15, 10, 0, 0),
+        )
+        _add_order_item(
+            session,
+            order=top_order,
+            item_detail_id="top-detail",
+            manage_number="MN-TOP",
+            item_number="ITEM-TOP",
+            sku_key="",
+            item_name="Top",
+        )
+        for index in range(10):
+            outside_order = _add_order(
+                session,
+                owner_username="alice",
+                store_id=store.id,
+                order_number=f"OUTSIDE-{index}",
+                ordered_at=datetime(2026, 7, 15, 11, index, 0),
+            )
+            _add_order_item(
+                session,
+                order=outside_order,
+                item_detail_id=f"outside-{index}",
+                manage_number="MN-OUTSIDE",
+                item_number="ITEM-OUTSIDE",
+                sku_key="",
+                item_name="Outside",
+            )
+        session.commit()
+        store_id = store.id
+
+    monkeypatch.setattr(
+        sales_analysis_service,
+        "MAX_RANKING_FACT_ROWS",
+        2,
+        raising=False,
+    )
+    engine = session_factory.kw["bind"]
+    statements: list[str] = []
+
+    def record_statement(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        result = execute(
+            "get_product_sales_ranking",
+            {
+                "storeId": store_id,
+                "startDate": "2026-07-15",
+                "endDate": "2026-07-15",
+                "metric": "effectiveUnits",
+                "limit": 1,
+                "includeSku": False,
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert [row["manageNumber"] for row in result["rows"]] == ["MN-TOP"]
+    fact_statement = next(
+        statement
+        for statement in statements
+        if "SELECT DISTINCT" in statement.upper()
+        and "lt_sales_order_items.order_number" in statement
+    )
+    assert "lt_sales_order_items.manage_number" in fact_statement
+    assert "LIMIT" in fact_statement.upper()
+
+
+def test_order_count_ranking_has_controlled_fact_row_limit(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = _add_user_and_store(
+            session,
+            "alice",
+            "order-count-limit",
+        )
+        for index in range(3):
+            order = _add_order(
+                session,
+                owner_username="alice",
+                store_id=store.id,
+                order_number=f"ORDER-{index}",
+                ordered_at=datetime(2026, 7, 15, 10, index, 0),
+            )
+            _add_order_item(
+                session,
+                order=order,
+                item_detail_id=f"detail-{index}",
+                manage_number=f"MN-{index}",
+                item_number=f"ITEM-{index}",
+                sku_key="",
+                item_name=f"Item {index}",
+            )
+            _add_daily(
+                session,
+                owner_username="alice",
+                store_id=store.id,
+                sales_date=date(2026, 7, 15),
+                manage_number=f"MN-{index}",
+                item_number=f"ITEM-{index}",
+                sku_key="",
+                item_name=f"Item {index}",
+                order_count=1,
+                ordered_units=1,
+                effective_units=1,
+                gross_amount="100",
+                effective_amount="100",
+            )
+        session.commit()
+        store_id = store.id
+
+    monkeypatch.setattr(
+        sales_analysis_service,
+        "MAX_RANKING_FACT_ROWS",
+        2,
+        raising=False,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="订单数排行数据量过大.*缩小日期范围",
+    ):
+        execute(
+            "get_product_sales_ranking",
+            {
+                "storeId": store_id,
+                "startDate": "2026-07-15",
+                "endDate": "2026-07-15",
+                "metric": "orderCount",
+                "limit": 10,
+                "includeSku": False,
+            },
+        )
 
 
 def test_product_trend_supports_day_week_and_month_grains(seeded_sales):
@@ -1472,6 +1784,101 @@ def test_data_updated_at_uses_local_naive_fallback_and_authoritative_sync(
         "2026-07-16T20:00:00+08:00"
     )
     assert order_id > 0
+
+
+def test_sales_date_queries_use_shanghai_local_naive_boundaries(
+    session_factory,
+):
+    with session_factory() as session:
+        store = _add_user_and_store(
+            session,
+            "alice",
+            "boundary-shop",
+        )
+        before_midnight = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="BOUNDARY-15",
+            ordered_at=datetime(2026, 7, 15, 23, 59, 59),
+        )
+        _add_order_item(
+            session,
+            order=before_midnight,
+            item_detail_id="boundary-15",
+            manage_number="MN-15",
+            item_number="ITEM-15",
+            sku_key="",
+            item_name="July 15",
+        )
+        at_midnight = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="BOUNDARY-16",
+            ordered_at=datetime(2026, 7, 16, 0, 0, 0),
+        )
+        _add_order_item(
+            session,
+            order=at_midnight,
+            item_detail_id="boundary-16",
+            manage_number="MN-16",
+            item_number="ITEM-16",
+            sku_key="",
+            item_name="July 16",
+        )
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 15),
+            manage_number="MN-15",
+            sku_key="",
+            item_name="July 15",
+            order_count=1,
+            ordered_units=1,
+            effective_units=1,
+            gross_amount="100",
+            effective_amount="100",
+        )
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 16),
+            manage_number="MN-16",
+            sku_key="",
+            item_name="July 16",
+            order_count=1,
+            ordered_units=1,
+            effective_units=1,
+            gross_amount="100",
+            effective_amount="100",
+        )
+        session.commit()
+        store_id = store.id
+
+    july_15 = execute(
+        "get_store_sales_overview",
+        {
+            "storeId": store_id,
+            "startDate": "2026-07-15",
+            "endDate": "2026-07-15",
+        },
+    )
+    july_16 = execute(
+        "get_store_sales_overview",
+        {
+            "storeId": store_id,
+            "startDate": "2026-07-16",
+            "endDate": "2026-07-16",
+        },
+    )
+
+    assert july_15["rows"][0]["orderCount"] == 1
+    assert july_15["rows"][0]["effectiveUnits"] == 1
+    assert july_16["rows"][0]["orderCount"] == 1
+    assert july_16["rows"][0]["effectiveUnits"] == 1
 
 
 def test_iso_updated_at_converts_aware_values_to_shanghai():

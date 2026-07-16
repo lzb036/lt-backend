@@ -770,6 +770,92 @@ def ensure_mysql_database_exists() -> None:
         admin_engine.dispose()
 
 
+def ensure_sales_parent_keys_before_create_all(bind=None) -> None:
+    target_bind = bind or engine
+    from app.db import models as model_module
+
+    store_table = model_module.StoreModel.__table__
+    store_identity_constraint = next(
+        constraint
+        for constraint in store_table.constraints
+        if constraint.name == "uq_lt_store_id_owner"
+    )
+    expected_columns = tuple(
+        column.name for column in store_identity_constraint.columns
+    )
+
+    with target_bind.begin() as connection:
+        if store_table.name not in _table_names(connection):
+            return
+        available_columns = set(
+            _column_info(connection, store_table.name)
+        )
+        missing_columns = [
+            column_name
+            for column_name in expected_columns
+            if column_name not in available_columns
+        ]
+        if missing_columns:
+            raise _compatibility_error(
+                store_table.name,
+                "sales parent key columns missing: "
+                + ", ".join(missing_columns),
+            )
+
+        if any(
+            tuple(existing.get("column_names") or ())
+            == expected_columns
+            for existing in _unique_constraint_info(
+                connection,
+                store_table.name,
+            )
+        ):
+            return
+        existing_indexes = _index_info(
+            connection,
+            store_table.name,
+        )
+        for existing in existing_indexes.values():
+            if (
+                bool(existing.get("unique"))
+                and tuple(existing.get("column_names") or ())
+                == expected_columns
+            ):
+                return
+        conflicting = existing_indexes.get(
+            store_identity_constraint.name
+        )
+        if conflicting is not None:
+            raise _compatibility_error(
+                store_table.name,
+                "index uq_lt_store_id_owner has a conflicting definition",
+            )
+
+        _validate_unique_constraint_data(
+            connection,
+            store_table,
+            store_identity_constraint,
+        )
+        quote = connection.dialect.identifier_preparer.quote
+        columns_sql = ", ".join(
+            quote(column_name)
+            for column_name in expected_columns
+        )
+        try:
+            connection.execute(
+                text(
+                    f"CREATE UNIQUE INDEX "
+                    f"{quote(store_identity_constraint.name)} "
+                    f"ON {quote(store_table.name)} ({columns_sql})"
+                )
+            )
+        except SQLAlchemyError as exc:
+            raise _compatibility_error(
+                store_table.name,
+                "sales parent key uq_lt_store_id_owner cannot install",
+            ) from exc
+
+
 def ensure_schema_compatibility() -> None:
     url = make_url(settings.database_url)
     if not url.drivername.startswith("mysql"):
@@ -1219,6 +1305,7 @@ def init_database() -> None:
     from app.services.sensitive_word_service import seed_default_sensitive_words
     from app.services.user_service import ensure_initial_superadmin
 
+    ensure_sales_parent_keys_before_create_all()
     Base.metadata.create_all(bind=engine)
     ensure_schema_compatibility()
     ensure_initial_superadmin()

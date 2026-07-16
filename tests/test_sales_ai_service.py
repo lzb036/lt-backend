@@ -185,6 +185,13 @@ def _compact_result(store_id: int) -> dict[str, Any]:
         "metric": "effectiveUnits",
         "dataUpdatedAt": "2026-07-16T14:30:00+08:00",
         "unresolvedAdjustmentCount": 2,
+        "initialSyncCompleted": False,
+        "dataIncomplete": True,
+        "effectiveSalesAmountDefinition": (
+            "估算商品金额：按商品行单价 × 有效销量计算；"
+            "未分摊优惠券、折扣或税额，存在口径差异，"
+            "不代表权威净收入。"
+        ),
         "rows": [
             {
                 "manageNumber": "MN-1",
@@ -1393,6 +1400,9 @@ def test_tool_result_uses_strict_recursive_schema_allowlist(
         "metric",
         "dataUpdatedAt",
         "unresolvedAdjustmentCount",
+        "initialSyncCompleted",
+        "dataIncomplete",
+        "effectiveSalesAmountDefinition",
         "rows",
     }
     assert set(tool_result["store"]) == {"id", "name"}
@@ -1430,6 +1440,11 @@ def test_tool_result_uses_strict_recursive_schema_allowlist(
     assert row is not None
     persisted_result = json.loads(row.result_summary_json)[0]["result"]
     assert persisted_result == tool_result
+    assert persisted_result["initialSyncCompleted"] is False
+    assert persisted_result["dataIncomplete"] is True
+    assert "不代表权威净收入" in (
+        persisted_result["effectiveSalesAmountDefinition"]
+    )
 
     serialized = json.dumps(
         {
@@ -1972,7 +1987,7 @@ def test_explanation_failure_after_tool_success_uses_deterministic_fallback(
     assert row.answer_text == answer
 
 
-def test_valid_model_answer_gets_mandatory_grounding_footer(
+def test_model_answer_is_discarded_for_deterministic_grounded_output(
     monkeypatch,
     session_factory,
 ):
@@ -2017,7 +2032,8 @@ def test_valid_model_answer_gets_mandatory_grounding_footer(
     assert events[-1]["type"] == "completed"
     assert events[-1]["message"]["fallback"] is False
     answer = events[-1]["message"]["answer"]
-    assert "Safe Product 表现稳定。" in answer
+    assert "Safe Product 表现稳定。" not in answer
+    assert "以下为后端生成的受控结果。" in answer
     for required in (
         sales_ai_service.CANONICAL_FOOTER_MARKER,
         "store: Analysis Shop 1",
@@ -2026,11 +2042,14 @@ def test_valid_model_answer_gets_mandatory_grounding_footer(
         "有效销量 = 下单数量 - 取消数量 - 退款数量 - 退货数量",
         "dataUpdatedAt: 2026-07-16T14:30:00+08:00",
         "unresolvedAdjustmentCount: 2",
+        "initialSyncCompleted: false",
+        "dataIncomplete: true",
+        "effectiveSalesAmountDefinition: 估算商品金额",
     ):
         assert required in answer
 
 
-def test_fabricated_numeric_model_answer_after_tool_uses_fallback(
+def test_fabricated_numeric_model_answer_after_tool_is_discarded(
     monkeypatch,
     session_factory,
 ):
@@ -2077,7 +2096,7 @@ def test_fabricated_numeric_model_answer_after_tool_uses_fallback(
     )
 
     assert events[-1]["type"] == "completed"
-    assert events[-1]["message"]["fallback"] is True
+    assert events[-1]["message"]["fallback"] is False
     answer = events[-1]["message"]["answer"]
     assert "999999" not in answer
     assert "123456789012" in answer
@@ -2136,8 +2155,67 @@ def test_any_numeric_model_prose_uses_fallback(
     )
 
     assert events[-1]["type"] == "completed"
-    assert events[-1]["message"]["fallback"] is True
+    assert events[-1]["message"]["fallback"] is False
     assert "模型声称" not in events[-1]["message"]["answer"]
+
+
+@pytest.mark.parametrize(
+    "unsupported_conclusion",
+    [
+        "Safe Product 是第一名。",
+        "Safe Product 的销量遥遥领先。",
+        "Safe Product 表现最好且增长明显。",
+        "退款情况非常严重。",
+    ],
+)
+def test_qualitative_and_chinese_numeral_model_conclusions_are_discarded(
+    monkeypatch,
+    session_factory,
+    unsupported_conclusion,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content=unsupported_conclusion),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: _compact_result(store_id),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    answer = events[-1]["message"]["answer"]
+    assert events[-1]["type"] == "completed"
+    assert unsupported_conclusion not in answer
+    assert "以下为后端生成的受控结果。" in answer
+    assert '"effectiveUnits":12' in answer
 
 
 def test_numeric_after_prose_limit_still_uses_fallback(
@@ -2186,7 +2264,7 @@ def test_numeric_after_prose_limit_still_uses_fallback(
     )
 
     assert events[-1]["type"] == "completed"
-    assert events[-1]["message"]["fallback"] is True
+    assert events[-1]["message"]["fallback"] is False
     assert "很长的模型说明" not in events[-1]["message"]["answer"]
 
 
@@ -2236,6 +2314,7 @@ def test_long_model_prose_reserves_complete_canonical_footer(
     answer = events[-1]["message"]["answer"]
     assert len(answer) <= sales_ai_service.MAX_PERSISTED_ANSWER_CHARS
     assert len(answer) < len(long_prose)
+    assert "很长的模型说明" not in answer
     assert answer.count(sales_ai_service.CANONICAL_FOOTER_MARKER) == 1
     footer = answer.split(
         sales_ai_service.CANONICAL_FOOTER_MARKER,
@@ -2248,6 +2327,9 @@ def test_long_model_prose_reserves_complete_canonical_footer(
         f"effectiveSalesDefinition: {EFFECTIVE_SALES_DEFINITION_TEXT}",
         "dataUpdatedAt: 2026-07-16T14:30:00+08:00",
         "unresolvedAdjustmentCount: 2",
+        "initialSyncCompleted: false",
+        "dataIncomplete: true",
+        "effectiveSalesAmountDefinition: 估算商品金额",
     ):
         assert required in footer
     rows_line = next(
@@ -2309,6 +2391,7 @@ def test_misleading_unresolved_prose_still_gets_exact_canonical_count(
     answer = events[-1]["message"]["answer"]
     assert answer.count(sales_ai_service.CANONICAL_FOOTER_MARKER) == 1
     assert answer.count("unresolvedAdjustmentCount: 2") == 1
+    assert "未决调整已经很多" not in answer
 
 
 def test_missing_verified_user_ai_settings_emits_error_without_model_call(
