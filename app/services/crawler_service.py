@@ -9632,6 +9632,10 @@ def queue_sales_analysis_sync(
             normalized_owner,
             normalized_store_id,
         )
+        if not store.enabled:
+            raise ValueError(
+                "店铺已停用，无法立即同步销量；请先启用店铺后再重试。"
+            )
         sync_service = _loaded_sales_sync_service()
         if not sync_service.store_has_sync_credentials(store):
             raise ValueError(

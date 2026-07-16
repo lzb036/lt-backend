@@ -61,6 +61,12 @@ TRUNCATION_MARKER = "...[已截断]"
 SENSITIVE_FRAGMENT_MARKER = "[敏感片段已省略]"
 CANONICAL_FOOTER_MARKER = "【分析依据】"
 DEFAULT_CONVERSATION_TITLE = "新分析"
+STORE_SCOPE_CONFLICT_MESSAGE = (
+    "当前会话已绑定其他店铺，请新建会话后再分析该店铺。"
+)
+STORE_SCOPE_UNAVAILABLE_MESSAGE = (
+    "当前会话绑定的店铺已不存在或无权访问，请新建会话后再分析。"
+)
 EFFECTIVE_SALES_DEFINITION = (
     "有效销量 = 下单数量 - 取消数量 - 退款数量 - 退货数量"
 )
@@ -80,6 +86,12 @@ DATE_SCOPED_TOOLS = set(STORE_SCOPED_TOOLS)
 ALLOWED_TOOL_NAMES = {
     tool["function"]["name"] for tool in SALES_ANALYSIS_TOOLS
 }
+
+
+class SalesAnalysisStoreScopeError(RuntimeError):
+    pass
+
+
 TOOL_LABELS = {
     "list_owned_stores": "店铺列表",
     "get_store_sales_overview": "店铺销量概览",
@@ -983,6 +995,20 @@ def _store_phrase_matches(message: str, candidate: str) -> bool:
     return re.search(escaped, message) is not None
 
 
+def _locked_scope_store(
+    stores_by_id: dict[int, StoreModel],
+    stored_scope: list[Any],
+) -> StoreModel | None:
+    if not stored_scope:
+        return None
+    if len(stored_scope) != 1 or type(stored_scope[0]) is not int:
+        raise SalesAnalysisStoreScopeError(STORE_SCOPE_UNAVAILABLE_MESSAGE)
+    store = stores_by_id.get(stored_scope[0])
+    if store is None:
+        raise SalesAnalysisStoreScopeError(STORE_SCOPE_UNAVAILABLE_MESSAGE)
+    return store
+
+
 def _select_store(
     message: str,
     stores: list[StoreModel],
@@ -990,17 +1016,19 @@ def _select_store(
 ) -> StoreModel | None:
     stores_by_id = {store.id: store for store in stores}
     explicit = _explicit_store_matches(message, stores)
+    locked_store = _locked_scope_store(stores_by_id, stored_scope)
+    if locked_store is not None:
+        if len(explicit) == 1:
+            if explicit[0].id != locked_store.id:
+                raise SalesAnalysisStoreScopeError(STORE_SCOPE_CONFLICT_MESSAGE)
+            return locked_store
+        if explicit:
+            return None
+        return locked_store
     if len(explicit) == 1:
         return explicit[0]
     if explicit:
         return None
-    scoped = [
-        stores_by_id[store_id]
-        for store_id in stored_scope
-        if isinstance(store_id, int) and store_id in stores_by_id
-    ]
-    if len(scoped) == 1:
-        return scoped[0]
     if len(stores) == 1:
         return stores[0]
     return None
@@ -1762,11 +1790,19 @@ def _persist_message_state(
         store_scope = (
             [selected_store_id] if selected_store_id is not None else []
         )
+        existing_scope = _json_load(conversation.store_scope_json, [])
+        if not isinstance(existing_scope, list):
+            existing_scope = []
+        locked_scope_present = bool(existing_scope)
+        if existing_scope and selected_store_id is not None:
+            if existing_scope != store_scope:
+                raise SalesAnalysisStoreScopeError(STORE_SCOPE_CONFLICT_MESSAGE)
         row.store_scope_json = _json_dump(store_scope)
         row.statistics_window_json = _json_dump(
             _statistics_window(relative_window, tool_records)
         )
-        conversation.store_scope_json = _json_dump(store_scope)
+        if selected_store_id is not None or not locked_scope_present:
+            conversation.store_scope_json = _json_dump(store_scope)
         conversation.last_message_at = _now_local_naive()
         session.flush()
         return _message_to_public(row, fallback=fallback)
@@ -2276,11 +2312,15 @@ def stream_analysis(
     )
     if _analysis_cancelled(is_cancelled):
         return
-    turn = _start_turn(
-        normalized_owner,
-        int(conversation_id),
-        input_message,
-    )
+    try:
+        turn = _start_turn(
+            normalized_owner,
+            int(conversation_id),
+            input_message,
+        )
+    except SalesAnalysisStoreScopeError as exc:
+        yield {"type": "error", "message": str(exc)}
+        return
     if _analysis_cancelled(is_cancelled):
         return
     persisted_message = turn["question"]

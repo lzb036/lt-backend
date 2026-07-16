@@ -139,7 +139,9 @@ def _add_daily(
             store_id=store_id,
             sales_date=sales_date,
             manage_number=manage_number,
-            item_number=item_number or f"ITEM-{manage_number}",
+            item_number=(
+                item_number if item_number is not None else f"ITEM-{manage_number}"
+            ),
             sku_key=sku_key,
             item_name_snapshot=item_name,
             order_count=order_count,
@@ -272,6 +274,7 @@ def _add_order_item(
     item_number: str,
     sku_key: str,
     item_name: str,
+    item_id: str = "",
     ordered_units: int = 1,
     updated_at: datetime | None = None,
 ) -> SalesOrderItemModel:
@@ -284,6 +287,7 @@ def _add_order_item(
         item_detail_id=item_detail_id,
         manage_number=manage_number,
         item_number=item_number,
+        item_id=item_id,
         sku_key=sku_key,
         item_name=item_name,
         unit_price=Decimal("100"),
@@ -1153,6 +1157,110 @@ def test_product_ranking_reuses_daily_fallback_key_for_blank_manage_number(
         (row["skuKey"], row["orderCount"])
         for row in sku_result["rows"]
     } == {("blue", 1), ("red", 1)}
+
+
+def test_non_order_ranking_filters_hashed_item_id_by_exact_product_key(
+    monkeypatch,
+    session_factory,
+):
+    long_item_id = "item-" + "X" * 260
+    unrelated_item_id = "item-" + "Y" * 260
+    candidate_key = sales_sync_service._bounded_fallback_product_key(
+        "item-id",
+        long_item_id,
+    )
+    assert candidate_key.startswith("v1:item-id:")
+
+    with session_factory() as session:
+        store = _add_user_and_store(
+            session,
+            "alice",
+            "hashed-item-id",
+        )
+        _add_daily(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 15),
+            manage_number=candidate_key,
+            item_number="",
+            sku_key="",
+            item_name="Hashed Item",
+            order_count=1,
+            ordered_units=10,
+            effective_units=10,
+            gross_amount="1000",
+            effective_amount="1000",
+        )
+        candidate_order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="HASHED-CANDIDATE",
+            ordered_at=datetime(2026, 7, 15, 10, 0, 0),
+        )
+        _add_order_item(
+            session,
+            order=candidate_order,
+            item_detail_id="candidate-detail",
+            manage_number="",
+            item_number="",
+            item_id=long_item_id,
+            sku_key="",
+            item_name="Hashed Item",
+        )
+        unrelated_order = _add_order(
+            session,
+            owner_username="alice",
+            store_id=store.id,
+            order_number="HASHED-UNRELATED",
+            ordered_at=datetime(2026, 7, 15, 11, 0, 0),
+        )
+        _add_order_item(
+            session,
+            order=unrelated_order,
+            item_detail_id="unrelated-detail",
+            manage_number="",
+            item_number="",
+            item_id=unrelated_item_id,
+            sku_key="",
+            item_name="Unrelated Hashed Item",
+        )
+        session.commit()
+        store_id = store.id
+
+    monkeypatch.setattr(
+        sales_analysis_service,
+        "MAX_RANKING_FACT_ROWS",
+        1,
+        raising=False,
+    )
+
+    result = execute(
+        "get_product_sales_ranking",
+        {
+            "storeId": store_id,
+            "startDate": "2026-07-15",
+            "endDate": "2026-07-15",
+            "metric": "effectiveUnits",
+            "limit": 1,
+            "includeSku": False,
+        },
+    )
+
+    assert result["rows"] == [
+        {
+            "manageNumber": candidate_key,
+            "itemNumber": "",
+            "itemName": "Hashed Item",
+            "orderCount": 1,
+            "orderedUnits": 10,
+            "effectiveUnits": 10,
+            "grossSalesAmount": 1000.0,
+            "effectiveSalesAmount": 1000.0,
+            "metricValue": 10,
+        }
+    ]
 
 
 def test_non_order_ranking_counts_only_top_candidate_fact_keys(

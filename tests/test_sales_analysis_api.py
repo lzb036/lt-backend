@@ -1645,6 +1645,44 @@ def test_manual_sync_missing_credentials_returns_actionable_message(
     )
 
 
+def test_manual_sync_rejects_disabled_store_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    sales_session_factory,
+) -> None:
+    with sales_session_factory() as session:
+        _add_user(session, "disabled-sync-owner")
+        store = _add_store(
+            session,
+            "disabled-sync-owner",
+            "disabled",
+            enabled=False,
+            credentials=True,
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_sales_analysis_sync_task",
+        lambda *_args: pytest.fail("disabled store must fail before dispatch"),
+    )
+
+    response = _client(
+        {
+            "username": "disabled-sync-owner",
+            "role": "operator",
+            "permissionCodes": ["ai.manage"],
+        }
+    ).post(
+        "/crawler/sales-analysis/sync",
+        json={"storeId": store.id},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "店铺已停用，无法立即同步销量；请先启用店铺后再重试。"
+    )
+
+
 def test_sales_sync_service_rejects_missing_credentials_before_lease(
     monkeypatch: pytest.MonkeyPatch,
     sales_session_factory,

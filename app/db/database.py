@@ -12,6 +12,7 @@ from sqlalchemy import (
     func,
     inspect,
     literal,
+    or_,
     select,
     text,
 )
@@ -113,6 +114,7 @@ def _column_has_nulls(connection: Connection, table, column) -> bool:
 
 
 _NO_BACKFILL = object()
+_PRODUCT_KEY_BACKFILL_BATCH_SIZE = 1000
 
 
 def _safe_backfill_value(column):
@@ -750,6 +752,61 @@ def _ensure_table_layout(connection: Connection, table) -> dict[str, list[str]]:
     }
 
 
+def _backfill_sales_order_item_product_keys(
+    connection: Connection,
+    table,
+) -> int:
+    columns = _column_info(connection, table.name)
+    required_columns = {
+        "id",
+        "product_key",
+        "manage_number",
+        "item_number",
+        "item_id",
+        "item_detail_id",
+    }
+    if not required_columns <= set(columns):
+        return 0
+
+    from app.db.models import canonical_sales_order_item_product_key
+
+    total = 0
+    while True:
+        rows = connection.execute(
+            select(
+                table.c.id,
+                table.c.manage_number,
+                table.c.item_number,
+                table.c.item_id,
+                table.c.item_detail_id,
+            )
+            .where(
+                or_(
+                    table.c.product_key.is_(None),
+                    table.c.product_key == "",
+                )
+            )
+            .order_by(table.c.id.asc())
+            .limit(_PRODUCT_KEY_BACKFILL_BATCH_SIZE)
+        ).mappings().all()
+        if not rows:
+            return total
+        for row in rows:
+            connection.execute(
+                table.update()
+                .where(table.c.id == row["id"])
+                .values(
+                    product_key=canonical_sales_order_item_product_key(
+                        manage_number=row["manage_number"],
+                        item_number=row["item_number"],
+                        item_id=row["item_id"],
+                        item_detail_id=row["item_detail_id"],
+                    )
+                )
+            )
+        total += len(rows)
+
+
 def ensure_mysql_database_exists() -> None:
     url = make_url(settings.database_url)
     if not url.drivername.startswith("mysql") or not url.database:
@@ -1281,6 +1338,10 @@ def ensure_schema_compatibility() -> None:
         )
         for sales_table in sales_tables:
             _ensure_table_layout(connection, sales_table)
+        _backfill_sales_order_item_product_keys(
+            connection,
+            model_module.SalesOrderItemModel.__table__,
+        )
 
 
 engine = create_engine(

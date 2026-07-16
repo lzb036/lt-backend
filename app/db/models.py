@@ -12,6 +12,50 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.database import Base
 
 
+SALES_ORDER_ITEM_PRODUCT_KEY_MAX_LENGTH = 255
+
+
+def _product_key_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def bounded_sales_order_item_product_key(prefix: str, value: object) -> str:
+    normalized_value = _product_key_text(value)
+    readable = f"{prefix}:{normalized_value}"
+    if len(readable) <= SALES_ORDER_ITEM_PRODUCT_KEY_MAX_LENGTH:
+        return readable
+    digest = hashlib.sha256(normalized_value.encode("utf-8")).hexdigest()
+    return f"v1:{prefix}:{digest}"
+
+
+def canonical_sales_order_item_product_key(
+    *,
+    manage_number: object = "",
+    item_number: object = "",
+    item_id: object = "",
+    item_detail_id: object = "",
+) -> str:
+    normalized_manage_number = _product_key_text(manage_number)
+    if normalized_manage_number:
+        return normalized_manage_number[:SALES_ORDER_ITEM_PRODUCT_KEY_MAX_LENGTH]
+    normalized_item_number = _product_key_text(item_number)
+    if normalized_item_number:
+        return bounded_sales_order_item_product_key(
+            "item-number",
+            normalized_item_number,
+        )
+    normalized_item_id = _product_key_text(item_id)
+    if normalized_item_id:
+        return bounded_sales_order_item_product_key(
+            "item-id",
+            normalized_item_id,
+        )
+    return bounded_sales_order_item_product_key(
+        "item-detail",
+        item_detail_id,
+    )
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -480,6 +524,8 @@ class SalesOrderItemModel(TimestampMixin, Base):
         Index("ix_lt_sales_order_item_owner_store", "owner_username", "store_id"),
         Index("ix_lt_sales_order_item_store_manage", "store_id", "manage_number"),
         Index("ix_lt_sales_order_item_store_manage_sku", "store_id", "manage_number", "sku_key"),
+        Index("ix_lt_sales_order_item_store_product_key", "store_id", "product_key"),
+        Index("ix_lt_sales_order_item_store_product_sku", "store_id", "product_key", "sku_key"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -503,6 +549,7 @@ class SalesOrderItemModel(TimestampMixin, Base):
     sales_order_id: Mapped[int] = mapped_column(Integer, nullable=False)
     order_number: Mapped[str] = mapped_column(String(64), nullable=False)
     item_detail_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    product_key: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     manage_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     item_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     item_id: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
@@ -646,6 +693,12 @@ class SalesOrderItemModel(TimestampMixin, Base):
             sales_order_id=sales_order_id,
             order_number=order_number,
             item_detail_id=item_detail_id,
+            product_key=canonical_sales_order_item_product_key(
+                manage_number=manage_number,
+                item_number=item_number,
+                item_id=item_id,
+                item_detail_id=item_detail_id,
+            ),
             manage_number=manage_number,
             item_number=item_number,
             item_id=item_id,

@@ -901,46 +901,8 @@ def _ranking_daily_query_parts(
 
 def _ranking_fact_identity_filter(
     product_key: str,
-    item_number: str,
 ) -> Any:
-    blank_manage = (
-        func.trim(SalesOrderItemModel.manage_number) == ""
-    )
-    if (
-        item_number
-        and product_key
-        == sales_sync_service._bounded_fallback_product_key(
-            "item-number",
-            item_number,
-        )
-    ):
-        return and_(
-            blank_manage,
-            SalesOrderItemModel.item_number == item_number,
-        )
-    if product_key.startswith("item-id:"):
-        return and_(
-            blank_manage,
-            func.trim(SalesOrderItemModel.item_number) == "",
-            SalesOrderItemModel.item_id
-            == product_key.removeprefix("item-id:"),
-        )
-    if product_key.startswith("item-detail:"):
-        return and_(
-            blank_manage,
-            func.trim(SalesOrderItemModel.item_number) == "",
-            func.trim(SalesOrderItemModel.item_id) == "",
-            SalesOrderItemModel.item_detail_id
-            == product_key.removeprefix("item-detail:"),
-        )
-    if product_key.startswith(
-        ("v1:item-id:", "v1:item-detail:")
-    ):
-        return and_(
-            blank_manage,
-            func.trim(SalesOrderItemModel.item_number) == "",
-        )
-    return SalesOrderItemModel.manage_number == product_key
+    return SalesOrderItemModel.product_key == product_key
 
 
 def _bounded_ranking_fact_rows(
@@ -950,6 +912,7 @@ def _bounded_ranking_fact_rows(
     candidate_rows: list[dict[str, Any]] | None = None,
 ) -> list[Any]:
     query = select(
+        SalesOrderItemModel.product_key,
         SalesOrderItemModel.manage_number,
         SalesOrderItemModel.item_number,
         SalesOrderItemModel.item_id,
@@ -971,7 +934,6 @@ def _bounded_ranking_fact_rows(
         for candidate in candidate_rows:
             identity_filter = _ranking_fact_identity_filter(
                 str(candidate["manage_number"] or ""),
-                str(candidate["item_number"] or ""),
             )
             if args.include_sku:
                 identity_filter = and_(
@@ -998,8 +960,10 @@ def _ranking_fact_order_counts(
 ) -> dict[tuple[str, str | None], int]:
     order_numbers: dict[tuple[str, str | None], set[str]] = {}
     for fact_row in fact_rows:
-        product_key = sales_sync_service._daily_product_key(
-            fact_row
+        product_key = str(
+            getattr(fact_row, "product_key", "") or ""
+        ) or sales_sync_service._daily_product_key(
+            fact_row,
         )
         count_key = (
             product_key,

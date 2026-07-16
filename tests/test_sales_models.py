@@ -367,6 +367,26 @@ def test_sales_order_item_service_constructor_clamps_effective_units_to_zero(sql
     assert persisted.effective_amount == Decimal("0")
 
 
+def test_sales_order_item_service_constructor_persists_canonical_product_key():
+    item = SalesOrderItemModel.from_service_payload(
+        owner_username="alice",
+        store_id=1,
+        sales_order_id=1,
+        order_number="ORDER-1",
+        item_detail_id="detail-1",
+        manage_number="",
+        item_number="I" * 260,
+        item_id="item-1",
+        sku_key="",
+        unit_price=100,
+        ordered_units=1,
+        ordered_at=datetime(2026, 7, 16, 10, 0, 0),
+    )
+
+    assert item.product_key.startswith("v1:item-number:")
+    assert len(item.product_key) <= 255
+
+
 def test_product_sales_daily_enforces_daily_product_sku_uniqueness(sqlite_engine):
     with Session(sqlite_engine, future=True) as session:
         store, _ = seed_owner_store_and_order(session)
@@ -862,6 +882,65 @@ def test_ensure_table_layout_adds_safe_defaulted_columns_to_partial_populated_ta
         assert set(result["added_columns"]) == {"status", "attempt_count", "notes"}
     finally:
         partial_engine.dispose()
+
+
+def test_order_item_product_key_column_is_added_and_backfilled(sqlite_engine):
+    with Session(sqlite_engine, future=True) as session:
+        store, order = seed_owner_store_and_order(session)
+        item = SalesOrderItemModel.from_service_payload(
+            owner_username="alice",
+            store_id=store.id,
+            sales_order_id=order.id,
+            order_number=order.order_number,
+            item_detail_id="legacy-detail",
+            manage_number="MN-LEGACY",
+            item_number="ITEM-LEGACY",
+            item_id="rakuten-legacy",
+            sku_key="default",
+            item_name="Legacy Item",
+            unit_price=Decimal("100.00"),
+            ordered_units=1,
+            ordered_at=order.ordered_at,
+        )
+        session.add(item)
+        session.commit()
+
+    with sqlite_engine.begin() as connection:
+        connection.execute(
+            text("DROP INDEX ix_lt_sales_order_item_store_product_sku")
+        )
+        connection.execute(
+            text("DROP INDEX ix_lt_sales_order_item_store_product_key")
+        )
+        connection.execute(
+            text("ALTER TABLE lt_sales_order_items DROP COLUMN product_key")
+        )
+
+        result = database_module._ensure_table_layout(
+            connection,
+            SalesOrderItemModel.__table__,
+        )
+        backfilled_count = database_module._backfill_sales_order_item_product_keys(
+            connection,
+            SalesOrderItemModel.__table__,
+        )
+        product_key = connection.execute(
+            text(
+                """
+                SELECT product_key
+                FROM lt_sales_order_items
+                WHERE item_detail_id = 'legacy-detail'
+                """
+            )
+        ).scalar_one()
+
+    assert "product_key" in result["added_columns"]
+    assert {
+        "ix_lt_sales_order_item_store_product_key",
+        "ix_lt_sales_order_item_store_product_sku",
+    } <= set(result["added_indexes"])
+    assert backfilled_count == 1
+    assert product_key == "MN-LEGACY"
 
 
 def _create_complete_legacy_conversation_engine(

@@ -919,11 +919,11 @@ def test_multiple_stores_require_clarification_without_calling_model(
     assert json.loads(row.store_scope_json) == []
 
 
-def test_explicit_owned_store_in_current_message_overrides_persisted_scope(
+def test_explicit_owned_store_in_current_message_requires_new_conversation(
     monkeypatch,
     session_factory,
 ):
-    first_store_id, second_store_id = _seed_owner(
+    first_store_id, _second_store_id = _seed_owner(
         session_factory,
         store_count=2,
     )
@@ -937,37 +937,16 @@ def test_explicit_owned_store_in_current_message_overrides_persisted_scope(
         row.store_scope_json = json.dumps([first_store_id])
         session.commit()
 
-    responses = iter(
-        [
-            _model_response(
-                tool_calls=[
-                    (
-                        "get_product_sales_ranking",
-                        {
-                            "storeId": first_store_id,
-                            "startDate": RECENT_START,
-                            "endDate": RECENT_END,
-                        },
-                    )
-                ]
-            ),
-            _model_response(content="第二家店铺分析完成。"),
-        ]
-    )
     monkeypatch.setattr(
         sales_ai_service,
         "litellm_completion",
-        lambda **_: next(responses),
+        lambda **_: pytest.fail("scope conflict must fail before model call"),
     )
-    executed: list[dict[str, Any]] = []
-
-    def fake_execute(_owner, _tool_name, arguments):
-        executed.append(copy.deepcopy(arguments))
-        result = _compact_result(second_store_id)
-        result["store"]["name"] = "Analysis Shop 2"
-        return result
-
-    monkeypatch.setattr(sales_ai_service, "execute_sales_tool", fake_execute)
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: pytest.fail("scope conflict must fail before tool call"),
+    )
 
     events = list(
         sales_ai_service.stream_analysis(
@@ -977,25 +956,77 @@ def test_explicit_owned_store_in_current_message_overrides_persisted_scope(
         )
     )
 
-    assert events[-1]["type"] == "completed"
-    assert executed[0]["storeId"] == second_store_id
+    assert events == [
+        {
+            "type": "error",
+            "message": (
+                "当前会话已绑定其他店铺，请新建会话后再分析该店铺。"
+            ),
+        }
+    ]
     with session_factory() as session:
         stored_conversation = session.get(
             SalesAnalysisConversationModel,
             conversation["id"],
         )
-        message_row = session.scalar(
-            select(SalesAnalysisMessageModel).where(
-                SalesAnalysisMessageModel.conversation_id
-                == conversation["id"]
-            )
-        )
     assert stored_conversation is not None
     assert json.loads(stored_conversation.store_scope_json) == [
-        second_store_id
+        first_store_id
     ]
-    assert message_row is not None
-    assert json.loads(message_row.store_scope_json) == [second_store_id]
+
+
+def test_missing_persisted_store_scope_cannot_rebind_to_explicit_store(
+    monkeypatch,
+    session_factory,
+):
+    _first_store_id, _second_store_id = _seed_owner(
+        session_factory,
+        store_count=2,
+    )
+    conversation = _create_conversation()
+    with session_factory() as session:
+        row = session.get(
+            SalesAnalysisConversationModel,
+            conversation["id"],
+        )
+        assert row is not None
+        row.store_scope_json = json.dumps([9999])
+        session.commit()
+
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: pytest.fail("missing persisted scope must fail first"),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: pytest.fail("missing persisted scope must fail first"),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "请分析 shop-2 的近期销量",
+        )
+    )
+
+    assert events == [
+        {
+            "type": "error",
+            "message": (
+                "当前会话绑定的店铺已不存在或无权访问，请新建会话后再分析。"
+            ),
+        }
+    ]
+    with session_factory() as session:
+        stored_conversation = session.get(
+            SalesAnalysisConversationModel,
+            conversation["id"],
+        )
+    assert stored_conversation is not None
+    assert json.loads(stored_conversation.store_scope_json) == [9999]
 
 
 def test_unique_longest_explicit_store_name_overrides_overlapping_match(
@@ -1004,7 +1035,7 @@ def test_unique_longest_explicit_store_name_overrides_overlapping_match(
 ):
     with session_factory() as session:
         _add_user(session, OWNER)
-        short_store = _add_store(
+        _add_store(
             session,
             OWNER,
             "tokyo",
@@ -1017,17 +1048,8 @@ def test_unique_longest_explicit_store_name_overrides_overlapping_match(
             "Tokyo Plus",
         )
         session.commit()
-        short_store_id = short_store.id
         long_store_id = long_store.id
     conversation = _create_conversation()
-    with session_factory() as session:
-        row = session.get(
-            SalesAnalysisConversationModel,
-            conversation["id"],
-        )
-        assert row is not None
-        row.store_scope_json = json.dumps([short_store_id])
-        session.commit()
 
     responses = iter(
         [

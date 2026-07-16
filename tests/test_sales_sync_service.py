@@ -1408,6 +1408,8 @@ def test_syncing_same_snapshot_twice_is_idempotent(
     assert second["status"] == "completed"
     assert item.ordered_units == 5
     assert item.latest_units == 5
+    assert item.product_key == sales_sync_service._daily_product_key(item)
+    assert item.product_key == "MN-1"
     assert daily.ordered_units == 5
     assert item.refunded_units == 2
     assert item.effective_units == 3

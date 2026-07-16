@@ -22,6 +22,8 @@ from app.db.models import (
     SalesOrderModel,
     SalesSyncStateModel,
     StoreModel,
+    bounded_sales_order_item_product_key,
+    canonical_sales_order_item_product_key,
 )
 from app.services import rakuten_order_service
 from app.services.sales_time import (
@@ -35,7 +37,6 @@ INCREMENTAL_RECHECK_DAYS = 7
 INCOMPLETE_ADJUSTED_RECHECK_DAYS = 30
 COMPLETED_RECHECK_MAX_DAYS = 90
 COMPLETED_RECHECK_INTERVAL = timedelta(days=1)
-DAILY_PRODUCT_KEY_MAX_LENGTH = 255
 RAKUTEN_ORDER_STATUSES = [100, 200, 300, 400, 500, 600, 700, 800, 900]
 SNAPSHOT_ADJUSTMENT_SOURCE_PREFIX = "sales_sync:"
 SALES_SYNC_LEASE_TIMEOUT = timedelta(minutes=10)
@@ -1293,6 +1294,7 @@ def _reconcile_order_snapshot(
             item.sku_key = sku_key
             item.sku_json = sku_json
             item.item_name = _first_text(raw_item, ("itemName", "name"))
+            item.product_key = _daily_product_key(item)
             item.unit_price = unit_price
             item.latest_units = current_units
             item.canceled_units = derivation.canceled_units
@@ -1743,30 +1745,16 @@ def _sku_key(sku_json: str) -> str:
 
 
 def _daily_product_key(item: SalesOrderItemModel) -> str:
-    manage_number = _text(item.manage_number)
-    if manage_number:
-        return manage_number
-    item_number = _text(item.item_number)
-    if item_number:
-        return _bounded_fallback_product_key(
-            "item-number",
-            item_number,
-        )
-    item_id = _text(item.item_id)
-    if item_id:
-        return _bounded_fallback_product_key("item-id", item_id)
-    return _bounded_fallback_product_key(
-        "item-detail",
-        _text(item.item_detail_id),
+    return canonical_sales_order_item_product_key(
+        manage_number=getattr(item, "manage_number", ""),
+        item_number=getattr(item, "item_number", ""),
+        item_id=getattr(item, "item_id", ""),
+        item_detail_id=getattr(item, "item_detail_id", ""),
     )
 
 
 def _bounded_fallback_product_key(prefix: str, value: str) -> str:
-    readable = f"{prefix}:{value}"
-    if len(readable) <= DAILY_PRODUCT_KEY_MAX_LENGTH:
-        return readable
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-    return f"v1:{prefix}:{digest}"
+    return bounded_sales_order_item_product_key(prefix, value)
 
 
 def _snapshot_item_detail_id(
