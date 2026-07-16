@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
+from typing import Any
 from urllib.parse import quote
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from decimal import Decimal
@@ -188,6 +189,18 @@ class AiTitleSettingsPayload(BaseModel):
 
 class AiTitleVersionSavePayload(BaseModel):
     versionId: int = Field(gt=0)
+
+
+class SalesAnalysisSyncPayload(BaseModel):
+    storeId: int = Field(gt=0)
+
+
+class SalesAnalysisConversationPayload(BaseModel):
+    title: str = Field(default="新分析", max_length=255)
+
+
+class SalesAnalysisMessagePayload(BaseModel):
+    message: str = Field(min_length=1, max_length=100_000)
 
 
 class ListingTaskPayload(BaseModel):
@@ -869,6 +882,230 @@ def generate_product_title_version(
         stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _raise_sales_analysis_http_error(exc: Exception) -> None:
+    if isinstance(exc, LookupError):
+        raise HTTPException(
+            status_code=404,
+            detail="资源不存在或无权访问。",
+        ) from exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise HTTPException(
+        status_code=400,
+        detail="销量分析操作失败，请稍后重试。",
+    ) from exc
+
+
+@router.get("/sales-analysis/stores")
+def list_sales_analysis_stores(
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        result = crawler_service.list_sales_analysis_stores(
+            user["username"]
+        )
+        return {
+            "stores": result.get("rows", []),
+            "dataUpdatedAt": result.get("dataUpdatedAt"),
+        }
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+
+@router.get("/sales-analysis/sync-state")
+def get_sales_analysis_sync_state(
+    storeId: int = Query(gt=0),
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        return {
+            "syncState": crawler_service.get_sales_analysis_sync_state(
+                user["username"],
+                storeId,
+            )
+        }
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+
+@router.post("/sales-analysis/sync")
+def queue_sales_analysis_sync(
+    payload: SalesAnalysisSyncPayload,
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        return {
+            "syncTask": crawler_service.queue_sales_analysis_sync(
+                user["username"],
+                payload.storeId,
+            )
+        }
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+
+@router.get("/sales-analysis/sync/{task_id}")
+def get_sales_analysis_sync_task(
+    task_id: str = ApiPath(
+        min_length=7,
+        max_length=64,
+        pattern=r"^sales-\d+$",
+    ),
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        return {
+            "syncTask": crawler_service.get_sales_analysis_sync_task(
+                user["username"],
+                task_id,
+            )
+        }
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+
+@router.get("/sales-analysis/conversations")
+def list_sales_analysis_conversations(
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        return {
+            "conversations": (
+                crawler_service.list_sales_analysis_conversations(
+                    user["username"]
+                )
+            )
+        }
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+
+@router.post("/sales-analysis/conversations")
+def create_sales_analysis_conversation(
+    payload: SalesAnalysisConversationPayload,
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        return {
+            "conversation": (
+                crawler_service.create_sales_analysis_conversation(
+                    user["username"],
+                    payload.title.strip(),
+                )
+            )
+        }
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+
+@router.delete(
+    "/sales-analysis/conversations/{conversation_id}"
+)
+def delete_sales_analysis_conversation(
+    conversation_id: int = ApiPath(gt=0),
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        crawler_service.delete_sales_analysis_conversation(
+            user["username"],
+            conversation_id,
+        )
+        return {"deleted": True}
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+
+@router.get(
+    "/sales-analysis/conversations/{conversation_id}/messages"
+)
+def list_sales_analysis_messages(
+    conversation_id: int = ApiPath(gt=0),
+    limit: int = Query(default=200, ge=1, le=200),
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        messages = crawler_service.list_sales_analysis_messages(
+            user["username"],
+            conversation_id,
+            limit,
+        )
+        return {"messages": messages, "total": len(messages)}
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+
+@router.post(
+    "/sales-analysis/conversations/{conversation_id}/messages"
+)
+def stream_sales_analysis_message(
+    payload: SalesAnalysisMessagePayload,
+    conversation_id: int = ApiPath(gt=0),
+    user: dict = Depends(require_ai_permission),
+) -> StreamingResponse:
+    try:
+        crawler_service.require_sales_analysis_conversation(
+            user["username"],
+            conversation_id,
+        )
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+    def stream():
+        iterator = None
+        terminal_event_sent = False
+        try:
+            iterator = crawler_service.stream_sales_analysis(
+                user["username"],
+                conversation_id,
+                payload.message,
+            )
+            for event in iterator:
+                if not isinstance(event, dict):
+                    raise RuntimeError("销量分析事件格式无效。")
+                event_type = str(event.get("type") or "")
+                if event_type not in {
+                    "status",
+                    "tool_call",
+                    "tool_result",
+                    "delta",
+                    "completed",
+                    "error",
+                }:
+                    raise RuntimeError("销量分析事件类型无效。")
+                yield serialize_sse_event(event)
+                if event_type in {"completed", "error"}:
+                    terminal_event_sent = True
+                    break
+            if not terminal_event_sent:
+                yield serialize_sse_event(
+                    {
+                        "type": "error",
+                        "message": "销量分析未能完成，请稍后重试。",
+                    }
+                )
+        except Exception:
+            if not terminal_event_sent:
+                yield serialize_sse_event(
+                    {
+                        "type": "error",
+                        "message": "销量分析失败，请稍后重试。",
+                    }
+                )
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
