@@ -6,7 +6,6 @@ import re
 import unicodedata
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import func, select
@@ -45,7 +44,9 @@ MAX_TOOL_CALL_ID_CHARS = 128
 MAX_MODEL_TOOL_RESULT_CHARS = 16_000
 MAX_MODEL_TOOL_RESULT_ROWS = 40
 MAX_MODEL_MESSAGES_TOTAL_CHARS = 64_000
-TRUNCATION_MARKER = "…[已截断]"
+TRUNCATION_MARKER = "...[已截断]"
+SENSITIVE_FRAGMENT_MARKER = "[敏感片段已省略]"
+CANONICAL_FOOTER_MARKER = "【分析依据】"
 SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
 DEFAULT_CONVERSATION_TITLE = "新分析"
 EFFECTIVE_SALES_DEFINITION = (
@@ -314,56 +315,138 @@ TOOL_RESULT_SCHEMAS = {
         }
     ),
 }
-_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)(?<![A-Z0-9_])(?:"
-    r"owner(?:_?username|_?name)?|"
-    r"buyer(?:_?name|_?email|_?phone|_?address)?|"
-    r"customer(?:_?name|_?email|_?phone|_?address)?|"
-    r"recipient(?:_?name|_?email|_?phone|_?address)?|"
-    r"shipping(?:_?name|_?email|_?phone|_?address)?|"
-    r"contact(?:_?name|_?email|_?phone|_?address)?|"
-    r"email|e_?mail|phone|mobile|telephone|address|"
-    r"order(?:_?number|_?no|_?list|_?model_?list)?|"
-    r"credentials?|password|authorization|"
-    r"api(?:_?base|_?key|_?secret|_?token)?|"
-    r"access(?:_?key_?id|_?key_?secret|_?token)?|"
-    r"license(?:_?key)?|service(?:_?secret)?|secret|"
-    r"sql(?:_?metadata)?|query|pragma|"
-    r"raw(?:_?order|_?payload)"
-    r")\s*[:=：]\s*[^,，;；\n]+"
+
+
+def _flexible_alias_pattern(alias: str) -> str:
+    return r"[\s_-]*".join(re.escape(character) for character in alias)
+
+
+_ENGLISH_SENSITIVE_ALIASES = (
+    "owner",
+    "ownerusername",
+    "ownername",
+    "buyer",
+    "buyername",
+    "buyeremail",
+    "buyerphone",
+    "buyeraddress",
+    "customer",
+    "customername",
+    "customeremail",
+    "customerphone",
+    "customeraddress",
+    "recipient",
+    "recipientname",
+    "recipientemail",
+    "recipientphone",
+    "recipientaddress",
+    "shippingaddress",
+    "shippingname",
+    "shippingemail",
+    "shippingphone",
+    "contactname",
+    "contactemail",
+    "contactphone",
+    "contactaddress",
+    "email",
+    "phone",
+    "mobile",
+    "telephone",
+    "address",
+    "ordernumber",
+    "orderno",
+    "orderlist",
+    "ordermodellist",
+    "packagemodellist",
+    "itemmodellist",
+    "credential",
+    "credentials",
+    "password",
+    "authorization",
+    "api",
+    "apibase",
+    "apikey",
+    "apisecret",
+    "apitoken",
+    "accesskeyid",
+    "accesskeysecret",
+    "accesstoken",
+    "license",
+    "licensekey",
+    "servicesecret",
+    "secret",
+    "sql",
+    "sqlmetadata",
+    "query",
+    "pragma",
+    "raworder",
+    "rawpayload",
 )
-_CHINESE_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?:"
-    r"buyer(?:_?name|_?email|_?phone|_?address)?|"
-    r"买家(?:姓名|名称|邮箱|电话|手机|地址)?|"
-    r"购买者(?:姓名|名称|邮箱|电话|手机|地址)?|"
-    r"客户(?:姓名|名称|邮箱|电话|手机|地址)?|"
-    r"收件人(?:姓名|名称|邮箱|电话|手机|地址)?|"
-    r"收货人(?:姓名|名称|邮箱|电话|手机|地址)?|"
-    r"收件地址|收货地址|配送地址|联系地址|"
-    r"联系电话|联系手机|手机号码|电话号码|邮箱地址|"
-    r"订单号|订单编号|订单列表|订单明细|"
-    r"凭证|证书|密码|授权|访问密钥|接口密钥|许可证|密钥|"
-    r"接口地址|查询|数据库语句"
-    r")\s*[:=：]\s*[^,，;；\n]+"
+_CHINESE_SENSITIVE_ALIASES = (
+    "买家",
+    "买家姓名",
+    "买家邮箱",
+    "买家电话",
+    "买家手机",
+    "买家地址",
+    "购买者",
+    "客户",
+    "客户姓名",
+    "收件人",
+    "收货人",
+    "收件地址",
+    "收货地址",
+    "配送地址",
+    "联系地址",
+    "联系电话",
+    "联系手机",
+    "手机号码",
+    "电话号码",
+    "邮箱地址",
+    "订单号",
+    "订单编号",
+    "订单列表",
+    "订单明细",
+    "凭证",
+    "证书",
+    "密码",
+    "授权",
+    "访问密钥",
+    "接口密钥",
+    "许可证",
+    "密钥",
+    "接口地址",
+    "查询",
+    "数据库语句",
+)
+_SENSITIVE_FRAGMENT_LABEL_RE = re.compile(
+    (
+        r"(?i)(?<![A-Z0-9])(?:"
+        + "|".join(
+            _flexible_alias_pattern(alias)
+            for alias in sorted(
+                _ENGLISH_SENSITIVE_ALIASES,
+                key=len,
+                reverse=True,
+            )
+        )
+        + r")(?![A-Z0-9])|(?:"
+        + "|".join(
+            _flexible_alias_pattern(alias)
+            for alias in sorted(
+                _CHINESE_SENSITIVE_ALIASES,
+                key=len,
+                reverse=True,
+            )
+        )
+        + r")"
+    )
 )
 _EMAIL_RE = re.compile(
     r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
 )
 _PHONE_CANDIDATE_RE = re.compile(
-    r"(?<![\w-])(?:\+?\d[\d ()-]{7,}\d)(?!\w)"
-)
-_RAW_ORDER_SEGMENT_RE = re.compile(
-    r"(?is)[\"']?(?:"
-    r"raw[_ -]?order|orderModelList|packageModelList|itemModelList|"
-    r"orderNumber"
-    r")[\"']?\s*[:=：]\s*.*?(?=(?:[;；\n]|$))"
-)
-_RAW_ORDER_MARKER_RE = re.compile(
-    r"(?i)\b(?:"
-    r"raw[_ -]?order|orderModelList|packageModelList|itemModelList|"
-    r"orderNumber"
-    r")\b"
+    r"(?<![\w-])(?:\+?\d[\d ().-]{7,}\d)(?!\w)"
 )
 _DATABASE_STATEMENT_RE = re.compile(
     r"(?is)\b(?:select|insert|update|delete|drop|alter|create|replace|"
@@ -371,12 +454,10 @@ _DATABASE_STATEMENT_RE = re.compile(
 )
 _NUMERIC_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])"
-    r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?"
+    r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)"
+    r"(?:[eE][+-]?\d+)?%?"
     r"(?![A-Za-z0-9_])"
 )
-ALLOWED_FORMATTING_NUMBERS = {
-    str(value) for value in range(0, 11)
-} | {"20", "30", "50", "100"}
 
 
 def _current_shanghai_date() -> date:
@@ -857,17 +938,16 @@ def _safe_text(
     protected_identifiers: tuple[str, ...] = (),
     max_chars: int | None = None,
 ) -> str | None:
-    text = str(value or "")
+    text = unicodedata.normalize("NFKC", str(value or ""))
     if policy == "identifier":
         if any(
-            secret and secret in text
+            secret
+            and unicodedata.normalize("NFKC", secret) in text
             for secret in (owner_username, *secrets)
         ):
             return None
         if (
-            _SENSITIVE_ASSIGNMENT_RE.search(text)
-            or _CHINESE_SENSITIVE_ASSIGNMENT_RE.search(text)
-            or _RAW_ORDER_MARKER_RE.search(text)
+            _SENSITIVE_FRAGMENT_LABEL_RE.search(text)
             or _EMAIL_RE.search(text)
             or _DATABASE_STATEMENT_RE.search(text)
         ):
@@ -880,7 +960,7 @@ def _safe_text(
 
     protected_values = sorted(
         {
-            identifier
+            unicodedata.normalize("NFKC", identifier)
             for identifier in protected_identifiers
             if isinstance(identifier, str) and identifier
         },
@@ -889,20 +969,17 @@ def _safe_text(
     )
     placeholders: list[tuple[str, str]] = []
     for index, identifier in enumerate(protected_values):
-        placeholder = f"\uFFF0{index}\uFFF1"
+        placeholder = chr(0xE000 + index) * len(identifier)
         text = text.replace(identifier, placeholder)
         placeholders.append((placeholder, identifier))
 
     for secret in (owner_username, *secrets):
         if secret:
-            text = text.replace(secret, "[敏感信息已省略]")
-    text = _SENSITIVE_ASSIGNMENT_RE.sub("[敏感信息已省略]", text)
-    text = _CHINESE_SENSITIVE_ASSIGNMENT_RE.sub(
-        "[敏感信息已省略]",
-        text,
-    )
-    text = _RAW_ORDER_SEGMENT_RE.sub("[完整订单已省略]", text)
-    text = _RAW_ORDER_MARKER_RE.sub("[完整订单已省略]", text)
+            text = text.replace(
+                unicodedata.normalize("NFKC", secret),
+                "[敏感信息已省略]",
+            )
+    text = _redact_sensitive_fragments(text)
     text = _EMAIL_RE.sub("[敏感信息已省略]", text)
     text = _PHONE_CANDIDATE_RE.sub(
         lambda match: (
@@ -922,6 +999,39 @@ def _safe_text(
         if max_chars is not None
         else text
     )
+
+
+def _redact_sensitive_fragments(text: str) -> str:
+    safe_lines: list[str] = []
+    redact_next_fragment = False
+    for line in text.split("\n"):
+        fragments = re.split(r"(;)", line)
+        safe_fragments: list[str] = []
+        for fragment in fragments:
+            if fragment == ";":
+                safe_fragments.append(fragment)
+                continue
+            if redact_next_fragment and fragment.strip():
+                safe_fragments.append(SENSITIVE_FRAGMENT_MARKER)
+                redact_next_fragment = False
+                continue
+            sensitive_match = _SENSITIVE_FRAGMENT_LABEL_RE.search(fragment)
+            if sensitive_match is not None:
+                suffix = fragment[sensitive_match.end() :]
+                redact_next_fragment = bool(
+                    re.fullmatch(
+                        r"""\s*["']?\s*[:=]\s*""",
+                        suffix,
+                    )
+                )
+                safe_fragments.append(SENSITIVE_FRAGMENT_MARKER)
+                continue
+            if _DATABASE_STATEMENT_RE.search(fragment):
+                safe_fragments.append(SENSITIVE_FRAGMENT_MARKER)
+                continue
+            safe_fragments.append(fragment)
+        safe_lines.append("".join(safe_fragments))
+    return "\n".join(safe_lines)
 
 
 _DROP_SCHEMA_VALUE = object()
@@ -1595,80 +1705,27 @@ def _fallback_answer(
     secrets: tuple[str, ...],
 ) -> str:
     protected_identifiers = _collect_tool_identifiers(tool_records)
-    statistics_window = _statistics_window(
+    metadata = _grounding_metadata(
+        selected_store,
         relative_window,
         tool_records,
+        owner_username=owner_username,
+        secrets=secrets,
     )
-    start_date = statistics_window.get("start", "未提供")
-    end_date = statistics_window.get("end", "未提供")
-    updated_at: str | None = None
-    unresolved_count = 0
-    row_lines: list[str] = []
-    for record in tool_records:
-        result = record["result"]
-        if isinstance(result.get("dataUpdatedAt"), str):
-            updated_at = result["dataUpdatedAt"]
-        raw_unresolved = result.get("unresolvedAdjustmentCount")
-        if isinstance(raw_unresolved, int):
-            unresolved_count = max(unresolved_count, raw_unresolved)
-        rows = result.get("rows")
-        if isinstance(rows, list):
-            row_lines.extend(
-                _json_dump(row)
-                for row in rows
-                if isinstance(row, dict)
-            )
-    if not row_lines:
-        row_lines.append("（无返回行）")
-    safe_store_name = (
-        _safe_text(
-            selected_store.get("name", ""),
-            owner_username=owner_username,
-            secrets=secrets,
-            max_chars=255,
-        )
-        or "[敏感信息已省略]"
+    footer = _canonical_footer(
+        metadata,
+        tool_records,
+        owner_username=owner_username,
+        secrets=secrets,
+        protected_identifiers=protected_identifiers,
     )
-    return (
-        _safe_text(
-            "\n".join(
-                [
-                    f"店铺：{safe_store_name}",
-                    f"日期：{start_date} 至 {end_date}",
-                    f"口径：{EFFECTIVE_SALES_DEFINITION}",
-                    f"数据最后更新时间：{updated_at or '暂无'}",
-                    f"未决调整数量：{unresolved_count}",
-                    "返回表格行：",
-                    *row_lines,
-                ]
-            ),
-            owner_username=owner_username,
-            secrets=secrets,
-            protected_identifiers=protected_identifiers,
-            max_chars=MAX_PERSISTED_ANSWER_CHARS,
-        )
-        or ""
+    return _compose_answer_with_footer(
+        "模型解释未通过校验，以下为受控结果。",
+        footer,
+        owner_username=owner_username,
+        secrets=secrets,
+        protected_identifiers=protected_identifiers,
     )
-
-
-def _normalize_numeric_token(value: str) -> str | None:
-    normalized = value.replace(",", "").rstrip("%")
-    try:
-        decimal_value = Decimal(normalized)
-    except InvalidOperation:
-        return None
-    if decimal_value == decimal_value.to_integral_value():
-        return str(int(decimal_value))
-    return format(decimal_value.normalize(), "f")
-
-
-def _numeric_tokens(value: Any) -> set[str]:
-    tokens: set[str] = set()
-    for match in _NUMERIC_TOKEN_RE.finditer(str(value or "")):
-        normalized = _normalize_numeric_token(match.group())
-        if normalized is not None:
-            tokens.add(normalized)
-    return tokens
 
 
 def _grounding_metadata(
@@ -1719,65 +1776,103 @@ def _grounding_metadata(
     }
 
 
-def _answer_numbers_are_grounded(
-    answer: str,
+def _canonical_footer(
     metadata: dict[str, Any],
     tool_records: list[dict[str, Any]],
-) -> bool:
-    allowed = set(ALLOWED_FORMATTING_NUMBERS)
-    allowed.update(
-        _numeric_tokens(
-            _json_dump(
-                [record["result"] for record in tool_records]
-            )
-        )
-    )
-    allowed.update(_numeric_tokens(_json_dump(metadata)))
-    return _numeric_tokens(answer) <= allowed
-
-
-def _append_grounding_footer(
-    answer: str,
-    metadata: dict[str, Any],
     *,
     owner_username: str,
     secrets: tuple[str, ...],
     protected_identifiers: tuple[str, ...],
 ) -> str:
-    missing_lines: list[str] = []
-    store_name = metadata["storeName"]
-    start_date = metadata["startDate"]
-    end_date = metadata["endDate"]
-    updated_at = metadata["dataUpdatedAt"]
-    unresolved_count = metadata["unresolvedAdjustmentCount"]
-    if store_name not in answer:
-        missing_lines.append(f"店铺：{store_name}")
-    if start_date not in answer or end_date not in answer:
-        missing_lines.append(f"日期：{start_date} 至 {end_date}")
-    if EFFECTIVE_SALES_DEFINITION not in answer:
-        missing_lines.append(f"口径：{EFFECTIVE_SALES_DEFINITION}")
-    if updated_at not in answer:
-        missing_lines.append(f"数据最后更新时间：{updated_at}")
-    if (
-        "未决调整" not in answer
-        or str(unresolved_count) not in answer
-    ):
-        missing_lines.append(f"未决调整数量：{unresolved_count}")
-    combined = (
-        answer
-        if not missing_lines
-        else f"{answer.rstrip()}\n\n" + "\n".join(missing_lines)
-    )
+    row_groups = [
+        {
+            "toolName": record["toolName"],
+            "rows": (
+                list(record["result"].get("rows", []))
+                if isinstance(record["result"].get("rows"), list)
+                else []
+            ),
+        }
+        for record in tool_records
+    ]
+
+    def render() -> str:
+        return "\n".join(
+            [
+                CANONICAL_FOOTER_MARKER,
+                f"store: {metadata['storeName']}",
+                f"startDate: {metadata['startDate']}",
+                f"endDate: {metadata['endDate']}",
+                (
+                    "effectiveSalesDefinition: "
+                    f"{EFFECTIVE_SALES_DEFINITION}"
+                ),
+                f"dataUpdatedAt: {metadata['dataUpdatedAt']}",
+                (
+                    "unresolvedAdjustmentCount: "
+                    f"{metadata['unresolvedAdjustmentCount']}"
+                ),
+                f"rows: {_json_dump(row_groups)}",
+            ]
+        )
+
+    footer = render()
+    while len(footer) > MAX_PERSISTED_ANSWER_CHARS:
+        target = next(
+            (
+                group["rows"]
+                for group in reversed(row_groups)
+                if group["rows"]
+            ),
+            None,
+        )
+        if target is None:
+            break
+        target.pop()
+        footer = render()
     return (
         _safe_text(
-            combined,
+            footer,
             owner_username=owner_username,
             secrets=secrets,
             protected_identifiers=protected_identifiers,
-            max_chars=MAX_PERSISTED_ANSWER_CHARS,
         )
         or ""
     )
+
+
+def _compose_answer_with_footer(
+    prose: Any,
+    footer: str,
+    *,
+    owner_username: str,
+    secrets: tuple[str, ...],
+    protected_identifiers: tuple[str, ...],
+) -> str:
+    clean_prose = str(prose or "").replace(
+        CANONICAL_FOOTER_MARKER,
+        "",
+    ).strip()
+    separator_chars = 2 if clean_prose else 0
+    prose_budget = max(
+        0,
+        MAX_PERSISTED_ANSWER_CHARS
+        - len(footer)
+        - separator_chars,
+    )
+    bounded_prose = (
+        _safe_text(
+            clean_prose,
+            owner_username=owner_username,
+            secrets=secrets,
+            protected_identifiers=protected_identifiers,
+            max_chars=prose_budget,
+        )
+        or ""
+    ).strip()
+    if not bounded_prose:
+        return footer
+    return f"{bounded_prose}\n\n{footer}"
 
 
 def _ground_final_answer(
@@ -1790,9 +1885,13 @@ def _ground_final_answer(
     secrets: tuple[str, ...],
 ) -> tuple[str, bool]:
     protected_identifiers = _collect_tool_identifiers(tool_records)
+    normalized_content = unicodedata.normalize(
+        "NFKC",
+        str(content or ""),
+    )
     safe_answer = (
         _safe_text(
-            content,
+            normalized_content,
             owner_username=owner_username,
             secrets=secrets,
             protected_identifiers=protected_identifiers,
@@ -1809,11 +1908,7 @@ def _ground_final_answer(
     )
     if (
         not safe_answer
-        or not _answer_numbers_are_grounded(
-            safe_answer,
-            metadata,
-            tool_records,
-        )
+        or _NUMERIC_TOKEN_RE.search(normalized_content)
     ):
         return (
             _fallback_answer(
@@ -1825,10 +1920,17 @@ def _ground_final_answer(
             ),
             True,
         )
+    footer = _canonical_footer(
+        metadata,
+        tool_records,
+        owner_username=owner_username,
+        secrets=secrets,
+        protected_identifiers=protected_identifiers,
+    )
     return (
-        _append_grounding_footer(
+        _compose_answer_with_footer(
             safe_answer,
-            metadata,
+            footer,
             owner_username=owner_username,
             secrets=secrets,
             protected_identifiers=protected_identifiers,

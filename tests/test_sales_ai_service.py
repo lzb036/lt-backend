@@ -390,15 +390,15 @@ def test_one_store_auto_selects_expands_recent_dates_and_sanitizes_model_payload
         )
 
     assert row is not None
-    assert row.answer_text.startswith(
-        "Analysis Shop 1 的近期有效销量已完成分析。"
-    )
-    assert f"日期：{RECENT_START} 至 {RECENT_END}" in row.answer_text
+    assert sales_ai_service.CANONICAL_FOOTER_MARKER in row.answer_text
+    assert "store: Analysis Shop 1" in row.answer_text
+    assert f"startDate: {RECENT_START}" in row.answer_text
+    assert f"endDate: {RECENT_END}" in row.answer_text
     assert EFFECTIVE_SALES_DEFINITION_TEXT in row.answer_text
-    assert "数据最后更新时间：2026-07-16T14:30:00+08:00" in (
+    assert "dataUpdatedAt: 2026-07-16T14:30:00+08:00" in (
         row.answer_text
     )
-    assert "未决调整数量：2" in row.answer_text
+    assert "unresolvedAdjustmentCount: 2" in row.answer_text
     assert row.model_name == "openai/test-model"
     assert json.loads(row.store_scope_json) == [store_id]
     assert json.loads(row.statistics_window_json) == {
@@ -508,6 +508,92 @@ def test_sensitive_user_question_is_sanitized_before_storage_model_and_public(
         "private_orders",
     ):
         assert forbidden not in serialized
+
+
+def test_safe_text_nfkc_redacts_quoted_spaced_fragments_and_phone_formats():
+    raw = "\n".join(
+        [
+            "SAFE PRODUCT QUESTION",
+            '{"buyer name":"Alice Buyer","keep":"must disappear"}',
+            "shipping-address : Tokyo Secret Address",
+            "access key id = ACCESS-SECRET",
+            "收 件 人 ： 张三",
+            "订 单-号：ORDER-SECRET",
+            "Call 139.1234.5678",
+            "Fullwidth １３８．１２３４．５６７８",
+            "ＰＲＡＧＭＡ table_info(secret)",
+        ]
+    )
+
+    safe = sales_ai_service._safe_text(
+        raw,
+        owner_username=OWNER,
+    )
+
+    assert safe is not None
+    assert "SAFE PRODUCT QUESTION" in safe
+    for forbidden in (
+        "buyer name",
+        "Alice Buyer",
+        "must disappear",
+        "shipping-address",
+        "Tokyo Secret Address",
+        "access key id",
+        "ACCESS-SECRET",
+        "收 件 人",
+        "张三",
+        "订 单-号",
+        "ORDER-SECRET",
+        "139.1234.5678",
+        "１３８",
+        "138.1234.5678",
+        "table_info",
+    ):
+        assert forbidden not in safe
+    assert safe.count(sales_ai_service.SENSITIVE_FRAGMENT_MARKER) >= 6
+    assert (
+        sales_ai_service._safe_text(
+            "１２３４５６７８９０１２",
+            policy="identifier",
+            owner_username=OWNER,
+        )
+        == "123456789012"
+    )
+    assert (
+        sales_ai_service._safe_text(
+            "ＳＱＬ query=private",
+            policy="identifier",
+            owner_username=OWNER,
+        )
+        is None
+    )
+
+
+def test_safe_text_redacts_multiline_quoted_json_value_and_keeps_safe_fragments():
+    raw = "\n".join(
+        [
+            "safe prefix；shipping-address: Tokyo Secret；safe suffix",
+            "{",
+            '  "buyer name":',
+            '  "Alice Confidential",',
+            '  "safe": "keep this"',
+            "}",
+        ]
+    )
+
+    safe = sales_ai_service._safe_text(
+        raw,
+        owner_username=OWNER,
+    )
+
+    assert safe is not None
+    assert "safe prefix" in safe
+    assert "safe suffix" in safe
+    assert '"safe": "keep this"' in safe
+    assert "shipping-address" not in safe
+    assert "Tokyo Secret" not in safe
+    assert "buyer name" not in safe
+    assert "Alice Confidential" not in safe
 
 
 def test_allowed_display_fields_redact_phone_email_and_keep_identifiers(
@@ -1866,7 +1952,7 @@ def test_explanation_failure_after_tool_success_uses_deterministic_fallback(
         RECENT_END,
         "有效销量 = 下单数量 - 取消数量 - 退款数量 - 退货数量",
         "2026-07-16T14:30:00+08:00",
-        "未决调整数量：2",
+        "unresolvedAdjustmentCount: 2",
         "MN-1",
         "Safe Product",
         "12",
@@ -1906,9 +1992,7 @@ def test_valid_model_answer_gets_mandatory_grounding_footer(
                     )
                 ]
             ),
-            _model_response(
-                content="Safe Product 的有效销量为 12。"
-            ),
+            _model_response(content="Safe Product 表现稳定。"),
         ]
     )
     monkeypatch.setattr(
@@ -1933,13 +2017,15 @@ def test_valid_model_answer_gets_mandatory_grounding_footer(
     assert events[-1]["type"] == "completed"
     assert events[-1]["message"]["fallback"] is False
     answer = events[-1]["message"]["answer"]
-    assert "Safe Product 的有效销量为 12。" in answer
+    assert "Safe Product 表现稳定。" in answer
     for required in (
-        "店铺：Analysis Shop 1",
-        f"日期：{RECENT_START} 至 {RECENT_END}",
+        sales_ai_service.CANONICAL_FOOTER_MARKER,
+        "store: Analysis Shop 1",
+        f"startDate: {RECENT_START}",
+        f"endDate: {RECENT_END}",
         "有效销量 = 下单数量 - 取消数量 - 退款数量 - 退货数量",
-        "数据最后更新时间：2026-07-16T14:30:00+08:00",
-        "未决调整数量：2",
+        "dataUpdatedAt: 2026-07-16T14:30:00+08:00",
+        "unresolvedAdjustmentCount: 2",
     ):
         assert required in answer
 
@@ -1997,8 +2083,232 @@ def test_fabricated_numeric_model_answer_after_tool_uses_fallback(
     assert "123456789012" in answer
     assert "Safe Product" in answer
     assert '"effectiveUnits":12' in answer
-    assert "店铺：Analysis Shop 1" in answer
-    assert f"日期：{RECENT_START} 至 {RECENT_END}" in answer
+    assert "store: Analysis Shop 1" in answer
+    assert f"startDate: {RECENT_START}" in answer
+    assert f"endDate: {RECENT_END}" in answer
+
+
+@pytest.mark.parametrize(
+    "fabricated",
+    ["100", "2026", "3.14", "9e5", "-1.2e-3%", "９９％"],
+)
+def test_any_numeric_model_prose_uses_fallback(
+    monkeypatch,
+    session_factory,
+    fabricated,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content=f"模型声称结果为 {fabricated}。"),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: _compact_result(store_id),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    assert events[-1]["type"] == "completed"
+    assert events[-1]["message"]["fallback"] is True
+    assert "模型声称" not in events[-1]["message"]["answer"]
+
+
+def test_numeric_after_prose_limit_still_uses_fallback(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    long_prose_with_trailing_number = (
+        "很长的模型说明。" * 4_000
+    ) + " 最终声称为９９％。"
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content=long_prose_with_trailing_number),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: _compact_result(store_id),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    assert events[-1]["type"] == "completed"
+    assert events[-1]["message"]["fallback"] is True
+    assert "很长的模型说明" not in events[-1]["message"]["answer"]
+
+
+def test_long_model_prose_reserves_complete_canonical_footer(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    long_prose = "很长的模型说明。" * 4_000
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content=long_prose),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: _compact_result(store_id),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    answer = events[-1]["message"]["answer"]
+    assert len(answer) <= sales_ai_service.MAX_PERSISTED_ANSWER_CHARS
+    assert len(answer) < len(long_prose)
+    assert answer.count(sales_ai_service.CANONICAL_FOOTER_MARKER) == 1
+    footer = answer.split(
+        sales_ai_service.CANONICAL_FOOTER_MARKER,
+        1,
+    )[1]
+    for required in (
+        "store: Analysis Shop 1",
+        f"startDate: {RECENT_START}",
+        f"endDate: {RECENT_END}",
+        f"effectiveSalesDefinition: {EFFECTIVE_SALES_DEFINITION_TEXT}",
+        "dataUpdatedAt: 2026-07-16T14:30:00+08:00",
+        "unresolvedAdjustmentCount: 2",
+    ):
+        assert required in footer
+    rows_line = next(
+        line for line in footer.splitlines() if line.startswith("rows: ")
+    )
+    structured_rows = json.loads(rows_line.removeprefix("rows: "))
+    assert structured_rows[0]["toolName"] == (
+        "get_product_sales_ranking"
+    )
+    assert structured_rows[0]["rows"][0]["effectiveUnits"] == 12
+
+
+def test_misleading_unresolved_prose_still_gets_exact_canonical_count(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(
+                content=(
+                    "未决调整已经很多，数据最后更新时间看起来正常。"
+                )
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: _compact_result(store_id),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    answer = events[-1]["message"]["answer"]
+    assert answer.count(sales_ai_service.CANONICAL_FOOTER_MARKER) == 1
+    assert answer.count("unresolvedAdjustmentCount: 2") == 1
 
 
 def test_missing_verified_user_ai_settings_emits_error_without_model_call(
