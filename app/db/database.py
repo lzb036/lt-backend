@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import UniqueConstraint, create_engine, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.schema import AddConstraint, CreateColumn
 
 from app.core.config import settings
 
@@ -42,7 +43,85 @@ def ensure_schema_compatibility() -> None:
     url = make_url(settings.database_url)
     if not url.drivername.startswith("mysql"):
         return
+    from app.db import models as model_module
+
     with engine.begin() as connection:
+        def table_names() -> set[str]:
+            return set(inspect(connection).get_table_names())
+
+        def column_info(table_name: str) -> dict[str, dict]:
+            if table_name not in table_names():
+                return {}
+            return {
+                column["name"]: column
+                for column in inspect(connection).get_columns(table_name)
+            }
+
+        def unique_constraint_names(table_name: str) -> set[str]:
+            if table_name not in table_names():
+                return set()
+            return {
+                constraint["name"]
+                for constraint in inspect(connection).get_unique_constraints(table_name)
+                if constraint.get("name")
+            }
+
+        def index_names(table_name: str) -> set[str]:
+            if table_name not in table_names():
+                return set()
+            return {
+                index["name"]
+                for index in inspect(connection).get_indexes(table_name)
+                if index.get("name")
+            }
+
+        def ensure_table_layout(table) -> None:
+            table.create(bind=connection, checkfirst=True)
+
+            existing_columns = column_info(table.name)
+            for column in table.columns:
+                if column.name not in existing_columns:
+                    compiled_column = str(CreateColumn(column).compile(dialect=connection.dialect))
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE {_quote_mysql_identifier(table.name)} "
+                            f"ADD COLUMN {compiled_column}"
+                        )
+                    )
+
+            refreshed_columns = column_info(table.name)
+            for column in table.columns:
+                compiled_type = str(column.type.compile(dialect=connection.dialect)).strip().lower()
+                current_column = refreshed_columns.get(column.name)
+                if compiled_type != "longtext" or not current_column:
+                    continue
+                current_type = str(current_column["type"]).strip().lower()
+                if current_type == "longtext":
+                    continue
+                compiled_column = str(CreateColumn(column).compile(dialect=connection.dialect))
+                connection.execute(
+                    text(
+                        f"ALTER TABLE {_quote_mysql_identifier(table.name)} "
+                        f"MODIFY COLUMN {compiled_column}"
+                    )
+                )
+
+            existing_unique_constraints = unique_constraint_names(table.name)
+            for constraint in table.constraints:
+                if not isinstance(constraint, UniqueConstraint) or not constraint.name:
+                    continue
+                if constraint.name in existing_unique_constraints:
+                    continue
+                compiled_constraint = str(AddConstraint(constraint).compile(dialect=connection.dialect)).strip()
+                if compiled_constraint:
+                    connection.execute(text(compiled_constraint))
+
+            existing_indexes = index_names(table.name)
+            for index in table.indexes:
+                if not index.name or index.name in existing_indexes:
+                    continue
+                index.create(bind=connection, checkfirst=True)
+
         user_columns = set(
             connection.execute(
                 text(
@@ -439,6 +518,18 @@ def ensure_schema_compatibility() -> None:
         )
         if schedule_columns and "schedule_time" not in schedule_columns:
             connection.execute(text("ALTER TABLE lt_scheduled_crawls ADD COLUMN schedule_time VARCHAR(5) NOT NULL DEFAULT '09:00'"))
+
+        sales_tables = (
+            model_module.SalesOrderModel.__table__,
+            model_module.SalesOrderItemModel.__table__,
+            model_module.SalesItemAdjustmentModel.__table__,
+            model_module.ProductSalesDailyModel.__table__,
+            model_module.SalesSyncStateModel.__table__,
+            model_module.SalesAnalysisConversationModel.__table__,
+            model_module.SalesAnalysisMessageModel.__table__,
+        )
+        for sales_table in sales_tables:
+            ensure_table_layout(sales_table)
 
 
 engine = create_engine(

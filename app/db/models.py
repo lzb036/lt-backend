@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.mysql import LONGTEXT
@@ -388,6 +389,308 @@ class CrawlLogModel(TimestampMixin, Base):
     task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     level: Mapped[str] = mapped_column(String(16), nullable=False, default="info")
     message: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+def _normalize_decimal(value: Decimal | float | int | str) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+class SalesOrderModel(TimestampMixin, Base):
+    __tablename__ = "lt_sales_orders"
+    __table_args__ = (
+        UniqueConstraint("store_id", "order_number", name="uq_lt_sales_order_store_order_number"),
+        Index("ix_lt_sales_order_owner_store", "owner_username", "store_id"),
+        Index("ix_lt_sales_order_store_synced", "store_id", "last_synced_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
+    order_number: Mapped[str] = mapped_column(String(64), nullable=False)
+    order_progress: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
+    order_status: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
+    ordered_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False)
+    updated_at_remote: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    currency: Mapped[str] = mapped_column(String(16), nullable=False, default="JPY", server_default="JPY")
+    is_canceled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    has_unresolved_adjustment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    raw_order_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    last_synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        default=datetime.utcnow,
+    )
+
+    items: Mapped[list[SalesOrderItemModel]] = relationship(
+        back_populates="sales_order",
+        cascade="all, delete-orphan",
+    )
+
+
+class SalesOrderItemModel(TimestampMixin, Base):
+    __tablename__ = "lt_sales_order_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "store_id",
+            "order_number",
+            "item_detail_id",
+            name="uq_lt_sales_order_item_store_order_detail",
+        ),
+        Index("ix_lt_sales_order_item_owner_store", "owner_username", "store_id"),
+        Index("ix_lt_sales_order_item_store_manage", "store_id", "manage_number"),
+        Index("ix_lt_sales_order_item_store_manage_sku", "store_id", "manage_number", "sku_key"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
+    sales_order_id: Mapped[int] = mapped_column(
+        ForeignKey("lt_sales_orders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    order_number: Mapped[str] = mapped_column(String(64), nullable=False)
+    item_detail_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    manage_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    item_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    item_id: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    sku_key: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    sku_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    item_name: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="")
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    ordered_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    latest_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    canceled_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    refunded_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    returned_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    effective_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    effective_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    delete_item_flag: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    restore_inventory_flag: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    ordered_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False)
+
+    sales_order: Mapped[SalesOrderModel] = relationship(back_populates="items")
+    adjustments: Mapped[list[SalesItemAdjustmentModel]] = relationship(
+        back_populates="sales_order_item",
+        cascade="all, delete-orphan",
+    )
+
+    @staticmethod
+    def calculate_effective_units(
+        ordered_units: int,
+        canceled_units: int,
+        refunded_units: int,
+        returned_units: int,
+    ) -> int:
+        return max(0, ordered_units - canceled_units - refunded_units - returned_units)
+
+    @classmethod
+    def from_service_payload(
+        cls,
+        *,
+        owner_username: str,
+        store_id: int,
+        sales_order_id: int,
+        order_number: str,
+        item_detail_id: str,
+        manage_number: str = "",
+        item_number: str = "",
+        item_id: str = "",
+        sku_key: str = "",
+        sku_json: str = "{}",
+        item_name: str = "",
+        unit_price: Decimal | float | int | str = 0,
+        ordered_units: int = 0,
+        latest_units: int | None = None,
+        canceled_units: int = 0,
+        refunded_units: int = 0,
+        returned_units: int = 0,
+        delete_item_flag: bool = False,
+        restore_inventory_flag: bool = False,
+        ordered_at: datetime | None = None,
+    ) -> SalesOrderItemModel:
+        normalized_unit_price = _normalize_decimal(unit_price)
+        computed_effective_units = cls.calculate_effective_units(
+            ordered_units=ordered_units,
+            canceled_units=canceled_units,
+            refunded_units=refunded_units,
+            returned_units=returned_units,
+        )
+        return cls(
+            owner_username=owner_username,
+            store_id=store_id,
+            sales_order_id=sales_order_id,
+            order_number=order_number,
+            item_detail_id=item_detail_id,
+            manage_number=manage_number,
+            item_number=item_number,
+            item_id=item_id,
+            sku_key=sku_key,
+            sku_json=sku_json,
+            item_name=item_name,
+            unit_price=normalized_unit_price,
+            ordered_units=ordered_units,
+            latest_units=ordered_units if latest_units is None else latest_units,
+            canceled_units=canceled_units,
+            refunded_units=refunded_units,
+            returned_units=returned_units,
+            effective_units=computed_effective_units,
+            effective_amount=normalized_unit_price * computed_effective_units,
+            delete_item_flag=delete_item_flag,
+            restore_inventory_flag=restore_inventory_flag,
+            ordered_at=ordered_at or datetime.utcnow(),
+        )
+
+
+class SalesItemAdjustmentModel(TimestampMixin, Base):
+    __tablename__ = "lt_sales_item_adjustments"
+    __table_args__ = (
+        Index("ix_lt_sales_item_adjustment_owner_store", "owner_username", "store_id"),
+        Index("ix_lt_sales_item_adjustment_item_status", "sales_order_item_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
+    sales_order_item_id: Mapped[int] = mapped_column(
+        ForeignKey("lt_sales_order_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    adjustment_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="confirmed", server_default="confirmed")
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    remote_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    raw_payload_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+
+    sales_order_item: Mapped[SalesOrderItemModel] = relationship(back_populates="adjustments")
+
+
+class ProductSalesDailyModel(TimestampMixin, Base):
+    __tablename__ = "lt_product_sales_daily"
+    __table_args__ = (
+        UniqueConstraint(
+            "store_id",
+            "sales_date",
+            "manage_number",
+            "sku_key",
+            name="uq_lt_product_sales_daily_store_date_manage_sku",
+        ),
+        Index("ix_lt_product_sales_daily_owner_store_date", "owner_username", "store_id", "sales_date"),
+        Index("ix_lt_product_sales_daily_store_manage", "store_id", "manage_number"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    store_id: Mapped[int] = mapped_column(ForeignKey("lt_stores.id", ondelete="CASCADE"), nullable=False)
+    sales_date: Mapped[date] = mapped_column(nullable=False)
+    manage_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    item_number: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    sku_key: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    item_name_snapshot: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="")
+    order_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    ordered_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    canceled_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    refunded_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    returned_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    effective_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    gross_sales_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    effective_sales_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+
+
+class SalesSyncStateModel(TimestampMixin, Base):
+    __tablename__ = "lt_sales_sync_states"
+    __table_args__ = (
+        Index("ix_lt_sales_sync_state_owner_status", "owner_username", "sync_status"),
+    )
+
+    store_id: Mapped[int] = mapped_column(
+        ForeignKey("lt_stores.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    initial_sync_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    last_remote_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    sync_status: Mapped[str] = mapped_column(String(32), nullable=False, default="idle", server_default="idle")
+    progress_current: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    progress_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class SalesAnalysisConversationModel(TimestampMixin, Base):
+    __tablename__ = "lt_sales_analysis_conversations"
+    __table_args__ = (
+        Index("ix_lt_sales_analysis_conversation_owner_updated", "owner_username", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="新分析", server_default="新分析")
+    store_scope_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="[]")
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+
+    messages: Mapped[list[SalesAnalysisMessageModel]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+    )
+
+
+class SalesAnalysisMessageModel(TimestampMixin, Base):
+    __tablename__ = "lt_sales_analysis_messages"
+    __table_args__ = (
+        Index("ix_lt_sales_analysis_message_conversation_created", "conversation_id", "created_at"),
+        Index("ix_lt_sales_analysis_message_owner_created", "owner_username", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("lt_sales_analysis_conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    question_text: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="")
+    answer_text: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="")
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default="")
+    tool_arguments_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    result_summary_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    store_scope_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="[]")
+    statistics_window_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="{}")
+
+    conversation: Mapped[SalesAnalysisConversationModel] = relationship(back_populates="messages")
 
 
 def make_source_url_hash(source_url: str) -> str:
