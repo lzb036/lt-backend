@@ -312,6 +312,40 @@ class UserAiTitleSettingsModel(TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
+class UserSalesAnalysisModelSettingsModel(TimestampMixin, Base):
+    __tablename__ = "lt_user_sales_analysis_model_settings"
+
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    provider: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="custom_openai",
+    )
+    api_base_url: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+        default="",
+    )
+    api_key_encrypted: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="",
+    )
+    model_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        default="",
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False)
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
 class UserSalesAnalysisSettingsModel(TimestampMixin, Base):
     __tablename__ = "lt_user_sales_analysis_settings"
 

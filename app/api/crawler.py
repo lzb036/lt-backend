@@ -231,6 +231,13 @@ class SalesAnalysisSettingsPayload(BaseModel):
     customBusinessInstructions: str = Field(max_length=4000)
 
 
+class SalesAnalysisModelSettingsPayload(BaseModel):
+    provider: str = Field(min_length=1, max_length=64)
+    apiBaseUrl: str = Field(default="", max_length=500)
+    apiKey: str = Field(default="", max_length=1000)
+    modelName: str = Field(min_length=1, max_length=255)
+
+
 class SalesOrderSyncGlobalSettingsPayload(BaseModel):
     enabled: bool
     intervalMinutes: int = Field(ge=5, le=1440)
@@ -962,6 +969,69 @@ def update_sales_analysis_settings(
         )
         return {"settings": settings_payload}
     except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/settings/sales-analysis/model")
+def get_sales_analysis_model_settings(
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    from app.services import sales_analysis_model_settings_service
+
+    return {
+        "settings": (
+            sales_analysis_model_settings_service.get_settings(
+                user["username"]
+            )
+        )
+    }
+
+
+@router.get("/settings/sales-analysis/model/providers")
+def get_sales_analysis_model_providers(
+    _: dict = Depends(require_ai_permission),
+) -> dict:
+    from app.services import sales_analysis_model_settings_service
+
+    return {
+        "providers": (
+            sales_analysis_model_settings_service.provider_catalog()
+        )
+    }
+
+
+@router.put("/settings/sales-analysis/model")
+def update_sales_analysis_model_settings(
+    payload: SalesAnalysisModelSettingsPayload,
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    from app.services import sales_analysis_model_settings_service
+
+    try:
+        return {
+            "settings": (
+                sales_analysis_model_settings_service.update_settings(
+                    user["username"],
+                    payload,
+                )
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/settings/sales-analysis/model/test")
+def test_sales_analysis_model_settings(
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    from app.services import sales_analysis_model_settings_service
+
+    try:
+        return (
+            sales_analysis_model_settings_service
+            .test_settings_connection(user["username"])
+        )
+    except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

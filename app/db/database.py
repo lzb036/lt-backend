@@ -1336,6 +1336,7 @@ def ensure_schema_compatibility() -> None:
             model_module.SalesOrderSyncRunModel.__table__,
             model_module.SalesAnalysisConversationModel.__table__,
             model_module.SalesAnalysisMessageModel.__table__,
+            model_module.UserSalesAnalysisModelSettingsModel.__table__,
             model_module.UserSalesAnalysisSettingsModel.__table__,
         )
         for sales_table in sales_tables:

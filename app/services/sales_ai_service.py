@@ -18,13 +18,10 @@ from app.db.models import (
     StoreModel,
     UserAccountModel,
 )
-from app.services.ai_title_service import (
-    ensure_user_settings,
-    litellm_completion,
-    resolved_model_name,
-)
+from app.services.ai_title_service import litellm_completion
 from app.services import (
     sales_analysis_service,
+    sales_analysis_model_settings_service,
     sales_analysis_settings_service,
 )
 from app.services.sales_analysis_service import (
@@ -1232,19 +1229,30 @@ def _start_turn(
 
 def _load_model_configuration(owner_username: str) -> dict[str, str]:
     with session_scope() as session:
-        settings = ensure_user_settings(session, owner_username)
+        settings = (
+            sales_analysis_model_settings_service.ensure_user_settings(
+                session,
+                owner_username,
+            )
+        )
         api_key = decrypt_text(settings.api_key_encrypted)
         if not api_key:
             raise RuntimeError(
-                "请先在 AI 管理中配置你自己的 API Key。"
+                "请先在商品分析设置的模型配置中填写 API Key。"
             )
         if not settings.verified_at or settings.last_error:
             raise RuntimeError(
-                "请先在 AI 管理中保存配置并通过连接测试。"
+                "请先在商品分析设置中保存模型配置并通过连接测试。"
             )
-        model_name = resolved_model_name(settings)
+        model_name = (
+            sales_analysis_model_settings_service.resolved_model_name(
+                settings
+            )
+        )
         if not model_name:
-            raise RuntimeError("请先在 AI 管理中配置模型名称。")
+            raise RuntimeError(
+                "请先在商品分析设置的模型配置中选择模型。"
+            )
         return {
             "apiKey": api_key,
             "apiBase": settings.api_base_url or "",
