@@ -6,7 +6,6 @@ import re
 import unicodedata
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from sqlalchemy import func, select
@@ -511,43 +510,8 @@ _MODEL_NUMERIC_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 _MODEL_COMPLETION_ACK_RE = re.compile(
-    r"^(?:(?:的)?(?:近期有效销量|受控|趋势|受控上下文)?"
-    r"(?:分析完成|完成分析|已完成分析)|"
-    r"已确认店铺范围|已根据受控排行结果完成分析)[。.!！]?$"
-)
-_MODEL_FACTUAL_CLAIM_ALLOWED_TEXT_RE = re.compile(
-    r"^(?:的|为|是|约|共|合计|其中|有效销量|下单数量|取消数量|"
-    r"退款数量|退货数量|销售额|有效销售额|订单数|订单数量|"
-    r"商品数|SKU数|件|单|元|日元|JPY|，|,|。|\.|：|:|"
-    r"；|;|\s)*$",
-    re.IGNORECASE,
-)
-_FACT_FIELD_LABELS = {
-    "有效销量": "effectiveUnits",
-    "下单数量": "orderedUnits",
-    "下单件数": "orderedUnits",
-    "取消数量": "canceledUnits",
-    "退款数量": "refundedUnits",
-    "退货数量": "returnedUnits",
-    "订单数": "orderCount",
-    "订单数量": "orderCount",
-    "有效销售额": "effectiveSalesAmount",
-    "销售额": "effectiveSalesAmount",
-}
-_FACT_FIELD_CLAIM_RE = re.compile(
-    r"(?P<label>"
-    + "|".join(
-        re.escape(label)
-        for label in sorted(
-            _FACT_FIELD_LABELS,
-            key=len,
-            reverse=True,
-        )
-    )
-    + r")\s*(?:为|是|=|:|：)\s*(?P<value>"
-    + _MODEL_NUMERIC_CLAIM_RE.pattern
-    + r")",
-    re.IGNORECASE,
+    r"^(?:分析完成|已完成分析|受控分析完成|已完成受控分析)"
+    r"[。.!！]?$"
 )
 
 
@@ -608,117 +572,22 @@ def _collect_tool_identifiers(value: Any) -> tuple[str, ...]:
     return tuple(dict.fromkeys(identifiers))
 
 
-def _iter_scalar_values(value: Any) -> Iterator[Any]:
-    if isinstance(value, dict):
-        for child in value.values():
-            yield from _iter_scalar_values(child)
-        return
-    if isinstance(value, list):
-        for child in value:
-            yield from _iter_scalar_values(child)
-        return
-    yield value
-
-
-def _collect_numeric_field_values(
-    value: Any,
-) -> dict[str, set[tuple[Decimal, bool]]]:
-    collected: dict[str, set[tuple[Decimal, bool]]] = {}
-
-    def visit(item: Any) -> None:
-        if isinstance(item, dict):
-            for key, child in item.items():
-                canonical = _canonical_numeric(child)
-                if canonical is not None and not isinstance(child, str):
-                    collected.setdefault(str(key), set()).add(canonical)
-                visit(child)
-        elif isinstance(item, list):
-            for child in item:
-                visit(child)
-
-    visit(value)
-    return collected
-
-
-def _canonical_numeric(value: Any) -> tuple[Decimal, bool] | None:
-    if isinstance(value, bool):
-        return None
-    normalized_value = unicodedata.normalize("NFKC", str(value))
-    is_percent = normalized_value.endswith("%")
-    try:
-        decimal_value = Decimal(normalized_value.rstrip("%"))
-    except (InvalidOperation, ValueError):
-        return None
-    if not decimal_value.is_finite():
-        return None
-    return decimal_value.normalize(), is_percent
-
-
 def _supported_model_answer(
     content: Any,
     selected_store: dict[str, Any],
     tool_records: list[dict[str, Any]],
 ) -> bool:
+    del selected_store, tool_records
     normalized_content = unicodedata.normalize(
         "NFKC",
         str(content or ""),
     ).strip()
     if not normalized_content:
         return False
-
-    known_text_values = {
-        str(selected_store.get("name") or ""),
-        *(
-            str(value)
-            for record in tool_records
-            for value in _iter_scalar_values(record["result"])
-            if isinstance(value, str)
-        ),
-    }
-    claim_text = normalized_content
-    for known_value in sorted(
-        (
-            unicodedata.normalize("NFKC", value)
-            for value in known_text_values
-            if value
-        ),
-        key=len,
-        reverse=True,
-    ):
-        claim_text = claim_text.replace(known_value, "")
-    claim_text = claim_text.strip()
-    if _MODEL_COMPLETION_ACK_RE.fullmatch(claim_text):
-        return True
-
-    supported_numbers = {
-        canonical
-        for record in tool_records
-        for value in _iter_scalar_values(record["result"])
-        if (canonical := _canonical_numeric(value)) is not None
-        and not isinstance(value, str)
-    }
-    numeric_matches = list(_MODEL_NUMERIC_CLAIM_RE.finditer(claim_text))
-    if not numeric_matches:
+    if _MODEL_NUMERIC_CLAIM_RE.search(normalized_content):
         return False
-    field_values: dict[str, set[tuple[Decimal, bool]]] = {}
-    for record in tool_records:
-        for field, values in _collect_numeric_field_values(
-            record["result"]
-        ).items():
-            field_values.setdefault(field, set()).update(values)
-    for field_claim in _FACT_FIELD_CLAIM_RE.finditer(claim_text):
-        field = _FACT_FIELD_LABELS[field_claim.group("label")]
-        claimed_value = _canonical_numeric(
-            field_claim.group("value")
-        )
-        if claimed_value not in field_values.get(field, set()):
-            return False
-    for match in numeric_matches:
-        if _canonical_numeric(match.group()) not in supported_numbers:
-            return False
-    residual_text = _MODEL_NUMERIC_CLAIM_RE.sub("", claim_text)
     return bool(
-        _MODEL_FACTUAL_CLAIM_ALLOWED_TEXT_RE.fullmatch(residual_text)
+        _MODEL_COMPLETION_ACK_RE.fullmatch(normalized_content)
     )
 
 
@@ -1897,16 +1766,22 @@ def _prepare_tool_arguments(
             arguments["metric"] = explicit_question["metric"]
         elif (
             "metric" not in arguments
-            or arguments["metric"]
-            == sales_analysis_settings_service.DEFAULT_METRIC
+            or (
+                isinstance(arguments["metric"], str)
+                and arguments["metric"]
+                in sales_analysis_settings_service.METRICS
+            )
         ):
             arguments["metric"] = effective_preferences["defaultMetric"]
         if "limit" in explicit_question:
             arguments["limit"] = explicit_question["limit"]
         elif (
             "limit" not in arguments
-            or arguments["limit"]
-            == sales_analysis_settings_service.DEFAULT_RANKING_LIMIT
+            or (
+                isinstance(arguments["limit"], int)
+                and not isinstance(arguments["limit"], bool)
+                and 1 <= arguments["limit"] <= 100
+            )
         ):
             arguments["limit"] = (
                 effective_preferences["defaultRankingLimit"]
@@ -1919,8 +1794,11 @@ def _prepare_tool_arguments(
             arguments["grain"] = explicit_question["grain"]
         elif (
             "grain" not in arguments
-            or arguments["grain"]
-            == sales_analysis_settings_service.DEFAULT_GRAIN
+            or (
+                isinstance(arguments["grain"], str)
+                and arguments["grain"]
+                in sales_analysis_settings_service.GRAINS
+            )
         ):
             arguments["grain"] = effective_preferences["defaultGrain"]
     argument_model = sales_analysis_service._TOOL_MODELS[tool_name]
@@ -2269,8 +2147,10 @@ def _system_prompt(
         f"{date_rule}"
         f"“销量”默认指有效销量，定义为：{EFFECTIVE_SALES_DEFINITION}。"
         f"effectiveSalesAmount 的口径为：{EFFECTIVE_SALES_AMOUNT_DEFINITION}"
-        "回答必须显示店铺、具体起止日期、有效销量口径、数据最后更新时间、"
-        "初始同步完整性和未决调整数量。"
+        "服务端将根据工具结果生成包含店铺、起止日期、销量口径、数据更新时间、"
+        "同步完整性和调整风险的受控答案。"
+        "工具调用全部完成后，最终只回复“分析完成。”，"
+        "不得包含任何数字、百分比、商品或 SKU 事实、对比、趋势、风险、建议或业务结论。"
         f"{preference_prompt}"
     )
 

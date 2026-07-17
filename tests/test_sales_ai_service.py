@@ -295,7 +295,7 @@ def test_one_store_auto_selects_expands_recent_dates_and_sanitizes_model_payload
                     )
                 ]
             ),
-            _model_response(content="Analysis Shop 1 的近期有效销量已完成分析。"),
+            _model_response(content="分析完成。"),
         ]
     )
 
@@ -717,7 +717,7 @@ def test_store_display_name_is_sanitized_before_entering_system_message(
                     )
                 ]
             ),
-            _model_response(content="已确认店铺范围。"),
+            _model_response(content="分析完成。"),
         ]
     )
 
@@ -1084,7 +1084,7 @@ def test_unique_longest_explicit_store_name_overrides_overlapping_match(
                     )
                 ]
             ),
-            _model_response(content="Tokyo Plus 分析完成。"),
+            _model_response(content="分析完成。"),
         ]
     )
     monkeypatch.setattr(
@@ -1189,7 +1189,7 @@ def test_short_store_code_requires_boundary_and_does_not_match_sales_word(
                     )
                 ]
             ),
-            _model_response(content="Main Shop 分析完成。"),
+            _model_response(content="分析完成。"),
         ]
     )
     monkeypatch.setattr(
@@ -1543,7 +1543,7 @@ def test_numeric_12_digit_manage_number_is_valid_tool_argument(
                     )
                 ]
             ),
-            _model_response(content="趋势分析完成。"),
+            _model_response(content="分析完成。"),
         ]
     )
     monkeypatch.setattr(
@@ -1700,7 +1700,7 @@ def test_model_context_is_bounded_and_keeps_newest_history(
                     )
                 ]
             ),
-            _model_response(content="受控上下文分析完成。"),
+            _model_response(content="分析完成。"),
         ]
     )
 
@@ -2266,7 +2266,7 @@ def test_fabricated_numeric_model_answer_after_tool_emits_error(
     assert row.answer_text == ""
 
 
-def test_supported_numeric_model_claim_from_tool_result_is_allowed(
+def test_neutral_completion_acknowledgment_allows_controlled_output(
     monkeypatch,
     session_factory,
 ):
@@ -2286,9 +2286,7 @@ def test_supported_numeric_model_claim_from_tool_result_is_allowed(
                     )
                 ]
             ),
-            _model_response(
-                content="Safe Product 的有效销量为 12。"
-            ),
+            _model_response(content="分析完成。"),
         ]
     )
     monkeypatch.setattr(
@@ -2376,17 +2374,19 @@ def test_empty_final_model_response_after_tool_is_rejected(
 
 
 @pytest.mark.parametrize(
-    ("claim", "expected_type"),
+    "claim",
     [
-        ("有效销量为 12，退款数量为 5。", "completed"),
-        ("有效销量为 5，退款数量为 12。", "error"),
+        "有效销量为 12，退款数量为 5。",
+        "有效销量约为 12。",
+        "有效销量为 5，退款数量为 12。",
+        "Safe Product 分析完成。",
+        "Safe Product 的销量表现稳定。",
     ],
 )
-def test_fact_validation_preserves_field_value_associations(
+def test_any_numeric_or_business_final_model_claim_is_rejected(
     monkeypatch,
     session_factory,
     claim,
-    expected_type,
 ):
     store_id = _seed_owner(session_factory)[0]
     conversation = _create_conversation()
@@ -2439,9 +2439,10 @@ def test_fact_validation_preserves_field_value_associations(
         )
     )
 
-    assert events[-1]["type"] == expected_type
-    if expected_type == "error":
-        assert events[-1]["message"] == "AI 回答未通过事实校验，请重试。"
+    assert events[-1] == {
+        "type": "error",
+        "message": "AI 回答未通过事实校验，请重试。",
+    }
 
 
 def test_numeric_claim_with_unsupported_percent_unit_is_rejected(
@@ -2910,8 +2911,8 @@ def test_user_defaults_apply_to_vague_period_and_omitted_ranking_arguments(
                     (
                         "get_product_sales_ranking",
                         {
-                            "metric": "effectiveUnits",
-                            "limit": 10,
+                            "metric": "effectiveSalesAmount",
+                            "limit": 99,
                         },
                     )
                 ]
@@ -3030,14 +3031,14 @@ def test_default_grain_applies_only_when_tool_argument_is_omitted(
                         "get_product_sales_trend",
                         {
                             "manageNumber": "MN-1",
-                            "grain": "day",
+                            "grain": "month",
                         },
                     ),
                     (
                         "compare_product_sales",
                         {
                             "manageNumbers": ["MN-1", "MN-2"],
-                            "grain": "day",
+                            "grain": "month",
                         },
                     ),
                 ]
@@ -3136,6 +3137,7 @@ def test_custom_preferences_are_sanitized_and_cannot_override_security_rules(
     ):
         assert forbidden not in system_prompt
     assert "只能使用提供的只读分析工具" in system_prompt
+    assert "最终只回复“分析完成。”" in system_prompt
     assert executed[0]["storeId"] == store_id
     assert executed[0]["limit"] == 100
 
