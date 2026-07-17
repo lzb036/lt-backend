@@ -2080,6 +2080,78 @@ def test_tool_execution_failure_persists_error_status(
     assert row.answer_text == ""
 
 
+@pytest.mark.parametrize(
+    "failure_target",
+    [
+        "_sanitize_tool_result",
+        "_persist_tool_audit",
+        "_bounded_tool_result_for_model",
+    ],
+)
+def test_tool_result_processing_failure_emits_only_controlled_error(
+    monkeypatch,
+    session_factory,
+    failure_target,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: _model_response(
+            tool_calls=[
+                (
+                    "get_product_sales_ranking",
+                    {
+                        "storeId": store_id,
+                        "startDate": RECENT_START,
+                        "endDate": RECENT_END,
+                    },
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: _compact_result(store_id),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        failure_target,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("private tool result detail")
+        ),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    assert [event["type"] for event in events] == [
+        "status",
+        "tool_call",
+        "error",
+    ]
+    assert events[-1]["message"] == "销量分析结果处理失败，请稍后重试。"
+    with session_factory() as session:
+        row = session.scalar(
+            select(SalesAnalysisMessageModel).where(
+                SalesAnalysisMessageModel.conversation_id
+                == conversation["id"]
+            )
+        )
+    assert row is not None
+    assert row.status == "error"
+    assert row.error_code == "tool_result_processing_error"
+    assert "private tool result detail" not in row.error_message
+    assert row.answer_text == ""
+
+
 def test_unsupported_stability_conclusion_is_rejected(
     monkeypatch,
     session_factory,
@@ -2240,6 +2312,136 @@ def test_supported_numeric_model_claim_from_tool_result_is_allowed(
 
     assert events[-1]["type"] == "completed"
     assert events[-1]["message"]["status"] == "completed"
+
+
+def test_empty_final_model_response_after_tool_is_rejected(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content="   \n\t"),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: _compact_result(store_id),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    assert [event["type"] for event in events] == [
+        "status",
+        "tool_call",
+        "tool_result",
+        "error",
+    ]
+    with session_factory() as session:
+        row = session.scalar(
+            select(SalesAnalysisMessageModel).where(
+                SalesAnalysisMessageModel.conversation_id
+                == conversation["id"]
+            )
+        )
+    assert row is not None
+    assert row.status == "error"
+    assert row.error_code == "answer_validation_error"
+    assert row.answer_text == ""
+
+
+@pytest.mark.parametrize(
+    ("claim", "expected_type"),
+    [
+        ("有效销量为 12，退款数量为 5。", "completed"),
+        ("有效销量为 5，退款数量为 12。", "error"),
+    ],
+)
+def test_fact_validation_preserves_field_value_associations(
+    monkeypatch,
+    session_factory,
+    claim,
+    expected_type,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    result = _compact_result(store_id)
+    result["rows"] = [
+        {
+            "orderCount": 3,
+            "orderedUnits": 17,
+            "effectiveUnits": 12,
+            "grossSalesAmount": 5100.0,
+            "effectiveSalesAmount": 3600.0,
+            "canceledUnits": 0,
+            "refundedUnits": 5,
+            "returnedUnits": 0,
+        }
+    ]
+    responses = iter(
+        [
+            _model_response(
+                tool_calls=[
+                    (
+                        "get_store_sales_overview",
+                        {
+                            "storeId": store_id,
+                            "startDate": RECENT_START,
+                            "endDate": RECENT_END,
+                        },
+                    )
+                ]
+            ),
+            _model_response(content=claim),
+        ]
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: next(responses),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: copy.deepcopy(result),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    assert events[-1]["type"] == expected_type
+    if expected_type == "error":
+        assert events[-1]["message"] == "AI 回答未通过事实校验，请重试。"
 
 
 def test_numeric_claim_with_unsupported_percent_unit_is_rejected(
@@ -2704,7 +2906,15 @@ def test_user_defaults_apply_to_vague_period_and_omitted_ranking_arguments(
     responses = iter(
         [
             _model_response(
-                tool_calls=[("get_product_sales_ranking", {})]
+                tool_calls=[
+                    (
+                        "get_product_sales_ranking",
+                        {
+                            "metric": "effectiveUnits",
+                            "limit": 10,
+                        },
+                    )
+                ]
             ),
             _model_response(content="分析完成。"),
         ]
@@ -2818,13 +3028,16 @@ def test_default_grain_applies_only_when_tool_argument_is_omitted(
                 tool_calls=[
                     (
                         "get_product_sales_trend",
-                        {"manageNumber": "MN-1"},
+                        {
+                            "manageNumber": "MN-1",
+                            "grain": "day",
+                        },
                     ),
                     (
                         "compare_product_sales",
                         {
                             "manageNumbers": ["MN-1", "MN-2"],
-                            "grain": "month",
+                            "grain": "day",
                         },
                     ),
                 ]
@@ -2859,7 +3072,7 @@ def test_default_grain_applies_only_when_tool_argument_is_omitted(
 
     assert events[-1]["type"] == "completed"
     assert executed[0][1]["grain"] == "week"
-    assert executed[1][1]["grain"] == "month"
+    assert executed[1][1]["grain"] == "week"
 
 
 def test_custom_preferences_are_sanitized_and_cannot_override_security_rules(

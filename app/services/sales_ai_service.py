@@ -522,6 +522,33 @@ _MODEL_FACTUAL_CLAIM_ALLOWED_TEXT_RE = re.compile(
     r"；|;|\s)*$",
     re.IGNORECASE,
 )
+_FACT_FIELD_LABELS = {
+    "有效销量": "effectiveUnits",
+    "下单数量": "orderedUnits",
+    "下单件数": "orderedUnits",
+    "取消数量": "canceledUnits",
+    "退款数量": "refundedUnits",
+    "退货数量": "returnedUnits",
+    "订单数": "orderCount",
+    "订单数量": "orderCount",
+    "有效销售额": "effectiveSalesAmount",
+    "销售额": "effectiveSalesAmount",
+}
+_FACT_FIELD_CLAIM_RE = re.compile(
+    r"(?P<label>"
+    + "|".join(
+        re.escape(label)
+        for label in sorted(
+            _FACT_FIELD_LABELS,
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")\s*(?:为|是|=|:|：)\s*(?P<value>"
+    + _MODEL_NUMERIC_CLAIM_RE.pattern
+    + r")",
+    re.IGNORECASE,
+)
 
 
 def _current_shanghai_date() -> date:
@@ -593,6 +620,26 @@ def _iter_scalar_values(value: Any) -> Iterator[Any]:
     yield value
 
 
+def _collect_numeric_field_values(
+    value: Any,
+) -> dict[str, set[tuple[Decimal, bool]]]:
+    collected: dict[str, set[tuple[Decimal, bool]]] = {}
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                canonical = _canonical_numeric(child)
+                if canonical is not None and not isinstance(child, str):
+                    collected.setdefault(str(key), set()).add(canonical)
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return collected
+
+
 def _canonical_numeric(value: Any) -> tuple[Decimal, bool] | None:
     if isinstance(value, bool):
         return None
@@ -617,7 +664,7 @@ def _supported_model_answer(
         str(content or ""),
     ).strip()
     if not normalized_content:
-        return True
+        return False
 
     known_text_values = {
         str(selected_store.get("name") or ""),
@@ -653,6 +700,19 @@ def _supported_model_answer(
     numeric_matches = list(_MODEL_NUMERIC_CLAIM_RE.finditer(claim_text))
     if not numeric_matches:
         return False
+    field_values: dict[str, set[tuple[Decimal, bool]]] = {}
+    for record in tool_records:
+        for field, values in _collect_numeric_field_values(
+            record["result"]
+        ).items():
+            field_values.setdefault(field, set()).update(values)
+    for field_claim in _FACT_FIELD_CLAIM_RE.finditer(claim_text):
+        field = _FACT_FIELD_LABELS[field_claim.group("label")]
+        claimed_value = _canonical_numeric(
+            field_claim.group("value")
+        )
+        if claimed_value not in field_values.get(field, set()):
+            return False
     for match in numeric_matches:
         if _canonical_numeric(match.group()) not in supported_numbers:
             return False
@@ -1835,17 +1895,21 @@ def _prepare_tool_arguments(
     if tool_name == "get_product_sales_ranking":
         if "metric" in explicit_question:
             arguments["metric"] = explicit_question["metric"]
-        else:
-            arguments.setdefault(
-                "metric",
-                effective_preferences["defaultMetric"],
-            )
+        elif (
+            "metric" not in arguments
+            or arguments["metric"]
+            == sales_analysis_settings_service.DEFAULT_METRIC
+        ):
+            arguments["metric"] = effective_preferences["defaultMetric"]
         if "limit" in explicit_question:
             arguments["limit"] = explicit_question["limit"]
-        else:
-            arguments.setdefault(
-                "limit",
-                effective_preferences["defaultRankingLimit"],
+        elif (
+            "limit" not in arguments
+            or arguments["limit"]
+            == sales_analysis_settings_service.DEFAULT_RANKING_LIMIT
+        ):
+            arguments["limit"] = (
+                effective_preferences["defaultRankingLimit"]
             )
     if tool_name in {
         "get_product_sales_trend",
@@ -1853,11 +1917,12 @@ def _prepare_tool_arguments(
     }:
         if "grain" in explicit_question:
             arguments["grain"] = explicit_question["grain"]
-        else:
-            arguments.setdefault(
-                "grain",
-                effective_preferences["defaultGrain"],
-            )
+        elif (
+            "grain" not in arguments
+            or arguments["grain"]
+            == sales_analysis_settings_service.DEFAULT_GRAIN
+        ):
+            arguments["grain"] = effective_preferences["defaultGrain"]
     argument_model = sales_analysis_service._TOOL_MODELS[tool_name]
     validated = argument_model.model_validate(arguments)
     validated_arguments = validated.model_dump(
@@ -2128,6 +2193,33 @@ def _persist_final_processing_error(
         row.model_name = model_name
         row.status = "error"
         row.error_code = "answer_processing_error"
+        row.error_message = error_message
+        session.flush()
+
+
+def _persist_tool_result_processing_error(
+    *,
+    owner_username: str,
+    conversation_id: int,
+    message_id: int,
+    model_name: str,
+    error_message: str,
+) -> None:
+    with session_scope() as session:
+        row = session.scalar(
+            select(SalesAnalysisMessageModel).where(
+                SalesAnalysisMessageModel.id == message_id,
+                SalesAnalysisMessageModel.conversation_id
+                == conversation_id,
+                SalesAnalysisMessageModel.owner_username == owner_username,
+            )
+        )
+        if row is None:
+            raise LookupError("会话消息不存在或无权访问。")
+        row.answer_text = ""
+        row.model_name = model_name
+        row.status = "error"
+        row.error_code = "tool_result_processing_error"
         row.error_message = error_message
         session.flush()
 
@@ -2985,29 +3077,47 @@ def stream_analysis(
                 )
                 yield {"type": "error", "message": answer}
                 return
-            sanitized_result = _sanitize_tool_result(
-                tool_name,
-                raw_result,
-                owner_username=normalized_owner,
-                secrets=redaction_secrets,
-            )
-            record = {
-                "toolName": tool_name,
-                "arguments": arguments,
-                "result": sanitized_result,
-            }
-            tool_records.append(record)
+            try:
+                sanitized_result = _sanitize_tool_result(
+                    tool_name,
+                    raw_result,
+                    owner_username=normalized_owner,
+                    secrets=redaction_secrets,
+                )
+                record = {
+                    "toolName": tool_name,
+                    "arguments": arguments,
+                    "result": sanitized_result,
+                }
+                updated_tool_records = [*tool_records, record]
+                model_tool_content = _json_dump(
+                    _bounded_tool_result_for_model(
+                        sanitized_result
+                    )
+                )
+                _persist_tool_audit(
+                    owner_username=normalized_owner,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    model_name=model_name,
+                    selected_store_id=selected_store["id"],
+                    relative_window=relative_window,
+                    tool_records=updated_tool_records,
+                )
+            except Exception:
+                answer = "销量分析结果处理失败，请稍后重试。"
+                _persist_tool_result_processing_error(
+                    owner_username=normalized_owner,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    model_name=model_name,
+                    error_message=answer,
+                )
+                yield {"type": "error", "message": answer}
+                return
+            tool_records = updated_tool_records
             if _analysis_cancelled(is_cancelled):
                 return
-            _persist_tool_audit(
-                owner_username=normalized_owner,
-                conversation_id=conversation_id,
-                message_id=message_id,
-                model_name=model_name,
-                selected_store_id=selected_store["id"],
-                relative_window=relative_window,
-                tool_records=tool_records,
-            )
             yield {
                 "type": "tool_result",
                 "toolName": tool_name,
@@ -3021,10 +3131,6 @@ def stream_analysis(
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "name": tool_name,
-                    "content": _json_dump(
-                        _bounded_tool_result_for_model(
-                            sanitized_result
-                        )
-                    ),
+                    "content": model_tool_content,
                 }
             )
