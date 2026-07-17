@@ -312,6 +312,74 @@ class UserAiTitleSettingsModel(TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
+class UserSalesAnalysisSettingsModel(TimestampMixin, Base):
+    __tablename__ = "lt_user_sales_analysis_settings"
+
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_user_sales_analysis_settings_owner_user",
+        ),
+        primary_key=True,
+    )
+    default_period_days: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=30,
+        server_default="30",
+    )
+    default_ranking_limit: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=10,
+        server_default="10",
+    )
+    default_metric: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="effectiveUnits",
+        server_default="effectiveUnits",
+    )
+    default_grain: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="day",
+        server_default="day",
+    )
+    answer_detail_level: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="standard",
+        server_default="standard",
+    )
+    prioritize_adjustment_risk: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="1",
+    )
+    show_data_updated_at: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="1",
+    )
+    show_metric_definition: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="1",
+    )
+    custom_business_instructions: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="",
+        server_default="",
+    )
+
+
 class ProductTitleVersionModel(TimestampMixin, Base):
     __tablename__ = "lt_product_title_versions"
     __table_args__ = (

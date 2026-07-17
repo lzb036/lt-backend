@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from io import BytesIO
 from threading import Event
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 import requests
@@ -13,7 +13,11 @@ from pydantic import BaseModel, Field
 from decimal import Decimal
 
 from app.core.auth import has_permission, require_any_permission, require_permission, require_superadmin
-from app.services import crawler_service, sensitive_word_service
+from app.services import (
+    crawler_service,
+    sales_analysis_settings_service,
+    sensitive_word_service,
+)
 from app.services.user_service import require_existing_account
 
 router = APIRouter(prefix="/crawler", tags=["crawler"])
@@ -202,6 +206,27 @@ class SalesAnalysisConversationPayload(BaseModel):
 
 class SalesAnalysisMessagePayload(BaseModel):
     message: str = Field(min_length=1, max_length=100_000)
+
+
+class SalesAnalysisSettingsPayload(BaseModel):
+    defaultPeriodDays: Literal[7, 30, 60, 90] = 30
+    defaultRankingLimit: int = Field(default=10, ge=5, le=100)
+    defaultMetric: Literal[
+        "effectiveUnits",
+        "orderedUnits",
+        "effectiveSalesAmount",
+        "orderCount",
+    ] = "effectiveUnits"
+    defaultGrain: Literal["day", "week", "month"] = "day"
+    answerDetailLevel: Literal[
+        "concise",
+        "standard",
+        "detailed",
+    ] = "standard"
+    prioritizeAdjustmentRisk: bool = True
+    showDataUpdatedAt: bool = True
+    showMetricDefinition: bool = True
+    customBusinessInstructions: str = Field(default="", max_length=4000)
 
 
 class ListingTaskPayload(BaseModel):
@@ -898,6 +923,54 @@ def _raise_sales_analysis_http_error(exc: Exception) -> None:
         status_code=400,
         detail="销量分析操作失败，请稍后重试。",
     ) from exc
+
+
+@router.get("/settings/sales-analysis")
+def get_sales_analysis_settings(
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    return {
+        "settings": sales_analysis_settings_service.get_settings(
+            user["username"]
+        )
+    }
+
+
+@router.put("/settings/sales-analysis")
+def update_sales_analysis_settings(
+    payload: SalesAnalysisSettingsPayload,
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        settings_payload = (
+            sales_analysis_settings_service.update_settings(
+                user["username"],
+                payload,
+            )
+        )
+        return {"settings": settings_payload}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/settings/sales-analysis/capabilities")
+def get_sales_analysis_capabilities(
+    _: dict = Depends(require_ai_permission),
+) -> dict:
+    return {
+        "capabilities": (
+            sales_analysis_settings_service.capability_catalog()
+        )
+    }
+
+
+@router.get("/settings/sales-analysis/constraints")
+def get_sales_analysis_constraints(
+    _: dict = Depends(require_ai_permission),
+) -> dict:
+    return {
+        "constraints": sales_analysis_settings_service.constraint_catalog()
+    }
 
 
 @router.get("/sales-analysis/stores")

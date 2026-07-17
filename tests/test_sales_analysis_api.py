@@ -152,6 +152,10 @@ def _add_store(
 
 def test_sales_analysis_routes_require_ai_manage_permission() -> None:
     expected = {
+        ("GET", "/crawler/settings/sales-analysis"),
+        ("PUT", "/crawler/settings/sales-analysis"),
+        ("GET", "/crawler/settings/sales-analysis/capabilities"),
+        ("GET", "/crawler/settings/sales-analysis/constraints"),
         ("GET", "/crawler/sales-analysis/stores"),
         ("GET", "/crawler/sales-analysis/sync-state"),
         ("POST", "/crawler/sales-analysis/sync"),
@@ -175,7 +179,10 @@ def test_sales_analysis_routes_require_ai_manage_permission() -> None:
         route
         for route in crawler_api.router.routes
         if isinstance(route, APIRoute)
-        and route.path.startswith("/crawler/sales-analysis")
+        and (
+            route.path.startswith("/crawler/sales-analysis")
+            or route.path.startswith("/crawler/settings/sales-analysis")
+        )
     ]
     actual = {
         (method, route.path)
@@ -196,6 +203,130 @@ def test_sales_analysis_routes_require_ai_manage_permission() -> None:
         }
     ).get("/crawler/sales-analysis/stores")
     assert response.status_code == 403
+
+
+def test_sales_analysis_settings_api_uses_current_user_and_ignores_payload_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, Any]] = []
+    saved = {
+        "defaultPeriodDays": 60,
+        "defaultRankingLimit": 25,
+        "defaultMetric": "orderCount",
+        "defaultGrain": "week",
+        "answerDetailLevel": "detailed",
+        "prioritizeAdjustmentRisk": False,
+        "showDataUpdatedAt": True,
+        "showMetricDefinition": False,
+        "customBusinessInstructions": "Focus on repeat purchases.",
+    }
+
+    def get_settings(owner_username: str) -> dict[str, Any]:
+        calls.append(("get", owner_username))
+        return saved
+
+    def update_settings(
+        owner_username: str,
+        payload: Any,
+    ) -> dict[str, Any]:
+        calls.append(("put", owner_username, payload.defaultRankingLimit))
+        return saved
+
+    monkeypatch.setattr(
+        crawler_api.sales_analysis_settings_service,
+        "get_settings",
+        get_settings,
+    )
+    monkeypatch.setattr(
+        crawler_api.sales_analysis_settings_service,
+        "update_settings",
+        update_settings,
+    )
+    client = _client(AI_USER)
+
+    get_response = client.get("/crawler/settings/sales-analysis")
+    put_response = client.put(
+        "/crawler/settings/sales-analysis",
+        json={
+            **saved,
+            "ownerUsername": "other-owner",
+        },
+    )
+
+    assert get_response.status_code == 200
+    assert get_response.json() == {"settings": saved}
+    assert put_response.status_code == 200
+    assert put_response.json() == {"settings": saved}
+    assert calls == [
+        ("get", "owner-a"),
+        ("put", "owner-a", 25),
+    ]
+
+
+def test_sales_analysis_settings_api_validates_payload_boundaries() -> None:
+    payload = {
+        "defaultPeriodDays": 30,
+        "defaultRankingLimit": 10,
+        "defaultMetric": "effectiveUnits",
+        "defaultGrain": "day",
+        "answerDetailLevel": "standard",
+        "prioritizeAdjustmentRisk": True,
+        "showDataUpdatedAt": True,
+        "showMetricDefinition": True,
+        "customBusinessInstructions": "",
+    }
+    client = _client(AI_USER)
+
+    assert client.put(
+        "/crawler/settings/sales-analysis",
+        json={**payload, "defaultPeriodDays": 14},
+    ).status_code == 422
+    assert client.put(
+        "/crawler/settings/sales-analysis",
+        json={**payload, "defaultRankingLimit": 101},
+    ).status_code == 422
+    assert client.put(
+        "/crawler/settings/sales-analysis",
+        json={**payload, "customBusinessInstructions": "x" * 4001},
+    ).status_code == 422
+
+
+def test_sales_analysis_catalog_api_is_get_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        crawler_api.sales_analysis_settings_service,
+        "capability_catalog",
+        lambda: [{"title": "排行"}],
+    )
+    monkeypatch.setattr(
+        crawler_api.sales_analysis_settings_service,
+        "constraint_catalog",
+        lambda: [{"key": "dataPermissions", "items": ["仅本人店铺"]}],
+    )
+    client = _client(AI_USER)
+
+    capabilities = client.get(
+        "/crawler/settings/sales-analysis/capabilities"
+    )
+    constraints = client.get(
+        "/crawler/settings/sales-analysis/constraints"
+    )
+
+    assert capabilities.json() == {"capabilities": [{"title": "排行"}]}
+    assert constraints.json() == {
+        "constraints": [
+            {"key": "dataPermissions", "items": ["仅本人店铺"]}
+        ]
+    }
+    assert client.put(
+        "/crawler/settings/sales-analysis/capabilities",
+        json={},
+    ).status_code == 405
+    assert client.put(
+        "/crawler/settings/sales-analysis/constraints",
+        json={},
+    ).status_code == 405
 
 
 def test_list_sales_analysis_stores_uses_current_tenant(
