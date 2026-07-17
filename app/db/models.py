@@ -317,7 +317,11 @@ class UserSalesAnalysisModelSettingsModel(TimestampMixin, Base):
 
     owner_username: Mapped[str] = mapped_column(
         String(255),
-        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_user_sales_analysis_model_settings_owner_user",
+        ),
         primary_key=True,
     )
     provider: Mapped[str] = mapped_column(
