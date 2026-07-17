@@ -6,6 +6,7 @@ import re
 import unicodedata
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from sqlalchemy import func, select
@@ -497,8 +498,17 @@ _MODEL_NUMERIC_CLAIM_RE = re.compile(
     r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[-+]?\d+)?%?",
     re.IGNORECASE,
 )
-_UNSUPPORTED_QUALITATIVE_CLAIM_RE = re.compile(
-    r"第一名|遥遥领先|表现最好|增长明显|非常严重"
+_MODEL_COMPLETION_ACK_RE = re.compile(
+    r"^(?:(?:的)?(?:近期有效销量|受控|趋势|受控上下文)?"
+    r"(?:分析完成|完成分析|已完成分析)|"
+    r"已确认店铺范围|已根据受控排行结果完成分析)[。.!！]?$"
+)
+_MODEL_FACTUAL_CLAIM_ALLOWED_TEXT_RE = re.compile(
+    r"^(?:的|为|是|约|共|合计|其中|有效销量|下单数量|取消数量|"
+    r"退款数量|退货数量|销售额|有效销售额|订单数|订单数量|"
+    r"商品数|SKU数|件|单|元|日元|JPY|，|,|。|\.|：|:|"
+    r"；|;|\s)*$",
+    re.IGNORECASE,
 )
 
 
@@ -569,6 +579,75 @@ def _iter_scalar_values(value: Any) -> Iterator[Any]:
             yield from _iter_scalar_values(child)
         return
     yield value
+
+
+def _canonical_numeric(value: Any) -> tuple[Decimal, bool] | None:
+    if isinstance(value, bool):
+        return None
+    normalized_value = unicodedata.normalize("NFKC", str(value))
+    is_percent = normalized_value.endswith("%")
+    try:
+        decimal_value = Decimal(normalized_value.rstrip("%"))
+    except (InvalidOperation, ValueError):
+        return None
+    if not decimal_value.is_finite():
+        return None
+    return decimal_value.normalize(), is_percent
+
+
+def _supported_model_answer(
+    content: Any,
+    selected_store: dict[str, Any],
+    tool_records: list[dict[str, Any]],
+) -> bool:
+    normalized_content = unicodedata.normalize(
+        "NFKC",
+        str(content or ""),
+    ).strip()
+    if not normalized_content:
+        return True
+
+    known_text_values = {
+        str(selected_store.get("name") or ""),
+        *(
+            str(value)
+            for record in tool_records
+            for value in _iter_scalar_values(record["result"])
+            if isinstance(value, str)
+        ),
+    }
+    claim_text = normalized_content
+    for known_value in sorted(
+        (
+            unicodedata.normalize("NFKC", value)
+            for value in known_text_values
+            if value
+        ),
+        key=len,
+        reverse=True,
+    ):
+        claim_text = claim_text.replace(known_value, "")
+    claim_text = claim_text.strip()
+    if _MODEL_COMPLETION_ACK_RE.fullmatch(claim_text):
+        return True
+
+    supported_numbers = {
+        canonical
+        for record in tool_records
+        for value in _iter_scalar_values(record["result"])
+        if (canonical := _canonical_numeric(value)) is not None
+        and not isinstance(value, str)
+    }
+    numeric_matches = list(_MODEL_NUMERIC_CLAIM_RE.finditer(claim_text))
+    if not numeric_matches:
+        return False
+    for match in numeric_matches:
+        if _canonical_numeric(match.group()) not in supported_numbers:
+            return False
+    residual_text = _MODEL_NUMERIC_CLAIM_RE.sub("", claim_text)
+    return bool(
+        _MODEL_FACTUAL_CLAIM_ALLOWED_TEXT_RE.fullmatch(residual_text)
+    )
 
 
 def _timestamp_to_public(value: datetime | None) -> str | None:
@@ -1147,9 +1226,9 @@ def _start_turn(
             model_name="",
             store_scope_json=_json_dump(store_scope),
             statistics_window_json="{}",
-            status="pending",
-            error_code="",
-            error_message="",
+            status="error",
+            error_code="analysis_interrupted",
+            error_message="分析已中断，请重新提问。",
         )
         session.add(message_row)
         session.flush()
@@ -1919,6 +1998,33 @@ def _fail_message(
     )
 
 
+def _persist_final_processing_error(
+    *,
+    owner_username: str,
+    conversation_id: int,
+    message_id: int,
+    model_name: str,
+    error_message: str,
+) -> None:
+    with session_scope() as session:
+        row = session.scalar(
+            select(SalesAnalysisMessageModel).where(
+                SalesAnalysisMessageModel.id == message_id,
+                SalesAnalysisMessageModel.conversation_id
+                == conversation_id,
+                SalesAnalysisMessageModel.owner_username == owner_username,
+            )
+        )
+        if row is None:
+            raise LookupError("会话消息不存在或无权访问。")
+        row.answer_text = ""
+        row.model_name = model_name
+        row.status = "error"
+        row.error_code = "answer_processing_error"
+        row.error_message = error_message
+        session.flush()
+
+
 def _clarification_answer(
     stores: list[dict[str, Any]],
     *,
@@ -2310,33 +2416,10 @@ def _ground_final_answer(
     owner_username: str,
     secrets: tuple[str, ...],
 ) -> tuple[str | None, bool]:
-    normalized_content = unicodedata.normalize(
-        "NFKC",
-        str(content or ""),
-    )
-    known_text_values = {
-        str(selected_store.get("name") or ""),
-        *(
-            str(value)
-            for record in tool_records
-            for value in _iter_scalar_values(record["result"])
-            if isinstance(value, str)
-        ),
-    }
-    claim_text = normalized_content
-    for known_value in sorted(
-        (
-            unicodedata.normalize("NFKC", value)
-            for value in known_text_values
-            if value
-        ),
-        key=len,
-        reverse=True,
-    ):
-        claim_text = claim_text.replace(known_value, "")
-    if (
-        _MODEL_NUMERIC_CLAIM_RE.search(claim_text)
-        or _UNSUPPORTED_QUALITATIVE_CLAIM_RE.search(claim_text)
+    if not _supported_model_answer(
+        content,
+        selected_store,
+        tool_records,
     ):
         return None, False
     return (
@@ -2533,45 +2616,57 @@ def stream_analysis(
                 )
                 yield {"type": "error", "message": answer}
                 return
-            sanitized_answer, fallback = _ground_final_answer(
-                content,
-                selected_store,
-                relative_window,
-                tool_records,
-                owner_username=normalized_owner,
-                secrets=redaction_secrets,
-            )
-            if _analysis_cancelled(is_cancelled):
-                return
-            if sanitized_answer is None:
-                answer = "AI 回答未通过事实校验，请重试。"
-                failed = _fail_message(
+            try:
+                sanitized_answer, fallback = _ground_final_answer(
+                    content,
+                    selected_store,
+                    relative_window,
+                    tool_records,
+                    owner_username=normalized_owner,
+                    secrets=redaction_secrets,
+                )
+                if _analysis_cancelled(is_cancelled):
+                    return
+                if sanitized_answer is None:
+                    answer = "AI 回答未通过事实校验，请重试。"
+                    _fail_message(
+                        owner_username=normalized_owner,
+                        conversation_id=conversation_id,
+                        message_id=message_id,
+                        error_code="answer_validation_error",
+                        error_message=answer,
+                        model_name=model_name,
+                        selected_store_id=selected_store["id"],
+                        relative_window=relative_window,
+                        tool_records=tool_records,
+                    )
+                    yield {
+                        "type": "error",
+                        "message": answer,
+                    }
+                    return
+                persisted = _finalize_message(
                     owner_username=normalized_owner,
                     conversation_id=conversation_id,
                     message_id=message_id,
-                    error_code="answer_validation_error",
-                    error_message=answer,
+                    answer=sanitized_answer,
                     model_name=model_name,
                     selected_store_id=selected_store["id"],
                     relative_window=relative_window,
                     tool_records=tool_records,
+                    fallback=fallback,
                 )
-                yield {
-                    "type": "error",
-                    "message": answer,
-                }
+            except Exception:
+                answer = "AI 最终回答处理失败，请稍后重试。"
+                _persist_final_processing_error(
+                    owner_username=normalized_owner,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    model_name=model_name,
+                    error_message=answer,
+                )
+                yield {"type": "error", "message": answer}
                 return
-            persisted = _finalize_message(
-                owner_username=normalized_owner,
-                conversation_id=conversation_id,
-                message_id=message_id,
-                answer=sanitized_answer,
-                model_name=model_name,
-                selected_store_id=selected_store["id"],
-                relative_window=relative_window,
-                tool_records=tool_records,
-                fallback=fallback,
-            )
             yield {"type": "delta", "content": persisted["answer"]}
             yield {"type": "completed", "message": persisted}
             return
