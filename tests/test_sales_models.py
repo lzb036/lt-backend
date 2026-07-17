@@ -796,7 +796,19 @@ def test_sales_analysis_message_status_fields_default_to_completed():
 
     assert columns.status.server_default.arg == "completed"
     assert columns.error_code.server_default.arg == ""
-    assert columns.error_message.server_default.arg == ""
+    assert columns.error_message.nullable is True
+    assert columns.error_message.server_default is None
+
+
+def test_mysql_sales_analysis_error_message_can_be_added_without_default():
+    ddl = str(
+        CreateColumn(
+            SalesAnalysisMessageModel.__table__.c.error_message
+        ).compile(dialect=mysql.dialect())
+    )
+
+    assert "TEXT" in ddl
+    assert "DEFAULT" not in ddl
 
 
 def test_ensure_table_layout_adds_sales_message_status_to_legacy_table():
@@ -864,7 +876,7 @@ def test_ensure_table_layout_adds_sales_message_status_to_legacy_table():
             "error_code",
             "error_message",
         }
-        assert row == ("completed", "", "")
+        assert row == ("completed", "", None)
     finally:
         legacy_engine.dispose()
 
