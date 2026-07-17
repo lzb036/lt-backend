@@ -38,6 +38,7 @@ from app.db.models import (
     SalesSyncStateModel,
     StoreModel,
     UserAccountModel,
+    UserSalesAnalysisSettingsModel,
 )
 
 
@@ -1807,6 +1808,17 @@ def test_mysql_longtext_column_ddl_does_not_require_a_server_default():
         CreateColumn(SalesOrderModel.__table__.c.raw_order_json).compile(
             dialect=mysql.dialect()
         )
+    )
+
+    assert "LONGTEXT NOT NULL" in ddl
+    assert "DEFAULT" not in ddl
+
+
+def test_mysql_sales_analysis_settings_longtext_has_no_server_default():
+    ddl = str(
+        CreateColumn(
+            UserSalesAnalysisSettingsModel.__table__.c.custom_business_instructions
+        ).compile(dialect=mysql.dialect())
     )
 
     assert "LONGTEXT NOT NULL" in ddl

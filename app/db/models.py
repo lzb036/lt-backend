@@ -376,7 +376,6 @@ class UserSalesAnalysisSettingsModel(TimestampMixin, Base):
         Text().with_variant(LONGTEXT(), "mysql"),
         nullable=False,
         default="",
-        server_default="",
     )
 
 
