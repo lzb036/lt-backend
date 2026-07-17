@@ -12,6 +12,7 @@ DEFAULT_RANKING_LIMIT = 10
 DEFAULT_METRIC = "effectiveUnits"
 DEFAULT_GRAIN = "day"
 DEFAULT_ANSWER_DETAIL_LEVEL = "standard"
+MAX_ORCHESTRATION_INSTRUCTIONS_CHARS = 1000
 DEFAULT_SETTINGS = {
     "defaultPeriodDays": DEFAULT_PERIOD_DAYS,
     "defaultRankingLimit": DEFAULT_RANKING_LIMIT,
@@ -231,6 +232,29 @@ def get_settings(owner_username: str) -> dict[str, Any]:
         if row is None:
             return dict(DEFAULT_SETTINGS)
         return _settings_to_public(row)
+
+
+def get_orchestration_settings(
+    owner_username: str,
+    *,
+    session: Any | None = None,
+) -> dict[str, Any]:
+    if session is None:
+        settings = get_settings(owner_username)
+    else:
+        row = session.get(
+            UserSalesAnalysisSettingsModel,
+            owner_username,
+        )
+        settings = (
+            dict(DEFAULT_SETTINGS)
+            if row is None
+            else _settings_to_public(row)
+        )
+    settings["customBusinessInstructions"] = str(
+        settings.get("customBusinessInstructions") or ""
+    )[:MAX_ORCHESTRATION_INSTRUCTIONS_CHARS]
+    return settings
 
 
 def update_settings(
