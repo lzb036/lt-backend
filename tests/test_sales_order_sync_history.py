@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -323,3 +323,258 @@ def test_delete_runs_never_deletes_another_owners_rows(
     with history_session_factory() as session:
         assert session.get(SalesOrderSyncRunModel, "run-a") is None
         assert session.get(SalesOrderSyncRunModel, "run-b") is not None
+
+
+def test_retry_run_creates_linked_retry_through_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    history_session_factory,
+) -> None:
+    with history_session_factory() as session:
+        store = _seed_owner(session, "owner-a", "a")
+        _add_run(
+            session,
+            run_id="failed-run",
+            owner_username="owner-a",
+            store=store,
+            status="failed",
+        )
+        session.commit()
+        store_id = store.id
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        sales_order_sync_history_service,
+        "_queue_sales_analysis_sync",
+        lambda owner, target_store_id, **kwargs: calls.append(
+            (owner, target_store_id, kwargs)
+        )
+        or {"id": "sales-1", "runId": "retry-run"},
+        raising=False,
+    )
+
+    result = sales_order_sync_history_service.retry_run(
+        "owner-a",
+        "failed-run",
+    )
+
+    assert result["runId"] == "retry-run"
+    assert calls == [
+        (
+            "owner-a",
+            store_id,
+            {
+                "trigger_type": "retry",
+                "parent_run_id": "failed-run",
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "success"])
+def test_retry_run_rejects_non_retryable_status(
+    monkeypatch: pytest.MonkeyPatch,
+    history_session_factory,
+    status: str,
+) -> None:
+    with history_session_factory() as session:
+        store = _seed_owner(session, "owner-a", "a")
+        _add_run(
+            session,
+            run_id="source-run",
+            owner_username="owner-a",
+            store=store,
+            status=status,
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        sales_order_sync_history_service,
+        "_queue_sales_analysis_sync",
+        lambda *_args, **_kwargs: pytest.fail("must reject before queue"),
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="重试"):
+        sales_order_sync_history_service.retry_run(
+            "owner-a",
+            "source-run",
+        )
+
+
+def test_cleanup_only_deletes_expired_success_rows(
+    history_session_factory,
+) -> None:
+    now = datetime(2026, 7, 17, 12, 0, 0)
+    with history_session_factory() as session:
+        store = _seed_owner(session, "owner-a", "a")
+        for run_id, status, finished_at in (
+            ("expired-success", "success", now - timedelta(days=31)),
+            ("recent-success", "success", now - timedelta(days=29)),
+            ("old-failed", "failed", now - timedelta(days=60)),
+            ("old-partial", "partial", now - timedelta(days=60)),
+        ):
+            row = _add_run(
+                session,
+                run_id=run_id,
+                owner_username="owner-a",
+                store=store,
+                status=status,
+            )
+            row.finished_at = finished_at
+        session.commit()
+
+    deleted = (
+        sales_order_sync_history_service.cleanup_successful_runs_if_due(
+            now=now,
+            force=True,
+        )
+    )
+
+    assert deleted == 1
+    with history_session_factory() as session:
+        remaining = set(
+            session.scalars(select(SalesOrderSyncRunModel.id)).all()
+        )
+    assert remaining == {
+        "recent-success",
+        "old-failed",
+        "old-partial",
+    }
+
+
+def test_stale_queued_and_running_runs_are_recovered_as_failed(
+    history_session_factory,
+) -> None:
+    now = datetime(2026, 7, 17, 12, 0, 0)
+    with history_session_factory() as session:
+        store = _seed_owner(session, "owner-a", "a")
+        for run_id, status, updated_at in (
+            ("stale-queued", "queued", now - timedelta(minutes=11)),
+            ("stale-running", "running", now - timedelta(minutes=11)),
+            ("active-running", "running", now - timedelta(minutes=9)),
+        ):
+            row = _add_run(
+                session,
+                run_id=run_id,
+                owner_username="owner-a",
+                store=store,
+                status=status,
+            )
+            row.updated_at = updated_at
+        session.commit()
+
+    recovered = sales_order_sync_history_service.recover_stale_runs(
+        now=now,
+        stale_after=timedelta(minutes=10),
+    )
+
+    assert recovered == 2
+    with history_session_factory() as session:
+        rows = {
+            row.id: row
+            for row in session.scalars(
+                select(SalesOrderSyncRunModel)
+            ).all()
+        }
+    assert rows["stale-queued"].status == "failed"
+    assert rows["stale-running"].status == "failed"
+    assert rows["stale-running"].finished_at == now
+    assert rows["active-running"].status == "running"
+
+
+def test_history_heartbeat_refreshes_running_run_without_progress(
+    history_session_factory,
+) -> None:
+    with history_session_factory() as session:
+        store = _seed_owner(session, "owner-a", "a")
+        row = _add_run(
+            session,
+            run_id="running-run",
+            owner_username="owner-a",
+            store=store,
+            status="running",
+            created_at=datetime(2026, 7, 17, 8, 0, 0),
+        )
+        row.updated_at = datetime(2026, 7, 17, 8, 0, 0)
+        session.commit()
+
+    sales_order_sync_history_service.update_run_progress(
+        "owner-a",
+        "running-run",
+        progress_current=None,
+        progress_total=None,
+    )
+
+    with history_session_factory() as session:
+        row = session.get(SalesOrderSyncRunModel, "running-run")
+    assert row is not None
+    assert row.updated_at > datetime(2026, 7, 17, 8, 0, 0)
+    assert row.progress_current == 0
+    assert row.progress_total == 0
+
+
+def test_complete_run_marks_mixed_result_partial(
+    history_session_factory,
+) -> None:
+    with history_session_factory() as session:
+        store = _seed_owner(session, "owner-a", "a")
+        _add_run(
+            session,
+            run_id="partial-run",
+            owner_username="owner-a",
+            store=store,
+            status="running",
+        )
+        session.commit()
+
+    sales_order_sync_history_service.complete_run(
+        "owner-a",
+        "partial-run",
+        {
+            "totalOrderCount": 5,
+            "newOrderCount": 2,
+            "updatedOrderCount": 1,
+            "unchangedOrderCount": 1,
+            "failedOrderCount": 1,
+        },
+    )
+
+    with history_session_factory() as session:
+        row = session.get(SalesOrderSyncRunModel, "partial-run")
+    assert row is not None
+    assert row.status == "partial"
+    assert row.total_order_count == 5
+    assert row.failed_order_count == 1
+
+
+def test_complete_run_marks_all_failed_result_failed(
+    history_session_factory,
+) -> None:
+    with history_session_factory() as session:
+        store = _seed_owner(session, "owner-a", "a")
+        _add_run(
+            session,
+            run_id="failed-result",
+            owner_username="owner-a",
+            store=store,
+            status="running",
+        )
+        session.commit()
+
+    sales_order_sync_history_service.complete_run(
+        "owner-a",
+        "failed-result",
+        {
+            "totalOrderCount": 3,
+            "newOrderCount": 0,
+            "updatedOrderCount": 0,
+            "unchangedOrderCount": 0,
+            "failedOrderCount": 3,
+        },
+    )
+
+    with history_session_factory() as session:
+        row = session.get(SalesOrderSyncRunModel, "failed-result")
+    assert row is not None
+    assert row.status == "failed"
+    assert row.message == "订单同步失败，请稍后重试。"

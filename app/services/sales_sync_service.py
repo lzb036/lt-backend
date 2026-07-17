@@ -25,7 +25,10 @@ from app.db.models import (
     bounded_sales_order_item_product_key,
     canonical_sales_order_item_product_key,
 )
-from app.services import rakuten_order_service
+from app.services import (
+    rakuten_order_service,
+    sales_order_sync_history_service,
+)
 from app.services.sales_time import (
     iso_sales_datetime,
     sales_now_naive,
@@ -112,11 +115,13 @@ class _PeriodicLeaseHeartbeat:
         store_id: int,
         lease_status: str,
         *,
+        run_id: str | None = None,
         interval_seconds: float | None = None,
     ) -> None:
         self.owner_username = owner_username
         self.store_id = store_id
         self.lease_status = lease_status
+        self.run_id = run_id
         self.interval_seconds = max(
             0.001,
             float(
@@ -179,12 +184,17 @@ class _PeriodicLeaseHeartbeat:
         with self._lock:
             progress_current = self._progress_current
             progress_total = self._progress_total
+        heartbeat_kwargs = {
+            "progress_current": progress_current,
+            "progress_total": progress_total,
+        }
+        if self.run_id is not None:
+            heartbeat_kwargs["run_id"] = self.run_id
         _heartbeat_lease_in_new_transaction(
             self.owner_username,
             self.store_id,
             self.lease_status,
-            progress_current=progress_current,
-            progress_total=progress_total,
+            **heartbeat_kwargs,
         )
 
     def raise_if_failed(self) -> None:
@@ -287,6 +297,7 @@ def sync_owned_store(
     store_id: int,
     *,
     initial_days: int = 90,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_owner = _text(owner_username)
     normalized_store_id = int(store_id)
@@ -343,6 +354,12 @@ def sync_owned_store(
             encrypted_license_key = store.rakuten_license_key_encrypted
 
     if not acquired:
+        if run_id is not None:
+            sales_order_sync_history_service.fail_run(
+                normalized_owner,
+                run_id,
+                message="店铺已有订单同步任务正在执行。",
+            )
         with session_scope() as session:
             state = session.scalar(
                 _active_sync_state_statement(
@@ -361,12 +378,19 @@ def sync_owned_store(
         else normalized_initial_days
     )
     start_at = now - timedelta(days=search_days)
-
+    order_numbers: list[str] = []
     try:
+        if run_id is not None:
+            sales_order_sync_history_service.mark_run_running(
+                normalized_owner,
+                run_id,
+                initial_sync=not initial_sync_completed,
+            )
         with _PeriodicLeaseHeartbeat(
             normalized_owner,
             normalized_store_id,
             lease_status,
+            run_id=run_id,
         ) as heartbeat:
             service_secret = decrypt_text(encrypted_service_secret)
             license_key = decrypt_text(encrypted_license_key)
@@ -431,6 +455,9 @@ def sync_owned_store(
                 last_remote_updated_at = state.last_remote_updated_at
                 stale_order_count = 0
                 incomplete_order_count = 0
+                new_order_count = 0
+                updated_order_count = 0
+                unchanged_order_count = 0
                 for index, order_payload in enumerate(orders, start=1):
                     heartbeat.raise_if_failed()
                     try:
@@ -446,6 +473,12 @@ def sync_owned_store(
                         affected_dates.update(outcome.affected_dates)
                         if outcome.disposition == "stale":
                             stale_order_count += 1
+                        if outcome.disposition == "new":
+                            new_order_count += 1
+                        elif outcome.disposition == "updated":
+                            updated_order_count += 1
+                        else:
+                            unchanged_order_count += 1
                         remote_updated_at = outcome.remote_updated_at
                         if (
                             remote_updated_at is not None
@@ -514,11 +547,23 @@ def sync_owned_store(
                     {
                         "status": "completed",
                         "orderCount": len(orders),
+                        "totalOrderCount": len(orders),
+                        "newOrderCount": new_order_count,
+                        "updatedOrderCount": updated_order_count,
+                        "unchangedOrderCount": unchanged_order_count,
+                        "failedOrderCount": incomplete_order_count,
                         "affectedDateCount": len(affected_dates),
                         "staleOrderCount": stale_order_count,
                         "incompleteOrderCount": incomplete_order_count,
                     }
                 )
+                if run_id is not None:
+                    sales_order_sync_history_service.complete_run_in_session(
+                        session,
+                        normalized_owner,
+                        run_id,
+                        result,
+                    )
                 return result
     except Exception:
         with session_scope() as session:
@@ -535,6 +580,12 @@ def sync_owned_store(
                     last_error="销量同步失败，请稍后重试。",
                     updated_at=failed_at,
                 )
+            )
+        if run_id is not None:
+            sales_order_sync_history_service.fail_run(
+                normalized_owner,
+                run_id,
+                failed_order_count=len(order_numbers),
             )
         raise
 
@@ -830,6 +881,7 @@ def _heartbeat_lease_in_new_transaction(
     *,
     progress_current: int | None = None,
     progress_total: int | None = None,
+    run_id: str | None = None,
 ) -> None:
     with session_scope() as session:
         _require_lease_heartbeat(
@@ -841,6 +893,14 @@ def _heartbeat_lease_in_new_transaction(
             progress_current=progress_current,
             progress_total=progress_total,
         )
+        if run_id is not None:
+            sales_order_sync_history_service.update_run_progress_in_session(
+                session,
+                owner_username,
+                run_id,
+                progress_current=progress_current,
+                progress_total=progress_total,
+            )
 
 
 def rebuild_daily_sales(
@@ -974,6 +1034,7 @@ def _reconcile_order_snapshot(
             SalesOrderModel.order_number == order_number,
         )
     )
+    order_was_new = order is None
     if (
         order is not None
         and order.updated_at_remote is not None
@@ -1382,7 +1443,7 @@ def _reconcile_order_snapshot(
     return ReconcileOutcome(
         affected_dates=affected_dates,
         remote_updated_at=remote_updated_at,
-        disposition="applied",
+        disposition=("new" if order_was_new else "updated"),
     )
 
 

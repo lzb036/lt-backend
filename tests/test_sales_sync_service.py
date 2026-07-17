@@ -18,11 +18,12 @@ from app.db.models import (
     SalesItemAdjustmentModel,
     SalesOrderItemModel,
     SalesOrderModel,
+    SalesOrderSyncRunModel,
     SalesSyncStateModel,
     StoreModel,
     UserAccountModel,
 )
-from app.services import sales_sync_service
+from app.services import sales_order_sync_history_service, sales_sync_service
 
 
 @pytest.fixture()
@@ -129,6 +130,11 @@ def patch_local_sync_dependencies(
             session.close()
 
     monkeypatch.setattr(sales_sync_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(
+        sales_order_sync_history_service,
+        "session_scope",
+        local_session_scope,
+    )
     monkeypatch.setattr(sales_sync_service, "decrypt_text", lambda value: value)
     monkeypatch.setattr(
         sales_sync_service.rakuten_order_service,
@@ -1406,6 +1412,16 @@ def test_syncing_same_snapshot_twice_is_idempotent(
 
     assert first["status"] == "completed"
     assert second["status"] == "completed"
+    assert first["totalOrderCount"] == 1
+    assert first["newOrderCount"] == 1
+    assert first["updatedOrderCount"] == 0
+    assert first["unchangedOrderCount"] == 0
+    assert first["failedOrderCount"] == 0
+    assert second["totalOrderCount"] == 1
+    assert second["newOrderCount"] == 0
+    assert second["updatedOrderCount"] == 0
+    assert second["unchangedOrderCount"] == 1
+    assert second["failedOrderCount"] == 0
     assert item.ordered_units == 5
     assert item.latest_units == 5
     assert item.product_key == sales_sync_service._daily_product_key(item)
@@ -1416,6 +1432,49 @@ def test_syncing_same_snapshot_twice_is_idempotent(
     assert daily.refunded_units == 2
     assert daily.effective_units == 3
     assert daily.order_count == 1
+
+
+def test_sync_owned_store_updates_linked_history_run(
+    monkeypatch,
+    session_factory,
+):
+    with session_factory() as session:
+        store = seed_store(session)
+        run = SalesOrderSyncRunModel(
+            id="run-1",
+            owner_username="alice",
+            store_id=store.id,
+            store_name=store.store_name,
+            trigger_type="manual",
+            status="queued",
+        )
+        session.add(run)
+        store_id = store.id
+        session.commit()
+
+    patch_local_sync_dependencies(
+        monkeypatch,
+        session_factory,
+        [order_snapshot()],
+    )
+
+    result = sales_sync_service.sync_owned_store(
+        "alice",
+        store_id,
+        run_id="run-1",
+    )
+
+    with session_factory() as session:
+        run = session.get(SalesOrderSyncRunModel, "run-1")
+    assert result["newOrderCount"] == 1
+    assert run is not None
+    assert run.status == "success"
+    assert run.initial_sync is True
+    assert run.progress_current == 1
+    assert run.progress_total == 1
+    assert run.total_order_count == 1
+    assert run.new_order_count == 1
+    assert run.finished_at is not None
 
 
 def test_fallback_line_ids_survive_reordering_of_different_lines(

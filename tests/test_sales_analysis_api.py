@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -23,6 +23,7 @@ from app.core.auth import require_authenticated_account
 from app.db.database import Base
 from app.db.models import (
     SalesAnalysisMessageModel,
+    SalesOrderSyncRunModel,
     SalesSyncStateModel,
     StoreModel,
     UserAccountModel,
@@ -30,6 +31,7 @@ from app.db.models import (
 from app.services import (
     crawler_service,
     sales_ai_service,
+    sales_order_sync_history_service,
     sales_sync_service,
 )
 
@@ -109,6 +111,11 @@ def sales_session_factory(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(crawler_service, "session_scope", _session_scope)
     monkeypatch.setattr(sales_ai_service, "session_scope", _session_scope)
     monkeypatch.setattr(sales_sync_service, "session_scope", _session_scope)
+    monkeypatch.setattr(
+        sales_order_sync_history_service,
+        "session_scope",
+        _session_scope,
+    )
     try:
         yield factory
     finally:
@@ -170,6 +177,10 @@ def test_sales_analysis_routes_require_ai_manage_permission() -> None:
         ("POST", "/crawler/sales-analysis/conversations"),
         ("GET", "/crawler/sales-analysis/order-sync-runs"),
         ("DELETE", "/crawler/sales-analysis/order-sync-runs"),
+        (
+            "POST",
+            "/crawler/sales-analysis/order-sync-runs/{run_id}/retry",
+        ),
         (
             "DELETE",
             "/crawler/sales-analysis/conversations/{conversation_id}",
@@ -345,6 +356,29 @@ def test_sales_order_sync_history_api_uses_current_owner(
     assert calls[0][2]["trigger_type"] == "manual"
     assert calls[0][2]["status"] == "failed"
     assert calls[1] == ("delete", "root", ["run-1"])
+
+
+def test_sales_order_sync_retry_api_uses_current_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        crawler_api.sales_order_sync_history_service,
+        "retry_run",
+        lambda owner, run_id: calls.append((owner, run_id))
+        or {"id": "sales-7", "runId": "retry-7"},
+        raising=False,
+    )
+
+    response = _client(AI_USER).post(
+        "/crawler/sales-analysis/order-sync-runs/source-7/retry"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "syncTask": {"id": "sales-7", "runId": "retry-7"}
+    }
+    assert calls == [("owner-a", "source-7")]
 
 
 def test_sales_analysis_settings_api_uses_current_user_and_ignores_payload_owner(
@@ -1664,6 +1698,18 @@ def test_sales_sync_due_threshold_and_active_states() -> None:
         now=now,
         state_updated_at=stale_at - timedelta(seconds=1),
     )
+    assert not crawler_service.sales_analysis_sync_is_due(
+        now - timedelta(minutes=59),
+        "idle",
+        now=now,
+        interval=timedelta(minutes=60),
+    )
+    assert crawler_service.sales_analysis_sync_is_due(
+        now - timedelta(minutes=60),
+        "idle",
+        now=now,
+        interval=timedelta(minutes=60),
+    )
 
 
 def test_due_sales_sync_candidates_are_batched_and_deterministic(
@@ -2042,6 +2088,7 @@ def test_non_redis_sales_sync_dispatch_uses_bounded_executor(
     crawler_service.dispatch_sales_analysis_sync_task(
         "owner-a",
         7,
+        "run-7",
     )
 
     assert submitted == [
@@ -2049,6 +2096,7 @@ def test_non_redis_sales_sync_dispatch_uses_bounded_executor(
             crawler_service.run_sales_analysis_sync_task,
             "owner-a",
             7,
+            "run-7",
         )
     ]
 
@@ -2090,12 +2138,12 @@ def test_manual_sales_sync_recovers_stale_running_state(
         session.commit()
         store_id = store.id
 
-    dispatched: list[tuple[str, int]] = []
+    dispatched: list[tuple[str, int, str]] = []
     monkeypatch.setattr(
         crawler_service,
         "dispatch_sales_analysis_sync_task",
-        lambda owner, target_store_id: dispatched.append(
-            (owner, target_store_id)
+        lambda owner, target_store_id, run_id: dispatched.append(
+            (owner, target_store_id, run_id)
         ),
     )
 
@@ -2108,9 +2156,53 @@ def test_manual_sales_sync_recovers_stale_running_state(
         state = session.get(SalesSyncStateModel, store_id)
     assert result["status"] == "queued"
     assert result["alreadyRunning"] is False
-    assert dispatched == [("manual-recovery-owner", store_id)]
+    assert len(dispatched) == 1
+    assert dispatched[0][0:2] == ("manual-recovery-owner", store_id)
     assert state is not None
     assert state.sync_status == "queued"
+    assert result["runId"] == dispatched[0][2]
+    with sales_session_factory() as session:
+        run = session.get(SalesOrderSyncRunModel, result["runId"])
+    assert run is not None
+    assert run.trigger_type == "manual"
+    assert run.status == "queued"
+
+
+def test_retry_sales_sync_rejects_active_store_without_new_run(
+    sales_session_factory,
+) -> None:
+    now = crawler_service.sales_now_naive()
+    with sales_session_factory() as session:
+        _add_user(session, "retry-active-owner")
+        store = _add_store(
+            session,
+            "retry-active-owner",
+            "retry-active",
+        )
+        session.add(
+            SalesSyncStateModel(
+                owner_username="retry-active-owner",
+                store_id=store.id,
+                sync_status="running:active",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+        store_id = store.id
+
+    with pytest.raises(ValueError, match="正在执行"):
+        crawler_service.queue_sales_analysis_sync(
+            "retry-active-owner",
+            store_id,
+            trigger_type="retry",
+            parent_run_id="source-run",
+        )
+
+    with sales_session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(SalesOrderSyncRunModel)
+        ) == 0
 
 
 def test_sales_sync_state_timestamps_have_explicit_shanghai_offset() -> None:
@@ -2141,12 +2233,36 @@ def test_scheduled_sales_sync_continues_after_one_store_fails(
     queued: list[tuple[str, int]] = []
     monkeypatch.setattr(
         crawler_service,
+        "sales_order_sync_history_service",
+        SimpleNamespace(
+            get_global_settings=lambda: {
+                "enabled": True,
+                "intervalMinutes": 30,
+                "successRetentionDays": 30,
+            },
+            recover_stale_runs=lambda **_kwargs: 0,
+            cleanup_successful_runs_if_due=lambda **_kwargs: 0,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        crawler_service,
         "sales_analysis_sync_due_candidates",
-        lambda _now: [("owner-a", 1), ("owner-b", 2), ("owner-c", 3)],
+        lambda _now, **_kwargs: [
+            ("owner-a", 1),
+            ("owner-b", 2),
+            ("owner-c", 3),
+        ],
         raising=False,
     )
 
-    def queue(owner_username: str, store_id: int) -> dict[str, Any]:
+    def queue(
+        owner_username: str,
+        store_id: int,
+        *,
+        trigger_type: str,
+    ) -> dict[str, Any]:
+        assert trigger_type == "automatic"
         if store_id == 1:
             raise RuntimeError("first store failed")
         queued.append((owner_username, store_id))
@@ -2163,6 +2279,62 @@ def test_scheduled_sales_sync_continues_after_one_store_fails(
     assert queued == [("owner-b", 2), ("owner-c", 3)]
 
 
+def test_disabled_global_sales_sync_skips_automatic_but_not_manual(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        crawler_service,
+        "sales_order_sync_history_service",
+        SimpleNamespace(
+            get_global_settings=lambda: {
+                "enabled": False,
+                "intervalMinutes": 60,
+                "successRetentionDays": 30,
+            },
+            recover_stale_runs=lambda **_kwargs: 0,
+            cleanup_successful_runs_if_due=lambda **_kwargs: 0,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "sales_analysis_sync_due_candidates",
+        lambda *_args, **_kwargs: pytest.fail(
+            "disabled automatic sync must not query candidates"
+        ),
+    )
+
+    assert crawler_service.run_due_sales_analysis_syncs_once() == 0
+
+
+def test_scheduler_uses_dynamic_global_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[timedelta] = []
+    monkeypatch.setattr(
+        crawler_service,
+        "sales_order_sync_history_service",
+        SimpleNamespace(
+            get_global_settings=lambda: {
+                "enabled": True,
+                "intervalMinutes": 75,
+                "successRetentionDays": 30,
+            },
+            recover_stale_runs=lambda **_kwargs: 0,
+            cleanup_successful_runs_if_due=lambda **_kwargs: 0,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "sales_analysis_sync_due_candidates",
+        lambda _now, *, interval: captured.append(interval) or [],
+    )
+
+    assert crawler_service.run_due_sales_analysis_syncs_once() == 0
+    assert captured == [timedelta(minutes=75)]
+
+
 def test_sales_sync_worker_reuses_task_3_lease_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2171,16 +2343,16 @@ def test_sales_sync_worker_reuses_task_3_lease_service(
         crawler_service,
         "sales_sync_service",
         SimpleNamespace(
-            sync_owned_store=lambda owner, store_id: calls.append(
-                (owner, store_id)
+            sync_owned_store=lambda owner, store_id, run_id=None: calls.append(
+                (owner, store_id, run_id)
             )
         ),
         raising=False,
     )
 
-    crawler_service.run_sales_analysis_sync_task("owner-a", 7)
+    crawler_service.run_sales_analysis_sync_task("owner-a", 7, "run-7")
 
-    assert calls == [("owner-a", 7)]
+    assert calls == [("owner-a", 7, "run-7")]
 
 
 def test_existing_schedule_runner_contains_sales_sync_tick() -> None:

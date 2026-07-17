@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
+from threading import Lock
 from typing import Any
+import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.orm import Session
 
 from app.db.database import session_scope
-from app.db.models import SalesOrderSyncRunModel, SystemSettingModel
+from app.db.models import (
+    SalesOrderSyncRunModel,
+    StoreModel,
+    SystemSettingModel,
+)
+from app.services.sales_time import sales_now_naive
 
 
 GLOBAL_SETTINGS_KEY = "sales_order_sync_settings"
@@ -27,6 +35,11 @@ RUN_STATUSES = {
     "cancelled",
 }
 ACTIVE_RUN_STATUSES = {"queued", "running"}
+RETRYABLE_RUN_STATUSES = {"failed", "partial", "cancelled"}
+RUN_STALE_AFTER = timedelta(minutes=10)
+SUCCESS_CLEANUP_INTERVAL = timedelta(hours=1)
+SUCCESS_CLEANUP_LOCK = Lock()
+SUCCESS_CLEANUP_LAST_RUN_AT: datetime | None = None
 
 
 def _validated_settings(payload: Any) -> dict[str, Any]:
@@ -89,6 +102,320 @@ def save_global_settings(payload: Any) -> dict[str, Any]:
         row.value_json = json.dumps(settings, ensure_ascii=False)
         session.flush()
     return settings
+
+
+def create_run(
+    session: Session,
+    *,
+    owner_username: str,
+    store: StoreModel,
+    trigger_type: str,
+    parent_run_id: str | None = None,
+    initial_sync: bool = False,
+) -> SalesOrderSyncRunModel:
+    if trigger_type not in TRIGGER_TYPES:
+        raise ValueError("触发方式不受支持。")
+    row = SalesOrderSyncRunModel(
+        id=f"sales-run-{uuid.uuid4().hex}",
+        owner_username=owner_username,
+        store_id=store.id,
+        store_name=store.store_name,
+        trigger_type=trigger_type,
+        parent_run_id=parent_run_id,
+        status="queued",
+        initial_sync=initial_sync,
+        message="等待执行。",
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def mark_run_running(
+    owner_username: str,
+    run_id: str,
+    *,
+    initial_sync: bool,
+) -> None:
+    now = sales_now_naive()
+    with session_scope() as session:
+        updated = session.execute(
+            update(SalesOrderSyncRunModel)
+            .where(
+                SalesOrderSyncRunModel.id == run_id,
+                SalesOrderSyncRunModel.owner_username == owner_username,
+                SalesOrderSyncRunModel.status == "queued",
+            )
+            .values(
+                status="running",
+                initial_sync=initial_sync,
+                started_at=now,
+                message="正在获取订单。",
+                error_detail=None,
+                updated_at=now,
+            )
+        ).rowcount
+        if updated != 1:
+            raise LookupError("订单同步记录不存在或状态已变化。")
+
+
+def update_run_progress(
+    owner_username: str,
+    run_id: str,
+    *,
+    progress_current: int | None,
+    progress_total: int | None,
+) -> None:
+    with session_scope() as session:
+        update_run_progress_in_session(
+            session,
+            owner_username,
+            run_id,
+            progress_current=progress_current,
+            progress_total=progress_total,
+        )
+
+
+def update_run_progress_in_session(
+    session: Session,
+    owner_username: str,
+    run_id: str,
+    *,
+    progress_current: int | None,
+    progress_total: int | None,
+) -> None:
+    values: dict[str, Any] = {
+        "message": "正在获取订单。",
+        "updated_at": sales_now_naive(),
+    }
+    if progress_current is not None:
+        values["progress_current"] = max(
+            0, int(progress_current)
+        )
+    if progress_total is not None:
+        values["progress_total"] = max(0, int(progress_total))
+    session.execute(
+        update(SalesOrderSyncRunModel)
+        .where(
+            SalesOrderSyncRunModel.id == run_id,
+            SalesOrderSyncRunModel.owner_username == owner_username,
+            SalesOrderSyncRunModel.status == "running",
+        )
+        .values(**values)
+    )
+
+
+def _result_values(result: dict[str, Any]) -> dict[str, Any]:
+    counts = {
+        "total_order_count": max(
+            0, int(result.get("totalOrderCount") or 0)
+        ),
+        "new_order_count": max(
+            0, int(result.get("newOrderCount") or 0)
+        ),
+        "updated_order_count": max(
+            0, int(result.get("updatedOrderCount") or 0)
+        ),
+        "unchanged_order_count": max(
+            0, int(result.get("unchangedOrderCount") or 0)
+        ),
+        "failed_order_count": max(
+            0, int(result.get("failedOrderCount") or 0)
+        ),
+    }
+    successful_count = (
+        counts["new_order_count"]
+        + counts["updated_order_count"]
+        + counts["unchanged_order_count"]
+    )
+    if counts["failed_order_count"] == 0:
+        status = "success"
+    elif successful_count > 0:
+        status = "partial"
+    else:
+        status = "failed"
+    now = sales_now_naive()
+    messages = {
+        "success": ("订单同步完成。", None),
+        "partial": (
+            "订单同步部分完成。",
+            "部分订单同步失败，请重试。",
+        ),
+        "failed": (
+            "订单同步失败，请稍后重试。",
+            "订单同步失败，请稍后重试。",
+        ),
+    }
+    message, error_detail = messages[status]
+    return {
+        "status": status,
+        "progress_current": counts["total_order_count"],
+        "progress_total": counts["total_order_count"],
+        "message": message,
+        "error_detail": error_detail,
+        "finished_at": now,
+        "updated_at": now,
+        **counts,
+    }
+
+
+def complete_run_in_session(
+    session: Session,
+    owner_username: str,
+    run_id: str,
+    result: dict[str, Any],
+) -> None:
+    session.execute(
+        update(SalesOrderSyncRunModel)
+        .where(
+            SalesOrderSyncRunModel.id == run_id,
+            SalesOrderSyncRunModel.owner_username == owner_username,
+            SalesOrderSyncRunModel.status.in_(("queued", "running")),
+        )
+        .values(**_result_values(result))
+    )
+
+
+def complete_run(
+    owner_username: str,
+    run_id: str,
+    result: dict[str, Any],
+) -> None:
+    with session_scope() as session:
+        complete_run_in_session(
+            session,
+            owner_username,
+            run_id,
+            result,
+        )
+
+
+def fail_run(
+    owner_username: str,
+    run_id: str,
+    *,
+    message: str = "订单同步失败，请稍后重试。",
+    failed_order_count: int | None = None,
+) -> None:
+    now = sales_now_naive()
+    values: dict[str, Any] = {
+        "status": "failed",
+        "message": message,
+        "error_detail": message,
+        "finished_at": now,
+        "updated_at": now,
+    }
+    if failed_order_count is not None:
+        values["failed_order_count"] = max(
+            0, int(failed_order_count)
+        )
+        values["total_order_count"] = max(
+            0, int(failed_order_count)
+        )
+    with session_scope() as session:
+        session.execute(
+            update(SalesOrderSyncRunModel)
+            .where(
+                SalesOrderSyncRunModel.id == run_id,
+                SalesOrderSyncRunModel.owner_username == owner_username,
+                SalesOrderSyncRunModel.status.in_(("queued", "running")),
+            )
+            .values(**values)
+        )
+
+
+def retry_run(owner_username: str, run_id: str) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.scalar(
+            select(SalesOrderSyncRunModel).where(
+                SalesOrderSyncRunModel.id == run_id,
+                SalesOrderSyncRunModel.owner_username == owner_username,
+            )
+        )
+        if row is None:
+            raise LookupError("订单同步记录不存在或无权访问。")
+        if row.status not in RETRYABLE_RUN_STATUSES:
+            raise ValueError("当前订单同步记录不可重试。")
+        if row.store_id is None:
+            raise ValueError("原店铺已删除，无法重试。")
+        store_id = row.store_id
+    return _queue_sales_analysis_sync(
+        owner_username,
+        store_id,
+        trigger_type="retry",
+        parent_run_id=run_id,
+    )
+
+
+def _queue_sales_analysis_sync(
+    owner_username: str,
+    store_id: int,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    from app.services.crawler_service import queue_sales_analysis_sync
+
+    return queue_sales_analysis_sync(owner_username, store_id, **kwargs)
+
+
+def recover_stale_runs(
+    *,
+    now: datetime | None = None,
+    stale_after: timedelta = RUN_STALE_AFTER,
+) -> int:
+    current = now or sales_now_naive()
+    stale_before = current - stale_after
+    with session_scope() as session:
+        result = session.execute(
+            update(SalesOrderSyncRunModel)
+            .where(
+                SalesOrderSyncRunModel.status.in_(ACTIVE_RUN_STATUSES),
+                SalesOrderSyncRunModel.updated_at < stale_before,
+            )
+            .values(
+                status="failed",
+                message="订单同步任务已中断，请重试。",
+                error_detail="订单同步任务已中断，请重试。",
+                finished_at=current,
+                updated_at=current,
+            )
+        )
+        return max(0, int(result.rowcount or 0))
+
+
+def cleanup_successful_runs_if_due(
+    *,
+    now: datetime | None = None,
+    force: bool = False,
+) -> int:
+    global SUCCESS_CLEANUP_LAST_RUN_AT
+    current = now or sales_now_naive()
+    if not SUCCESS_CLEANUP_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        if (
+            not force
+            and SUCCESS_CLEANUP_LAST_RUN_AT is not None
+            and current - SUCCESS_CLEANUP_LAST_RUN_AT
+            < SUCCESS_CLEANUP_INTERVAL
+        ):
+            return 0
+        settings = get_global_settings()
+        cutoff = current - timedelta(
+            days=int(settings["successRetentionDays"])
+        )
+        with session_scope() as session:
+            result = session.execute(
+                delete(SalesOrderSyncRunModel).where(
+                    SalesOrderSyncRunModel.status == "success",
+                    SalesOrderSyncRunModel.finished_at.is_not(None),
+                    SalesOrderSyncRunModel.finished_at < cutoff,
+                )
+            )
+            deleted_count = max(0, int(result.rowcount or 0))
+        SUCCESS_CLEANUP_LAST_RUN_AT = current
+        return deleted_count
+    finally:
+        SUCCESS_CLEANUP_LOCK.release()
 
 
 def _run_to_public(row: SalesOrderSyncRunModel) -> dict[str, Any]:

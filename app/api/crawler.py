@@ -1069,6 +1069,22 @@ def delete_sales_order_sync_runs(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/sales-analysis/order-sync-runs/{run_id}/retry")
+def retry_sales_order_sync_run(
+    run_id: str = ApiPath(min_length=1, max_length=64),
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        return {
+            "syncTask": sales_order_sync_history_service.retry_run(
+                user["username"],
+                run_id,
+            )
+        }
+    except (LookupError, ValueError) as exc:
+        _raise_sales_analysis_http_error(exc)
+
+
 @router.get("/sales-analysis/stores")
 def list_sales_analysis_stores(
     user: dict = Depends(require_ai_permission),

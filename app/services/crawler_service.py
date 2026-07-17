@@ -55,6 +55,7 @@ from app.db.models import (
     UserAccountModel,
     make_source_url_hash,
 )
+from app.services import sales_order_sync_history_service
 from app.services.product_image_storage import (
     DRAFT_IMAGE_OBJECT_PREFIX,
     DRAFT_IMAGE_URL_PREFIX,
@@ -9559,6 +9560,7 @@ def _loaded_sales_sync_service() -> Any:
 def run_sales_analysis_sync_task(
     owner_username: str,
     store_id: int,
+    run_id: str | None = None,
 ) -> None:
     normalized_owner = str(owner_username or "").strip()
     normalized_store_id = int(store_id)
@@ -9566,6 +9568,7 @@ def run_sales_analysis_sync_task(
         _loaded_sales_sync_service().sync_owned_store(
             normalized_owner,
             normalized_store_id,
+            run_id=run_id,
         )
     except Exception:
         with session_scope() as session:
@@ -9581,12 +9584,18 @@ def run_sales_analysis_sync_task(
                 state.sync_status = "error"
                 state.last_error = "销量同步失败，请稍后重试。"
                 state.updated_at = failed_at
+        if run_id is not None:
+            sales_order_sync_history_service.fail_run(
+                normalized_owner,
+                run_id,
+            )
         raise
 
 
 def dispatch_sales_analysis_sync_task(
     owner_username: str,
     store_id: int,
+    run_id: str,
 ) -> None:
     task_id = _sales_analysis_sync_task_id(store_id)
     if should_use_redis_task_queue():
@@ -9594,6 +9603,7 @@ def dispatch_sales_analysis_sync_task(
             run_sales_analysis_sync_task,
             owner_username,
             store_id,
+            run_id,
             job_id=f"{task_id}-{uuid.uuid4().hex[:12]}",
             description=f"销量同步 {store_id}",
             queue_name=task_queue_name_for_kind("sync"),
@@ -9606,6 +9616,7 @@ def dispatch_sales_analysis_sync_task(
             run_sales_analysis_sync_task,
             owner_username,
             store_id,
+            run_id,
         )
     except Exception:
         SALES_ANALYSIS_SYNC_LOCAL_SLOTS.release()
@@ -9623,6 +9634,9 @@ def dispatch_sales_analysis_sync_task(
 def queue_sales_analysis_sync(
     owner_username: str,
     store_id: int,
+    *,
+    trigger_type: str = "manual",
+    parent_run_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_owner = str(owner_username or "").strip()
     normalized_store_id = int(store_id)
@@ -9663,6 +9677,10 @@ def queue_sales_analysis_sync(
             now=queue_decision_at,
         )
         if active:
+            if trigger_type == "retry":
+                raise ValueError(
+                    "该店铺的订单同步任务正在执行，请完成后再重试。"
+                )
             return _sales_analysis_sync_state_to_public(
                 state,
                 already_running=True,
@@ -9672,12 +9690,22 @@ def queue_sales_analysis_sync(
         state.progress_total = 0
         state.last_error = None
         state.updated_at = queue_decision_at
+        run = sales_order_sync_history_service.create_run(
+            session,
+            owner_username=normalized_owner,
+            store=store,
+            trigger_type=trigger_type,
+            parent_run_id=parent_run_id,
+            initial_sync=not bool(state.initial_sync_completed),
+        )
         queued_task = _sales_analysis_sync_state_to_public(state)
+        queued_task["runId"] = run.id
 
     try:
         dispatch_sales_analysis_sync_task(
             normalized_owner,
             normalized_store_id,
+            run.id,
         )
     except Exception:
         with session_scope() as session:
@@ -9693,6 +9721,11 @@ def queue_sales_analysis_sync(
                 state.sync_status = "error"
                 state.last_error = "销量同步任务投递失败，请稍后重试。"
                 state.updated_at = failed_at
+        sales_order_sync_history_service.fail_run(
+            normalized_owner,
+            run.id,
+            message="销量同步任务投递失败，请稍后重试。",
+        )
         raise
     return queued_task
 
@@ -9935,6 +9968,7 @@ def sales_analysis_sync_is_due(
     *,
     now: datetime | None = None,
     state_updated_at: datetime | None = None,
+    interval: timedelta = SALES_ANALYSIS_SYNC_INTERVAL,
 ) -> bool:
     current = now or sales_now_naive()
     if _sales_analysis_sync_status_is_active(
@@ -9952,14 +9986,16 @@ def sales_analysis_sync_is_due(
     if last_successful_sync_at is None:
         return True
     return last_successful_sync_at <= (
-        current - SALES_ANALYSIS_SYNC_INTERVAL
+        current - interval
     )
 
 
 def sales_analysis_sync_due_candidates(
     now: datetime,
+    *,
+    interval: timedelta = SALES_ANALYSIS_SYNC_INTERVAL,
 ) -> list[tuple[str, int]]:
-    cutoff = now - SALES_ANALYSIS_SYNC_INTERVAL
+    cutoff = now - interval
     active_after = (
         now - _sales_analysis_sync_active_timeout()
     )
@@ -10051,12 +10087,35 @@ def run_due_sales_analysis_syncs_once() -> int:
     if not SALES_ANALYSIS_SYNC_RUN_LOCK.acquire(blocking=False):
         return 0
     try:
+        sales_order_sync_history_service.recover_stale_runs(
+            stale_after=_sales_analysis_sync_active_timeout(),
+        )
+        try:
+            sales_order_sync_history_service.cleanup_successful_runs_if_due()
+        except Exception:
+            logger.warning(
+                "销量订单同步成功记录清理失败",
+                exc_info=True,
+            )
+        global_settings = (
+            sales_order_sync_history_service.get_global_settings()
+        )
+        if not global_settings["enabled"]:
+            return 0
+        interval = timedelta(
+            minutes=int(global_settings["intervalMinutes"])
+        )
         queued_count = 0
         for owner_username, store_id in sales_analysis_sync_due_candidates(
-            sales_now_naive()
+            sales_now_naive(),
+            interval=interval,
         ):
             try:
-                queue_sales_analysis_sync(owner_username, store_id)
+                queue_sales_analysis_sync(
+                    owner_username,
+                    store_id,
+                    trigger_type="automatic",
+                )
             except Exception:
                 logger.warning(
                     "店铺 %s 的定时销量同步投递失败",
