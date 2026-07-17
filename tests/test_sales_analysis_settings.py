@@ -4,12 +4,15 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db.database import Base
-from app.db.models import UserAccountModel
+from app.db.models import (
+    UserAccountModel,
+    UserSalesAnalysisSettingsModel,
+)
 from app.services import sales_analysis_settings_service
 
 
@@ -84,7 +87,7 @@ def _payload(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_get_settings_creates_camel_case_defaults(
+def test_get_settings_returns_defaults_without_persisting_a_row(
     settings_session_factory,
 ) -> None:
     assert sales_analysis_settings_service.get_settings("alice") == {
@@ -98,6 +101,15 @@ def test_get_settings_creates_camel_case_defaults(
         "showMetricDefinition": True,
         "customBusinessInstructions": "",
     }
+    with settings_session_factory() as session:
+        row_count = session.scalar(
+            select(func.count())
+            .select_from(UserSalesAnalysisSettingsModel)
+            .where(
+                UserSalesAnalysisSettingsModel.owner_username == "alice"
+            )
+        )
+    assert row_count == 0
 
 
 def test_user_sales_analysis_settings_are_owner_scoped(
@@ -200,6 +212,38 @@ def test_default_metric_matches_existing_sales_tool_metric_contract(
     assert result["defaultMetric"] == "effectiveSalesAmount"
 
 
+def test_get_settings_normalizes_invalid_persisted_values(
+    settings_session_factory,
+) -> None:
+    with settings_session_factory.begin() as session:
+        session.add(
+            UserSalesAnalysisSettingsModel(
+                owner_username="alice",
+                default_period_days=14,
+                default_ranking_limit="invalid",
+                default_metric="profit",
+                default_grain="quarter",
+                answer_detail_level="verbose",
+                prioritize_adjustment_risk=False,
+                show_data_updated_at=False,
+                show_metric_definition=False,
+                custom_business_instructions="x" * 4001,
+            )
+        )
+
+    assert sales_analysis_settings_service.get_settings("alice") == {
+        "defaultPeriodDays": 30,
+        "defaultRankingLimit": 10,
+        "defaultMetric": "effectiveUnits",
+        "defaultGrain": "day",
+        "answerDetailLevel": "standard",
+        "prioritizeAdjustmentRisk": False,
+        "showDataUpdatedAt": False,
+        "showMetricDefinition": False,
+        "customBusinessInstructions": "",
+    }
+
+
 def test_capability_and_constraint_catalogs_are_fresh_read_only_data() -> None:
     capabilities = sales_analysis_settings_service.capability_catalog()
     constraints = sales_analysis_settings_service.constraint_catalog()
@@ -226,3 +270,20 @@ def test_capability_and_constraint_catalogs_are_fresh_read_only_data() -> None:
         "changed"
         not in sales_analysis_settings_service.constraint_catalog()[0]["items"]
     )
+
+
+def test_server_authoritative_catalogs_include_operational_facts() -> None:
+    catalog_text = str(
+        {
+            "capabilities": (
+                sales_analysis_settings_service.capability_catalog()
+            ),
+            "constraints": (
+                sales_analysis_settings_service.constraint_catalog()
+            ),
+        }
+    )
+
+    assert "首次同步默认覆盖最近 90 天" in catalog_text
+    assert "自动同步间隔约为 30 分钟" in catalog_text
+    assert "一个会话绑定一个店铺" in catalog_text

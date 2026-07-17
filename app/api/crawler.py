@@ -209,24 +209,24 @@ class SalesAnalysisMessagePayload(BaseModel):
 
 
 class SalesAnalysisSettingsPayload(BaseModel):
-    defaultPeriodDays: Literal[7, 30, 60, 90] = 30
-    defaultRankingLimit: int = Field(default=10, ge=5, le=100)
+    defaultPeriodDays: Literal[7, 30, 60, 90]
+    defaultRankingLimit: int = Field(ge=5, le=100)
     defaultMetric: Literal[
         "effectiveUnits",
         "orderedUnits",
         "effectiveSalesAmount",
         "orderCount",
-    ] = "effectiveUnits"
-    defaultGrain: Literal["day", "week", "month"] = "day"
+    ]
+    defaultGrain: Literal["day", "week", "month"]
     answerDetailLevel: Literal[
         "concise",
         "standard",
         "detailed",
-    ] = "standard"
-    prioritizeAdjustmentRisk: bool = True
-    showDataUpdatedAt: bool = True
-    showMetricDefinition: bool = True
-    customBusinessInstructions: str = Field(default="", max_length=4000)
+    ]
+    prioritizeAdjustmentRisk: bool
+    showDataUpdatedAt: bool
+    showMetricDefinition: bool
+    customBusinessInstructions: str = Field(max_length=4000)
 
 
 class ListingTaskPayload(BaseModel):

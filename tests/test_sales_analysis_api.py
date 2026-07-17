@@ -291,6 +291,31 @@ def test_sales_analysis_settings_api_validates_payload_boundaries() -> None:
     ).status_code == 422
 
 
+def test_sales_analysis_settings_put_requires_complete_replacement_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def update_settings(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(
+        crawler_api.sales_analysis_settings_service,
+        "update_settings",
+        update_settings,
+    )
+
+    response = _client(AI_USER).put(
+        "/crawler/settings/sales-analysis",
+        json={"defaultRankingLimit": 20},
+    )
+
+    assert response.status_code == 422
+    assert called is False
+
+
 def test_sales_analysis_catalog_api_is_get_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

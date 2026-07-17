@@ -12,6 +12,17 @@ DEFAULT_RANKING_LIMIT = 10
 DEFAULT_METRIC = "effectiveUnits"
 DEFAULT_GRAIN = "day"
 DEFAULT_ANSWER_DETAIL_LEVEL = "standard"
+DEFAULT_SETTINGS = {
+    "defaultPeriodDays": DEFAULT_PERIOD_DAYS,
+    "defaultRankingLimit": DEFAULT_RANKING_LIMIT,
+    "defaultMetric": DEFAULT_METRIC,
+    "defaultGrain": DEFAULT_GRAIN,
+    "answerDetailLevel": DEFAULT_ANSWER_DETAIL_LEVEL,
+    "prioritizeAdjustmentRisk": True,
+    "showDataUpdatedAt": True,
+    "showMetricDefinition": True,
+    "customBusinessInstructions": "",
+}
 
 PERIOD_DAYS = {7, 30, 60, 90}
 METRICS = {
@@ -79,6 +90,10 @@ CAPABILITIES = [
         "description": "查看同步状态并按权限触发店铺订单增量同步。",
         "example": "当前销量数据更新到什么时候？",
         "metrics": ["同步状态", "数据更新时间"],
+        "facts": [
+            "首次同步默认覆盖最近 90 天。",
+            "自动同步间隔约为 30 分钟。",
+        ],
     },
     {
         "key": "aiConversation",
@@ -140,16 +155,43 @@ CONSTRAINTS = [
 def _settings_to_public(
     row: UserSalesAnalysisSettingsModel,
 ) -> dict[str, Any]:
+    instructions = str(row.custom_business_instructions or "").strip()
     return {
-        "defaultPeriodDays": row.default_period_days,
-        "defaultRankingLimit": row.default_ranking_limit,
-        "defaultMetric": row.default_metric,
-        "defaultGrain": row.default_grain,
-        "answerDetailLevel": row.answer_detail_level,
-        "prioritizeAdjustmentRisk": row.prioritize_adjustment_risk,
-        "showDataUpdatedAt": row.show_data_updated_at,
-        "showMetricDefinition": row.show_metric_definition,
-        "customBusinessInstructions": row.custom_business_instructions,
+        "defaultPeriodDays": (
+            row.default_period_days
+            if row.default_period_days in PERIOD_DAYS
+            else DEFAULT_PERIOD_DAYS
+        ),
+        "defaultRankingLimit": (
+            row.default_ranking_limit
+            if isinstance(row.default_ranking_limit, int)
+            and not isinstance(row.default_ranking_limit, bool)
+            and 5 <= row.default_ranking_limit <= 100
+            else DEFAULT_RANKING_LIMIT
+        ),
+        "defaultMetric": (
+            row.default_metric
+            if row.default_metric in METRICS
+            else DEFAULT_METRIC
+        ),
+        "defaultGrain": (
+            row.default_grain
+            if row.default_grain in GRAINS
+            else DEFAULT_GRAIN
+        ),
+        "answerDetailLevel": (
+            row.answer_detail_level
+            if row.answer_detail_level in ANSWER_DETAIL_LEVELS
+            else DEFAULT_ANSWER_DETAIL_LEVEL
+        ),
+        "prioritizeAdjustmentRisk": bool(
+            row.prioritize_adjustment_risk
+        ),
+        "showDataUpdatedAt": bool(row.show_data_updated_at),
+        "showMetricDefinition": bool(row.show_metric_definition),
+        "customBusinessInstructions": (
+            instructions if len(instructions) <= 4000 else ""
+        ),
     }
 
 
@@ -185,9 +227,10 @@ def _boolean_value(payload: Any, field: str) -> bool:
 
 def get_settings(owner_username: str) -> dict[str, Any]:
     with session_scope() as session:
-        return _settings_to_public(
-            _ensure_settings(session, owner_username)
-        )
+        row = session.get(UserSalesAnalysisSettingsModel, owner_username)
+        if row is None:
+            return dict(DEFAULT_SETTINGS)
+        return _settings_to_public(row)
 
 
 def update_settings(
