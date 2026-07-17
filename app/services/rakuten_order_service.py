@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from typing import Any, Iterable, NoReturn
@@ -14,6 +14,7 @@ from app.services.crawler_service import (
     first_text_from_keys,
     normalize_text,
 )
+from app.services.sales_time import SALES_TIMEZONE
 
 
 RAKUTEN_ORDER_SEARCH_URL = "https://api.rms.rakuten.co.jp/es/2.0/order/searchOrder/"
@@ -22,6 +23,8 @@ RAKUTEN_ORDER_SEARCH_PAGE_SIZE = 1000
 RMS_SAFE_ORDER_BATCH_SIZE = 30
 RAKUTEN_ORDER_DETAIL_VERSION = 7
 RAKUTEN_ORDER_SORT_MODEL_LIST = [{"sortColumn": 1, "sortDirection": 2}]
+RAKUTEN_ORDER_SEARCH_MAX_RANGE = timedelta(days=63)
+RAKUTEN_ORDER_TIMEZONE = timezone(timedelta(hours=9), name="Asia/Tokyo")
 
 
 def search_order_numbers(
@@ -35,54 +38,83 @@ def search_order_numbers(
     session = requests.Session()
     seen: set[str] = set()
     order_numbers: list[str] = []
-    expected_page = 1
 
     try:
-        while True:
-            payload = _post_order_json(
-                session,
-                RAKUTEN_ORDER_SEARCH_URL,
-                operation="乐天订单查询",
-                headers=headers,
-                payload={
-                    "dateType": 1,
-                    "startDatetime": _format_api_datetime(start_at),
-                    "endDatetime": _format_api_datetime(end_at),
-                    "orderProgressList": [int(status) for status in statuses],
-                    "PaginationRequestModel": {
-                        "requestRecordsAmount": RAKUTEN_ORDER_SEARCH_PAGE_SIZE,
-                        "requestPage": expected_page,
-                        "SortModelList": list(RAKUTEN_ORDER_SORT_MODEL_LIST),
-                    },
-                },
+        window_start = start_at
+        while window_start < end_at:
+            window_end = min(
+                window_start + RAKUTEN_ORDER_SEARCH_MAX_RANGE,
+                end_at,
             )
-            pagination = payload.get("PaginationResponseModel")
-            if not isinstance(pagination, dict):
-                _raise_sanitized_runtime_error("乐天订单查询分页信息缺失。")
-
-            total_pages = _int_or_none(pagination.get("totalPages"))
-            response_page = _int_or_none(pagination.get("requestPage"))
-            if total_pages is None:
-                _raise_sanitized_runtime_error("乐天订单查询分页信息缺失。")
-            if total_pages == 0:
-                normalized_page_orders = _normalize_text_list(payload.get("orderNumberList"))
-                if expected_page != 1 or order_numbers or normalized_page_orders or response_page not in {0, 1, None}:
-                    _raise_sanitized_runtime_error("乐天订单查询分页响应无效。")
-                return []
-            if total_pages < expected_page or response_page != expected_page:
-                _raise_sanitized_runtime_error("乐天订单查询分页响应无效。")
-
-            for order_number in _normalize_text_list(payload.get("orderNumberList")):
-                if order_number in seen:
-                    continue
-                seen.add(order_number)
-                order_numbers.append(order_number)
-
-            if expected_page >= total_pages:
-                return order_numbers
-            expected_page += 1
+            _search_order_number_window(
+                session,
+                headers=headers,
+                start_at=window_start,
+                end_at=window_end,
+                statuses=statuses,
+                seen=seen,
+                order_numbers=order_numbers,
+            )
+            window_start = window_end
+        return order_numbers
     finally:
         session.close()
+
+
+def _search_order_number_window(
+    session: requests.Session,
+    *,
+    headers: dict[str, str],
+    start_at: datetime,
+    end_at: datetime,
+    statuses: list[int],
+    seen: set[str],
+    order_numbers: list[str],
+) -> None:
+    expected_page = 1
+    while True:
+        payload = _post_order_json(
+            session,
+            RAKUTEN_ORDER_SEARCH_URL,
+            operation="乐天订单查询",
+            headers=headers,
+            payload={
+                "dateType": 1,
+                "startDatetime": _format_api_datetime(start_at),
+                "endDatetime": _format_api_datetime(end_at),
+                "orderProgressList": [int(status) for status in statuses],
+                "PaginationRequestModel": {
+                    "requestRecordsAmount": RAKUTEN_ORDER_SEARCH_PAGE_SIZE,
+                    "requestPage": expected_page,
+                    "SortModelList": list(RAKUTEN_ORDER_SORT_MODEL_LIST),
+                },
+            },
+        )
+        pagination = payload.get("PaginationResponseModel")
+        if not isinstance(pagination, dict):
+            _raise_sanitized_runtime_error("乐天订单查询分页信息缺失。")
+
+        total_pages = _int_or_none(pagination.get("totalPages"))
+        response_page = _int_or_none(pagination.get("requestPage"))
+        if total_pages is None:
+            _raise_sanitized_runtime_error("乐天订单查询分页信息缺失。")
+        if total_pages == 0:
+            normalized_page_orders = _normalize_text_list(payload.get("orderNumberList"))
+            if expected_page != 1 or normalized_page_orders or response_page not in {0, 1, None}:
+                _raise_sanitized_runtime_error("乐天订单查询分页响应无效。")
+            return
+        if total_pages < expected_page or response_page != expected_page:
+            _raise_sanitized_runtime_error("乐天订单查询分页响应无效。")
+
+        for order_number in _normalize_text_list(payload.get("orderNumberList")):
+            if order_number in seen:
+                continue
+            seen.add(order_number)
+            order_numbers.append(order_number)
+
+        if expected_page >= total_pages:
+            return
+        expected_page += 1
 
 
 def get_orders(service_secret: str, license_key: str, order_numbers: list[str]) -> list[dict[str, Any]]:
@@ -272,8 +304,10 @@ def _parse_json_dict(response: requests.Response) -> tuple[dict[str, Any] | None
 
 def _format_api_datetime(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
-        return value.strftime("%Y-%m-%dT%H:%M:%S")
-    return value.strftime("%Y-%m-%dT%H:%M:%S%z")
+        value = value.replace(tzinfo=SALES_TIMEZONE)
+    return value.astimezone(RAKUTEN_ORDER_TIMEZONE).strftime(
+        "%Y-%m-%dT%H:%M:%S%z"
+    )
 
 
 def _normalize_text_list(values: Any) -> list[str]:

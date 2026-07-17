@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import traceback
 import unittest
 from unittest.mock import Mock, patch
@@ -89,6 +89,61 @@ class RakutenOrderServiceTests(unittest.TestCase):
             [1, 2],
         )
         self.assertEqual(post.call_args_list[0].args[0], rakuten_order_service.RAKUTEN_ORDER_SEARCH_URL)
+        self.assertEqual(
+            post.call_args_list[0].kwargs["json"]["startDatetime"],
+            "2026-07-01T01:00:00+0900",
+        )
+        self.assertEqual(
+            post.call_args_list[0].kwargs["json"]["endDatetime"],
+            "2026-07-02T01:00:00+0900",
+        )
+
+    def test_search_order_numbers_splits_ranges_longer_than_rakuten_limit(self) -> None:
+        empty_page = {
+            "orderNumberList": [],
+            "PaginationResponseModel": {
+                "totalPages": 0,
+                "requestPage": 0,
+            },
+        }
+        with patch.object(
+            rakuten_order_service.requests.Session,
+            "post",
+            side_effect=[
+                json_response(empty_page),
+                json_response(empty_page),
+            ],
+        ) as post:
+            result = rakuten_order_service.search_order_numbers(
+                "secret-123",
+                "key-456",
+                datetime(2026, 4, 1, 0, 0, 0),
+                datetime(2026, 6, 30, 0, 0, 0),
+                [100],
+            )
+
+        self.assertEqual(result, [])
+        self.assertEqual(post.call_count, 2)
+        first_payload = post.call_args_list[0].kwargs["json"]
+        second_payload = post.call_args_list[1].kwargs["json"]
+        self.assertEqual(first_payload["startDatetime"], "2026-04-01T01:00:00+0900")
+        self.assertEqual(first_payload["endDatetime"], "2026-06-03T01:00:00+0900")
+        self.assertEqual(second_payload["startDatetime"], first_payload["endDatetime"])
+        self.assertEqual(second_payload["endDatetime"], "2026-06-30T01:00:00+0900")
+
+    def test_format_api_datetime_converts_aware_values_to_japan_time(self) -> None:
+        value = datetime(
+            2026,
+            7,
+            17,
+            15,
+            30,
+            tzinfo=timezone(timedelta(hours=8)),
+        )
+        self.assertEqual(
+            rakuten_order_service._format_api_datetime(value),
+            "2026-07-17T16:30:00+0900",
+        )
 
     def test_search_order_numbers_accepts_total_pages_zero_only_for_first_requested_page(self) -> None:
         response = json_response({
