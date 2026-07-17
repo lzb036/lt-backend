@@ -2045,7 +2045,7 @@ def _fail_message(
         owner_username=owner_username,
         conversation_id=conversation_id,
         message_id=message_id,
-        answer="",
+        answer=error_message,
         model_name=model_name,
         selected_store_id=selected_store_id,
         relative_window=relative_window,
@@ -2054,6 +2054,52 @@ def _fail_message(
         error_code=error_code,
         error_message=error_message,
     )
+
+
+def _ai_service_failure_message(exc: Exception) -> str:
+    if isinstance(exc, ModuleNotFoundError):
+        missing_module = str(getattr(exc, "name", "") or "").strip()
+        if missing_module == "orjson":
+            return (
+                "AI 服务依赖缺失：orjson 未安装，"
+                "请联系管理员完成服务更新后重试。"
+            )
+        return "AI 服务依赖不完整，请联系管理员处理。"
+
+    status_code = getattr(exc, "status_code", None)
+    normalized = f"{type(exc).__name__} {exc}".lower()
+    if status_code in {401, 403} or any(
+        token in normalized
+        for token in (
+            "authentication",
+            "unauthorized",
+            "forbidden",
+            "invalid api key",
+            "incorrect api key",
+        )
+    ):
+        return "AI 模型认证失败，请检查模型地址和 API Key。"
+    if status_code == 429 or any(
+        token in normalized
+        for token in ("rate limit", "ratelimit", "too many requests")
+    ):
+        return "AI 模型请求过于频繁，请稍后重试。"
+    if any(
+        token in normalized
+        for token in ("timeout", "timed out", "deadline exceeded")
+    ):
+        return "AI 模型请求超时，请稍后重试。"
+    if any(
+        token in normalized
+        for token in (
+            "connection error",
+            "connection refused",
+            "network is unreachable",
+            "name resolution",
+        )
+    ):
+        return "AI 模型网络连接失败，请检查模型地址或稍后重试。"
+    return "AI 模型调用失败，请稍后重试；如持续失败请联系管理员。"
 
 
 def _persist_final_processing_error(
@@ -2075,7 +2121,7 @@ def _persist_final_processing_error(
         )
         if row is None:
             raise LookupError("会话消息不存在或无权访问。")
-        row.answer_text = ""
+        row.answer_text = error_message
         row.model_name = model_name
         row.status = "error"
         row.error_code = "answer_processing_error"
@@ -2102,7 +2148,7 @@ def _persist_tool_result_processing_error(
         )
         if row is None:
             raise LookupError("会话消息不存在或无权访问。")
-        row.answer_text = ""
+        row.answer_text = error_message
         row.model_name = model_name
         row.status = "error"
         row.error_code = "tool_result_processing_error"
@@ -2763,10 +2809,10 @@ def stream_analysis(
                 owner_username=normalized_owner,
                 secrets=redaction_secrets,
             )
-        except Exception:
+        except Exception as exc:
             if _analysis_cancelled(is_cancelled):
                 return
-            answer = "AI 分析失败，请稍后重试。"
+            answer = _ai_service_failure_message(exc)
             failed = _fail_message(
                 owner_username=normalized_owner,
                 conversation_id=conversation_id,
