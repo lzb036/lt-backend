@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from io import BytesIO
 from threading import Event
 from typing import Any, Literal
@@ -16,6 +17,7 @@ from app.core.auth import has_permission, require_any_permission, require_permis
 from app.services import (
     crawler_service,
     sales_analysis_settings_service,
+    sales_order_sync_history_service,
     sensitive_word_service,
 )
 from app.services.user_service import require_existing_account
@@ -227,6 +229,16 @@ class SalesAnalysisSettingsPayload(BaseModel):
     showDataUpdatedAt: bool
     showMetricDefinition: bool
     customBusinessInstructions: str = Field(max_length=4000)
+
+
+class SalesOrderSyncGlobalSettingsPayload(BaseModel):
+    enabled: bool
+    intervalMinutes: int = Field(ge=5, le=1440)
+    successRetentionDays: int = Field(ge=1, le=365)
+
+
+class SalesOrderSyncRunDeletePayload(BaseModel):
+    runIds: list[str] = Field(min_length=1, max_length=100)
 
 
 class ListingTaskPayload(BaseModel):
@@ -953,6 +965,32 @@ def update_sales_analysis_settings(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/settings/sales-order-sync")
+def get_sales_order_sync_global_settings(
+    _: dict = Depends(require_ai_permission),
+) -> dict:
+    return {
+        "settings": sales_order_sync_history_service.get_global_settings()
+    }
+
+
+@router.put("/settings/sales-order-sync")
+def update_sales_order_sync_global_settings(
+    payload: SalesOrderSyncGlobalSettingsPayload,
+    _: dict = Depends(require_superadmin),
+) -> dict:
+    try:
+        return {
+            "settings": (
+                sales_order_sync_history_service.save_global_settings(
+                    payload
+                )
+            )
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/settings/sales-analysis/capabilities")
 def get_sales_analysis_capabilities(
     _: dict = Depends(require_ai_permission),
@@ -971,6 +1009,64 @@ def get_sales_analysis_constraints(
     return {
         "constraints": sales_analysis_settings_service.constraint_catalog()
     }
+
+
+@router.get("/sales-analysis/order-sync-runs")
+def list_sales_order_sync_runs(
+    page: int = Query(default=1, ge=1, le=10_000),
+    pageSize: int = Query(default=30, ge=1, le=100),
+    storeId: int | None = Query(default=None, gt=0),
+    triggerType: Literal["automatic", "manual", "retry"] | None = Query(
+        default=None
+    ),
+    status: Literal[
+        "queued",
+        "running",
+        "success",
+        "partial",
+        "failed",
+        "cancelled",
+    ]
+    | None = Query(default=None),
+    createdAtFrom: datetime | None = Query(default=None),
+    createdAtTo: datetime | None = Query(default=None),
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        result = sales_order_sync_history_service.list_runs(
+            user["username"],
+            page=page,
+            page_size=pageSize,
+            store_id=storeId,
+            trigger_type=triggerType,
+            status=status,
+            created_at_from=createdAtFrom,
+            created_at_to=createdAtTo,
+        )
+        return {
+            "runs": result["rows"],
+            "pagination": {
+                "total": result["total"],
+                "page": result["page"],
+                "pageSize": result["pageSize"],
+            },
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/sales-analysis/order-sync-runs")
+def delete_sales_order_sync_runs(
+    payload: SalesOrderSyncRunDeletePayload,
+    user: dict = Depends(require_ai_permission),
+) -> dict:
+    try:
+        return sales_order_sync_history_service.delete_runs(
+            user["username"],
+            payload.runIds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/sales-analysis/stores")

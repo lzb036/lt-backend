@@ -40,6 +40,12 @@ AI_USER = {
     "permissionCodes": ["ai.manage"],
 }
 
+SUPERADMIN_USER = {
+    "username": "root",
+    "role": "superadmin",
+    "permissionCodes": [],
+}
+
 
 def _wait_for_owner_stream_capacity_release(
     timeout_seconds: float = 1.0,
@@ -162,6 +168,8 @@ def test_sales_analysis_routes_require_ai_manage_permission() -> None:
         ("GET", "/crawler/sales-analysis/sync/{task_id}"),
         ("GET", "/crawler/sales-analysis/conversations"),
         ("POST", "/crawler/sales-analysis/conversations"),
+        ("GET", "/crawler/sales-analysis/order-sync-runs"),
+        ("DELETE", "/crawler/sales-analysis/order-sync-runs"),
         (
             "DELETE",
             "/crawler/sales-analysis/conversations/{conversation_id}",
@@ -203,6 +211,140 @@ def test_sales_analysis_routes_require_ai_manage_permission() -> None:
         }
     ).get("/crawler/sales-analysis/stores")
     assert response.status_code == 403
+
+
+def test_sales_order_sync_global_settings_permissions_and_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    settings_payload = {
+        "enabled": False,
+        "intervalMinutes": 45,
+        "successRetentionDays": 60,
+    }
+    monkeypatch.setattr(
+        crawler_api.sales_order_sync_history_service,
+        "get_global_settings",
+        lambda: settings_payload,
+    )
+
+    def save_global_settings(payload):
+        calls.append(("save", payload.intervalMinutes))
+        return settings_payload
+
+    monkeypatch.setattr(
+        crawler_api.sales_order_sync_history_service,
+        "save_global_settings",
+        save_global_settings,
+    )
+
+    assert _client(AI_USER).get(
+        "/crawler/settings/sales-order-sync"
+    ).json() == {"settings": settings_payload}
+    assert _client(
+        {
+            "username": "owner-a",
+            "role": "operator",
+            "permissionCodes": [],
+        }
+    ).get("/crawler/settings/sales-order-sync").status_code == 403
+    assert _client(AI_USER).put(
+        "/crawler/settings/sales-order-sync",
+        json=settings_payload,
+    ).status_code == 403
+
+    response = _client(SUPERADMIN_USER).put(
+        "/crawler/settings/sales-order-sync",
+        json=settings_payload,
+    )
+    assert response.status_code == 200
+    assert response.json() == {"settings": settings_payload}
+    assert calls == [("save", 45)]
+
+
+def test_sales_order_sync_global_settings_api_validates_ranges() -> None:
+    client = _client(SUPERADMIN_USER)
+    payload = {
+        "enabled": True,
+        "intervalMinutes": 30,
+        "successRetentionDays": 30,
+    }
+
+    assert client.put(
+        "/crawler/settings/sales-order-sync",
+        json={**payload, "intervalMinutes": 4},
+    ).status_code == 422
+    assert client.put(
+        "/crawler/settings/sales-order-sync",
+        json={**payload, "intervalMinutes": 1441},
+    ).status_code == 422
+    assert client.put(
+        "/crawler/settings/sales-order-sync",
+        json={**payload, "successRetentionDays": 0},
+    ).status_code == 422
+    assert client.put(
+        "/crawler/settings/sales-order-sync",
+        json={**payload, "successRetentionDays": 366},
+    ).status_code == 422
+
+
+def test_sales_order_sync_history_api_uses_current_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple] = []
+
+    def list_runs(owner_username: str, **filters):
+        calls.append(("list", owner_username, filters))
+        return {
+            "rows": [{"id": "run-1"}],
+            "total": 1,
+            "page": filters["page"],
+            "pageSize": filters["page_size"],
+        }
+
+    def delete_runs(owner_username: str, run_ids: list[str]):
+        calls.append(("delete", owner_username, run_ids))
+        return {"deletedCount": 1}
+
+    monkeypatch.setattr(
+        crawler_api.sales_order_sync_history_service,
+        "list_runs",
+        list_runs,
+    )
+    monkeypatch.setattr(
+        crawler_api.sales_order_sync_history_service,
+        "delete_runs",
+        delete_runs,
+    )
+    client = _client(SUPERADMIN_USER)
+
+    listed = client.get(
+        "/crawler/sales-analysis/order-sync-runs"
+        "?page=2&pageSize=20&storeId=7&triggerType=manual&status=failed"
+        "&createdAtFrom=2026-07-01T00:00:00"
+        "&createdAtTo=2026-07-17T23:59:59"
+        "&ownerUsername=other-owner"
+    )
+    deleted = client.request(
+        "DELETE",
+        "/crawler/sales-analysis/order-sync-runs",
+        json={"runIds": ["run-1"]},
+    )
+
+    assert listed.status_code == 200
+    assert listed.json()["runs"] == [{"id": "run-1"}]
+    assert listed.json()["pagination"] == {
+        "total": 1,
+        "page": 2,
+        "pageSize": 20,
+    }
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deletedCount": 1}
+    assert calls[0][0:2] == ("list", "root")
+    assert calls[0][2]["store_id"] == 7
+    assert calls[0][2]["trigger_type"] == "manual"
+    assert calls[0][2]["status"] == "failed"
+    assert calls[1] == ("delete", "root", ["run-1"])
 
 
 def test_sales_analysis_settings_api_uses_current_user_and_ignores_payload_owner(

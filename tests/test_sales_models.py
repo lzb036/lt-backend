@@ -35,6 +35,7 @@ from app.db.models import (
     SalesItemAdjustmentModel,
     SalesOrderItemModel,
     SalesOrderModel,
+    SalesOrderSyncRunModel,
     SalesSyncStateModel,
     StoreModel,
     UserAccountModel,
@@ -48,6 +49,7 @@ SALES_TABLES = (
     SalesItemAdjustmentModel.__table__,
     ProductSalesDailyModel.__table__,
     SalesSyncStateModel.__table__,
+    SalesOrderSyncRunModel.__table__,
     SalesAnalysisConversationModel.__table__,
     SalesAnalysisMessageModel.__table__,
 )
@@ -183,6 +185,7 @@ def test_sales_tables_are_created(sqlite_engine):
         "lt_sales_item_adjustments",
         "lt_product_sales_daily",
         "lt_sales_sync_states",
+        "lt_sales_order_sync_runs",
         "lt_sales_analysis_conversations",
         "lt_sales_analysis_messages",
     } <= names
@@ -209,6 +212,14 @@ def test_all_sales_foreign_keys_are_named_for_compatibility():
     }
 
     assert unnamed == {table.name: [] for table in SALES_TABLES}
+
+
+def test_mysql_sales_order_sync_history_text_columns_have_no_server_default():
+    for column_name in ("message", "error_detail"):
+        column = SalesOrderSyncRunModel.__table__.c[column_name]
+        ddl = str(CreateColumn(column).compile(dialect=mysql.dialect()))
+
+        assert " DEFAULT " not in ddl.upper()
 
 
 def test_sales_order_item_parent_key_includes_order_number():

@@ -1333,6 +1333,7 @@ def ensure_schema_compatibility() -> None:
             model_module.SalesItemAdjustmentModel.__table__,
             model_module.ProductSalesDailyModel.__table__,
             model_module.SalesSyncStateModel.__table__,
+            model_module.SalesOrderSyncRunModel.__table__,
             model_module.SalesAnalysisConversationModel.__table__,
             model_module.SalesAnalysisMessageModel.__table__,
             model_module.UserSalesAnalysisSettingsModel.__table__,

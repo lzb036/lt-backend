@@ -915,6 +915,129 @@ class SalesSyncStateModel(TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
+class SalesOrderSyncRunModel(TimestampMixin, Base):
+    __tablename__ = "lt_sales_order_sync_runs"
+    __table_args__ = (
+        Index(
+            "ix_lt_sales_order_sync_run_owner_created",
+            "owner_username",
+            "created_at",
+        ),
+        Index(
+            "ix_lt_sales_order_sync_run_owner_status",
+            "owner_username",
+            "status",
+        ),
+        Index(
+            "ix_lt_sales_order_sync_run_store_created",
+            "store_id",
+            "created_at",
+        ),
+        Index(
+            "ix_lt_sales_order_sync_run_status_finished",
+            "status",
+            "finished_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_sales_order_sync_run_owner_user",
+        ),
+        nullable=False,
+    )
+    store_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey(
+            "lt_stores.id",
+            ondelete="SET NULL",
+            name="fk_lt_sales_order_sync_run_store",
+        ),
+    )
+    store_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        default="",
+        server_default="",
+    )
+    trigger_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="manual",
+        server_default="manual",
+    )
+    parent_run_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey(
+            "lt_sales_order_sync_runs.id",
+            ondelete="SET NULL",
+            name="fk_lt_sales_order_sync_run_parent",
+        ),
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="queued",
+        server_default="queued",
+    )
+    initial_sync: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+    )
+    progress_current: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    progress_total: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    total_order_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    new_order_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    updated_order_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    unchanged_order_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    failed_order_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+
+
 class SalesAnalysisConversationModel(TimestampMixin, Base):
     __tablename__ = "lt_sales_analysis_conversations"
     __table_args__ = (
