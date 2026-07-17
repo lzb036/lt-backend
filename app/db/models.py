@@ -938,6 +938,24 @@ class SalesAnalysisMessageModel(TimestampMixin, Base):
         nullable=False,
         default="{}",
     )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="completed",
+        server_default="completed",
+    )
+    error_code: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="",
+        server_default="",
+    )
+    error_message: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="",
+        server_default="",
+    )
 
     conversation: Mapped[SalesAnalysisConversationModel] = relationship(back_populates="messages")
 

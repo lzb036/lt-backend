@@ -734,7 +734,7 @@ def test_store_display_name_is_sanitized_before_entering_system_message(
     assert "buyer@example.com" not in serialized_messages
 
 
-def test_clarification_and_fallback_use_sanitized_store_names(
+def test_clarification_and_strict_failure_do_not_leak_store_names(
     monkeypatch,
     session_factory,
 ):
@@ -824,9 +824,10 @@ def test_clarification_and_fallback_use_sanitized_store_names(
             "查看近期销量",
         )
     )
-    fallback_text = fallback_events[-1]["message"]["answer"]
-    assert "buyer@example.com" not in fallback_text
-    assert "13912345678" not in fallback_text
+    failure_text = json.dumps(fallback_events, ensure_ascii=False)
+    assert fallback_events[-1]["type"] == "error"
+    assert "buyer@example.com" not in failure_text
+    assert "13912345678" not in failure_text
 
 
 def test_model_content_without_successful_tool_call_is_rejected_and_persisted(
@@ -867,7 +868,10 @@ def test_model_content_without_successful_tool_call_is_rejected_and_persisted(
             )
         )
     assert row is not None
-    assert "未调用销量分析工具" in row.answer_text
+    assert row.status == "error"
+    assert row.error_code == "missing_tool_call"
+    assert "未调用销量分析工具" in row.error_message
+    assert row.answer_text == ""
     assert fabricated not in row.answer_text
     assert row.tool_name == ""
 
@@ -1933,7 +1937,7 @@ def test_turn_executes_at_most_four_model_tool_calls(
     assert "最多调用 4 次" in events[-1]["message"]
 
 
-def test_explanation_failure_after_tool_success_uses_deterministic_fallback(
+def test_explanation_failure_after_tool_success_emits_error_without_fallback(
     monkeypatch,
     session_factory,
 ):
@@ -1979,24 +1983,10 @@ def test_explanation_failure_after_tool_success_uses_deterministic_fallback(
         "status",
         "tool_call",
         "tool_result",
-        "delta",
-        "completed",
+        "error",
     ]
-    answer = events[-1]["message"]["answer"]
-    for required in (
-        "Analysis Shop 1",
-        RECENT_START,
-        RECENT_END,
-        "有效销量 = 下单数量 - 取消数量 - 退款数量 - 退货数量",
-        "2026-07-16T14:30:00+08:00",
-        "unresolvedAdjustmentCount: 2",
-        "MN-1",
-        "Safe Product",
-        "12",
-        "3600.0",
-    ):
-        assert required in answer
-    assert events[-1]["message"]["fallback"] is True
+    assert events[-1]["message"] == "AI 分析失败，请稍后重试。"
+    assert all(event["type"] != "completed" for event in events)
 
     with session_factory() as session:
         row = session.scalar(
@@ -2006,7 +1996,68 @@ def test_explanation_failure_after_tool_success_uses_deterministic_fallback(
             )
         )
     assert row is not None
-    assert row.answer_text == answer
+    assert row.status == "error"
+    assert row.error_code == "ai_service_error"
+    assert row.error_message == "AI 分析失败，请稍后重试。"
+    assert row.answer_text == ""
+
+
+def test_tool_execution_failure_persists_error_status(
+    monkeypatch,
+    session_factory,
+):
+    store_id = _seed_owner(session_factory)[0]
+    conversation = _create_conversation()
+    monkeypatch.setattr(
+        sales_ai_service,
+        "litellm_completion",
+        lambda **_: _model_response(
+            tool_calls=[
+                (
+                    "get_product_sales_ranking",
+                    {
+                        "storeId": store_id,
+                        "startDate": RECENT_START,
+                        "endDate": RECENT_END,
+                    },
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        sales_ai_service,
+        "execute_sales_tool",
+        lambda *_: (_ for _ in ()).throw(
+            RuntimeError("private database detail")
+        ),
+    )
+
+    events = list(
+        sales_ai_service.stream_analysis(
+            OWNER,
+            conversation["id"],
+            "查看近期销量排行",
+        )
+    )
+
+    assert [event["type"] for event in events] == [
+        "status",
+        "tool_call",
+        "error",
+    ]
+    assert events[-1]["message"] == "销量分析工具执行失败，请检查查询条件。"
+    with session_factory() as session:
+        row = session.scalar(
+            select(SalesAnalysisMessageModel).where(
+                SalesAnalysisMessageModel.conversation_id
+                == conversation["id"]
+            )
+        )
+    assert row is not None
+    assert row.status == "error"
+    assert row.error_code == "tool_execution_error"
+    assert "private database detail" not in row.error_message
+    assert row.answer_text == ""
 
 
 def test_model_answer_is_discarded_for_deterministic_grounded_output(
@@ -2071,7 +2122,7 @@ def test_model_answer_is_discarded_for_deterministic_grounded_output(
         assert required in answer
 
 
-def test_fabricated_numeric_model_answer_after_tool_is_discarded(
+def test_fabricated_numeric_model_answer_after_tool_emits_error(
     monkeypatch,
     session_factory,
 ):
@@ -2117,23 +2168,31 @@ def test_fabricated_numeric_model_answer_after_tool_is_discarded(
         )
     )
 
-    assert events[-1]["type"] == "completed"
-    assert events[-1]["message"]["fallback"] is False
-    answer = events[-1]["message"]["answer"]
-    assert "999999" not in answer
-    assert "123456789012" in answer
-    assert "Safe Product" in answer
-    assert '"effectiveUnits":12' in answer
-    assert "store: Analysis Shop 1" in answer
-    assert f"startDate: {RECENT_START}" in answer
-    assert f"endDate: {RECENT_END}" in answer
+    assert [event["type"] for event in events] == [
+        "status",
+        "tool_call",
+        "tool_result",
+        "error",
+    ]
+    assert events[-1]["message"] == "AI 回答未通过事实校验，请重试。"
+    with session_factory() as session:
+        row = session.scalar(
+            select(SalesAnalysisMessageModel).where(
+                SalesAnalysisMessageModel.conversation_id
+                == conversation["id"]
+            )
+        )
+    assert row is not None
+    assert row.status == "error"
+    assert row.error_code == "answer_validation_error"
+    assert row.answer_text == ""
 
 
 @pytest.mark.parametrize(
     "fabricated",
     ["100", "2026", "3.14", "9e5", "-1.2e-3%", "９９％"],
 )
-def test_any_numeric_model_prose_uses_fallback(
+def test_any_unsupported_numeric_model_prose_emits_error(
     monkeypatch,
     session_factory,
     fabricated,
@@ -2176,9 +2235,10 @@ def test_any_numeric_model_prose_uses_fallback(
         )
     )
 
-    assert events[-1]["type"] == "completed"
-    assert events[-1]["message"]["fallback"] is False
-    assert "模型声称" not in events[-1]["message"]["answer"]
+    assert events[-1] == {
+        "type": "error",
+        "message": "AI 回答未通过事实校验，请重试。",
+    }
 
 
 @pytest.mark.parametrize(
@@ -2190,7 +2250,7 @@ def test_any_numeric_model_prose_uses_fallback(
         "退款情况非常严重。",
     ],
 )
-def test_qualitative_and_chinese_numeral_model_conclusions_are_discarded(
+def test_unsupported_qualitative_model_conclusions_emit_error(
     monkeypatch,
     session_factory,
     unsupported_conclusion,
@@ -2233,14 +2293,13 @@ def test_qualitative_and_chinese_numeral_model_conclusions_are_discarded(
         )
     )
 
-    answer = events[-1]["message"]["answer"]
-    assert events[-1]["type"] == "completed"
-    assert unsupported_conclusion not in answer
-    assert "以下为后端生成的受控结果。" in answer
-    assert '"effectiveUnits":12' in answer
+    assert events[-1] == {
+        "type": "error",
+        "message": "AI 回答未通过事实校验，请重试。",
+    }
 
 
-def test_numeric_after_prose_limit_still_uses_fallback(
+def test_numeric_after_prose_limit_emits_error(
     monkeypatch,
     session_factory,
 ):
@@ -2285,9 +2344,10 @@ def test_numeric_after_prose_limit_still_uses_fallback(
         )
     )
 
-    assert events[-1]["type"] == "completed"
-    assert events[-1]["message"]["fallback"] is False
-    assert "很长的模型说明" not in events[-1]["message"]["answer"]
+    assert events[-1] == {
+        "type": "error",
+        "message": "AI 回答未通过事实校验，请重试。",
+    }
 
 
 def test_long_model_prose_reserves_complete_canonical_footer(

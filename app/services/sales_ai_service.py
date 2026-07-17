@@ -493,6 +493,15 @@ _DATABASE_STATEMENT_RE = re.compile(
     r"(?is)\b(?:select|insert|update|delete|drop|alter|create|replace|"
     r"truncate|merge|pragma)\b.*?(?=(?:[,;；\n]|$))"
 )
+_MODEL_NUMERIC_CLAIM_RE = re.compile(
+    r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[-+]?\d+)?%?",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_QUALITATIVE_CLAIM_RE = re.compile(
+    r"第一名|遥遥领先|表现最好|增长明显|非常严重"
+)
+
+
 def _current_shanghai_date() -> date:
     return datetime.now(SHANGHAI_TIMEZONE).date()
 
@@ -550,6 +559,18 @@ def _collect_tool_identifiers(value: Any) -> tuple[str, ...]:
     return tuple(dict.fromkeys(identifiers))
 
 
+def _iter_scalar_values(value: Any) -> Iterator[Any]:
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_scalar_values(child)
+        return
+    if isinstance(value, list):
+        for child in value:
+            yield from _iter_scalar_values(child)
+        return
+    yield value
+
+
 def _timestamp_to_public(value: datetime | None) -> str | None:
     return value.isoformat(timespec="seconds") if value is not None else None
 
@@ -605,6 +626,9 @@ def _message_to_public(
         "modelName": row.model_name,
         "storeScope": store_scope,
         "statisticsWindow": statistics_window,
+        "status": row.status,
+        "errorCode": row.error_code,
+        "errorMessage": _truncate_text(row.error_message, 2_000),
         "fallback": fallback,
         "createdAt": _timestamp_to_public(row.created_at),
         "updatedAt": _timestamp_to_public(row.updated_at),
@@ -1123,6 +1147,9 @@ def _start_turn(
             model_name="",
             store_scope_json=_json_dump(store_scope),
             statistics_window_json="{}",
+            status="pending",
+            error_code="",
+            error_message="",
         )
         session.add(message_row)
         session.flush()
@@ -1738,6 +1765,9 @@ def _persist_message_state(
     relative_window: dict[str, str] | None,
     tool_records: list[dict[str, Any]],
     fallback: bool = False,
+    status: str | None = None,
+    error_code: str = "",
+    error_message: str = "",
 ) -> dict[str, Any]:
     with session_scope() as session:
         row = session.scalar(
@@ -1801,6 +1831,10 @@ def _persist_message_state(
         row.statistics_window_json = _json_dump(
             _statistics_window(relative_window, tool_records)
         )
+        if status is not None:
+            row.status = status
+            row.error_code = error_code
+            row.error_message = _truncate_text(error_message, 2_000)
         if selected_store_id is not None or not locked_scope_present:
             conversation.store_scope_json = _json_dump(store_scope)
         conversation.last_message_at = _now_local_naive()
@@ -1852,6 +1886,36 @@ def _finalize_message(
         relative_window=relative_window,
         tool_records=tool_records,
         fallback=fallback,
+        status="completed",
+        error_code="",
+        error_message="",
+    )
+
+
+def _fail_message(
+    *,
+    owner_username: str,
+    conversation_id: int,
+    message_id: int,
+    error_code: str,
+    error_message: str,
+    model_name: str,
+    selected_store_id: int | None,
+    relative_window: dict[str, str] | None,
+    tool_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return _persist_message_state(
+        owner_username=owner_username,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        answer="",
+        model_name=model_name,
+        selected_store_id=selected_store_id,
+        relative_window=relative_window,
+        tool_records=tool_records,
+        status="error",
+        error_code=error_code,
+        error_message=error_message,
     )
 
 
@@ -2017,38 +2081,6 @@ def _completion_kwargs(
         "timeout": 120,
         "drop_params": True,
     }
-
-
-def _fallback_answer(
-    selected_store: dict[str, Any],
-    relative_window: dict[str, str] | None,
-    tool_records: list[dict[str, Any]],
-    *,
-    owner_username: str,
-    secrets: tuple[str, ...],
-) -> str:
-    protected_identifiers = _collect_tool_identifiers(tool_records)
-    metadata = _grounding_metadata(
-        selected_store,
-        relative_window,
-        tool_records,
-        owner_username=owner_username,
-        secrets=secrets,
-    )
-    footer = _canonical_footer(
-        metadata,
-        tool_records,
-        owner_username=owner_username,
-        secrets=secrets,
-        protected_identifiers=protected_identifiers,
-    )
-    return _compose_answer_with_footer(
-        "模型解释未通过校验，以下为受控结果。",
-        footer,
-        owner_username=owner_username,
-        secrets=secrets,
-        protected_identifiers=protected_identifiers,
-    )
 
 
 def _deterministic_answer(
@@ -2277,8 +2309,36 @@ def _ground_final_answer(
     *,
     owner_username: str,
     secrets: tuple[str, ...],
-) -> tuple[str, bool]:
-    del content
+) -> tuple[str | None, bool]:
+    normalized_content = unicodedata.normalize(
+        "NFKC",
+        str(content or ""),
+    )
+    known_text_values = {
+        str(selected_store.get("name") or ""),
+        *(
+            str(value)
+            for record in tool_records
+            for value in _iter_scalar_values(record["result"])
+            if isinstance(value, str)
+        ),
+    }
+    claim_text = normalized_content
+    for known_value in sorted(
+        (
+            unicodedata.normalize("NFKC", value)
+            for value in known_text_values
+            if value
+        ),
+        key=len,
+        reverse=True,
+    ):
+        claim_text = claim_text.replace(known_value, "")
+    if (
+        _MODEL_NUMERIC_CLAIM_RE.search(claim_text)
+        or _UNSUPPORTED_QUALITATIVE_CLAIM_RE.search(claim_text)
+    ):
+        return None, False
     return (
         _deterministic_answer(
             selected_store,
@@ -2371,11 +2431,12 @@ def stream_analysis(
             if isinstance(exc, RuntimeError)
             else "AI 配置不可用，请重新保存并验证配置。"
         )
-        _finalize_message(
+        failed = _fail_message(
             owner_username=normalized_owner,
             conversation_id=conversation_id,
             message_id=message_id,
-            answer=answer,
+            error_code="ai_configuration_error",
+            error_message=answer,
             model_name="",
             selected_store_id=selected_store["id"],
             relative_window=relative_window,
@@ -2437,37 +2498,13 @@ def stream_analysis(
         except Exception:
             if _analysis_cancelled(is_cancelled):
                 return
-            if tool_records:
-                fallback_answer = _fallback_answer(
-                    selected_store,
-                    relative_window,
-                    tool_records,
-                    owner_username=normalized_owner,
-                    secrets=redaction_secrets,
-                )
-                persisted = _finalize_message(
-                    owner_username=normalized_owner,
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                    answer=fallback_answer,
-                    model_name=model_name,
-                    selected_store_id=selected_store["id"],
-                    relative_window=relative_window,
-                    tool_records=tool_records,
-                    fallback=True,
-                )
-                yield {
-                    "type": "delta",
-                    "content": persisted["answer"],
-                }
-                yield {"type": "completed", "message": persisted}
-                return
             answer = "AI 分析失败，请稍后重试。"
-            _finalize_message(
+            failed = _fail_message(
                 owner_username=normalized_owner,
                 conversation_id=conversation_id,
                 message_id=message_id,
-                answer=answer,
+                error_code="ai_service_error",
+                error_message=answer,
                 model_name=model_name,
                 selected_store_id=selected_store["id"],
                 relative_window=relative_window,
@@ -2483,11 +2520,12 @@ def stream_analysis(
                 answer = (
                     "模型未调用销量分析工具，无法生成可信的销量结论。"
                 )
-                _finalize_message(
+                failed = _fail_message(
                     owner_username=normalized_owner,
                     conversation_id=conversation_id,
                     message_id=message_id,
-                    answer=answer,
+                    error_code="missing_tool_call",
+                    error_message=answer,
                     model_name=model_name,
                     selected_store_id=selected_store["id"],
                     relative_window=relative_window,
@@ -2504,6 +2542,24 @@ def stream_analysis(
                 secrets=redaction_secrets,
             )
             if _analysis_cancelled(is_cancelled):
+                return
+            if sanitized_answer is None:
+                answer = "AI 回答未通过事实校验，请重试。"
+                failed = _fail_message(
+                    owner_username=normalized_owner,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    error_code="answer_validation_error",
+                    error_message=answer,
+                    model_name=model_name,
+                    selected_store_id=selected_store["id"],
+                    relative_window=relative_window,
+                    tool_records=tool_records,
+                )
+                yield {
+                    "type": "error",
+                    "message": answer,
+                }
                 return
             persisted = _finalize_message(
                 owner_username=normalized_owner,
@@ -2539,11 +2595,12 @@ def stream_analysis(
                     f"单次分析最多调用 {MAX_TOOL_CALLS_PER_TURN} 次工具，"
                     "请缩小问题范围后重试。"
                 )
-                _finalize_message(
+                failed = _fail_message(
                     owner_username=normalized_owner,
                     conversation_id=conversation_id,
                     message_id=message_id,
-                    answer=answer,
+                    error_code="tool_limit_error",
+                    error_message=answer,
                     model_name=model_name,
                     selected_store_id=selected_store["id"],
                     relative_window=relative_window,
@@ -2554,11 +2611,12 @@ def stream_analysis(
             tool_name = tool_call["name"]
             if tool_name not in ALLOWED_TOOL_NAMES:
                 answer = "模型请求了不允许的分析工具。"
-                _finalize_message(
+                failed = _fail_message(
                     owner_username=normalized_owner,
                     conversation_id=conversation_id,
                     message_id=message_id,
-                    answer=answer,
+                    error_code="disallowed_tool_error",
+                    error_message=answer,
                     model_name=model_name,
                     selected_store_id=selected_store["id"],
                     relative_window=relative_window,
@@ -2577,11 +2635,12 @@ def stream_analysis(
                 )
             except (TypeError, ValueError):
                 answer = "模型提供的分析工具参数不符合允许范围。"
-                _finalize_message(
+                failed = _fail_message(
                     owner_username=normalized_owner,
                     conversation_id=conversation_id,
                     message_id=message_id,
-                    answer=answer,
+                    error_code="tool_argument_error",
+                    error_message=answer,
                     model_name=model_name,
                     selected_store_id=selected_store["id"],
                     relative_window=relative_window,
@@ -2610,11 +2669,12 @@ def stream_analysis(
                 if _analysis_cancelled(is_cancelled):
                     return
                 answer = "销量分析工具执行失败，请检查查询条件。"
-                _finalize_message(
+                failed = _fail_message(
                     owner_username=normalized_owner,
                     conversation_id=conversation_id,
                     message_id=message_id,
-                    answer=answer,
+                    error_code="tool_execution_error",
+                    error_message=answer,
                     model_name=model_name,
                     selected_store_id=selected_store["id"],
                     relative_window=relative_window,

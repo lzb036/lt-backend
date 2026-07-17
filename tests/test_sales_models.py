@@ -790,6 +790,84 @@ def test_sales_analysis_message_rejects_cross_owner_conversation_reference(sqlit
             session.commit()
 
 
+def test_sales_analysis_message_status_fields_default_to_completed():
+    columns = SalesAnalysisMessageModel.__table__.c
+
+    assert columns.status.server_default.arg == "completed"
+    assert columns.error_code.server_default.arg == ""
+    assert columns.error_message.server_default.arg == ""
+
+
+def test_ensure_table_layout_adds_sales_message_status_to_legacy_table():
+    legacy_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        Base.metadata.create_all(legacy_engine)
+        with legacy_engine.begin() as connection:
+            for column_name in ("status", "error_code", "error_message"):
+                connection.execute(
+                    text(
+                        "ALTER TABLE lt_sales_analysis_messages "
+                        f"DROP COLUMN {column_name}"
+                    )
+                )
+            connection.execute(
+                UserAccountModel.__table__.insert().values(
+                    username="alice",
+                    display_name="Alice",
+                    password_salt_b64="salt",
+                    password_hash_b64="hash",
+                )
+            )
+            conversation_id = connection.execute(
+                SalesAnalysisConversationModel.__table__.insert().values(
+                    owner_username="alice",
+                    title="Legacy",
+                    store_scope_json="[]",
+                )
+            ).inserted_primary_key[0]
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO lt_sales_analysis_messages (
+                        id, conversation_id, owner_username, question_text,
+                        answer_text, tool_name, tool_arguments_json,
+                        result_summary_json, model_name, store_scope_json,
+                        statistics_window_json
+                    )
+                    VALUES (
+                        1, :conversation_id, 'alice', 'legacy',
+                        'legacy answer', '', '[]', '[]', '', '[]', '{}'
+                    )
+                    """
+                ),
+                {"conversation_id": conversation_id},
+            )
+            result = database_module._ensure_table_layout(
+                connection,
+                SalesAnalysisMessageModel.__table__,
+            )
+
+        with legacy_engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT status, error_code, error_message
+                    FROM lt_sales_analysis_messages
+                    WHERE id = 1
+                    """
+                )
+            ).one()
+
+        assert set(result["added_columns"]) == {
+            "status",
+            "error_code",
+            "error_message",
+        }
+        assert row == ("completed", "", "")
+    finally:
+        legacy_engine.dispose()
+
+
 def test_ensure_table_layout_fails_for_required_no_default_column(sqlite_engine):
     partial_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     try:
