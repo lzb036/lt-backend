@@ -8670,7 +8670,19 @@ def perform_product_title_optimization(
                     or int(product.store_id or 0) != int(store_id)
                 ):
                     raise RuntimeError("商品已不存在、已移出店铺商品或店铺已发生变化。")
-            ai_title_service.generate_version(owner_username, product_id, owner_username)
+            generated_version = ai_title_service.generate_version(
+                owner_username,
+                product_id,
+                owner_username,
+            )
+            version_id = int(generated_version.get("id") or 0)
+            if version_id <= 0:
+                raise RuntimeError("标题优化已生成，但没有返回可应用的版本。")
+            ai_title_service.save_title_version(
+                owner_username,
+                product_id,
+                version_id,
+            )
             success_ids.append(product_id)
         except Exception as exc:
             failed_ids.append(product_id)
