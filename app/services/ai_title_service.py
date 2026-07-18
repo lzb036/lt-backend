@@ -351,8 +351,8 @@ def save_title_version_in_session(
     version = session.get(ProductTitleVersionModel, version_id)
     if product is None or product.owner_username != owner_username:
         raise RuntimeError("商品不存在。")
-    if product.review_status != "pending":
-        raise RuntimeError("只有待审核商品可以保存优化标题。")
+    if product.review_status not in {"pending", "listed"}:
+        raise RuntimeError("只有待审核商品或店铺商品可以保存优化标题。")
     if version is None or version.product_id != product_id or version.owner_username != owner_username:
         raise RuntimeError("标题优化版本不存在。")
     title = truncate_utf8_bytes(version.title, RAKUTEN_TITLE_MAX_BYTES)
@@ -399,8 +399,8 @@ def delete_title_version_in_session(
     version = session.get(ProductTitleVersionModel, version_id)
     if product is None or product.owner_username != owner_username:
         raise RuntimeError("商品不存在。")
-    if product.review_status != "pending":
-        raise RuntimeError("只有待审核商品可以删除标题历史版本。")
+    if product.review_status not in {"pending", "listed"}:
+        raise RuntimeError("只有待审核商品或店铺商品可以删除标题历史版本。")
     if version is None or version.product_id != product_id or version.owner_username != owner_username:
         raise RuntimeError("标题优化版本不存在。")
     if version.is_selected:
@@ -497,8 +497,8 @@ def stream_generate_version(owner_username: str, product_id: int, created_by: st
         product = session.get(ProductModel, product_id)
         if product is None or product.owner_username != owner_username:
             raise RuntimeError("商品不存在。")
-        if product.review_status != "pending":
-            raise RuntimeError("只有待审核商品可以优化标题。")
+        if product.review_status not in {"pending", "listed"}:
+            raise RuntimeError("只有待审核商品或店铺商品可以优化标题。")
         settings = ensure_user_settings(session, created_by)
         api_key = decrypt_text(settings.api_key_encrypted)
         if not api_key:

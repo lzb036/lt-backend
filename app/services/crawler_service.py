@@ -46,6 +46,7 @@ from app.db.models import (
     ListingTaskModel,
     ProductSalesDailyModel,
     ProductModel,
+    ProductTitleVersionModel,
     RoleModel,
     SalesOrderModel,
     SalesSyncStateModel,
@@ -953,6 +954,7 @@ def product_to_public(
     row: ProductModel,
     *,
     period_sales_count: int | None = None,
+    title_optimization_count: int = 0,
 ) -> dict[str, Any]:
     listed_at = product_listed_at_text(row)
     raw_payload = product_raw_payload(row)
@@ -990,6 +992,7 @@ def product_to_public(
         "currency": row.currency,
         "salesCount": product_sales_count(raw_payload),
         "periodSalesCount": period_sales_count,
+        "titleOptimizationCount": title_optimization_count,
         "genreId": row.genre_id,
         "genrePath": rakuten_genre_path(row.genre_id),
         "genrePathZh": rakuten_genre_zh_path(rakuten_genre_path(row.genre_id)),
@@ -5885,6 +5888,7 @@ def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any
     return {
         "cleanupWeekday": SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY,
         "cleanupTime": SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME,
+        "cleanupEnabled": True,
         "retentionDays": SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS,
         "nextCleanupAt": datetime_to_public(next_cleanup_at),
         "lastCleanupAt": None,
@@ -5895,6 +5899,7 @@ def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any
         "productSyncNextAt": datetime_to_public(next_product_sync_at),
         "productSyncLastAt": None,
         "productSyncLastTaskCount": 0,
+        "unlistedCleanupEnabled": True,
         "unlistedCleanupMonthDay": STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY,
         "unlistedCleanupTime": STORE_UNLISTED_PRODUCT_CLEANUP_TIME,
         "unlistedNextCleanupAt": datetime_to_public(next_unlisted_cleanup_at),
@@ -5921,6 +5926,9 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         cleanup_time = normalize_schedule_time(payload.get("cleanupTime", default_payload["cleanupTime"]))
     except RuntimeError:
         cleanup_time = default_payload["cleanupTime"]
+    cleanup_enabled = payload.get("cleanupEnabled", default_payload["cleanupEnabled"])
+    if not isinstance(cleanup_enabled, bool):
+        cleanup_enabled = default_payload["cleanupEnabled"]
     product_sync_enabled = payload.get("productSyncEnabled", default_payload["productSyncEnabled"])
     if not isinstance(product_sync_enabled, bool):
         product_sync_enabled = default_payload["productSyncEnabled"]
@@ -5953,6 +5961,12 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         product_sync_last_task_count = max(0, int(product_sync_last_task_count or 0))
     except (TypeError, ValueError):
         product_sync_last_task_count = 0
+    unlisted_cleanup_enabled = payload.get(
+        "unlistedCleanupEnabled",
+        default_payload["unlistedCleanupEnabled"],
+    )
+    if not isinstance(unlisted_cleanup_enabled, bool):
+        unlisted_cleanup_enabled = default_payload["unlistedCleanupEnabled"]
     unlisted_month_day = STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY
     try:
         unlisted_cleanup_time = normalize_schedule_time(payload.get("unlistedCleanupTime", STORE_UNLISTED_PRODUCT_CLEANUP_TIME))
@@ -5975,6 +5989,7 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
     return {
         "cleanupWeekday": cleanup_weekday,
         "cleanupTime": cleanup_time,
+        "cleanupEnabled": cleanup_enabled,
         "retentionDays": SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS,
         "nextCleanupAt": datetime_to_public(next_cleanup_at),
         "lastCleanupAt": datetime_to_public(parse_public_datetime(payload.get("lastCleanupAt"))),
@@ -5985,6 +6000,7 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         "productSyncNextAt": datetime_to_public(product_sync_next_at),
         "productSyncLastAt": datetime_to_public(parse_public_datetime(payload.get("productSyncLastAt"))),
         "productSyncLastTaskCount": product_sync_last_task_count,
+        "unlistedCleanupEnabled": unlisted_cleanup_enabled,
         "unlistedCleanupMonthDay": unlisted_month_day,
         "unlistedCleanupTime": unlisted_cleanup_time,
         "unlistedNextCleanupAt": datetime_to_public(unlisted_next_cleanup_at),
@@ -6032,6 +6048,7 @@ def get_time_settings(*, include_queue_health: bool = True) -> dict[str, Any]:
 def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> dict[str, Any]:
     cleanup_weekday = normalize_cleanup_weekday(getattr(payload, "cleanupWeekday", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY))
     cleanup_time = normalize_schedule_time(getattr(payload, "cleanupTime", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME))
+    cleanup_enabled = bool(getattr(payload, "cleanupEnabled", True))
     product_sync_enabled = bool(getattr(payload, "productSyncEnabled", True))
     product_sync_weekday = normalize_cleanup_weekday(
         getattr(payload, "productSyncWeekday", STORE_PRODUCT_SYNC_DEFAULT_WEEKDAY)
@@ -6039,6 +6056,7 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
     product_sync_time = normalize_schedule_time(
         getattr(payload, "productSyncTime", STORE_PRODUCT_SYNC_DEFAULT_TIME)
     )
+    unlisted_cleanup_enabled = bool(getattr(payload, "unlistedCleanupEnabled", True))
     now = datetime.now()
     with session_scope() as session:
         row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
@@ -6047,6 +6065,7 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
             **existing,
             "cleanupWeekday": cleanup_weekday,
             "cleanupTime": cleanup_time,
+            "cleanupEnabled": cleanup_enabled,
             "retentionDays": SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS,
             "nextCleanupAt": datetime_to_public(next_weekly_run_at(cleanup_weekday, cleanup_time, now=now)),
             "productSyncEnabled": product_sync_enabled,
@@ -6055,6 +6074,7 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
             "productSyncNextAt": datetime_to_public(
                 next_weekly_run_at(product_sync_weekday, product_sync_time, now=now)
             ),
+            "unlistedCleanupEnabled": unlisted_cleanup_enabled,
         }
         row = upsert_time_settings_row(session, updated_payload)
         session.flush()
@@ -6071,7 +6091,10 @@ def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:
             payload = load_time_settings_payload(row, now=now)
             row = upsert_time_settings_row(session, payload)
             next_cleanup_at = parse_public_datetime(payload.get("nextCleanupAt"))
-            if not force and next_cleanup_at is not None and next_cleanup_at > now:
+            if not force and (
+                not payload["cleanupEnabled"]
+                or (next_cleanup_at is not None and next_cleanup_at > now)
+            ):
                 return 0
 
             retention_days = max(
@@ -6241,7 +6264,10 @@ def cleanup_store_unlisted_products(*, force: bool = False) -> dict[str, int]:
             payload = load_time_settings_payload(row, now=now)
             row = upsert_time_settings_row(session, payload)
             next_cleanup_at = parse_public_datetime(payload.get("unlistedNextCleanupAt"))
-            if not force and next_cleanup_at is not None and next_cleanup_at > now:
+            if not force and (
+                not payload["unlistedCleanupEnabled"]
+                or (next_cleanup_at is not None and next_cleanup_at > now)
+            ):
                 return {"taskCount": 0, "productCount": 0}
 
             task_refs, product_count = create_store_unlisted_product_delete_tasks(session, now)
@@ -6777,6 +6803,8 @@ def list_products(
         listed_store_filter = normalize_listed_store_filter(listed_store_id)
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
+        if product_status == "listed":
+            query = query.where(ProductModel.store_product_status != "removed")
         if normalize_text(task_id):
             query = query.where(
                 ProductModel.task_id == normalize_text(task_id),
@@ -6935,6 +6963,22 @@ def _products_to_public_with_period_sales(
     if not rows or sales_period_range is None:
         return [product_to_public(row) for row in rows]
 
+    title_optimization_counts = {
+        int(result.product_id): int(result.optimization_count or 0)
+        for result in session.execute(
+            select(
+                ProductTitleVersionModel.product_id,
+                func.count(ProductTitleVersionModel.id).label("optimization_count"),
+            )
+            .where(
+                ProductTitleVersionModel.owner_username == owner_username,
+                ProductTitleVersionModel.product_id.in_([row.id for row in rows]),
+                ProductTitleVersionModel.source != "original",
+            )
+            .group_by(ProductTitleVersionModel.product_id)
+        )
+    }
+
     store_ids = {
         int(row.store_id)
         for row in rows
@@ -7000,6 +7044,7 @@ def _products_to_public_with_period_sales(
                 if row.store_id in synced_store_ids
                 else None
             ),
+            title_optimization_count=title_optimization_counts.get(int(row.id), 0),
         )
         for row in rows
     ]
@@ -7176,40 +7221,132 @@ def delete_store(owner_username: str, store_id: int) -> None:
     cleanup_product_image_ids([int(product_id) for product_id in product_ids])
 
 
-def clear_store_products_for_reimport(
+def store_product_sync_identity(
+    *,
+    manage_number: str | None,
+    item_number: str | None,
+) -> str:
+    return normalize_text(manage_number) or normalize_text(item_number)
+
+
+def store_product_local_title_override(session: Any, product: ProductModel) -> bool:
+    selected = session.scalar(
+        select(ProductTitleVersionModel).where(
+            ProductTitleVersionModel.product_id == product.id,
+            ProductTitleVersionModel.owner_username == product.owner_username,
+            ProductTitleVersionModel.is_selected.is_(True),
+        )
+    )
+    return selected is not None and selected.source != "original"
+
+
+def apply_store_product_remote_update(
     session: Any,
     owner_username: str,
     store: StoreModel,
-) -> tuple[dict[str, dict[str, Any]], list[int]]:
-    rows = session.scalars(
-        select(ProductModel).where(
-            ProductModel.owner_username == owner_username,
-            ProductModel.store_id == store.id,
-        )
-    ).all()
-    previous_links: dict[str, dict[str, Any]] = {}
-    deleted_ids: list[int] = []
-    for row in rows:
-        remember_store_product_link(previous_links, row)
-        remove_listed_store_mark_for_store_product(session, row)
-        deleted_ids.append(row.id)
-        session.delete(row)
-    if deleted_ids:
-        session.flush()
-    return previous_links, deleted_ids
-
-
-def remember_store_product_link(previous_links: dict[str, dict[str, Any]], row: ProductModel) -> None:
-    if not row.parent_product_id:
-        return
-    link = {
-        "parentProductId": row.parent_product_id,
-        "listedAt": row.listed_at,
+    row: ProductModel,
+    item: dict[str, Any],
+    *,
+    active_words: list[str] | None = None,
+) -> bool:
+    item_number = first_text_from_keys(item, ("itemNumber", "manageNumber"))
+    manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
+    source_url = (
+        first_url_from_keys(item, ("itemUrl", "itemPageUrl", "url"))
+        or build_public_item_page_url(store.store_code, item_number or manage_number)
+    )
+    title = first_text_from_keys(item, ("itemName", "title", "name"))
+    raw_payload = item if isinstance(item, dict) else {}
+    remote_title_override = store_product_local_title_override(session, row)
+    current_payload = product_raw_payload(row)
+    current_tagline = product_tagline(current_payload)
+    normalized = {
+        "sourceUrl": source_url,
+        "sourceUrlHash": make_source_url_hash(
+            f"{source_url}#store={store.id}&manage={quote(manage_number or item_number, safe='')}"
+        ),
+        "imageUrl": first_rakuten_image_url(item, store.store_code),
+        "price": price_from_rakuten_item(item),
+        "itemNumber": item_number or manage_number,
+        "rakutenManageNumber": manage_number,
+        "listingStatus": rakuten_listing_status_from_item(item),
+        "genreId": first_text_from_keys(item, ("genreId", "genre_id", "genre")),
+        "shopName": store.store_name,
     }
-    for identifier in (normalize_text(row.rakuten_manage_number), normalize_text(row.item_number)):
-        if identifier:
-            previous_links[identifier] = link
+    changed = any(
+        (
+            row.source_url != normalized["sourceUrl"],
+            row.source_url_hash != normalized["sourceUrlHash"],
+            row.image_url != normalized["imageUrl"],
+            row.price != normalized["price"],
+            row.item_number != normalized["itemNumber"],
+            row.rakuten_manage_number != normalized["rakutenManageNumber"],
+            row.rakuten_listing_status != normalized["listingStatus"],
+            row.genre_id != normalized["genreId"],
+            row.shop_name != normalized["shopName"],
+            not remote_title_override and row.title != title[:500],
+            row.store_product_status == "removed",
+        )
+    )
+    row.source_url = normalized["sourceUrl"]
+    row.source_url_hash = normalized["sourceUrlHash"]
+    row.store_id = store.id
+    row.rakuten_manage_number = normalized["rakutenManageNumber"]
+    row.item_number = normalized["itemNumber"]
+    row.shop_name = normalized["shopName"]
+    row.image_url = normalized["imageUrl"]
+    row.price = Decimal(str(normalized["price"])) if normalized["price"] is not None else None
+    row.currency = "JPY"
+    row.genre_id = normalized["genreId"]
+    row.rakuten_listing_status = normalized["listingStatus"]
+    row.review_status = "listed"
+    row.store_product_status = "active"
+    row.store_last_seen_at = datetime.now()
+    row.listed_at = (
+        parse_rakuten_datetime_value(raw_payload.get("created"))
+        or row.listed_at
+    )
+    if not remote_title_override:
+        row.title = title[:500]
+        row.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+    else:
+        preserved_payload = patch_local_item_detail(
+            raw_payload,
+            title=row.title,
+            tagline=current_tagline,
+            variants=[],
+        )
+        row.raw_payload_json = json.dumps(preserved_payload, ensure_ascii=False)
+    row.last_error = None
+    if active_words:
+        sanitized_payload, _ = sanitize_product_payload(
+            json.loads(row.raw_payload_json or "{}"),
+            active_words,
+        )
+        row.raw_payload_json = json.dumps(sanitized_payload, ensure_ascii=False)
+    return changed
 
+
+def mark_missing_store_products_removed(
+    session: Any,
+    rows: list[ProductModel],
+    remote_identities: set[str],
+) -> int:
+    removed_count = 0
+    for row in rows:
+        identity = store_product_sync_identity(
+            manage_number=row.rakuten_manage_number,
+            item_number=row.item_number,
+        )
+        if not identity or identity in remote_identities:
+            continue
+        if row.store_product_status != "removed":
+            removed_count += 1
+        remove_listed_store_mark_for_store_product(session, row)
+        row.store_product_status = "removed"
+        row.rakuten_listing_status = "unlisted"
+        row.store_last_seen_at = None
+    return removed_count
 
 def verify_store_credentials(
     row: StoreModel,
@@ -7337,7 +7474,6 @@ def list_store_empty_cabinet_folders(owner_username: str, store_id: int) -> dict
 
 def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | None = None) -> dict[str, Any]:
     raise_if_task_cancelled(SyncTaskModel, task_id)
-    deleted_product_ids: list[int] = []
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
@@ -7353,50 +7489,116 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
         verify_store_credentials(row, include_product_counts=False)
         items, rakuten_total_count = fetch_rakuten_store_items_with_total(service_secret, license_key)
         apply_store_product_counts(row, items, rakuten_total_count=rakuten_total_count)
+        active_words = active_sensitive_words(session)
+        local_rows = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.store_id == row.id,
+            )
+        ).all()
+        local_by_identity: dict[str, ProductModel] = {}
+        for local_row in local_rows:
+            for identity in (
+                normalize_text(local_row.rakuten_manage_number),
+                normalize_text(local_row.item_number),
+            ):
+                if identity:
+                    local_by_identity.setdefault(identity, local_row)
+        remote_identities = {
+            store_product_sync_identity(
+                manage_number=first_text_from_keys(item, ("manageNumber", "itemNumber")),
+                item_number=first_text_from_keys(item, ("itemNumber", "manageNumber")),
+            )
+            for item in items
+        }
+        remote_identities.discard("")
+        removed_count = mark_missing_store_products_removed(
+            session,
+            local_rows,
+            remote_identities,
+        )
+        added_count = 0
+        updated_count = 0
+        unchanged_count = 0
+        failed_count = 0
+        total_count = len(items) + removed_count
+        processed_count = removed_count
         if task_id:
             update_task_progress(
                 SyncTaskModel,
                 task_id,
-                total_count=len(items),
-                success_count=0,
+                total_count=total_count,
+                success_count=processed_count - failed_count,
                 failed_count=0,
-                message=f"同步中，已处理 0 / {len(items)} 条",
+                message=(
+                    f"同步中，新增 0，更新 0，移除 {removed_count}，"
+                    f"已处理 {processed_count} / {total_count} 条"
+                ),
             )
-        raise_if_task_cancelled(SyncTaskModel, task_id)
-        active_words = active_sensitive_words(session)
-        previous_store_links, deleted_product_ids = clear_store_products_for_reimport(session, owner_username, row)
         for index, item in enumerate(items, start=1):
             raise_if_task_cancelled(SyncTaskModel, task_id)
-            if upsert_store_product(
-                session,
-                owner_username,
-                row,
-                item,
-                previous_store_links=previous_store_links,
-                active_words=active_words,
-            ):
-                synced_count += 1
-            else:
+            manage_number = first_text_from_keys(item, ("manageNumber", "itemNumber"))
+            item_number = first_text_from_keys(item, ("itemNumber", "manageNumber"))
+            identity = store_product_sync_identity(
+                manage_number=manage_number,
+                item_number=item_number,
+            )
+            existing = local_by_identity.get(identity)
+            try:
+                if existing is None:
+                    if upsert_store_product(
+                        session,
+                        owner_username,
+                        row,
+                        item,
+                        active_words=active_words,
+                    ):
+                        added_count += 1
+                    else:
+                        failed_count += 1
+                elif apply_store_product_remote_update(
+                    session,
+                    owner_username,
+                    row,
+                    existing,
+                    item,
+                    active_words=active_words,
+                ):
+                    updated_count += 1
+                else:
+                    unchanged_count += 1
+            except Exception as exc:
                 failed_count += 1
+                logger.exception("店铺商品差异同步失败 store_id=%s identity=%s", store_id, identity)
+                if existing is not None:
+                    existing.last_error = str(exc)[:1000]
+            processed_count += 1
             if task_id:
                 update_task_progress(
                     SyncTaskModel,
                     task_id,
-                    total_count=len(items),
-                    success_count=synced_count,
+                    total_count=total_count,
+                    success_count=processed_count - failed_count,
                     failed_count=failed_count,
-                    message=f"同步中，已处理 {index} / {len(items)} 条",
+                    message=(
+                        f"同步中，新增 {added_count}，更新 {updated_count}，"
+                        f"移除 {removed_count}，已处理 {processed_count} / {total_count} 条"
+                    ),
                 )
         row.last_product_synced_at = datetime.now()
         session.flush()
+        synced_count = added_count + updated_count + unchanged_count + removed_count
         result = {
             "store": store_to_public(row),
-            "totalCount": len(items),
+            "totalCount": total_count,
             "syncedCount": synced_count,
             "failedCount": failed_count,
+            "addedCount": added_count,
+            "updatedCount": updated_count,
+            "removedCount": removed_count,
+            "unchangedCount": unchanged_count,
             "cancelled": False,
         }
-    cleanup_product_image_ids(deleted_product_ids)
     return result
 
 
@@ -8447,12 +8649,19 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             total_count = int(result.get("totalCount") or 0)
             success_count = int(result.get("syncedCount") or 0)
             failed_count = int(result.get("failedCount") or 0)
+            payload["result"] = result
             if result.get("cancelled"):
                 status = "cancelled"
                 message = cancelled_task_progress_message("同步", total_count, success_count, failed_count)
             else:
                 status = "success" if failed_count == 0 else "partial"
-                message = f"完成，同步 {success_count} 条，异常 {failed_count} 条"
+                message = (
+                    f"完成，新增 {int(result.get('addedCount') or 0)} 条，"
+                    f"更新 {int(result.get('updatedCount') or 0)} 条，"
+                    f"移除 {int(result.get('removedCount') or 0)} 条，"
+                    f"未变化 {int(result.get('unchangedCount') or 0)} 条，"
+                    f"异常 {failed_count} 条"
+                )
             error_detail = None
     except TaskCancelled:
         with session_scope() as session:
@@ -17398,7 +17607,6 @@ def upsert_store_product(
     store: StoreModel,
     item: dict[str, Any],
     *,
-    previous_store_links: dict[str, dict[str, Any]] | None = None,
     active_words: list[str] | None = None,
 ) -> bool:
     item_number = first_text_from_keys(item, ("itemNumber", "manageNumber"))
@@ -17440,35 +17648,8 @@ def upsert_store_product(
             )
         )
         if row is not None:
-            restore_store_product_link(session, row, previous_store_links, manage_number, item_number)
             ensure_product_listed_store_mark_from_store_product(session, row, store)
     return saved
-
-
-def restore_store_product_link(
-    session: Any,
-    row: ProductModel,
-    previous_store_links: dict[str, dict[str, Any]] | None,
-    *identifiers: str,
-) -> None:
-    if not previous_store_links:
-        return
-    link: dict[str, Any] | None = None
-    for identifier in identifiers:
-        normalized = normalize_text(identifier)
-        if normalized and normalized in previous_store_links:
-            link = previous_store_links[normalized]
-            break
-    if not link:
-        return
-    parent_product_id = int(link.get("parentProductId") or 0)
-    if parent_product_id and not row.parent_product_id:
-        parent = session.get(ProductModel, parent_product_id)
-        if parent is not None and parent.owner_username == row.owner_username:
-            row.parent_product_id = parent.id
-    listed_at = link.get("listedAt")
-    if isinstance(listed_at, datetime) and row.listed_at is None:
-        row.listed_at = listed_at
 
 
 def upsert_product(
