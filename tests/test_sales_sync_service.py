@@ -935,7 +935,7 @@ def test_credential_decryption_failure_marks_current_lease_error(
     assert state.last_error == "销量同步失败，请稍后重试。"
 
 
-def test_initial_sync_searches_default_90_days_without_local_rechecks(
+def test_initial_sync_searches_default_365_days_without_local_rechecks(
     monkeypatch,
     session_factory,
 ):
@@ -1016,12 +1016,51 @@ def test_initial_sync_searches_default_90_days_without_local_rechecks(
         state = session.get(SalesSyncStateModel, store_id)
 
     assert result["status"] == "completed"
-    assert search_call["startAt"] == now - timedelta(days=90)
+    assert search_call["startAt"] == now - timedelta(days=365)
     assert search_call["endAt"] == now
     assert search_call["statuses"] == sales_sync_service.RAKUTEN_ORDER_STATUSES
     assert requested_order_numbers == ["FIRST-REMOTE"]
     assert state is not None
     assert state.initial_sync_completed is True
+
+
+def test_force_full_window_rechecks_365_days_for_existing_store(
+    monkeypatch,
+    session_factory,
+):
+    now = datetime(2026, 7, 16, 12, 0, 0)
+    with session_factory() as session:
+        store = seed_store(session)
+        session.add(
+            SalesSyncStateModel(
+                owner_username="alice",
+                store_id=store.id,
+                initial_sync_completed=True,
+                sync_status="idle",
+            )
+        )
+        store_id = store.id
+        session.commit()
+
+    search_starts: list[datetime] = []
+    patch_local_sync_dependencies(monkeypatch, session_factory, [])
+    monkeypatch.setattr(sales_sync_service, "_now", lambda: now)
+    monkeypatch.setattr(
+        sales_sync_service.rakuten_order_service,
+        "search_order_numbers",
+        lambda _secret, _key, start_at, _end_at, _statuses: (
+            search_starts.append(start_at) or []
+        ),
+    )
+
+    result = sales_sync_service.sync_owned_store(
+        "alice",
+        store_id,
+        force_full_window=True,
+    )
+
+    assert result["status"] == "completed"
+    assert search_starts == [now - timedelta(days=365)]
 
 
 def test_initial_sync_missing_order_detail_preserves_full_retry_window(
@@ -1097,8 +1136,8 @@ def test_initial_sync_missing_order_detail_preserves_full_retry_window(
     assert completed_state is not None
     assert completed_state.initial_sync_completed is True
     assert search_starts == [
-        now - timedelta(days=90),
-        now - timedelta(days=90),
+        now - timedelta(days=365),
+        now - timedelta(days=365),
     ]
 
 
@@ -2965,3 +3004,91 @@ def test_rebuild_daily_sales_replaces_range_without_committing(
 
     assert persisted.manage_number == "STALE"
     assert persisted.order_count == 99
+
+
+def test_prune_expired_sales_data_keeps_exact_365_day_boundary(
+    session_factory,
+):
+    now = datetime(2026, 7, 18, 12, 0, 0)
+    cutoff = now - timedelta(days=365)
+    with session_factory() as session:
+        store = seed_store(session)
+        expired_order = SalesOrderModel(
+            owner_username="alice",
+            store_id=store.id,
+            order_number="EXPIRED",
+            ordered_at=cutoff - timedelta(minutes=1),
+            raw_order_json="{}",
+            last_synced_at=now,
+        )
+        retained_order = SalesOrderModel(
+            owner_username="alice",
+            store_id=store.id,
+            order_number="RETAINED",
+            ordered_at=cutoff + timedelta(minutes=1),
+            raw_order_json="{}",
+            last_synced_at=now,
+        )
+        session.add_all([expired_order, retained_order])
+        session.flush()
+        session.add_all([
+            SalesOrderItemModel.from_service_payload(
+                owner_username="alice",
+                store_id=store.id,
+                sales_order_id=expired_order.id,
+                order_number=expired_order.order_number,
+                item_detail_id="expired-item",
+                manage_number="EXPIRED-MN",
+                unit_price=Decimal("100"),
+                ordered_units=1,
+                ordered_at=expired_order.ordered_at,
+            ),
+            SalesOrderItemModel.from_service_payload(
+                owner_username="alice",
+                store_id=store.id,
+                sales_order_id=retained_order.id,
+                order_number=retained_order.order_number,
+                item_detail_id="retained-item",
+                manage_number="RETAINED-MN",
+                unit_price=Decimal("200"),
+                ordered_units=2,
+                ordered_at=retained_order.ordered_at,
+            ),
+        ])
+        session.add(
+            ProductSalesDailyModel(
+                owner_username="alice",
+                store_id=store.id,
+                sales_date=cutoff.date() - timedelta(days=1),
+                manage_number="STALE",
+                sku_key="",
+                order_count=1,
+            )
+        )
+        store_id = store.id
+        session.commit()
+
+    with session_factory() as session:
+        deleted = sales_sync_service.prune_expired_sales_data(
+            session,
+            store_id,
+            now=now,
+        )
+        session.commit()
+
+    with session_factory() as session:
+        orders = session.scalars(
+            select(SalesOrderModel).order_by(SalesOrderModel.order_number)
+        ).all()
+        daily_rows = session.scalars(
+            select(ProductSalesDailyModel).order_by(
+                ProductSalesDailyModel.sales_date
+            )
+        ).all()
+
+    assert deleted == 1
+    assert [order.order_number for order in orders] == ["RETAINED"]
+    assert len(daily_rows) == 1
+    assert daily_rows[0].sales_date == cutoff.date()
+    assert daily_rows[0].manage_number == "RETAINED-MN"
+    assert daily_rows[0].ordered_units == 2

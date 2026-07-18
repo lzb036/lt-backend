@@ -37,6 +37,8 @@ from app.services.sales_time import (
 
 
 INCREMENTAL_RECHECK_DAYS = 7
+INITIAL_SYNC_DAYS = 365
+ORDER_RETENTION_DAYS = 365
 INCOMPLETE_ADJUSTED_RECHECK_DAYS = 30
 COMPLETED_RECHECK_MAX_DAYS = 90
 COMPLETED_RECHECK_INTERVAL = timedelta(days=1)
@@ -296,7 +298,8 @@ def sync_owned_store(
     owner_username: str,
     store_id: int,
     *,
-    initial_days: int = 90,
+    initial_days: int = INITIAL_SYNC_DAYS,
+    force_full_window: bool = False,
     run_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_owner = _text(owner_username)
@@ -372,10 +375,11 @@ def sync_owned_store(
             return _sync_state_payload(state, already_running=True)
 
     now = _now()
+    full_window_sync = bool(force_full_window or not initial_sync_completed)
     search_days = (
-        INCREMENTAL_RECHECK_DAYS
-        if initial_sync_completed
-        else normalized_initial_days
+        normalized_initial_days
+        if full_window_sync
+        else INCREMENTAL_RECHECK_DAYS
     )
     start_at = now - timedelta(days=search_days)
     order_numbers: list[str] = []
@@ -384,7 +388,7 @@ def sync_owned_store(
             sales_order_sync_history_service.mark_run_running(
                 normalized_owner,
                 run_id,
-                initial_sync=not initial_sync_completed,
+                initial_sync=full_window_sync,
             )
         with _PeriodicLeaseHeartbeat(
             normalized_owner,
@@ -406,7 +410,7 @@ def sync_owned_store(
             )
             heartbeat.raise_if_failed()
             local_order_numbers: list[str] = []
-            if initial_sync_completed:
+            if not full_window_sync:
                 with session_scope() as session:
                     local_order_numbers = _local_recheck_order_numbers(
                         session,
@@ -503,6 +507,11 @@ def sync_owned_store(
                         min(affected_dates),
                         max(affected_dates),
                     )
+                expired_order_count = prune_expired_sales_data(
+                    session,
+                    normalized_store_id,
+                    now=now,
+                )
                 heartbeat.raise_if_failed()
                 heartbeat.stop()
 
@@ -553,6 +562,7 @@ def sync_owned_store(
                         "unchangedOrderCount": unchanged_order_count,
                         "failedOrderCount": incomplete_order_count,
                         "affectedDateCount": len(affected_dates),
+                        "expiredOrderCount": expired_order_count,
                         "staleOrderCount": stale_order_count,
                         "incompleteOrderCount": incomplete_order_count,
                     }
@@ -1007,6 +1017,49 @@ def rebuild_daily_sales(
         ]
     )
     session.flush()
+
+
+def prune_expired_sales_data(
+    session: Session,
+    store_id: int,
+    *,
+    now: datetime | None = None,
+    retention_days: int = ORDER_RETENTION_DAYS,
+) -> int:
+    normalized_store_id = int(store_id)
+    normalized_retention_days = max(1, int(retention_days))
+    reference = now or _now()
+    cutoff = reference - timedelta(days=normalized_retention_days)
+    cutoff_date = cutoff.date()
+
+    store = session.scalar(
+        select(StoreModel).where(StoreModel.id == normalized_store_id)
+    )
+    if store is None:
+        raise LookupError("店铺不存在。")
+
+    deleted_orders = session.execute(
+        delete(SalesOrderModel).where(
+            SalesOrderModel.store_id == normalized_store_id,
+            SalesOrderModel.owner_username == store.owner_username,
+            SalesOrderModel.ordered_at < cutoff,
+        )
+    ).rowcount
+    session.execute(
+        delete(ProductSalesDailyModel).where(
+            ProductSalesDailyModel.store_id == normalized_store_id,
+            ProductSalesDailyModel.owner_username == store.owner_username,
+            ProductSalesDailyModel.sales_date < cutoff_date,
+        )
+    )
+    session.flush()
+    rebuild_daily_sales(
+        session,
+        normalized_store_id,
+        cutoff_date,
+        cutoff_date,
+    )
+    return max(0, int(deleted_orders or 0))
 
 
 def _reconcile_order_snapshot(

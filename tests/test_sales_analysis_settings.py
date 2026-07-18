@@ -284,6 +284,7 @@ def test_server_authoritative_catalogs_include_operational_facts() -> None:
         }
     )
 
-    assert "首次同步默认覆盖最近 90 天" in catalog_text
+    assert "首次同步默认覆盖最近 365 天" in catalog_text
+    assert "订单和销量汇总仅保留最近 365 天" in catalog_text
     assert "自动同步间隔约为 30 分钟" in catalog_text
     assert "一个会话绑定一个店铺" in catalog_text

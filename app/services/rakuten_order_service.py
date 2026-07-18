@@ -94,12 +94,22 @@ def _search_order_number_window(
         if not isinstance(pagination, dict):
             _raise_sanitized_runtime_error("乐天订单查询分页信息缺失。")
 
+        normalized_page_orders = _normalize_text_list(
+            payload.get("orderNumberList")
+        )
+        if _is_empty_order_search_response(
+            payload,
+            pagination,
+            expected_page=expected_page,
+            order_numbers=normalized_page_orders,
+        ):
+            return
+
         total_pages = _int_or_none(pagination.get("totalPages"))
         response_page = _int_or_none(pagination.get("requestPage"))
         if total_pages is None:
             _raise_sanitized_runtime_error("乐天订单查询分页信息缺失。")
         if total_pages == 0:
-            normalized_page_orders = _normalize_text_list(payload.get("orderNumberList"))
             if expected_page != 1 or normalized_page_orders or response_page not in {0, 1, None}:
                 _raise_sanitized_runtime_error("乐天订单查询分页响应无效。")
             return
@@ -115,6 +125,37 @@ def _search_order_number_window(
         if expected_page >= total_pages:
             return
         expected_page += 1
+
+
+def _is_empty_order_search_response(
+    payload: dict[str, Any],
+    pagination: dict[str, Any],
+    *,
+    expected_page: int,
+    order_numbers: list[str],
+) -> bool:
+    if expected_page != 1 or order_numbers:
+        return False
+    if any(
+        pagination.get(key) is not None
+        for key in ("totalPages", "requestPage", "totalRecordsAmount")
+    ):
+        return False
+
+    message_models = payload.get("MessageModelList")
+    if not isinstance(message_models, list):
+        return False
+    for entry in message_models:
+        if not isinstance(entry, dict):
+            continue
+        message_type = normalize_text(entry.get("messageType")).upper()
+        message_code = normalize_text(entry.get("messageCode")).upper()
+        if (
+            message_type == "INFO"
+            and message_code == "ORDER_EXT_API_SEARCH_ORDER_INFO_102"
+        ):
+            return True
+    return False
 
 
 def get_orders(service_secret: str, license_key: str, order_numbers: list[str]) -> list[dict[str, Any]]:

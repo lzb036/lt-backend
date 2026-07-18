@@ -166,6 +166,37 @@ class RakutenOrderServiceTests(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertEqual(post.call_count, 1)
 
+    def test_search_order_numbers_accepts_rakuten_null_pagination_for_zero_results(self) -> None:
+        response = json_response({
+            "MessageModelList": [{
+                "messageType": "INFO",
+                "messageCode": "ORDER_EXT_API_SEARCH_ORDER_INFO_102",
+                "message": "注文検索に成功しました。(検索結果０件)",
+            }],
+            "orderNumberList": [],
+            "PaginationResponseModel": {
+                "totalPages": None,
+                "requestPage": None,
+                "totalRecordsAmount": None,
+            },
+        })
+
+        with patch.object(
+            rakuten_order_service.requests.Session,
+            "post",
+            return_value=response,
+        ) as post:
+            result = rakuten_order_service.search_order_numbers(
+                "secret-123",
+                "key-456",
+                datetime(2025, 1, 1, 0, 0, 0),
+                datetime(2025, 2, 1, 0, 0, 0),
+                [100],
+            )
+
+        self.assertEqual(result, [])
+        self.assertEqual(post.call_count, 1)
+
     def test_search_order_numbers_rejects_zero_total_pages_after_prior_results(self) -> None:
         first_page = json_response({
             "orderNumberList": ["1001"],
