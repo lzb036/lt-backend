@@ -45,6 +45,7 @@ from app.db.models import (
     CrawlSourceModel,
     CrawlTaskModel,
     ListingTaskModel,
+    ProductSalesDailyModel,
     ProductModel,
     RoleModel,
     SalesOrderModel,
@@ -54,6 +55,7 @@ from app.db.models import (
     SyncTaskModel,
     SystemSettingModel,
     UserAccountModel,
+    canonical_sales_order_item_product_key,
     make_source_url_hash,
 )
 from app.services import sales_order_sync_history_service
@@ -954,7 +956,14 @@ def resolve_crawl_task_status(status: str, total_count: int, success_count: int,
     return status
 
 
-def product_to_public(row: ProductModel) -> dict[str, Any]:
+STORE_PRODUCT_SALES_PERIOD_DAYS = {7, 30, 90, 180, 365}
+
+
+def product_to_public(
+    row: ProductModel,
+    *,
+    period_sales_count: int | None = None,
+) -> dict[str, Any]:
     listed_at = product_listed_at_text(row)
     raw_payload = product_raw_payload(row)
     shop_code = product_shop_code(row, raw_payload)
@@ -990,6 +999,7 @@ def product_to_public(row: ProductModel) -> dict[str, Any]:
         "priceMax": price_max,
         "currency": row.currency,
         "salesCount": product_sales_count(raw_payload),
+        "periodSalesCount": period_sales_count,
         "genreId": row.genre_id,
         "genrePath": rakuten_genre_path(row.genre_id),
         "genrePathZh": rakuten_genre_zh_path(rakuten_genre_path(row.genre_id)),
@@ -6639,6 +6649,7 @@ def list_products(
     price_max: Decimal | None = None,
     collected_at_from: str | None = None,
     collected_at_to: str | None = None,
+    sales_period_days: int | None = None,
     page: int | None = None,
     page_size: int | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -6651,6 +6662,12 @@ def list_products(
         normalized_page = max(1, int(page or 1))
         normalized_page_size = min(500, max(1, int(page_size or 0))) if page_size else None
         product_status = _product_status_filter(status)
+        normalized_sales_period_days = (
+            int(sales_period_days)
+            if product_status == "listed"
+            and sales_period_days in STORE_PRODUCT_SALES_PERIOD_DAYS
+            else None
+        )
         listed_store_filter = normalize_listed_store_filter(listed_store_id)
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
@@ -6699,12 +6716,22 @@ def list_products(
                 start = (normalized_page - 1) * normalized_page_size
                 page_rows = filtered_rows[start:start + normalized_page_size]
                 return {
-                    "products": [product_to_public(row) for row in page_rows],
+                    "products": _products_to_public_with_period_sales(
+                        session,
+                        page_rows,
+                        owner_username,
+                        normalized_sales_period_days,
+                    ),
                     "total": total,
                     "page": normalized_page,
                     "pageSize": normalized_page_size,
                 }
-            return [product_to_public(row) for row in filtered_rows]
+            return _products_to_public_with_period_sales(
+                session,
+                filtered_rows,
+                owner_username,
+                normalized_sales_period_days,
+            )
         if normalized_page_size:
             total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
             if total:
@@ -6716,14 +6743,105 @@ def list_products(
                 .limit(normalized_page_size)
             ).all()
             return {
-                "products": [product_to_public(row) for row in rows],
+                "products": _products_to_public_with_period_sales(
+                    session,
+                    rows,
+                    owner_username,
+                    normalized_sales_period_days,
+                ),
                 "total": int(total),
                 "page": normalized_page,
                 "pageSize": normalized_page_size,
             }
 
         rows = session.scalars(query.order_by(*order_by)).all()
+        return _products_to_public_with_period_sales(
+            session,
+            rows,
+            owner_username,
+            normalized_sales_period_days,
+        )
+
+
+def _products_to_public_with_period_sales(
+    session: Any,
+    rows: list[ProductModel],
+    owner_username: str,
+    sales_period_days: int | None,
+) -> list[dict[str, Any]]:
+    if not rows or sales_period_days is None:
         return [product_to_public(row) for row in rows]
+
+    store_ids = {
+        int(row.store_id)
+        for row in rows
+        if row.store_id is not None
+    }
+    synced_store_ids = set(
+        session.scalars(
+            select(SalesSyncStateModel.store_id).where(
+                SalesSyncStateModel.owner_username == owner_username,
+                SalesSyncStateModel.store_id.in_(store_ids or {-1}),
+                SalesSyncStateModel.initial_sync_completed.is_(True),
+            )
+        ).all()
+    )
+    product_keys = {
+        canonical_sales_order_item_product_key(
+            manage_number=row.rakuten_manage_number,
+            item_number=row.item_number,
+        )
+        for row in rows
+        if row.store_id in synced_store_ids
+    }
+    cutoff_date = (
+        sales_now_naive().date()
+        - timedelta(days=sales_period_days - 1)
+    )
+    sales_counts = {
+        (int(result.store_id), str(result.manage_number)): int(
+            result.effective_units or 0
+        )
+        for result in session.execute(
+            select(
+                ProductSalesDailyModel.store_id,
+                ProductSalesDailyModel.manage_number,
+                func.sum(
+                    ProductSalesDailyModel.effective_units
+                ).label("effective_units"),
+            )
+            .where(
+                ProductSalesDailyModel.owner_username == owner_username,
+                ProductSalesDailyModel.store_id.in_(synced_store_ids or {-1}),
+                ProductSalesDailyModel.manage_number.in_(product_keys or {""}),
+                ProductSalesDailyModel.sales_date >= cutoff_date,
+            )
+            .group_by(
+                ProductSalesDailyModel.store_id,
+                ProductSalesDailyModel.manage_number,
+            )
+        )
+    }
+    return [
+        product_to_public(
+            row,
+            period_sales_count=(
+                sales_counts.get(
+                    (
+                        int(row.store_id),
+                        canonical_sales_order_item_product_key(
+                            manage_number=row.rakuten_manage_number,
+                            item_number=row.item_number,
+                        ),
+                    ),
+                    0,
+                )
+                if row.store_id in synced_store_ids
+                else None
+            ),
+        )
+        for row in rows
+    ]
 
 
 def normalize_listed_store_filter(value: str | None) -> int | str | None:

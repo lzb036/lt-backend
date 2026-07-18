@@ -576,6 +576,7 @@ def list_products(
     priceMax: Decimal | None = Query(default=None, ge=0),
     collectedAtFrom: str | None = Query(default=None),
     collectedAtTo: str | None = Query(default=None),
+    salesPeriodDays: int | None = Query(default=None),
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
     user: dict = Depends(require_products_or_stores_permission),
@@ -596,6 +597,7 @@ def list_products(
         price_max=priceMax,
         collected_at_from=collectedAtFrom,
         collected_at_to=collectedAtTo,
+        sales_period_days=salesPeriodDays,
         page=page,
         page_size=pageSize,
     )
