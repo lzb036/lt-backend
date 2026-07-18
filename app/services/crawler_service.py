@@ -16,7 +16,7 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from html import unescape
 from io import BytesIO
@@ -945,7 +945,8 @@ def resolve_crawl_task_status(status: str, total_count: int, success_count: int,
     return status
 
 
-STORE_PRODUCT_SALES_PERIOD_DAYS = {7, 30, 90, 180, 365}
+STORE_PRODUCT_SALES_PERIOD_DAYS = {7, 14, 30, 60, 90, 180, 365}
+STORE_PRODUCT_SALES_MAX_RANGE_DAYS = 365
 
 
 def product_to_public(
@@ -2109,6 +2110,60 @@ def parse_datetime_filter(value: str | None) -> datetime | None:
     except ValueError:
         return None
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def parse_sales_date_filter(value: str | None, *, field_name: str) -> date | None:
+    text = normalize_text(value)
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{field_name}格式不正确，应为YYYY-MM-DD。") from exc
+
+
+def normalize_store_product_sales_range(
+    sales_period_days: int | None,
+    sales_period_from: str | None,
+    sales_period_to: str | None,
+    *,
+    reference_date: date | None = None,
+) -> tuple[date, date] | None:
+    period_from = parse_sales_date_filter(
+        sales_period_from,
+        field_name="销量开始日期",
+    )
+    period_to = parse_sales_date_filter(
+        sales_period_to,
+        field_name="销量结束日期",
+    )
+    if (period_from is None) != (period_to is None):
+        raise ValueError("销量自定义时间范围必须同时填写开始日期和结束日期。")
+
+    today = reference_date or sales_now_naive().date()
+    earliest_allowed = today - timedelta(days=STORE_PRODUCT_SALES_MAX_RANGE_DAYS - 1)
+    if period_from is not None and period_to is not None:
+        if period_from > period_to:
+            raise ValueError("销量开始日期不能晚于结束日期。")
+        if period_to > today:
+            raise ValueError("销量结束日期不能晚于今天。")
+        if period_from < earliest_allowed:
+            raise ValueError("销量时间范围只能选择最近365天。")
+        if (period_to - period_from).days + 1 > STORE_PRODUCT_SALES_MAX_RANGE_DAYS:
+            raise ValueError("销量时间范围不能超过365天。")
+        return period_from, period_to
+
+    if sales_period_days is None:
+        return None
+    try:
+        normalized_days = int(sales_period_days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("销量周期不合法。") from exc
+    if normalized_days not in STORE_PRODUCT_SALES_PERIOD_DAYS:
+        raise ValueError(
+            "销量周期只能选择近1周、近2周、近1个月、近2个月、近3个月、近半年或近一年。"
+        )
+    return today - timedelta(days=normalized_days - 1), today
 
 
 def normalize_schedule_time(value: Any) -> str:
@@ -6690,6 +6745,8 @@ def list_products(
     collected_at_from: str | None = None,
     collected_at_to: str | None = None,
     sales_period_days: int | None = None,
+    sales_period_from: str | None = None,
+    sales_period_to: str | None = None,
     sales_sort: str | None = None,
     sales_min: int | None = None,
     sales_max: int | None = None,
@@ -6705,10 +6762,13 @@ def list_products(
         normalized_page = max(1, int(page or 1))
         normalized_page_size = min(500, max(1, int(page_size or 0))) if page_size else None
         product_status = _product_status_filter(status)
-        normalized_sales_period_days = (
-            int(sales_period_days)
+        sales_period_range = (
+            normalize_store_product_sales_range(
+                sales_period_days,
+                sales_period_from,
+                sales_period_to,
+            )
             if product_status == "listed"
-            and sales_period_days in STORE_PRODUCT_SALES_PERIOD_DAYS
             else None
         )
         normalized_sales_sort = (
@@ -6750,14 +6810,14 @@ def list_products(
         order_by = product_list_order_by(product_status)
         if (
             product_status == "listed"
-            and normalized_sales_period_days is not None
+            and sales_period_range is not None
         ):
             rows = session.scalars(query.order_by(*order_by)).all()
             public_rows = _products_to_public_with_period_sales(
                 session,
                 rows,
                 owner_username,
-                normalized_sales_period_days,
+                sales_period_range,
             )
             if sales_min is not None or sales_max is not None:
                 public_rows = [
@@ -6823,7 +6883,7 @@ def list_products(
                         session,
                         page_rows,
                         owner_username,
-                        normalized_sales_period_days,
+                        sales_period_range,
                     ),
                     "total": total,
                     "page": normalized_page,
@@ -6833,7 +6893,7 @@ def list_products(
                 session,
                 filtered_rows,
                 owner_username,
-                normalized_sales_period_days,
+                sales_period_range,
             )
         if normalized_page_size:
             total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
@@ -6850,7 +6910,7 @@ def list_products(
                     session,
                     rows,
                     owner_username,
-                    normalized_sales_period_days,
+                    sales_period_range,
                 ),
                 "total": int(total),
                 "page": normalized_page,
@@ -6862,7 +6922,7 @@ def list_products(
             session,
             rows,
             owner_username,
-            normalized_sales_period_days,
+            sales_period_range,
         )
 
 
@@ -6870,9 +6930,9 @@ def _products_to_public_with_period_sales(
     session: Any,
     rows: list[ProductModel],
     owner_username: str,
-    sales_period_days: int | None,
+    sales_period_range: tuple[date, date] | None,
 ) -> list[dict[str, Any]]:
-    if not rows or sales_period_days is None:
+    if not rows or sales_period_range is None:
         return [product_to_public(row) for row in rows]
 
     store_ids = {
@@ -6897,10 +6957,7 @@ def _products_to_public_with_period_sales(
         for row in rows
         if row.store_id in synced_store_ids
     }
-    cutoff_date = (
-        sales_now_naive().date()
-        - timedelta(days=sales_period_days - 1)
-    )
+    cutoff_date, period_end_date = sales_period_range
     sales_counts = {
         (int(result.store_id), str(result.manage_number)): int(
             result.effective_units or 0
@@ -6918,6 +6975,7 @@ def _products_to_public_with_period_sales(
                 ProductSalesDailyModel.store_id.in_(synced_store_ids or {-1}),
                 ProductSalesDailyModel.manage_number.in_(product_keys or {""}),
                 ProductSalesDailyModel.sales_date >= cutoff_date,
+                ProductSalesDailyModel.sales_date <= period_end_date,
             )
             .group_by(
                 ProductSalesDailyModel.store_id,

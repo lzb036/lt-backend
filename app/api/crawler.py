@@ -538,6 +538,8 @@ def list_products(
     collectedAtFrom: str | None = Query(default=None),
     collectedAtTo: str | None = Query(default=None),
     salesPeriodDays: int | None = Query(default=None),
+    salesPeriodFrom: str | None = Query(default=None),
+    salesPeriodTo: str | None = Query(default=None),
     salesSort: str | None = Query(default=None),
     salesMin: int | None = Query(default=None, ge=0),
     salesMax: int | None = Query(default=None, ge=0),
@@ -549,27 +551,32 @@ def list_products(
         raise HTTPException(status_code=403, detail="没有管理商品的权限")
     if salesMin is not None and salesMax is not None and salesMin > salesMax:
         raise HTTPException(status_code=400, detail="最小销量不能大于最大销量")
-    result = crawler_service.list_products(
-        user["username"],
-        status=status,
-        keyword=keyword,
-        task_id=taskId,
-        store_id=storeId,
-        listed_store_id=listedStoreId,
-        listing_status=listingStatus,
-        listed_at_from=listedAtFrom,
-        listed_at_to=listedAtTo,
-        price_min=priceMin,
-        price_max=priceMax,
-        collected_at_from=collectedAtFrom,
-        collected_at_to=collectedAtTo,
-        sales_period_days=salesPeriodDays,
-        sales_sort=salesSort,
-        sales_min=salesMin,
-        sales_max=salesMax,
-        page=page,
-        page_size=pageSize,
-    )
+    try:
+        result = crawler_service.list_products(
+            user["username"],
+            status=status,
+            keyword=keyword,
+            task_id=taskId,
+            store_id=storeId,
+            listed_store_id=listedStoreId,
+            listing_status=listingStatus,
+            listed_at_from=listedAtFrom,
+            listed_at_to=listedAtTo,
+            price_min=priceMin,
+            price_max=priceMax,
+            collected_at_from=collectedAtFrom,
+            collected_at_to=collectedAtTo,
+            sales_period_days=salesPeriodDays,
+            sales_period_from=salesPeriodFrom,
+            sales_period_to=salesPeriodTo,
+            sales_sort=salesSort,
+            sales_min=salesMin,
+            sales_max=salesMax,
+            page=page,
+            page_size=pageSize,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if isinstance(result, dict):
         return result
     return {
