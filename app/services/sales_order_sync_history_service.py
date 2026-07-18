@@ -340,7 +340,7 @@ def retry_run(owner_username: str, run_id: str) -> dict[str, Any]:
         if row.store_id is None:
             raise ValueError("原店铺已删除，无法重试。")
         store_id = row.store_id
-    return _queue_sales_analysis_sync(
+    return _queue_sales_order_sync(
         owner_username,
         store_id,
         trigger_type="retry",
@@ -348,14 +348,14 @@ def retry_run(owner_username: str, run_id: str) -> dict[str, Any]:
     )
 
 
-def _queue_sales_analysis_sync(
+def _queue_sales_order_sync(
     owner_username: str,
     store_id: int,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    from app.services.crawler_service import queue_sales_analysis_sync
+    from app.services.crawler_service import queue_sales_order_sync
 
-    return queue_sales_analysis_sync(owner_username, store_id, **kwargs)
+    return queue_sales_order_sync(owner_username, store_id, **kwargs)
 
 
 def recover_stale_runs(

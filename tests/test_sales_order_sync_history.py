@@ -366,7 +366,7 @@ def test_retry_run_creates_linked_retry_through_queue(
     calls: list[tuple] = []
     monkeypatch.setattr(
         sales_order_sync_history_service,
-        "_queue_sales_analysis_sync",
+        "_queue_sales_order_sync",
         lambda owner, target_store_id, **kwargs: calls.append(
             (owner, target_store_id, kwargs)
         )
@@ -411,7 +411,7 @@ def test_retry_run_rejects_non_retryable_status(
 
     monkeypatch.setattr(
         sales_order_sync_history_service,
-        "_queue_sales_analysis_sync",
+        "_queue_sales_order_sync",
         lambda *_args, **_kwargs: pytest.fail("must reject before queue"),
         raising=False,
     )

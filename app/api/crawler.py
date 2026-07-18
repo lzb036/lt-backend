@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from io import BytesIO
-from threading import Event
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -16,7 +15,6 @@ from decimal import Decimal
 from app.core.auth import has_permission, require_any_permission, require_permission, require_superadmin
 from app.services import (
     crawler_service,
-    sales_analysis_settings_service,
     sales_order_sync_history_service,
     sensitive_word_service,
 )
@@ -196,46 +194,6 @@ class AiTitleSettingsPayload(BaseModel):
 
 class AiTitleVersionSavePayload(BaseModel):
     versionId: int = Field(gt=0)
-
-
-class SalesAnalysisSyncPayload(BaseModel):
-    storeId: int = Field(gt=0)
-
-
-class SalesAnalysisConversationPayload(BaseModel):
-    title: str = Field(default="新分析", max_length=255)
-
-
-class SalesAnalysisMessagePayload(BaseModel):
-    message: str = Field(min_length=1, max_length=100_000)
-
-
-class SalesAnalysisSettingsPayload(BaseModel):
-    defaultPeriodDays: Literal[7, 30, 60, 90]
-    defaultRankingLimit: int = Field(ge=5, le=100)
-    defaultMetric: Literal[
-        "effectiveUnits",
-        "orderedUnits",
-        "effectiveSalesAmount",
-        "orderCount",
-    ]
-    defaultGrain: Literal["day", "week", "month"]
-    answerDetailLevel: Literal[
-        "concise",
-        "standard",
-        "detailed",
-    ]
-    prioritizeAdjustmentRisk: bool
-    showDataUpdatedAt: bool
-    showMetricDefinition: bool
-    customBusinessInstructions: str = Field(max_length=4000)
-
-
-class SalesAnalysisModelSettingsPayload(BaseModel):
-    provider: str = Field(min_length=1, max_length=64)
-    apiBaseUrl: str = Field(default="", max_length=500)
-    apiKey: str = Field(default="", max_length=1000)
-    modelName: str = Field(min_length=1, max_length=255)
 
 
 class SalesOrderSyncGlobalSettingsPayload(BaseModel):
@@ -943,7 +901,7 @@ def generate_product_title_version(
     )
 
 
-def _raise_sales_analysis_http_error(exc: Exception) -> None:
+def _raise_order_sync_http_error(exc: Exception) -> None:
     if isinstance(exc, LookupError):
         raise HTTPException(
             status_code=404,
@@ -953,99 +911,8 @@ def _raise_sales_analysis_http_error(exc: Exception) -> None:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     raise HTTPException(
         status_code=400,
-        detail="销量分析操作失败，请稍后重试。",
+        detail="订单同步操作失败，请稍后重试。",
     ) from exc
-
-
-@router.get("/settings/sales-analysis")
-def get_sales_analysis_settings(
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    return {
-        "settings": sales_analysis_settings_service.get_settings(
-            user["username"]
-        )
-    }
-
-
-@router.put("/settings/sales-analysis")
-def update_sales_analysis_settings(
-    payload: SalesAnalysisSettingsPayload,
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    try:
-        settings_payload = (
-            sales_analysis_settings_service.update_settings(
-                user["username"],
-                payload,
-            )
-        )
-        return {"settings": settings_payload}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.get("/settings/sales-analysis/model")
-def get_sales_analysis_model_settings(
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    from app.services import sales_analysis_model_settings_service
-
-    return {
-        "settings": (
-            sales_analysis_model_settings_service.get_settings(
-                user["username"]
-            )
-        )
-    }
-
-
-@router.get("/settings/sales-analysis/model/providers")
-def get_sales_analysis_model_providers(
-    _: dict = Depends(require_ai_permission),
-) -> dict:
-    from app.services import sales_analysis_model_settings_service
-
-    return {
-        "providers": (
-            sales_analysis_model_settings_service.provider_catalog()
-        )
-    }
-
-
-@router.put("/settings/sales-analysis/model")
-def update_sales_analysis_model_settings(
-    payload: SalesAnalysisModelSettingsPayload,
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    from app.services import sales_analysis_model_settings_service
-
-    try:
-        return {
-            "settings": (
-                sales_analysis_model_settings_service.update_settings(
-                    user["username"],
-                    payload,
-                )
-            )
-        }
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/settings/sales-analysis/model/test")
-def test_sales_analysis_model_settings(
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    from app.services import sales_analysis_model_settings_service
-
-    try:
-        return (
-            sales_analysis_model_settings_service
-            .test_settings_connection(user["username"])
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/settings/sales-order-sync")
@@ -1074,27 +941,7 @@ def update_sales_order_sync_global_settings(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.get("/settings/sales-analysis/capabilities")
-def get_sales_analysis_capabilities(
-    _: dict = Depends(require_ai_permission),
-) -> dict:
-    return {
-        "capabilities": (
-            sales_analysis_settings_service.capability_catalog()
-        )
-    }
-
-
-@router.get("/settings/sales-analysis/constraints")
-def get_sales_analysis_constraints(
-    _: dict = Depends(require_ai_permission),
-) -> dict:
-    return {
-        "constraints": sales_analysis_settings_service.constraint_catalog()
-    }
-
-
-@router.get("/sales-analysis/order-sync-runs")
+@router.get("/order-sync/runs")
 def list_sales_order_sync_runs(
     page: int = Query(default=1, ge=1, le=10_000),
     pageSize: int = Query(default=30, ge=1, le=100),
@@ -1138,7 +985,7 @@ def list_sales_order_sync_runs(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.delete("/sales-analysis/order-sync-runs")
+@router.delete("/order-sync/runs")
 def delete_sales_order_sync_runs(
     payload: SalesOrderSyncRunDeletePayload,
     user: dict = Depends(require_superadmin),
@@ -1152,7 +999,7 @@ def delete_sales_order_sync_runs(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/sales-analysis/order-sync-runs/{run_id}/retry")
+@router.post("/order-sync/runs/{run_id}/retry")
 def retry_sales_order_sync_run(
     run_id: str = ApiPath(min_length=1, max_length=64),
     user: dict = Depends(require_superadmin),
@@ -1165,221 +1012,14 @@ def retry_sales_order_sync_run(
             )
         }
     except (LookupError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
+        _raise_order_sync_http_error(exc)
 
 
-@router.get("/sales-analysis/stores")
-def list_sales_analysis_stores(
-    user: dict = Depends(require_superadmin),
+@router.get("/order-sync/stores")
+def list_order_sync_stores(
+    _: dict = Depends(require_superadmin),
 ) -> dict:
-    try:
-        result = crawler_service.list_sales_analysis_stores(
-            user["username"]
-        )
-        return {
-            "stores": result.get("rows", []),
-            "dataUpdatedAt": result.get("dataUpdatedAt"),
-        }
-    except (LookupError, RuntimeError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
-
-
-@router.get("/sales-analysis/sync-state")
-def get_sales_analysis_sync_state(
-    storeId: int = Query(gt=0),
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    try:
-        return {
-            "syncState": crawler_service.get_sales_analysis_sync_state(
-                user["username"],
-                storeId,
-            )
-        }
-    except (LookupError, RuntimeError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
-
-
-@router.post("/sales-analysis/sync")
-def queue_sales_analysis_sync(
-    payload: SalesAnalysisSyncPayload,
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    try:
-        return {
-            "syncTask": crawler_service.queue_sales_analysis_sync(
-                user["username"],
-                payload.storeId,
-            )
-        }
-    except (LookupError, RuntimeError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
-
-
-@router.get("/sales-analysis/sync/{task_id}")
-def get_sales_analysis_sync_task(
-    task_id: str = ApiPath(
-        min_length=7,
-        max_length=64,
-        pattern=r"^sales-\d+$",
-    ),
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    try:
-        return {
-            "syncTask": crawler_service.get_sales_analysis_sync_task(
-                user["username"],
-                task_id,
-            )
-        }
-    except (LookupError, RuntimeError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
-
-
-@router.get("/sales-analysis/conversations")
-def list_sales_analysis_conversations(
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    try:
-        return {
-            "conversations": (
-                crawler_service.list_sales_analysis_conversations(
-                    user["username"]
-                )
-            )
-        }
-    except (LookupError, RuntimeError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
-
-
-@router.post("/sales-analysis/conversations")
-def create_sales_analysis_conversation(
-    payload: SalesAnalysisConversationPayload,
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    try:
-        return {
-            "conversation": (
-                crawler_service.create_sales_analysis_conversation(
-                    user["username"],
-                    payload.title.strip(),
-                )
-            )
-        }
-    except (LookupError, RuntimeError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
-
-
-@router.delete(
-    "/sales-analysis/conversations/{conversation_id}"
-)
-def delete_sales_analysis_conversation(
-    conversation_id: int = ApiPath(gt=0),
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    try:
-        crawler_service.delete_sales_analysis_conversation(
-            user["username"],
-            conversation_id,
-        )
-        return {"deleted": True}
-    except (LookupError, RuntimeError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
-
-
-@router.get(
-    "/sales-analysis/conversations/{conversation_id}/messages"
-)
-def list_sales_analysis_messages(
-    conversation_id: int = ApiPath(gt=0),
-    page: int = Query(default=1, ge=1, le=10_000),
-    limit: int = Query(default=50, ge=1, le=100),
-    user: dict = Depends(require_ai_permission),
-) -> dict:
-    try:
-        return crawler_service.list_sales_analysis_messages(
-            user["username"],
-            conversation_id,
-            page,
-            limit,
-        )
-    except (LookupError, RuntimeError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
-
-
-@router.post(
-    "/sales-analysis/conversations/{conversation_id}/messages"
-)
-def stream_sales_analysis_message(
-    payload: SalesAnalysisMessagePayload,
-    conversation_id: int = ApiPath(gt=0),
-    user: dict = Depends(require_ai_permission),
-) -> StreamingResponse:
-    try:
-        crawler_service.require_sales_analysis_conversation(
-            user["username"],
-            conversation_id,
-        )
-    except (LookupError, RuntimeError, ValueError) as exc:
-        _raise_sales_analysis_http_error(exc)
-
-    def stream():
-        iterator = None
-        cancel_event = Event()
-        terminal_event_sent = False
-        try:
-            iterator = crawler_service.stream_sales_analysis(
-                user["username"],
-                conversation_id,
-                payload.message,
-                cancel_event=cancel_event,
-            )
-            for event in iterator:
-                if not isinstance(event, dict):
-                    raise RuntimeError("销量分析事件格式无效。")
-                event_type = str(event.get("type") or "")
-                if event_type not in {
-                    "status",
-                    "tool_call",
-                    "tool_result",
-                    "delta",
-                    "completed",
-                    "error",
-                }:
-                    raise RuntimeError("销量分析事件类型无效。")
-                yield serialize_sse_event(event)
-                if event_type in {"completed", "error"}:
-                    terminal_event_sent = True
-                    break
-            if not terminal_event_sent:
-                yield serialize_sse_event(
-                    {
-                        "type": "error",
-                        "message": "销量分析未能完成，请稍后重试。",
-                    }
-                )
-        except Exception:
-            if not terminal_event_sent:
-                yield serialize_sse_event(
-                    {
-                        "type": "error",
-                        "message": "销量分析失败，请稍后重试。",
-                    }
-                )
-        finally:
-            cancel_event.set()
-            close = getattr(iterator, "close", None)
-            if callable(close):
-                close()
-
-    return StreamingResponse(
-        stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return {"stores": crawler_service.list_order_sync_stores()}
 
 
 @router.get("/products/{product_id}/images/{image_index}/download")

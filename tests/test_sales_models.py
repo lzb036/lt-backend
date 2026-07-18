@@ -30,8 +30,6 @@ import app.db.database as database_module
 from app.db.database import Base
 from app.db.models import (
     ProductSalesDailyModel,
-    SalesAnalysisConversationModel,
-    SalesAnalysisMessageModel,
     SalesItemAdjustmentModel,
     SalesOrderItemModel,
     SalesOrderModel,
@@ -39,7 +37,6 @@ from app.db.models import (
     SalesSyncStateModel,
     StoreModel,
     UserAccountModel,
-    UserSalesAnalysisSettingsModel,
 )
 
 
@@ -50,8 +47,6 @@ SALES_TABLES = (
     ProductSalesDailyModel.__table__,
     SalesSyncStateModel.__table__,
     SalesOrderSyncRunModel.__table__,
-    SalesAnalysisConversationModel.__table__,
-    SalesAnalysisMessageModel.__table__,
 )
 
 
@@ -186,8 +181,6 @@ def test_sales_tables_are_created(sqlite_engine):
         "lt_product_sales_daily",
         "lt_sales_sync_states",
         "lt_sales_order_sync_runs",
-        "lt_sales_analysis_conversations",
-        "lt_sales_analysis_messages",
     } <= names
 
 
@@ -755,179 +748,6 @@ def test_sales_adjustment_rejects_cross_owner_or_store_item_reference(sqlite_eng
             session.commit()
 
 
-def test_sales_analysis_message_rejects_cross_owner_conversation_reference(sqlite_engine):
-    with Session(sqlite_engine, future=True) as session:
-        session.add_all(
-            [
-                UserAccountModel(
-                    username="alice",
-                    display_name="Alice",
-                    password_salt_b64="salt",
-                    password_hash_b64="hash",
-                ),
-                UserAccountModel(
-                    username="bob",
-                    display_name="Bob",
-                    password_salt_b64="salt",
-                    password_hash_b64="hash",
-                ),
-            ]
-        )
-        session.flush()
-
-        conversation = SalesAnalysisConversationModel(
-            owner_username="alice",
-            title="Alice Analysis",
-            store_scope_json="[1]",
-        )
-        session.add(conversation)
-        session.flush()
-
-        session.add(
-            SalesAnalysisMessageModel(
-                conversation_id=conversation.id,
-                owner_username="bob",
-                question_text="Who owns this?",
-                answer_text="Should fail",
-                tool_name="overview",
-                tool_arguments_json="{}",
-                result_summary_json="{}",
-                model_name="demo",
-                store_scope_json="[1]",
-                statistics_window_json="{}",
-            )
-        )
-
-        with pytest.raises(IntegrityError):
-            session.commit()
-
-
-def test_sales_analysis_message_status_fields_default_to_completed():
-    columns = SalesAnalysisMessageModel.__table__.c
-
-    assert columns.status.server_default.arg == "completed"
-    assert columns.error_code.server_default.arg == ""
-    assert columns.error_message.nullable is True
-    assert columns.error_message.server_default is None
-
-
-def test_mysql_sales_analysis_error_message_can_be_added_without_default():
-    ddl = str(
-        CreateColumn(
-            SalesAnalysisMessageModel.__table__.c.error_message
-        ).compile(dialect=mysql.dialect())
-    )
-
-    assert "TEXT" in ddl
-    assert "DEFAULT" not in ddl
-
-
-def test_ensure_table_layout_adds_sales_message_status_to_legacy_table():
-    legacy_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
-    try:
-        Base.metadata.create_all(legacy_engine)
-        with legacy_engine.begin() as connection:
-            for column_name in ("status", "error_code", "error_message"):
-                connection.execute(
-                    text(
-                        "ALTER TABLE lt_sales_analysis_messages "
-                        f"DROP COLUMN {column_name}"
-                    )
-                )
-            connection.execute(
-                UserAccountModel.__table__.insert().values(
-                    username="alice",
-                    display_name="Alice",
-                    password_salt_b64="salt",
-                    password_hash_b64="hash",
-                )
-            )
-            conversation_id = connection.execute(
-                SalesAnalysisConversationModel.__table__.insert().values(
-                    owner_username="alice",
-                    title="Legacy",
-                    store_scope_json="[]",
-                )
-            ).inserted_primary_key[0]
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO lt_sales_analysis_messages (
-                        id, conversation_id, owner_username, question_text,
-                        answer_text, tool_name, tool_arguments_json,
-                        result_summary_json, model_name, store_scope_json,
-                        statistics_window_json
-                    )
-                    VALUES (
-                        1, :conversation_id, 'alice', 'legacy',
-                        'legacy answer', '', '[]', '[]', '', '[]', '{}'
-                    )
-                    """
-                ),
-                {"conversation_id": conversation_id},
-            )
-            result = database_module._ensure_table_layout(
-                connection,
-                SalesAnalysisMessageModel.__table__,
-            )
-
-        with legacy_engine.connect() as connection:
-            row = connection.execute(
-                text(
-                    """
-                    SELECT status, error_code, error_message
-                    FROM lt_sales_analysis_messages
-                    WHERE id = 1
-                    """
-                )
-            ).one()
-
-        assert set(result["added_columns"]) == {
-            "status",
-            "error_code",
-            "error_message",
-        }
-        assert row == ("completed", "", None)
-    finally:
-        legacy_engine.dispose()
-
-
-def test_ensure_table_layout_fails_for_required_no_default_column(sqlite_engine):
-    partial_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
-    try:
-        with partial_engine.begin() as connection:
-            connection.execute(
-                text(
-                    """
-                    CREATE TABLE lt_sales_analysis_messages (
-                        id INTEGER PRIMARY KEY,
-                        owner_username VARCHAR(255) NOT NULL,
-                        question_text TEXT NOT NULL DEFAULT ''
-                    )
-                    """
-                )
-            )
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO lt_sales_analysis_messages (id, owner_username, question_text)
-                    VALUES (1, 'alice', 'legacy row')
-                    """
-                )
-            )
-
-            with pytest.raises(
-                RuntimeError,
-                match=r"lt_sales_analysis_messages.*conversation_id.*server default",
-            ):
-                database_module._ensure_table_layout(
-                    connection,
-                    SalesAnalysisMessageModel.__table__,
-                )
-    finally:
-        partial_engine.dispose()
-
-
 def test_ensure_table_layout_adds_safe_defaulted_columns_to_partial_populated_table():
     target_metadata = MetaData()
     target_table = Table(
@@ -1043,213 +863,6 @@ def test_order_item_product_key_column_is_added_and_backfilled(sqlite_engine):
     } <= set(result["added_indexes"])
     assert backfilled_count == 1
     assert product_key == "MN-LEGACY"
-
-
-def _create_complete_legacy_conversation_engine(
-    *,
-    include_owner_fk: bool,
-    owner_fk_name: str | None = None,
-    owner_fk_ondelete: str | None = "CASCADE",
-    owner_fk_onupdate: str | None = None,
-):
-    legacy_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
-    if include_owner_fk:
-        constraint_name = (
-            f"CONSTRAINT {owner_fk_name} "
-            if owner_fk_name
-            else ""
-        )
-        ondelete_sql = (
-            f" ON DELETE {owner_fk_ondelete}"
-            if owner_fk_ondelete
-            else ""
-        )
-        onupdate_sql = (
-            f" ON UPDATE {owner_fk_onupdate}"
-            if owner_fk_onupdate
-            else ""
-        )
-        owner_fk_sql = (
-            f", {constraint_name}FOREIGN KEY (owner_username) "
-            "REFERENCES lt_user_accounts(username)"
-            f"{ondelete_sql}{onupdate_sql}"
-        )
-    else:
-        owner_fk_sql = ""
-    with legacy_engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                CREATE TABLE lt_user_accounts (
-                    username VARCHAR(255) PRIMARY KEY
-                )
-                """
-            )
-        )
-        connection.execute(
-            text(
-                f"""
-                CREATE TABLE lt_sales_analysis_conversations (
-                    id INTEGER PRIMARY KEY,
-                    owner_username VARCHAR(255) NOT NULL,
-                    title VARCHAR(255) NOT NULL DEFAULT 'Legacy',
-                    store_scope_json TEXT NOT NULL,
-                    last_message_at DATETIME NULL,
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT uq_lt_sales_analysis_conversation_id_owner
-                        UNIQUE (id, owner_username)
-                    {owner_fk_sql}
-                )
-                """
-            )
-        )
-        connection.execute(
-            text(
-                """
-                CREATE INDEX ix_lt_sales_analysis_conversation_owner_updated
-                ON lt_sales_analysis_conversations (owner_username, updated_at)
-                """
-            )
-        )
-        connection.execute(
-            text(
-                """
-                INSERT INTO lt_user_accounts (username)
-                VALUES ('alice')
-                """
-            )
-        )
-        connection.execute(
-            text(
-                """
-                INSERT INTO lt_sales_analysis_conversations (
-                    id,
-                    owner_username,
-                    title,
-                    store_scope_json
-                )
-                VALUES (1, 'alice', 'Legacy', '[]')
-                """
-            )
-        )
-    return legacy_engine
-
-
-def test_complete_legacy_conversation_owner_fk_is_detected():
-    legacy_engine = _create_complete_legacy_conversation_engine(
-        include_owner_fk=True
-    )
-    try:
-        owner_constraint = next(
-            constraint
-            for constraint in SalesAnalysisConversationModel.__table__.constraints
-            if constraint.name
-            == "fk_lt_sales_analysis_conversation_owner_user"
-        )
-        with legacy_engine.begin() as connection:
-            assert database_module._constraint_is_present(
-                connection,
-                SalesAnalysisConversationModel.__table__,
-                owner_constraint,
-            )
-            result = database_module._ensure_table_layout(
-                connection,
-                SalesAnalysisConversationModel.__table__,
-            )
-
-        assert result["added_constraints"] == []
-    finally:
-        legacy_engine.dispose()
-
-
-def test_complete_legacy_named_equivalent_conversation_owner_fk_is_detected():
-    legacy_engine = _create_complete_legacy_conversation_engine(
-        include_owner_fk=True,
-        owner_fk_name="fk_legacy_conversation_owner",
-    )
-    try:
-        with legacy_engine.begin() as connection:
-            result = database_module._ensure_table_layout(
-                connection,
-                SalesAnalysisConversationModel.__table__,
-            )
-
-        assert result["added_constraints"] == []
-    finally:
-        legacy_engine.dispose()
-
-
-def test_complete_legacy_conversation_owner_fk_action_conflict_fails():
-    legacy_engine = _create_complete_legacy_conversation_engine(
-        include_owner_fk=True,
-        owner_fk_name="fk_legacy_conversation_owner_no_action",
-        owner_fk_ondelete=None,
-    )
-    try:
-        with legacy_engine.begin() as connection:
-            with pytest.raises(
-                RuntimeError,
-                match=(
-                    r"lt_sales_analysis_conversations.*"
-                    r"fk_lt_sales_analysis_conversation_owner_user.*"
-                    r"fk_legacy_conversation_owner_no_action.*"
-                    r"referential action"
-                ),
-            ):
-                database_module._ensure_table_layout(
-                    connection,
-                    SalesAnalysisConversationModel.__table__,
-                )
-    finally:
-        legacy_engine.dispose()
-
-
-def test_complete_legacy_conversation_owner_fk_onupdate_conflict_fails():
-    legacy_engine = _create_complete_legacy_conversation_engine(
-        include_owner_fk=True,
-        owner_fk_name="fk_legacy_conversation_owner_onupdate",
-        owner_fk_onupdate="CASCADE",
-    )
-    try:
-        with legacy_engine.begin() as connection:
-            with pytest.raises(
-                RuntimeError,
-                match=(
-                    r"lt_sales_analysis_conversations.*"
-                    r"fk_lt_sales_analysis_conversation_owner_user.*"
-                    r"fk_legacy_conversation_owner_onupdate.*"
-                    r"referential action"
-                ),
-            ):
-                database_module._ensure_table_layout(
-                    connection,
-                    SalesAnalysisConversationModel.__table__,
-                )
-    finally:
-        legacy_engine.dispose()
-
-
-def test_complete_legacy_conversation_missing_owner_fk_fails_clearly():
-    legacy_engine = _create_complete_legacy_conversation_engine(
-        include_owner_fk=False
-    )
-    try:
-        with legacy_engine.begin() as connection:
-            with pytest.raises(
-                RuntimeError,
-                match=(
-                    r"lt_sales_analysis_conversations.*"
-                    r"fk_lt_sales_analysis_conversation_owner_user.*"
-                    r"cannot install"
-                ),
-            ):
-                database_module._ensure_table_layout(
-                    connection,
-                    SalesAnalysisConversationModel.__table__,
-                )
-    finally:
-        legacy_engine.dispose()
 
 
 def _compat_default_action_foreign_key_tables() -> tuple[Table, Table]:
@@ -1831,17 +1444,6 @@ def test_mysql_longtext_column_ddl_does_not_require_a_server_default():
         CreateColumn(SalesOrderModel.__table__.c.raw_order_json).compile(
             dialect=mysql.dialect()
         )
-    )
-
-    assert "LONGTEXT NOT NULL" in ddl
-    assert "DEFAULT" not in ddl
-
-
-def test_mysql_sales_analysis_settings_longtext_has_no_server_default():
-    ddl = str(
-        CreateColumn(
-            UserSalesAnalysisSettingsModel.__table__.c.custom_business_instructions
-        ).compile(dialect=mysql.dialect())
     )
 
     assert "LONGTEXT NOT NULL" in ddl
