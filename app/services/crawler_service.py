@@ -4195,29 +4195,28 @@ def ensure_listing_cabinet_folder(
     *,
     usage: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    slots = max(1, required_slots)
     folders = fetch_rakuten_cabinet_folders(service_secret, license_key)
-    prefix = listing_cabinet_directory_prefix(store)
     candidates = [
         folder
         for folder in folders
-        if listing_cabinet_folder_matches_directory_prefix(folder, prefix)
+        if listing_cabinet_folder_identity(folder) is not None
     ]
     for folder in sorted(candidates, key=cabinet_listing_folder_sort_key):
-        if cabinet_folder_remaining_slots(folder) >= slots:
+        if cabinet_folder_remaining_slots(folder) > 0:
             return prepare_listing_cabinet_folder(folder)
 
     usage = usage or fetch_rakuten_cabinet_usage(service_secret, license_key)
     if int(usage.get("remainingFolderCount") or 0) <= 0:
         raise RuntimeError("R-Cabinet 没有可用文件夹数量，不能自动创建新的图片文件夹。")
 
-    next_batch = next_listing_cabinet_batch_number(candidates)
+    created_date = datetime.now().strftime("%Y%m%d")
+    next_batch = next_listing_cabinet_batch_number(candidates, created_date)
     last_error: Exception | None = None
     for batch in range(next_batch, next_batch + RAKUTEN_CABINET_FOLDER_CREATE_ATTEMPTS):
-        directory_name = f"{prefix}{batch:03d}"
+        directory_name = listing_cabinet_directory_name(created_date, batch)
         existing = find_listing_cabinet_folder_by_directory(folders, directory_name)
         if existing:
-            if cabinet_folder_remaining_slots(existing) >= slots:
+            if cabinet_folder_remaining_slots(existing) > 0:
                 return prepare_listing_cabinet_folder(existing)
             continue
         try:
@@ -4260,11 +4259,13 @@ def listing_cabinet_folder_directory_candidates(folder: dict[str, Any]) -> list[
     return [value for value in values if value]
 
 
-def listing_cabinet_folder_matches_directory_prefix(folder: dict[str, Any], prefix: str) -> bool:
-    return any(
-        normalize_cabinet_directory_name(value).startswith(prefix)
-        for value in listing_cabinet_folder_directory_candidates(folder)
-    )
+def listing_cabinet_folder_identity(folder: dict[str, Any]) -> tuple[str, int] | None:
+    for value in listing_cabinet_folder_directory_candidates(folder):
+        normalized = normalize_cabinet_directory_name(value)
+        match = re.fullmatch(r"yx(\d{8})-(\d+)", normalized)
+        if match:
+            return match.group(1), int(match.group(2))
+    return None
 
 
 def prepare_listing_cabinet_folder(folder: dict[str, Any]) -> dict[str, Any]:
@@ -4283,31 +4284,28 @@ def find_listing_cabinet_folder_by_directory(folders: list[dict[str, Any]], dire
     return None
 
 
-def listing_cabinet_directory_prefix(store: StoreModel) -> str:
-    shop_part = normalize_cabinet_directory_segment(store.store_code or f"store-{store.id}", max_length=6)
-    month_part = datetime.now().strftime("%Y%m")
-    return f"lt-{shop_part}-{month_part}-"
+def listing_cabinet_directory_name(created_date: str, batch: int) -> str:
+    return normalize_cabinet_directory_name(f"YX{created_date}-{max(1, int(batch))}")
 
 
 def listing_cabinet_folder_display_name(store: StoreModel, batch: int) -> str:
-    alias = normalize_text(store.alias_name or store.store_name or store.store_code or "store")
-    return normalize_cabinet_folder_name(f"LT {alias} {datetime.now():%Y-%m} {batch:03d}")
+    return normalize_cabinet_folder_name(f"YX{datetime.now():%Y%m%d}-{max(1, int(batch))}")
 
 
-def cabinet_listing_folder_sort_key(folder: dict[str, Any]) -> tuple[int, int]:
-    directory = normalize_cabinet_directory_name(listing_cabinet_folder_directory(folder))
-    match = re.search(r"-(\d{3})$", directory)
-    batch = int(match.group(1)) if match else 0
-    return (batch, int(folder.get("folderId") or 0))
+def cabinet_listing_folder_sort_key(folder: dict[str, Any]) -> tuple[str, int, int]:
+    identity = listing_cabinet_folder_identity(folder)
+    if identity is None:
+        return ("99999999", 0, int(folder.get("folderId") or 0))
+    created_date, batch = identity
+    return (created_date, batch, int(folder.get("folderId") or 0))
 
 
-def next_listing_cabinet_batch_number(folders: list[dict[str, Any]]) -> int:
+def next_listing_cabinet_batch_number(folders: list[dict[str, Any]], created_date: str) -> int:
     max_batch = 0
     for folder in folders:
-        directory = normalize_cabinet_directory_name(listing_cabinet_folder_directory(folder))
-        match = re.search(r"-(\d{3})$", directory)
-        if match:
-            max_batch = max(max_batch, int(match.group(1)))
+        identity = listing_cabinet_folder_identity(folder)
+        if identity is not None and identity[0] == created_date:
+            max_batch = max(max_batch, identity[1])
     return max_batch + 1
 
 
@@ -7265,7 +7263,7 @@ def list_store_empty_cabinet_folders(owner_username: str, store_id: int) -> dict
         if not service_secret or not license_key:
             raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
         folders = fetch_rakuten_cabinet_folders(service_secret, license_key)
-        folder_prefix = listing_cabinet_directory_prefix(row)
+        folder_prefix = "YXYYYYMMDD-N"
         empty_folders = [
             {
                 "folderId": int(folder.get("folderId") or 0),
@@ -7276,15 +7274,9 @@ def list_store_empty_cabinet_folders(owner_username: str, store_id: int) -> dict
             for folder in folders
             if int(folder.get("folderId") or 0) > 0
             and int(folder.get("fileCount") or 0) == 0
-            and listing_cabinet_folder_matches_directory_prefix(folder, folder_prefix)
+            and listing_cabinet_folder_identity(folder) is not None
         ]
-        empty_folders.sort(
-            key=lambda folder: (
-                normalize_text(folder.get("folderPath")).lower(),
-                normalize_text(folder.get("folderName")).lower(),
-                int(folder.get("folderId") or 0),
-            )
-        )
+        empty_folders.sort(key=cabinet_listing_folder_sort_key)
         return {
             "store": {
                 "id": int(row.id),
@@ -12580,17 +12572,7 @@ def upload_product_images_to_rakuten(
     if not images:
         raise RuntimeError("商品缺少图片，不能上架到乐天。")
     uploaded_images: list[dict[str, str]] = []
-    cabinet_folder = ensure_listing_cabinet_folder_for_upload(
-        service_secret,
-        license_key,
-        store,
-        len(images),
-        cabinet_context=cabinet_context,
-    )
-    folder_id = int(cabinet_folder.get("folderId") or 0)
-    folder_path = normalize_text(cabinet_folder.get("directoryName") or cabinet_folder.get("folderPath") or cabinet_folder.get("folderName"))
-    if not folder_id or not folder_path:
-        raise RuntimeError("R-Cabinet 上架文件夹不可用。")
+    upload_cabinet_context = cabinet_context if isinstance(cabinet_context, dict) else {}
     image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
         for index, image_url in enumerate(images, start=1):
@@ -12615,6 +12597,21 @@ def upload_product_images_to_rakuten(
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="p")
             file_name = listing_cabinet_upload_file_name(file_path)
+            cabinet_folder = ensure_listing_cabinet_folder_for_upload(
+                service_secret,
+                license_key,
+                store,
+                1,
+                cabinet_context=upload_cabinet_context,
+            )
+            folder_id = int(cabinet_folder.get("folderId") or 0)
+            folder_path = normalize_text(
+                cabinet_folder.get("directoryName")
+                or cabinet_folder.get("folderPath")
+                or cabinet_folder.get("folderName")
+            )
+            if not folder_id or not folder_path:
+                raise RuntimeError("R-Cabinet 上架文件夹不可用。")
             result = insert_rakuten_cabinet_file(
                 service_secret,
                 license_key,
@@ -12638,6 +12635,7 @@ def upload_product_images_to_rakuten(
                     "fileUrl": result.get("fileUrl") or build_rakuten_cabinet_image_url(store.store_code, location),
                 }
             )
+            reserve_listing_cabinet_folder_slots(upload_cabinet_context, cabinet_folder, 1)
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
     except TaskCancelled:
@@ -12650,7 +12648,6 @@ def upload_product_images_to_rakuten(
         raise
     if not uploaded_images:
         raise RuntimeError("商品本地图片文件不存在或已失效，未能上传任何图片。")
-    reserve_listing_cabinet_folder_slots(cabinet_context, cabinet_folder, len(uploaded_images))
     return uploaded_images
 
 
@@ -12685,17 +12682,7 @@ def upload_product_description_images_to_rakuten(
 
     uploaded_images: list[dict[str, str]] = []
     replacement_map: dict[str, str] = {}
-    cabinet_folder = ensure_listing_cabinet_folder_for_upload(
-        service_secret,
-        license_key,
-        store,
-        len(image_urls),
-        cabinet_context=cabinet_context,
-    )
-    folder_id = int(cabinet_folder.get("folderId") or 0)
-    folder_path = normalize_text(cabinet_folder.get("directoryName") or cabinet_folder.get("folderPath") or cabinet_folder.get("folderName"))
-    if not folder_id or not folder_path:
-        raise RuntimeError("R-Cabinet 上架说明图文件夹不可用。")
+    upload_cabinet_context = cabinet_context if isinstance(cabinet_context, dict) else {}
     image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
         for index, image_url in enumerate(image_urls, start=1):
@@ -12722,6 +12709,21 @@ def upload_product_description_images_to_rakuten(
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="d")
             file_name = listing_cabinet_upload_file_name(file_path)
+            cabinet_folder = ensure_listing_cabinet_folder_for_upload(
+                service_secret,
+                license_key,
+                store,
+                1,
+                cabinet_context=upload_cabinet_context,
+            )
+            folder_id = int(cabinet_folder.get("folderId") or 0)
+            folder_path = normalize_text(
+                cabinet_folder.get("directoryName")
+                or cabinet_folder.get("folderPath")
+                or cabinet_folder.get("folderName")
+            )
+            if not folder_id or not folder_path:
+                raise RuntimeError("R-Cabinet 上架说明图文件夹不可用。")
             result = insert_rakuten_cabinet_file(
                 service_secret,
                 license_key,
@@ -12747,6 +12749,7 @@ def upload_product_description_images_to_rakuten(
                 }
             )
             replacement_map[image_url] = file_url
+            reserve_listing_cabinet_folder_slots(upload_cabinet_context, cabinet_folder, 1)
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
     except TaskCancelled:
@@ -12763,7 +12766,6 @@ def upload_product_description_images_to_rakuten(
     if not uploaded_images:
         return {"rawPayload": raw_payload, "uploadedImages": []}
     updated_payload = replace_product_description_image_urls(raw_payload, replacement_map)
-    reserve_listing_cabinet_folder_slots(cabinet_context, cabinet_folder, len(uploaded_images))
     return {"rawPayload": updated_payload, "uploadedImages": uploaded_images}
 
 
