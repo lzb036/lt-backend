@@ -47,6 +47,7 @@ from app.db.models import (
     ListingTaskModel,
     ProductModel,
     RoleModel,
+    SalesOrderModel,
     SalesSyncStateModel,
     ScheduledCrawlModel,
     StoreModel,
@@ -2298,7 +2299,12 @@ def scheduled_crawl_task_target(row: ScheduledCrawlModel) -> str:
     return append_shop_fallback_target(row.target, fallback)
 
 
-def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
+def store_to_public(
+    row: StoreModel,
+    *,
+    reveal: bool = False,
+    recent_year_order_count: int | None = None,
+) -> dict[str, Any]:
     service_secret = decrypt_text(row.rakuten_service_secret_encrypted)
     license_key = decrypt_text(row.rakuten_license_key_encrypted)
     checked_at = row.last_checked_at or row.last_synced_at
@@ -2326,6 +2332,7 @@ def store_to_public(row: StoreModel, *, reveal: bool = False) -> dict[str, Any]:
         },
         "cabinetUsedFolderCount": row.cabinet_used_folder_count,
         "cabinetRemainingFolderCount": row.cabinet_remaining_folder_count,
+        "recentYearOrderCount": recent_year_order_count,
         "cabinetUsageCheckedAt": row.cabinet_usage_checked_at.isoformat(sep=" ") if row.cabinet_usage_checked_at else None,
         "rakutenProductTotalCount": row.rakuten_product_total_count,
         "rakutenProductListedCount": row.rakuten_product_listed_count,
@@ -6767,6 +6774,43 @@ def list_stores(
 ) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         query = select(StoreModel).where(StoreModel.owner_username == owner_username)
+        synced_store_ids = set(
+            session.scalars(
+                select(SalesSyncStateModel.store_id).where(
+                    SalesSyncStateModel.owner_username == owner_username,
+                    SalesSyncStateModel.initial_sync_completed.is_(True),
+                )
+            ).all()
+        )
+        recent_year_order_counts: dict[int, int] = {}
+        if synced_store_ids:
+            cutoff = sales_now_naive() - timedelta(days=365)
+            recent_year_order_counts = {
+                int(row.store_id): int(row.order_count or 0)
+                for row in session.execute(
+                    select(
+                        SalesOrderModel.store_id,
+                        func.count(SalesOrderModel.id).label("order_count"),
+                    )
+                    .where(
+                        SalesOrderModel.owner_username == owner_username,
+                        SalesOrderModel.store_id.in_(synced_store_ids),
+                        SalesOrderModel.ordered_at >= cutoff,
+                    )
+                    .group_by(SalesOrderModel.store_id)
+                )
+            }
+
+        def serialize_store(row: StoreModel) -> dict[str, Any]:
+            return store_to_public(
+                row,
+                recent_year_order_count=(
+                    recent_year_order_counts.get(int(row.id), 0)
+                    if row.id in synced_store_ids
+                    else None
+                ),
+            )
+
         return paginate_query(
             session,
             query,
@@ -6774,7 +6818,7 @@ def list_stores(
             page=page,
             page_size=page_size,
             response_key="stores",
-            serializer=store_to_public,
+            serializer=serialize_store,
         )
 
 
