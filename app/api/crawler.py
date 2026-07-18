@@ -267,6 +267,9 @@ class RolePayload(BaseModel):
 class TimeSettingsPayload(BaseModel):
     cleanupWeekday: int = Field(ge=0, le=6)
     cleanupTime: str = Field(pattern=r"^\d{2}:\d{2}$")
+    productSyncEnabled: bool = True
+    productSyncWeekday: int = Field(default=6, ge=0, le=6)
+    productSyncTime: str = Field(default="21:00", pattern=r"^\d{2}:\d{2}$")
 
 
 def visible_time_settings(user: dict, settings_payload: dict) -> dict:

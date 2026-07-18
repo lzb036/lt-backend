@@ -446,6 +446,7 @@ RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
 CRAWLER_HTTP_RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
 SCHEDULE_RUN_LOCK = threading.Lock()
 SALES_ANALYSIS_SYNC_RUN_LOCK = threading.Lock()
+STORE_PRODUCT_SYNC_SCHEDULE_LOCK = threading.Lock()
 SCHEDULED_CRAWL_TASK_CLEANUP_LOCK = threading.Lock()
 STORE_UNLISTED_PRODUCT_CLEANUP_LOCK = threading.Lock()
 CRAWLER_REQUEST_LOCK = threading.Lock()
@@ -476,6 +477,8 @@ SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY = "scheduledCrawlTaskCleanup"
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY = 6
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME = "09:00"
 SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS = 7
+STORE_PRODUCT_SYNC_DEFAULT_WEEKDAY = 6
+STORE_PRODUCT_SYNC_DEFAULT_TIME = "21:00"
 STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY = 1
 STORE_UNLISTED_PRODUCT_CLEANUP_TIME = "01:00"
 SALES_ANALYSIS_SYNC_INTERVAL = timedelta(minutes=30)
@@ -5830,6 +5833,11 @@ def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any
         SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME,
         now=reference,
     )
+    next_product_sync_at = next_weekly_run_at(
+        STORE_PRODUCT_SYNC_DEFAULT_WEEKDAY,
+        STORE_PRODUCT_SYNC_DEFAULT_TIME,
+        now=reference,
+    )
     next_unlisted_cleanup_at = next_monthly_run_at(
         STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY,
         STORE_UNLISTED_PRODUCT_CLEANUP_TIME,
@@ -5842,6 +5850,12 @@ def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any
         "nextCleanupAt": datetime_to_public(next_cleanup_at),
         "lastCleanupAt": None,
         "lastCleanupDeletedCount": 0,
+        "productSyncEnabled": True,
+        "productSyncWeekday": STORE_PRODUCT_SYNC_DEFAULT_WEEKDAY,
+        "productSyncTime": STORE_PRODUCT_SYNC_DEFAULT_TIME,
+        "productSyncNextAt": datetime_to_public(next_product_sync_at),
+        "productSyncLastAt": None,
+        "productSyncLastTaskCount": 0,
         "unlistedCleanupMonthDay": STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY,
         "unlistedCleanupTime": STORE_UNLISTED_PRODUCT_CLEANUP_TIME,
         "unlistedNextCleanupAt": datetime_to_public(next_unlisted_cleanup_at),
@@ -5868,6 +5882,21 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         cleanup_time = normalize_schedule_time(payload.get("cleanupTime", default_payload["cleanupTime"]))
     except RuntimeError:
         cleanup_time = default_payload["cleanupTime"]
+    product_sync_enabled = payload.get("productSyncEnabled", default_payload["productSyncEnabled"])
+    if not isinstance(product_sync_enabled, bool):
+        product_sync_enabled = default_payload["productSyncEnabled"]
+    try:
+        product_sync_weekday = normalize_cleanup_weekday(
+            payload.get("productSyncWeekday", default_payload["productSyncWeekday"])
+        )
+    except RuntimeError:
+        product_sync_weekday = default_payload["productSyncWeekday"]
+    try:
+        product_sync_time = normalize_schedule_time(
+            payload.get("productSyncTime", default_payload["productSyncTime"])
+        )
+    except RuntimeError:
+        product_sync_time = default_payload["productSyncTime"]
 
     next_cleanup_at = parse_public_datetime(payload.get("nextCleanupAt"))
     if next_cleanup_at is None:
@@ -5877,6 +5906,14 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         last_cleanup_deleted_count = max(0, int(last_cleanup_deleted_count or 0))
     except (TypeError, ValueError):
         last_cleanup_deleted_count = 0
+    product_sync_next_at = parse_public_datetime(payload.get("productSyncNextAt"))
+    if product_sync_next_at is None:
+        product_sync_next_at = next_weekly_run_at(product_sync_weekday, product_sync_time, now=reference)
+    product_sync_last_task_count = payload.get("productSyncLastTaskCount", 0)
+    try:
+        product_sync_last_task_count = max(0, int(product_sync_last_task_count or 0))
+    except (TypeError, ValueError):
+        product_sync_last_task_count = 0
     unlisted_month_day = STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY
     try:
         unlisted_cleanup_time = normalize_schedule_time(payload.get("unlistedCleanupTime", STORE_UNLISTED_PRODUCT_CLEANUP_TIME))
@@ -5903,6 +5940,12 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         "nextCleanupAt": datetime_to_public(next_cleanup_at),
         "lastCleanupAt": datetime_to_public(parse_public_datetime(payload.get("lastCleanupAt"))),
         "lastCleanupDeletedCount": last_cleanup_deleted_count,
+        "productSyncEnabled": product_sync_enabled,
+        "productSyncWeekday": product_sync_weekday,
+        "productSyncTime": product_sync_time,
+        "productSyncNextAt": datetime_to_public(product_sync_next_at),
+        "productSyncLastAt": datetime_to_public(parse_public_datetime(payload.get("productSyncLastAt"))),
+        "productSyncLastTaskCount": product_sync_last_task_count,
         "unlistedCleanupMonthDay": unlisted_month_day,
         "unlistedCleanupTime": unlisted_cleanup_time,
         "unlistedNextCleanupAt": datetime_to_public(unlisted_next_cleanup_at),
@@ -5950,6 +5993,13 @@ def get_time_settings(*, include_queue_health: bool = True) -> dict[str, Any]:
 def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> dict[str, Any]:
     cleanup_weekday = normalize_cleanup_weekday(getattr(payload, "cleanupWeekday", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY))
     cleanup_time = normalize_schedule_time(getattr(payload, "cleanupTime", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME))
+    product_sync_enabled = bool(getattr(payload, "productSyncEnabled", True))
+    product_sync_weekday = normalize_cleanup_weekday(
+        getattr(payload, "productSyncWeekday", STORE_PRODUCT_SYNC_DEFAULT_WEEKDAY)
+    )
+    product_sync_time = normalize_schedule_time(
+        getattr(payload, "productSyncTime", STORE_PRODUCT_SYNC_DEFAULT_TIME)
+    )
     now = datetime.now()
     with session_scope() as session:
         row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
@@ -5960,6 +6010,12 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
             "cleanupTime": cleanup_time,
             "retentionDays": SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS,
             "nextCleanupAt": datetime_to_public(next_weekly_run_at(cleanup_weekday, cleanup_time, now=now)),
+            "productSyncEnabled": product_sync_enabled,
+            "productSyncWeekday": product_sync_weekday,
+            "productSyncTime": product_sync_time,
+            "productSyncNextAt": datetime_to_public(
+                next_weekly_run_at(product_sync_weekday, product_sync_time, now=now)
+            ),
         }
         row = upsert_time_settings_row(session, updated_payload)
         session.flush()
@@ -10354,6 +10410,61 @@ def run_due_sales_analysis_syncs_once() -> int:
         SALES_ANALYSIS_SYNC_RUN_LOCK.release()
 
 
+def run_due_store_product_syncs_once() -> int:
+    if not STORE_PRODUCT_SYNC_SCHEDULE_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        now = datetime.now()
+        with session_scope() as session:
+            row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+            payload = load_time_settings_payload(row, now=now)
+            row = upsert_time_settings_row(session, payload)
+            next_sync_at = parse_public_datetime(payload.get("productSyncNextAt"))
+            if not payload["productSyncEnabled"] or (next_sync_at is not None and next_sync_at > now):
+                return 0
+
+            due_stores = session.execute(
+                select(StoreModel.owner_username, StoreModel.id)
+                .where(
+                    StoreModel.enabled.is_(True),
+                    func.length(func.trim(StoreModel.rakuten_service_secret_encrypted)) > 0,
+                    func.length(func.trim(StoreModel.rakuten_license_key_encrypted)) > 0,
+                )
+                .order_by(StoreModel.owner_username.asc(), StoreModel.id.asc())
+            ).all()
+            payload["productSyncNextAt"] = datetime_to_public(
+                next_weekly_run_at(
+                    payload["productSyncWeekday"],
+                    payload["productSyncTime"],
+                    now=now,
+                )
+            )
+            row.value_json = json.dumps(payload, ensure_ascii=False)
+
+        queued_count = 0
+        for owner_username, store_id in due_stores:
+            try:
+                create_sync_task(str(owner_username), int(store_id))
+            except Exception:
+                logger.warning(
+                    "店铺 %s 的定时商品同步投递失败",
+                    store_id,
+                    exc_info=True,
+                )
+                continue
+            queued_count += 1
+
+        with session_scope() as session:
+            row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+            payload = load_time_settings_payload(row, now=now)
+            payload["productSyncLastAt"] = datetime_to_public(now)
+            payload["productSyncLastTaskCount"] = queued_count
+            upsert_time_settings_row(session, payload)
+        return queued_count
+    finally:
+        STORE_PRODUCT_SYNC_SCHEDULE_LOCK.release()
+
+
 def run_due_scheduled_crawls_once() -> int:
     if not SCHEDULE_RUN_LOCK.acquire(blocking=False):
         return 0
@@ -10431,6 +10542,7 @@ def start_schedule_runner(interval_seconds: int = 60) -> None:
             try:
                 run_due_scheduled_crawls_once()
                 run_due_sales_analysis_syncs_once()
+                run_due_store_product_syncs_once()
                 run_periodic_maintenance_once()
             except Exception:
                 pass
