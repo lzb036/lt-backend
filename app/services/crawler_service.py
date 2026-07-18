@@ -6650,6 +6650,9 @@ def list_products(
     collected_at_from: str | None = None,
     collected_at_to: str | None = None,
     sales_period_days: int | None = None,
+    sales_sort: str | None = None,
+    sales_min: int | None = None,
+    sales_max: int | None = None,
     page: int | None = None,
     page_size: int | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -6667,6 +6670,9 @@ def list_products(
             if product_status == "listed"
             and sales_period_days in STORE_PRODUCT_SALES_PERIOD_DAYS
             else None
+        )
+        normalized_sales_sort = (
+            sales_sort if sales_sort in {"asc", "desc"} else None
         )
         listed_store_filter = normalize_listed_store_filter(listed_store_id)
         if product_status:
@@ -6702,6 +6708,63 @@ def list_products(
         if listed_at_to_value is not None:
             query = query.where(ProductModel.listed_at <= listed_at_to_value)
         order_by = product_list_order_by(product_status)
+        if (
+            product_status == "listed"
+            and normalized_sales_period_days is not None
+        ):
+            rows = session.scalars(query.order_by(*order_by)).all()
+            public_rows = _products_to_public_with_period_sales(
+                session,
+                rows,
+                owner_username,
+                normalized_sales_period_days,
+            )
+            if sales_min is not None or sales_max is not None:
+                public_rows = [
+                    row
+                    for row in public_rows
+                    if row["periodSalesCount"] is not None
+                    and (
+                        sales_min is None
+                        or int(row["periodSalesCount"]) >= sales_min
+                    )
+                    and (
+                        sales_max is None
+                        or int(row["periodSalesCount"]) <= sales_max
+                    )
+                ]
+            if normalized_sales_sort is not None:
+                public_rows.sort(
+                    key=lambda row: (
+                        row["periodSalesCount"] is None,
+                        (
+                            int(row["periodSalesCount"] or 0)
+                            if normalized_sales_sort == "asc"
+                            else -int(row["periodSalesCount"] or 0)
+                        ),
+                        int(row["id"]),
+                    )
+                )
+            total = len(public_rows)
+            if normalized_page_size:
+                if total:
+                    max_page = max(
+                        1,
+                        (total + normalized_page_size - 1)
+                        // normalized_page_size,
+                    )
+                    normalized_page = min(normalized_page, max_page)
+                start = (normalized_page - 1) * normalized_page_size
+                public_rows = public_rows[
+                    start:start + normalized_page_size
+                ]
+                return {
+                    "products": public_rows,
+                    "total": total,
+                    "page": normalized_page,
+                    "pageSize": normalized_page_size,
+                }
+            return public_rows
         if product_status == "listed_master" and listed_store_filter is not None:
             rows = session.scalars(query.order_by(*order_by)).all()
             filtered_rows = [

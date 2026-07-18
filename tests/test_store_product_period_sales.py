@@ -75,16 +75,28 @@ def test_list_store_products_aggregates_effective_sales_for_selected_period(
             initial_sync_completed=True,
             sync_status="idle",
         ))
-        session.add(ProductModel(
-            owner_username="alice",
-            store_id=store.id,
-            title="Product",
-            source_url="https://example.com/product",
-            source_url_hash="hash",
-            rakuten_manage_number="manage-1",
-            item_number="item-1",
-            review_status="listed",
-        ))
+        session.add_all([
+            ProductModel(
+                owner_username="alice",
+                store_id=store.id,
+                title="Product 1",
+                source_url="https://example.com/product-1",
+                source_url_hash="hash-1",
+                rakuten_manage_number="manage-1",
+                item_number="item-1",
+                review_status="listed",
+            ),
+            ProductModel(
+                owner_username="alice",
+                store_id=store.id,
+                title="Product 2",
+                source_url="https://example.com/product-2",
+                source_url_hash="hash-2",
+                rakuten_manage_number="manage-2",
+                item_number="item-2",
+                review_status="listed",
+            ),
+        ])
         session.add_all([
             ProductSalesDailyModel(
                 owner_username="alice",
@@ -101,6 +113,14 @@ def test_list_store_products_aggregates_effective_sales_for_selected_period(
                 manage_number="manage-1",
                 sku_key="",
                 effective_units=5,
+            ),
+            ProductSalesDailyModel(
+                owner_username="alice",
+                store_id=store.id,
+                sales_date=date(2026, 7, 18),
+                manage_number="manage-2",
+                sku_key="",
+                effective_units=1,
             ),
         ])
         store_id = store.id
@@ -122,5 +142,21 @@ def test_list_store_products_aggregates_effective_sales_for_selected_period(
         sales_period_days=365,
     )
 
-    assert week[0]["periodSalesCount"] == 3
-    assert year[0]["periodSalesCount"] == 8
+    assert sorted(row["periodSalesCount"] for row in week) == [1, 3]
+    assert sorted(row["periodSalesCount"] for row in year) == [1, 8]
+
+    filtered = crawler_service.list_products(
+        "alice",
+        status="listed",
+        store_id=store_id,
+        sales_period_days=7,
+        sales_sort="desc",
+        sales_min=2,
+        sales_max=4,
+        page=1,
+        page_size=1,
+    )
+
+    assert filtered["total"] == 1
+    assert filtered["products"][0]["rakutenManageNumber"] == "manage-1"
+    assert filtered["products"][0]["periodSalesCount"] == 3

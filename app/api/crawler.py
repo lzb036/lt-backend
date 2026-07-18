@@ -577,12 +577,17 @@ def list_products(
     collectedAtFrom: str | None = Query(default=None),
     collectedAtTo: str | None = Query(default=None),
     salesPeriodDays: int | None = Query(default=None),
+    salesSort: str | None = Query(default=None),
+    salesMin: int | None = Query(default=None, ge=0),
+    salesMax: int | None = Query(default=None, ge=0),
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
     user: dict = Depends(require_products_or_stores_permission),
 ) -> dict:
     if status != "listed" and not has_permission(user, "products.manage"):
         raise HTTPException(status_code=403, detail="没有管理商品的权限")
+    if salesMin is not None and salesMax is not None and salesMin > salesMax:
+        raise HTTPException(status_code=400, detail="最小销量不能大于最大销量")
     result = crawler_service.list_products(
         user["username"],
         status=status,
@@ -598,6 +603,9 @@ def list_products(
         collected_at_from=collectedAtFrom,
         collected_at_to=collectedAtTo,
         sales_period_days=salesPeriodDays,
+        sales_sort=salesSort,
+        sales_min=salesMin,
+        sales_max=salesMax,
         page=page,
         page_size=pageSize,
     )
