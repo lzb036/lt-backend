@@ -244,7 +244,7 @@ def test_sales_order_sync_global_settings_permissions_and_payload(
         save_global_settings,
     )
 
-    assert _client(SETTINGS_USER).get(
+    assert _client(SUPERADMIN_USER).get(
         "/crawler/settings/sales-order-sync"
     ).json() == {"settings": settings_payload}
     assert _client(
@@ -254,6 +254,9 @@ def test_sales_order_sync_global_settings_permissions_and_payload(
             "permissionCodes": [],
         }
     ).get("/crawler/settings/sales-order-sync").status_code == 403
+    assert _client(SETTINGS_USER).get(
+        "/crawler/settings/sales-order-sync"
+    ).status_code == 403
     assert _client(SETTINGS_USER).put(
         "/crawler/settings/sales-order-sync",
         json=settings_payload,
@@ -365,7 +368,7 @@ def test_sales_order_sync_retry_api_uses_current_owner(
         raising=False,
     )
 
-    response = _client(STORE_USER).post(
+    response = _client(SUPERADMIN_USER).post(
         "/crawler/sales-analysis/order-sync-runs/source-7/retry"
     )
 
@@ -373,7 +376,7 @@ def test_sales_order_sync_retry_api_uses_current_owner(
     assert response.json() == {
         "syncTask": {"id": "sales-7", "runId": "retry-7"}
     }
-    assert calls == [("owner-a", "source-7")]
+    assert calls == [("root", "source-7")]
 
 
 def test_sales_analysis_settings_api_uses_current_user_and_ignores_payload_owner(
@@ -544,14 +547,34 @@ def test_list_sales_analysis_stores_uses_current_tenant(
         raising=False,
     )
 
-    response = _client(STORE_USER).get("/crawler/sales-analysis/stores")
+    response = _client(SUPERADMIN_USER).get("/crawler/sales-analysis/stores")
 
     assert response.status_code == 200
     assert response.json() == {
         "stores": [{"id": 3, "name": "Owned Store"}],
         "dataUpdatedAt": "2026-07-16T12:00:00",
     }
-    assert calls == ["owner-a"]
+    assert calls == ["root"]
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/crawler/settings/sales-order-sync"),
+        ("get", "/crawler/sales-analysis/stores"),
+        ("get", "/crawler/sales-analysis/order-sync-runs"),
+        (
+            "post",
+            "/crawler/sales-analysis/order-sync-runs/source-7/retry",
+        ),
+    ],
+)
+def test_order_administration_routes_reject_ordinary_users(
+    method: str,
+    path: str,
+) -> None:
+    response = getattr(_client(STORE_USER), method)(path)
+    assert response.status_code == 403
 
 
 @pytest.mark.parametrize(

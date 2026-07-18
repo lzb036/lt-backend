@@ -1047,7 +1047,7 @@ def test_sales_analysis_model_settings(
 
 @router.get("/settings/sales-order-sync")
 def get_sales_order_sync_global_settings(
-    _: dict = Depends(require_settings_permission),
+    _: dict = Depends(require_superadmin),
 ) -> dict:
     return {
         "settings": sales_order_sync_history_service.get_global_settings()
@@ -1110,7 +1110,7 @@ def list_sales_order_sync_runs(
     | None = Query(default=None),
     createdAtFrom: datetime | None = Query(default=None),
     createdAtTo: datetime | None = Query(default=None),
-    user: dict = Depends(require_stores_permission),
+    user: dict = Depends(require_superadmin),
 ) -> dict:
     try:
         result = sales_order_sync_history_service.list_runs(
@@ -1138,7 +1138,7 @@ def list_sales_order_sync_runs(
 @router.delete("/sales-analysis/order-sync-runs")
 def delete_sales_order_sync_runs(
     payload: SalesOrderSyncRunDeletePayload,
-    user: dict = Depends(require_stores_permission),
+    user: dict = Depends(require_superadmin),
 ) -> dict:
     try:
         return sales_order_sync_history_service.delete_runs(
@@ -1152,7 +1152,7 @@ def delete_sales_order_sync_runs(
 @router.post("/sales-analysis/order-sync-runs/{run_id}/retry")
 def retry_sales_order_sync_run(
     run_id: str = ApiPath(min_length=1, max_length=64),
-    user: dict = Depends(require_stores_permission),
+    user: dict = Depends(require_superadmin),
 ) -> dict:
     try:
         return {
@@ -1167,7 +1167,7 @@ def retry_sales_order_sync_run(
 
 @router.get("/sales-analysis/stores")
 def list_sales_analysis_stores(
-    user: dict = Depends(require_stores_permission),
+    user: dict = Depends(require_superadmin),
 ) -> dict:
     try:
         result = crawler_service.list_sales_analysis_stores(
