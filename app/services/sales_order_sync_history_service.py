@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.db.database import session_scope
 from app.db.models import (
+    SalesOrderModel,
     SalesOrderSyncRunModel,
     StoreModel,
     SystemSettingModel,
@@ -418,19 +419,29 @@ def cleanup_successful_runs_if_due(
         SUCCESS_CLEANUP_LOCK.release()
 
 
-def _run_to_public(row: SalesOrderSyncRunModel) -> dict[str, Any]:
+def _run_to_public(
+    row: SalesOrderSyncRunModel,
+    *,
+    store_alias_name: str = "",
+    current_total_order_count: int | None = None,
+) -> dict[str, Any]:
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
         "storeId": row.store_id,
         "storeName": row.store_name,
+        "storeAliasName": store_alias_name,
         "triggerType": row.trigger_type,
         "parentRunId": row.parent_run_id,
         "status": row.status,
         "initialSync": bool(row.initial_sync),
         "progressCurrent": row.progress_current,
         "progressTotal": row.progress_total,
-        "totalOrderCount": row.total_order_count,
+        "totalOrderCount": (
+            current_total_order_count
+            if current_total_order_count is not None
+            else row.total_order_count
+        ),
         "newOrderCount": row.new_order_count,
         "updatedOrderCount": row.updated_order_count,
         "unchangedOrderCount": row.unchanged_order_count,
@@ -496,8 +507,57 @@ def list_runs(
             .offset((page - 1) * page_size)
             .limit(page_size)
         ).all()
+        store_ids = {
+            int(row.store_id)
+            for row in rows
+            if row.store_id is not None
+        }
+        store_aliases = {
+            int(store.id): str(
+                store.alias_name or store.store_name or store.store_code
+            )
+            for store in session.scalars(
+                select(StoreModel).where(
+                    StoreModel.owner_username == owner_username,
+                    StoreModel.id.in_(store_ids or {-1}),
+                )
+            ).all()
+        }
+        cutoff = sales_now_naive() - timedelta(days=365)
+        current_order_counts = {
+            int(result.store_id): int(result.order_count or 0)
+            for result in session.execute(
+                select(
+                    SalesOrderModel.store_id,
+                    func.count(SalesOrderModel.id).label("order_count"),
+                )
+                .where(
+                    SalesOrderModel.owner_username == owner_username,
+                    SalesOrderModel.store_id.in_(store_ids or {-1}),
+                    SalesOrderModel.ordered_at >= cutoff,
+                )
+                .group_by(SalesOrderModel.store_id)
+            )
+        }
         return {
-            "rows": [_run_to_public(row) for row in rows],
+            "rows": [
+                _run_to_public(
+                    row,
+                    store_alias_name=store_aliases.get(
+                        int(row.store_id or 0),
+                        row.store_name,
+                    ),
+                    current_total_order_count=(
+                        current_order_counts.get(
+                            int(row.store_id),
+                            0,
+                        )
+                        if row.store_id is not None
+                        else None
+                    ),
+                )
+                for row in rows
+            ],
             "total": int(total or 0),
             "page": page,
             "pageSize": page_size,

@@ -11,6 +11,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.database import Base
 from app.db.models import (
+    SalesOrderModel,
     SalesOrderSyncRunModel,
     StoreModel,
     SystemSettingModel,
@@ -183,6 +184,7 @@ def test_list_runs_is_owner_scoped_and_server_paginated(
 ) -> None:
     with history_session_factory() as session:
         store_a = _seed_owner(session, "owner-a", "a")
+        store_a.alias_name = "Owner A Alias"
         store_b = _seed_owner(session, "owner-b", "b")
         _add_run(
             session,
@@ -192,6 +194,24 @@ def test_list_runs_is_owner_scoped_and_server_paginated(
             status="failed",
             created_at=datetime(2026, 7, 17, 8, 0, 0),
         )
+        session.add_all([
+            SalesOrderModel(
+                owner_username="owner-a",
+                store_id=store_a.id,
+                order_number="recent-1",
+                ordered_at=datetime(2026, 7, 10, 8, 0, 0),
+                raw_order_json="{}",
+                last_synced_at=datetime(2026, 7, 17, 8, 0, 0),
+            ),
+            SalesOrderModel(
+                owner_username="owner-a",
+                store_id=store_a.id,
+                order_number="recent-2",
+                ordered_at=datetime(2026, 7, 11, 8, 0, 0),
+                raw_order_json="{}",
+                last_synced_at=datetime(2026, 7, 17, 8, 0, 0),
+            ),
+        ])
         _add_run(
             session,
             run_id="run-a-new",
@@ -220,6 +240,8 @@ def test_list_runs_is_owner_scoped_and_server_paginated(
     assert result["page"] == 1
     assert result["pageSize"] == 1
     assert [row["id"] for row in result["rows"]] == ["run-a-new"]
+    assert result["rows"][0]["storeAliasName"] == "Owner A Alias"
+    assert result["rows"][0]["totalOrderCount"] == 2
 
 
 def test_list_runs_applies_owner_before_all_filters(
