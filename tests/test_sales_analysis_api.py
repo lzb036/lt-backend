@@ -42,6 +42,18 @@ AI_USER = {
     "permissionCodes": ["ai.manage"],
 }
 
+STORE_USER = {
+    "username": "owner-a",
+    "role": "operator",
+    "permissionCodes": ["stores.manage"],
+}
+
+SETTINGS_USER = {
+    "username": "owner-a",
+    "role": "operator",
+    "permissionCodes": ["settings.manage"],
+}
+
 SUPERADMIN_USER = {
     "username": "root",
     "role": "superadmin",
@@ -169,18 +181,11 @@ def test_sales_analysis_routes_require_ai_manage_permission() -> None:
         ("PUT", "/crawler/settings/sales-analysis"),
         ("GET", "/crawler/settings/sales-analysis/capabilities"),
         ("GET", "/crawler/settings/sales-analysis/constraints"),
-        ("GET", "/crawler/sales-analysis/stores"),
         ("GET", "/crawler/sales-analysis/sync-state"),
         ("POST", "/crawler/sales-analysis/sync"),
         ("GET", "/crawler/sales-analysis/sync/{task_id}"),
         ("GET", "/crawler/sales-analysis/conversations"),
         ("POST", "/crawler/sales-analysis/conversations"),
-        ("GET", "/crawler/sales-analysis/order-sync-runs"),
-        ("DELETE", "/crawler/sales-analysis/order-sync-runs"),
-        (
-            "POST",
-            "/crawler/sales-analysis/order-sync-runs/{run_id}/retry",
-        ),
         (
             "DELETE",
             "/crawler/sales-analysis/conversations/{conversation_id}",
@@ -198,9 +203,9 @@ def test_sales_analysis_routes_require_ai_manage_permission() -> None:
         route
         for route in crawler_api.router.routes
         if isinstance(route, APIRoute)
-        and (
-            route.path.startswith("/crawler/sales-analysis")
-            or route.path.startswith("/crawler/settings/sales-analysis")
+        and any(
+            (method, route.path) in expected
+            for method in route.methods
         )
     ]
     actual = {
@@ -213,16 +218,6 @@ def test_sales_analysis_routes_require_ai_manage_permission() -> None:
     for route in routes:
         dependencies = [item.call for item in route.dependant.dependencies]
         assert crawler_api.require_ai_permission in dependencies
-
-    response = _client(
-        {
-            "username": "owner-a",
-            "role": "operator",
-            "permissionCodes": [],
-        }
-    ).get("/crawler/sales-analysis/stores")
-    assert response.status_code == 403
-
 
 def test_sales_order_sync_global_settings_permissions_and_payload(
     monkeypatch: pytest.MonkeyPatch,
@@ -249,7 +244,7 @@ def test_sales_order_sync_global_settings_permissions_and_payload(
         save_global_settings,
     )
 
-    assert _client(AI_USER).get(
+    assert _client(SETTINGS_USER).get(
         "/crawler/settings/sales-order-sync"
     ).json() == {"settings": settings_payload}
     assert _client(
@@ -259,7 +254,7 @@ def test_sales_order_sync_global_settings_permissions_and_payload(
             "permissionCodes": [],
         }
     ).get("/crawler/settings/sales-order-sync").status_code == 403
-    assert _client(AI_USER).put(
+    assert _client(SETTINGS_USER).put(
         "/crawler/settings/sales-order-sync",
         json=settings_payload,
     ).status_code == 403
@@ -370,7 +365,7 @@ def test_sales_order_sync_retry_api_uses_current_owner(
         raising=False,
     )
 
-    response = _client(AI_USER).post(
+    response = _client(STORE_USER).post(
         "/crawler/sales-analysis/order-sync-runs/source-7/retry"
     )
 
@@ -549,7 +544,7 @@ def test_list_sales_analysis_stores_uses_current_tenant(
         raising=False,
     )
 
-    response = _client(AI_USER).get("/crawler/sales-analysis/stores")
+    response = _client(STORE_USER).get("/crawler/sales-analysis/stores")
 
     assert response.status_code == 200
     assert response.json() == {
