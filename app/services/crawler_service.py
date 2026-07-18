@@ -955,6 +955,7 @@ def product_to_public(
     *,
     period_sales_count: int | None = None,
     title_optimization_count: int = 0,
+    title_optimization_task_id: str | None = None,
 ) -> dict[str, Any]:
     listed_at = product_listed_at_text(row)
     raw_payload = product_raw_payload(row)
@@ -993,6 +994,7 @@ def product_to_public(
         "salesCount": product_sales_count(raw_payload),
         "periodSalesCount": period_sales_count,
         "titleOptimizationCount": title_optimization_count,
+        "titleOptimizationTaskId": title_optimization_task_id,
         "genreId": row.genre_id,
         "genrePath": rakuten_genre_path(row.genre_id),
         "genrePathZh": rakuten_genre_zh_path(rakuten_genre_path(row.genre_id)),
@@ -6960,8 +6962,22 @@ def _products_to_public_with_period_sales(
     owner_username: str,
     sales_period_range: tuple[date, date] | None,
 ) -> list[dict[str, Any]]:
-    if not rows or sales_period_range is None:
-        return [product_to_public(row) for row in rows]
+    if not rows:
+        return []
+
+    title_optimization_task_ids = active_title_optimization_task_ids(
+        session,
+        owner_username,
+        [int(row.id) for row in rows],
+    )
+    if sales_period_range is None:
+        return [
+            product_to_public(
+                row,
+                title_optimization_task_id=title_optimization_task_ids.get(int(row.id)),
+            )
+            for row in rows
+        ]
 
     title_optimization_counts = {
         int(result.product_id): int(result.optimization_count or 0)
@@ -7045,9 +7061,34 @@ def _products_to_public_with_period_sales(
                 else None
             ),
             title_optimization_count=title_optimization_counts.get(int(row.id), 0),
+            title_optimization_task_id=title_optimization_task_ids.get(int(row.id)),
         )
         for row in rows
     ]
+
+
+def active_title_optimization_task_ids(
+    session: Any,
+    owner_username: str,
+    product_ids: list[int],
+) -> dict[int, str]:
+    normalized_ids = set(normalize_product_ids(product_ids))
+    if not normalized_ids:
+        return {}
+    result: dict[int, str] = {}
+    rows = session.scalars(
+        select(SyncTaskModel).where(
+            SyncTaskModel.owner_username == owner_username,
+            SyncTaskModel.task_type == "title_optimization",
+            SyncTaskModel.status.in_(("queued", "running")),
+        )
+    ).all()
+    for task in rows:
+        payload = sync_task_payload(task)
+        for product_id in normalize_product_ids(list(payload.get("productIds") or [])):
+            if product_id in normalized_ids:
+                result.setdefault(product_id, task.id)
+    return result
 
 
 def normalize_listed_store_filter(value: str | None) -> int | str | None:
@@ -7746,6 +7787,73 @@ def create_product_delete_sync_task(owner_username: str, product_ids: list[int])
         task_ids.append(task_id)
     dispatch_next_sync_task()
     return created_sync_tasks_response(task_ids, message="批量删除任务已创建", total=len(normalized_ids))
+
+
+def create_product_title_optimization_task(
+    owner_username: str,
+    product_ids: list[int],
+) -> dict[str, Any]:
+    normalized_ids = normalize_product_ids(product_ids)
+    if not normalized_ids:
+        raise RuntimeError("请先选择商品。")
+    with session_scope() as session:
+        products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(normalized_ids),
+                ProductModel.review_status == "listed",
+            )
+        ).all()
+        found_ids = {int(product.id) for product in products}
+        missing_ids = [product_id for product_id in normalized_ids if product_id not in found_ids]
+        if missing_ids:
+            raise RuntimeError("存在不可优化的商品，请刷新列表后重新选择。")
+        store_ids = {int(product.store_id) for product in products if product.store_id is not None}
+        if len(store_ids) != 1:
+            raise RuntimeError("请选择同一个店铺下的店铺商品。")
+        store_id = next(iter(store_ids))
+        store = session.get(StoreModel, store_id)
+        if store is None or not store.enabled:
+            raise RuntimeError("商品关联店铺不存在或已停用。")
+
+        active_tasks = session.scalars(
+            select(SyncTaskModel).where(
+                SyncTaskModel.owner_username == owner_username,
+                SyncTaskModel.task_type == "title_optimization",
+                SyncTaskModel.status.in_(("queued", "running")),
+            )
+        ).all()
+        active_product_ids: set[int] = set()
+        for task in active_tasks:
+            active_product_ids.update(
+                normalize_product_ids(list(sync_task_payload(task).get("productIds") or []))
+            )
+        duplicated_ids = [product_id for product_id in normalized_ids if product_id in active_product_ids]
+        if duplicated_ids:
+            raise RuntimeError("所选商品中有标题优化任务正在执行，请等待任务完成后再试。")
+
+        task_id = uuid.uuid4().hex
+        task = SyncTaskModel(
+            id=task_id,
+            owner_username=owner_username,
+            store_id=store.id,
+            store_name=store.alias_name or store.store_name,
+            task_name=f"批量优化标题 {store.alias_name or store.store_name} {datetime.now():%Y-%m-%d %H:%M}",
+            task_type="title_optimization",
+            payload_json=json.dumps({"productIds": normalized_ids}, ensure_ascii=False),
+            status="queued",
+            total_count=len(normalized_ids),
+            message="等待执行标题优化",
+        )
+        session.add(task)
+        session.flush()
+
+    dispatch_next_sync_task()
+    return created_sync_tasks_response(
+        [task_id],
+        message="批量标题优化任务已创建",
+        total=len(normalized_ids),
+    )
 
 
 def normalize_product_ids(product_ids: list[int]) -> list[int]:
@@ -8533,6 +8641,60 @@ def product_replacement_payload_store_snapshot(store: StoreModel) -> dict[str, A
     }
 
 
+def perform_product_title_optimization(
+    owner_username: str,
+    store_id: int,
+    product_ids: list[int],
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    from app.services import ai_title_service
+
+    normalized_ids = normalize_product_ids(product_ids)
+    success_ids: list[int] = []
+    failed_ids: list[int] = []
+    errors: list[str] = []
+    cancelled = False
+    total_count = len(normalized_ids)
+    for index, product_id in enumerate(normalized_ids, start=1):
+        if task_id and is_task_cancel_requested(SyncTaskModel, task_id):
+            cancelled = True
+            break
+        try:
+            with session_scope() as session:
+                product = session.get(ProductModel, product_id)
+                if (
+                    product is None
+                    or product.owner_username != owner_username
+                    or product.review_status != "listed"
+                    or int(product.store_id or 0) != int(store_id)
+                ):
+                    raise RuntimeError("商品已不存在、已移出店铺商品或店铺已发生变化。")
+            ai_title_service.generate_version(owner_username, product_id, owner_username)
+            success_ids.append(product_id)
+        except Exception as exc:
+            failed_ids.append(product_id)
+            errors.append(f"商品 {product_id}：{exc}")
+        if task_id:
+            update_task_progress(
+                SyncTaskModel,
+                task_id,
+                total_count=total_count,
+                success_count=len(success_ids),
+                failed_count=len(failed_ids),
+                message=f"标题优化中，已处理 {index} / {total_count} 条",
+            )
+    return {
+        "totalCount": total_count,
+        "successCount": len(success_ids),
+        "failedCount": len(failed_ids),
+        "successIds": success_ids,
+        "failedIds": failed_ids,
+        "errors": errors,
+        "cancelled": cancelled,
+    }
+
+
 def run_sync_task(owner_username: str, task_id: str) -> None:
     defer_start = False
     with session_scope() as session:
@@ -8584,6 +8746,33 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             message = "商品替换完成"
             error_detail = None
             payload["result"] = result
+        elif task_type == "title_optimization":
+            product_ids = normalize_product_ids(list(payload.get("productIds") or []))
+            result = perform_product_title_optimization(
+                owner_username,
+                store_id,
+                product_ids,
+                task_id=task_id,
+            )
+            payload["result"] = {
+                "successIds": list(result.get("successIds") or []),
+                "failedIds": list(result.get("failedIds") or []),
+            }
+            total_count = int(result.get("totalCount") or 0)
+            success_count = int(result.get("successCount") or 0)
+            failed_count = int(result.get("failedCount") or 0)
+            if result.get("cancelled"):
+                status = "cancelled"
+                message = cancelled_task_progress_message(
+                    "标题优化",
+                    total_count,
+                    success_count,
+                    failed_count,
+                )
+            else:
+                status = "success" if failed_count == 0 else "partial"
+                message = f"完成，标题优化成功 {success_count} 条，失败 {failed_count} 条"
+            error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
         elif task_type == "listing_status":
             listing_status = normalize_text(payload.get("listingStatus"))
             result = perform_store_listing_status_sync(owner_username, store_id, listing_status, task_id=task_id)
@@ -8706,6 +8895,8 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
 
 def sync_task_running_message(task: SyncTaskModel) -> str:
     task_type = task.task_type or "store_sync"
+    if task_type == "title_optimization":
+        return "正在执行批量标题优化"
     if task_type == "product_replace":
         return "正在替换店铺商品"
     if task_type in {"listing_status", "product_listing_status"}:

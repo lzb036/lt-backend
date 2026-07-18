@@ -121,6 +121,10 @@ class ProductDeletePayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
 
 
+class ProductTitleOptimizationPayload(BaseModel):
+    productIds: list[int] = Field(default_factory=list)
+
+
 class ProductListingStatusPayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
     listingStatus: str = Field(pattern="^(listed|unlisted)$")
@@ -908,6 +912,20 @@ def generate_product_title_version(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/products/title-optimization")
+def create_product_title_optimization_task(
+    payload: ProductTitleOptimizationPayload,
+    user: dict = Depends(require_products_or_stores_permission),
+) -> dict:
+    try:
+        return crawler_service.create_product_title_optimization_task(
+            user["username"],
+            payload.productIds,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _raise_order_sync_http_error(exc: Exception) -> None:

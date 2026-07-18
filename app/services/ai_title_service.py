@@ -586,3 +586,13 @@ def stream_generate_version(owner_username: str, product_id: int, created_by: st
         session.add(version)
         session.flush()
         yield {"type": "completed", "version": version_to_public(version)}
+
+
+def generate_version(owner_username: str, product_id: int, created_by: str) -> dict[str, Any]:
+    completed_version: dict[str, Any] | None = None
+    for event in stream_generate_version(owner_username, product_id, created_by):
+        if event.get("type") == "completed" and isinstance(event.get("version"), dict):
+            completed_version = event["version"]
+    if completed_version is None:
+        raise RuntimeError("标题优化未生成有效结果。")
+    return completed_version
