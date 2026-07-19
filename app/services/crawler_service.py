@@ -7554,10 +7554,18 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
             for item in items
         }
         remote_identities.discard("")
-        removed_count = mark_missing_store_products_removed(
-            session,
-            local_rows,
-            remote_identities,
+        remote_listing_complete = (
+            rakuten_total_count is None
+            or len(items) >= int(rakuten_total_count)
+        )
+        removed_count = (
+            mark_missing_store_products_removed(
+                session,
+                local_rows,
+                remote_identities,
+            )
+            if remote_listing_complete
+            else 0
         )
         added_count = 0
         updated_count = 0
@@ -7654,6 +7662,9 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
             "removedCount": removed_count,
             "unchangedCount": unchanged_count,
             "errors": errors[:50],
+            "remoteListingComplete": remote_listing_complete,
+            "rakutenTotalCount": int(rakuten_total_count or len(items)),
+            "fetchedCount": len(items),
             "cancelled": False,
         }
     return result
