@@ -7537,14 +7537,15 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
                 ProductModel.store_id == row.id,
             )
         ).all()
-        local_by_identity: dict[str, ProductModel] = {}
+        local_by_manage_number: dict[str, ProductModel] = {}
+        local_by_item_number: dict[str, ProductModel] = {}
         for local_row in local_rows:
-            for identity in (
-                normalize_text(local_row.rakuten_manage_number),
-                normalize_text(local_row.item_number),
-            ):
-                if identity:
-                    local_by_identity.setdefault(identity, local_row)
+            manage_identity = normalize_text(local_row.rakuten_manage_number)
+            item_identity = normalize_text(local_row.item_number)
+            if manage_identity:
+                local_by_manage_number.setdefault(manage_identity, local_row)
+            if item_identity:
+                local_by_item_number.setdefault(item_identity, local_row)
         remote_identities = {
             store_product_sync_identity(
                 manage_number=first_text_from_keys(item, ("manageNumber", "itemNumber")),
@@ -7562,6 +7563,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
         updated_count = 0
         unchanged_count = 0
         failed_count = 0
+        errors: list[str] = []
         total_count = len(items) + removed_count
         processed_count = removed_count
         if task_id:
@@ -7584,32 +7586,45 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
                 manage_number=manage_number,
                 item_number=item_number,
             )
-            existing = local_by_identity.get(identity)
+            existing = (
+                local_by_manage_number.get(normalize_text(manage_number))
+                or local_by_item_number.get(normalize_text(item_number))
+            )
             try:
-                if existing is None:
-                    if upsert_store_product(
+                item_outcome = "unchanged"
+                with session.begin_nested():
+                    if existing is None:
+                        if upsert_store_product(
+                            session,
+                            owner_username,
+                            row,
+                            item,
+                            active_words=active_words,
+                        ):
+                            item_outcome = "added"
+                        else:
+                            item_outcome = "failed"
+                    elif apply_store_product_remote_update(
                         session,
                         owner_username,
                         row,
+                        existing,
                         item,
                         active_words=active_words,
                     ):
-                        added_count += 1
-                    else:
-                        failed_count += 1
-                elif apply_store_product_remote_update(
-                    session,
-                    owner_username,
-                    row,
-                    existing,
-                    item,
-                    active_words=active_words,
-                ):
+                        item_outcome = "updated"
+                    session.flush()
+                if item_outcome == "added":
+                    added_count += 1
+                elif item_outcome == "updated":
                     updated_count += 1
+                elif item_outcome == "failed":
+                    failed_count += 1
                 else:
                     unchanged_count += 1
             except Exception as exc:
                 failed_count += 1
+                errors.append(f"{identity or item_number or manage_number or index}: {exc}")
                 logger.exception("店铺商品差异同步失败 store_id=%s identity=%s", store_id, identity)
                 if existing is not None:
                     existing.last_error = str(exc)[:1000]
@@ -7638,6 +7653,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
             "updatedCount": updated_count,
             "removedCount": removed_count,
             "unchangedCount": unchanged_count,
+            "errors": errors[:50],
             "cancelled": False,
         }
     return result
@@ -8863,7 +8879,7 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
                     f"未变化 {int(result.get('unchangedCount') or 0)} 条，"
                     f"异常 {failed_count} 条"
                 )
-            error_detail = None
+            error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
     except TaskCancelled:
         with session_scope() as session:
             task = session.get(SyncTaskModel, task_id)
@@ -8887,6 +8903,21 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             store = session.get(StoreModel, task.store_id) if task and task.store_id else None
             if task is not None:
                 total_count = sync_task_known_total_count(task, payload)
+                success_count = max(0, int(task.success_count or 0))
+                failed_count = max(1, int(task.failed_count or 0))
+                if success_count > 0:
+                    status = "partial"
+                    unfinished_count = max(
+                        0,
+                        total_count - success_count - failed_count,
+                    )
+                    message = failed_sync_task_progress_message(
+                        sync_task_action_label(task),
+                        total_count,
+                        success_count,
+                        failed_count,
+                        unfinished_count=unfinished_count,
+                    )
             if store is not None:
                 store.last_error = error_detail
 
