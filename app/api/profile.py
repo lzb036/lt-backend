@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
@@ -29,8 +31,16 @@ class SecretProfileUpdate(BaseModel):
     autoCrawlIntervalMinutes: int | None = Field(default=None, ge=5, le=1440)
 
 
+class CrawlPriceRuleUpdate(BaseModel):
+    operator: Literal["all", "gt", "gte", "lt", "lte", "range"]
+    value: int | None = None
+    minPrice: int | None = None
+    maxPrice: int | None = None
+
+
 class CrawlSettingsUpdate(BaseModel):
-    crawlMinPrice: int
+    crawlMinPrice: int | None = None
+    crawlPriceRule: CrawlPriceRuleUpdate | None = None
 
 
 @router.get("/secrets")
@@ -65,7 +75,8 @@ def update_crawl_settings(
         return {
             "settings": user_service.update_crawl_settings(
                 user["username"],
-                payload.crawlMinPrice,
+                crawl_price_rule=payload.crawlPriceRule.model_dump() if payload.crawlPriceRule else None,
+                crawl_min_price=payload.crawlMinPrice,
             )
         }
     except RuntimeError as exc:

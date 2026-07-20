@@ -25,6 +25,8 @@ SUPERADMIN_PERMISSIONS = [
     "ai.manage",
 ]
 KNOWN_PERMISSIONS = set(SUPERADMIN_PERMISSIONS)
+CRAWL_PRICE_OPERATORS = {"all", "gt", "gte", "lt", "lte", "range"}
+CRAWL_PRICE_MAX_VALUE = 10_000_000
 
 
 def normalize_username(value: Any) -> str:
@@ -128,14 +130,73 @@ def normalize_crawl_min_price(value: Any) -> int:
     return normalized
 
 
+def normalize_crawl_price_value(value: Any, field_label: str) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{field_label}必须是整数。") from exc
+    if normalized < 1 or normalized > CRAWL_PRICE_MAX_VALUE:
+        raise RuntimeError(f"{field_label}必须在 1 至 {CRAWL_PRICE_MAX_VALUE:,} 日元之间。")
+    return normalized
+
+
+def legacy_crawl_price_rule(crawl_min_price: Any) -> dict[str, Any]:
+    normalized = normalize_crawl_min_price(crawl_min_price)
+    if normalized in {2500, 3800}:
+        return {"operator": "gte", "value": normalized}
+    return {"operator": "all"}
+
+
+def normalize_crawl_price_rule(value: Any, *, legacy_min_price: Any = 0) -> dict[str, Any]:
+    if value is None:
+        return legacy_crawl_price_rule(legacy_min_price)
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return legacy_crawl_price_rule(legacy_min_price)
+    if not isinstance(value, dict) or not value:
+        return legacy_crawl_price_rule(legacy_min_price)
+    operator = str(value.get("operator") or "").strip().lower()
+    if operator not in CRAWL_PRICE_OPERATORS:
+        raise RuntimeError("采集价格条件无效。")
+    if operator == "all":
+        return {"operator": "all"}
+    if operator == "range":
+        min_price = normalize_crawl_price_value(value.get("minPrice"), "价格下限")
+        max_price = normalize_crawl_price_value(value.get("maxPrice"), "价格上限")
+        if min_price >= max_price:
+            raise RuntimeError("价格区间下限必须小于上限。")
+        return {"operator": "range", "minPrice": min_price, "maxPrice": max_price}
+    return {
+        "operator": operator,
+        "value": normalize_crawl_price_value(value.get("value"), "价格"),
+    }
+
+
+def account_crawl_price_rule(row: UserAccountModel) -> dict[str, Any]:
+    return normalize_crawl_price_rule(
+        row.crawl_price_rule_json,
+        legacy_min_price=row.crawl_min_price,
+    )
+
+
+def crawl_min_price_from_rule(rule: dict[str, Any]) -> int:
+    if rule.get("operator") == "gte" and rule.get("value") in {2500, 3800}:
+        return int(rule["value"])
+    return 0
+
+
 def account_to_public(row: UserAccountModel) -> dict[str, Any]:
     permissions = parse_permissions_json(row.permissions_json, role=row.role)
+    crawl_price_rule = account_crawl_price_rule(row)
     return {
         "username": row.username,
         "displayName": row.display_name or row.username,
         "role": row.role,
         "enabled": bool(row.enabled),
-        "crawlMinPrice": normalize_crawl_min_price(row.crawl_min_price),
+        "crawlMinPrice": crawl_min_price_from_rule(crawl_price_rule),
+        "crawlPriceRule": crawl_price_rule,
         "permissionCodes": permissions,
         "permissions": permissions_to_flags(permissions, role=row.role),
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -193,22 +254,41 @@ def require_existing_account(username: str) -> dict[str, Any]:
         return account_to_public(row)
 
 
-def get_crawl_settings(username: str) -> dict[str, int]:
+def get_crawl_settings(username: str) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(UserAccountModel, normalize_username(username))
         if row is None or not row.enabled:
             raise RuntimeError("用户不存在或已停用。")
-        return {"crawlMinPrice": normalize_crawl_min_price(row.crawl_min_price)}
+        rule = account_crawl_price_rule(row)
+        return {
+            "crawlMinPrice": crawl_min_price_from_rule(rule),
+            "crawlPriceRule": rule,
+        }
 
 
-def update_crawl_settings(username: str, crawl_min_price: Any) -> dict[str, int]:
+def update_crawl_settings(
+    username: str,
+    *,
+    crawl_price_rule: Any = None,
+    crawl_min_price: Any = None,
+) -> dict[str, Any]:
+    if crawl_price_rule is None and crawl_min_price is None:
+        raise RuntimeError("请设置采集价格条件。")
     with session_scope() as session:
         row = session.get(UserAccountModel, normalize_username(username))
         if row is None or not row.enabled:
             raise RuntimeError("用户不存在或已停用。")
-        row.crawl_min_price = normalize_crawl_min_price(crawl_min_price)
+        rule = normalize_crawl_price_rule(
+            crawl_price_rule,
+            legacy_min_price=crawl_min_price,
+        )
+        row.crawl_price_rule_json = json.dumps(rule, ensure_ascii=False)
+        row.crawl_min_price = crawl_min_price_from_rule(rule)
         session.flush()
-        return {"crawlMinPrice": row.crawl_min_price}
+        return {
+            "crawlMinPrice": row.crawl_min_price,
+            "crawlPriceRule": rule,
+        }
 
 
 def list_users(*, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:

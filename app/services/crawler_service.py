@@ -73,6 +73,7 @@ from app.services.sales_time import (
     iso_sales_datetime,
     sales_now_naive,
 )
+from app.services.user_service import account_crawl_price_rule
 
 logger = logging.getLogger(__name__)
 
@@ -16168,7 +16169,8 @@ def save_collected_item(
         return {
             "saved": False,
             "skipped": True,
-            "error": f"商品价格 {price} 日元低于用户设置的采集门槛，已跳过。",
+            "error": normalize_text(item.get("_crawlPriceFilterReason"))
+            or f"商品价格 {price} 日元不符合用户设置的采集价格条件，已跳过。",
         }
     with session_scope() as session:
         duplicated_product = find_existing_collected_product(session, owner_username, item)
@@ -16274,14 +16276,14 @@ def collect_items(source_type: str, target: str, *, task_id: str | None = None) 
 
 def collect_items_for_target(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
     raise_if_task_cancelled(CrawlTaskModel, task_id)
-    min_price = crawl_min_price_for_task(task_id)
+    price_rule = crawl_price_rule_for_task(task_id)
     if source_type == "product_url":
         items: list[dict[str, Any]] = []
         for product_url in normalize_rakuten_product_targets(target):
             raise_if_task_cancelled(CrawlTaskModel, task_id)
             try:
                 detail = collect_product_detail(product_url)
-                mark_collected_item_price_filter(detail, min_price)
+                mark_collected_item_price_filter(detail, price_rule)
                 items.append(detail)
             except Exception as exc:
                 items.append(
@@ -16325,7 +16327,7 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
         items = [item for item in items if product_url_shop_code(item.get("source_url")) == shop_code_filter]
     limited_items = items if limit is None else items[:limit]
     for item in limited_items:
-        mark_collected_item_price_filter(item, min_price)
+        mark_collected_item_price_filter(item, price_rule)
     if task_id:
         update_task_progress(
             CrawlTaskModel,
@@ -16338,7 +16340,7 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
         limited_items,
         task_id=task_id,
         existing_source_hashes=existing_source_hashes,
-        min_price=min_price,
+        price_rule=price_rule,
     )
 
 
@@ -16461,34 +16463,59 @@ def existing_collected_source_hashes_for_task(
         return existing_hashes
 
 
-def crawl_min_price_for_task(task_id: str | None) -> int:
+def crawl_price_rule_for_task(task_id: str | None) -> dict[str, Any]:
     if not task_id:
-        return 0
+        return {"operator": "all"}
     with session_scope() as session:
         task = session.get(CrawlTaskModel, task_id)
         if task is None:
-            return 0
+            return {"operator": "all"}
         account = session.get(UserAccountModel, task.owner_username)
-        value = int(account.crawl_min_price or 0) if account is not None else 0
-        return value if value in {2500, 3800} else 0
+        return account_crawl_price_rule(account) if account is not None else {"operator": "all"}
 
 
-def should_filter_collected_item_by_price(item: dict[str, Any], min_price: int) -> bool:
-    if min_price not in {2500, 3800}:
-        return False
+def collected_item_price_filter_reason(item: dict[str, Any], price_rule: dict[str, Any]) -> str:
+    operator = normalize_text(price_rule.get("operator")).lower()
+    if operator == "all":
+        return ""
     raw_price = item.get("price")
     if raw_price is None or normalize_text(raw_price) == "":
-        return False
+        return ""
     try:
         price = float(raw_price)
     except (TypeError, ValueError):
-        return False
-    return price < min_price
+        return ""
+    value = float(price_rule.get("value") or 0)
+    min_price = float(price_rule.get("minPrice") or 0)
+    max_price = float(price_rule.get("maxPrice") or 0)
+    allowed = {
+        "gt": price > value,
+        "gte": price >= value,
+        "lt": price < value,
+        "lte": price <= value,
+        "range": min_price <= price <= max_price,
+    }.get(operator, True)
+    if allowed:
+        return ""
+    condition_text = {
+        "gt": f"大于 {int(value)} 日元",
+        "gte": f"大于等于 {int(value)} 日元",
+        "lt": f"小于 {int(value)} 日元",
+        "lte": f"小于等于 {int(value)} 日元",
+        "range": f"在 {int(min_price)} 至 {int(max_price)} 日元之间（含上下限）",
+    }.get(operator, "符合采集价格条件")
+    return f"商品价格 {price:g} 日元不符合“{condition_text}”的采集价格条件，已跳过。"
 
 
-def mark_collected_item_price_filter(item: dict[str, Any], min_price: int) -> None:
-    if should_filter_collected_item_by_price(item, min_price):
+def should_filter_collected_item_by_price(item: dict[str, Any], price_rule: dict[str, Any]) -> bool:
+    return bool(collected_item_price_filter_reason(item, price_rule))
+
+
+def mark_collected_item_price_filter(item: dict[str, Any], price_rule: dict[str, Any]) -> None:
+    reason = collected_item_price_filter_reason(item, price_rule)
+    if reason:
         item["_crawlPriceFiltered"] = True
+        item["_crawlPriceFilterReason"] = reason
 
 
 def enrich_collected_items_with_detail(
@@ -16496,9 +16523,10 @@ def enrich_collected_items_with_detail(
     *,
     task_id: str | None = None,
     existing_source_hashes: set[str] | None = None,
-    min_price: int = 0,
+    price_rule: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     known_hashes = existing_source_hashes or set()
+    active_price_rule = price_rule or {"operator": "all"}
     enriched_items: list[dict[str, Any]] = []
     for item in items:
         raise_if_task_cancelled(CrawlTaskModel, task_id)
@@ -16531,7 +16559,7 @@ def enrich_collected_items_with_detail(
             detail["price"] = item.get("price")
         if not detail.get("image_url"):
             detail["image_url"] = item.get("image_url")
-        mark_collected_item_price_filter(detail, min_price)
+        mark_collected_item_price_filter(detail, active_price_rule)
         enriched_items.append(detail)
     return enriched_items
 

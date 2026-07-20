@@ -74,6 +74,7 @@ class UserAccountModel(TimestampMixin, Base):
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="operator", server_default="operator")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
     crawl_min_price: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    crawl_price_rule_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     permissions_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     password_salt_b64: Mapped[str] = mapped_column(String(255), nullable=False)
     password_hash_b64: Mapped[str] = mapped_column(String(255), nullable=False)
