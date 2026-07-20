@@ -61,6 +61,7 @@ class TaskDeletePayload(BaseModel):
 
 class ScheduleDeletePayload(BaseModel):
     scheduleIds: list[int] = Field(default_factory=list)
+    deleteCollectedProducts: bool = False
 
 
 class ScheduleStatusBatchPayload(BaseModel):
@@ -1409,7 +1410,11 @@ def create_schedule(payload: ScheduledCrawlPayload, user: dict = Depends(require
 @router.api_route("/schedules", methods=["DELETE"])
 def delete_schedules(payload: ScheduleDeletePayload, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
-        return crawler_service.delete_scheduled_crawls(user["username"], payload.scheduleIds)
+        return crawler_service.delete_scheduled_crawls(
+            user["username"],
+            payload.scheduleIds,
+            delete_collected_products=payload.deleteCollectedProducts,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1443,10 +1448,21 @@ def update_schedule(
 
 
 @router.delete("/schedules/{schedule_id}")
-def delete_schedule(schedule_id: int, user: dict = Depends(require_crawler_permission)) -> dict:
+def delete_schedule(
+    schedule_id: int,
+    deleteCollectedProducts: bool = Query(default=False),
+    user: dict = Depends(require_crawler_permission),
+) -> dict:
     try:
-        crawler_service.delete_scheduled_crawl(user["username"], schedule_id)
-        return {"deleted": True}
+        result = crawler_service.delete_scheduled_crawl(
+            user["username"],
+            schedule_id,
+            delete_collected_products=deleteCollectedProducts,
+        )
+        return {
+            "deleted": bool(result["deletedCount"]),
+            "deletedProductCount": result["deletedProductCount"],
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

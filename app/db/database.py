@@ -1045,6 +1045,8 @@ def ensure_schema_compatibility() -> None:
         )
         if "store_id" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN store_id INT NULL"))
+        if "scheduled_crawl_id" not in product_columns:
+            connection.execute(text("ALTER TABLE lt_products ADD COLUMN scheduled_crawl_id INT NULL"))
         if "parent_product_id" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN parent_product_id INT NULL"))
         if "listing_task_id" not in product_columns:
@@ -1155,6 +1157,15 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("CREATE INDEX ix_lt_product_parent_status ON lt_products (parent_product_id, review_status)"))
         if "ix_lt_product_listing_task" not in product_indexes:
             connection.execute(text("CREATE INDEX ix_lt_product_listing_task ON lt_products (listing_task_id)"))
+        if "ix_lt_product_scheduled_crawl_status" not in product_indexes:
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX ix_lt_product_scheduled_crawl_status
+                    ON lt_products (scheduled_crawl_id, review_status)
+                    """
+                )
+            )
 
         product_unique_constraints = set(
             connection.execute(
@@ -1303,6 +1314,8 @@ def ensure_schema_compatibility() -> None:
                 connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN warning_detail TEXT NULL"))
             if "queue_job_id" not in crawl_task_columns:
                 connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN queue_job_id VARCHAR(64) NULL"))
+            if "scheduled_crawl_id" not in crawl_task_columns:
+                connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN scheduled_crawl_id INT NULL"))
             if "ix_lt_crawl_task_owner_status" not in crawl_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_crawl_task_owner_status ON lt_crawl_tasks (owner_username, status)"))
             if "ix_lt_crawl_task_owner_created" not in crawl_task_indexes:
@@ -1311,6 +1324,20 @@ def ensure_schema_compatibility() -> None:
                 connection.execute(text("CREATE INDEX ix_lt_crawl_task_owner_started ON lt_crawl_tasks (owner_username, started_at)"))
             if "ix_lt_crawl_task_owner_finished" not in crawl_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_crawl_task_owner_finished ON lt_crawl_tasks (owner_username, finished_at)"))
+            if "ix_lt_crawl_task_scheduled_crawl" not in crawl_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_crawl_task_scheduled_crawl ON lt_crawl_tasks (scheduled_crawl_id)"))
+
+            connection.execute(
+                text(
+                    """
+                    UPDATE lt_products AS product
+                    INNER JOIN lt_crawl_tasks AS task ON task.id = product.task_id
+                    SET product.scheduled_crawl_id = task.scheduled_crawl_id
+                    WHERE product.scheduled_crawl_id IS NULL
+                      AND task.scheduled_crawl_id IS NOT NULL
+                    """
+                )
+            )
 
         schedule_columns = set(
             connection.execute(

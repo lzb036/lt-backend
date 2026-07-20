@@ -971,6 +971,7 @@ def product_to_public(
         "id": row.id,
         "ownerUsername": row.owner_username,
         "taskId": row.task_id,
+        "scheduledCrawlId": row.scheduled_crawl_id,
         "parentProductId": row.parent_product_id,
         "listingTaskId": row.listing_task_id,
         "storeId": row.store_id,
@@ -9921,14 +9922,17 @@ def save_scheduled_crawl(owner_username: str, payload: Any, schedule_id: int | N
         return scheduled_crawl_to_public(row)
 
 
-def delete_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
-    with session_scope() as session:
-        row = session.get(ScheduledCrawlModel, schedule_id)
-        if row is None:
-            return
-        if row.owner_username != owner_username:
-            raise RuntimeError("不能删除其他用户的定时任务。")
-        session.delete(row)
+def delete_scheduled_crawl(
+    owner_username: str,
+    schedule_id: int,
+    *,
+    delete_collected_products: bool = False,
+) -> dict[str, Any]:
+    return delete_scheduled_crawls(
+        owner_username,
+        [schedule_id],
+        delete_collected_products=delete_collected_products,
+    )
 
 
 def update_scheduled_crawl_statuses(
@@ -9974,7 +9978,12 @@ def update_scheduled_crawl_statuses(
         }
 
 
-def delete_scheduled_crawls(owner_username: str, schedule_ids: list[int]) -> dict[str, Any]:
+def delete_scheduled_crawls(
+    owner_username: str,
+    schedule_ids: list[int],
+    *,
+    delete_collected_products: bool = False,
+) -> dict[str, Any]:
     normalized_ids: list[int] = []
     seen: set[int] = set()
     for value in schedule_ids or []:
@@ -9988,6 +9997,7 @@ def delete_scheduled_crawls(owner_username: str, schedule_ids: list[int]) -> dic
         normalized_ids.append(schedule_id)
     if not normalized_ids:
         raise RuntimeError("请选择要删除的采集店铺。")
+    deleted_product_ids: list[int] = []
     with session_scope() as session:
         rows = session.scalars(
             select(ScheduledCrawlModel).where(
@@ -9996,13 +10006,38 @@ def delete_scheduled_crawls(owner_username: str, schedule_ids: list[int]) -> dic
             )
         ).all()
         found_ids = {int(row.id) for row in rows}
+        if found_ids:
+            product_rows = session.scalars(
+                select(ProductModel).where(
+                    ProductModel.owner_username == owner_username,
+                    ProductModel.scheduled_crawl_id.in_(found_ids),
+                )
+            ).all()
+            for product in product_rows:
+                if delete_collected_products and product.review_status in {"pending", "approved", "error"}:
+                    deleted_product_ids.append(int(product.id))
+                    session.delete(product)
+                else:
+                    product.scheduled_crawl_id = None
+
+            task_rows = session.scalars(
+                select(CrawlTaskModel).where(
+                    CrawlTaskModel.owner_username == owner_username,
+                    CrawlTaskModel.scheduled_crawl_id.in_(found_ids),
+                )
+            ).all()
+            for task in task_rows:
+                task.scheduled_crawl_id = None
         for row in rows:
             session.delete(row)
-        return {
+        result = {
             "deletedIds": sorted(found_ids),
             "failedIds": [schedule_id for schedule_id in normalized_ids if schedule_id not in found_ids],
             "deletedCount": len(found_ids),
+            "deletedProductCount": len(deleted_product_ids),
         }
+    cleanup_product_image_ids(deleted_product_ids)
+    return result
 
 
 def run_scheduled_crawl(owner_username: str, schedule_id: int) -> dict[str, Any]:
@@ -10099,7 +10134,17 @@ def run_scheduled_crawl_job(owner_username: str, schedule_id: int) -> None:
         row_enabled = bool(row.enabled)
         schedule_time = row.schedule_time
 
-    task_payload = type("TaskPayload", (), {"sourceId": None, "sourceType": source_type, "target": target, "mode": "scheduled"})()
+    task_payload = type(
+        "TaskPayload",
+        (),
+        {
+            "sourceId": None,
+            "sourceType": source_type,
+            "target": target,
+            "mode": "scheduled",
+            "scheduledCrawlId": schedule_id,
+        },
+    )()
     try:
         create_task(owner_username, task_payload)
     except Exception as exc:
@@ -15686,9 +15731,17 @@ def delete_role(role_id: int) -> None:
 
 def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
     source_id = getattr(payload, "sourceId", None)
+    scheduled_crawl_id = getattr(payload, "scheduledCrawlId", None)
     source_type = str(getattr(payload, "sourceType", "") or "").strip()
     target = str(getattr(payload, "target", "") or "").strip()
     with session_scope() as session:
+        schedule = session.get(ScheduledCrawlModel, scheduled_crawl_id) if scheduled_crawl_id else None
+        if scheduled_crawl_id and (
+            schedule is None
+            or schedule.owner_username != owner_username
+            or schedule.source_type != "shop"
+        ):
+            raise RuntimeError("关联的采集店铺不存在或无权访问。")
         source = session.get(CrawlSourceModel, source_id) if source_id else None
         if source is not None:
             if source.owner_username != owner_username:
@@ -15716,6 +15769,7 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
             id=uuid.uuid4().hex,
             owner_username=owner_username,
             source_id=source.id if source else None,
+            scheduled_crawl_id=int(schedule.id) if schedule is not None else None,
             source_type=source_type,
             target=target,
             mode=str(getattr(payload, "mode", "") or "manual"),
@@ -15798,6 +15852,7 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
     owner_username = ""
     source_type = ""
     target = ""
+    scheduled_crawl_id: int | None = None
     should_run = False
     should_refill = False
     should_retry_thread_task = False
@@ -15861,6 +15916,7 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
                         task.total_count = initial_crawl_task_total_count(task.source_type, task.target)
                     source_type = task.source_type
                     target = task.target
+                    scheduled_crawl_id = task.scheduled_crawl_id
                     should_run = True
 
     if not should_run:
@@ -15899,7 +15955,13 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
                 raise_if_task_cancelled(CrawlTaskModel, task_id)
                 processed_count += 1
                 item_error = collected_item_error(item)
-                save_result = save_collected_item(owner_username, task_id, item, active_words=active_words)
+                save_result = save_collected_item(
+                    owner_username,
+                    task_id,
+                    item,
+                    active_words=active_words,
+                    scheduled_crawl_id=scheduled_crawl_id,
+                )
                 saved = bool(save_result.get("saved"))
                 skipped = bool(save_result.get("skipped"))
                 save_error = normalize_text(save_result.get("error"))
@@ -15990,6 +16052,7 @@ def save_collected_item(
     item: dict[str, Any],
     *,
     active_words: list[str] | None = None,
+    scheduled_crawl_id: int | None = None,
 ) -> dict[str, Any]:
     product_id: int | None = None
     if item.get("_crawlPriceFiltered"):
@@ -16016,6 +16079,7 @@ def save_collected_item(
             item,
             active_words=active_words,
             prepared_item=prepared_item,
+            scheduled_crawl_id=scheduled_crawl_id,
         )
         if saved:
             session.flush()
@@ -17907,6 +17971,7 @@ def upsert_product(
     store_id: int | None = None,
     active_words: list[str] | None = None,
     prepared_item: PreparedProductUpsertItem | None = None,
+    scheduled_crawl_id: int | None = None,
 ) -> bool:
     prepared = prepared_item or prepare_product_upsert_item(session, item, active_words=active_words)
     if prepared.error or not prepared.source_url or not prepared.title:
@@ -17935,6 +18000,8 @@ def upsert_product(
     row.source_url = prepared.source_url
     row.source_url_hash = source_url_hash
     row.task_id = task_id
+    if scheduled_crawl_id is not None:
+        row.scheduled_crawl_id = scheduled_crawl_id
     row.store_id = store_id
     row.rakuten_manage_number = prepared.rakuten_manage_number
     row.rakuten_listing_status = str(prepared.item.get("rakuten_listing_status") or row.rakuten_listing_status or "")

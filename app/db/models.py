@@ -211,6 +211,7 @@ class CrawlTaskModel(TimestampMixin, Base):
         Index("ix_lt_crawl_task_owner_created", "owner_username", "created_at"),
         Index("ix_lt_crawl_task_owner_started", "owner_username", "started_at"),
         Index("ix_lt_crawl_task_owner_finished", "owner_username", "finished_at"),
+        Index("ix_lt_crawl_task_scheduled_crawl", "scheduled_crawl_id"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -220,6 +221,9 @@ class CrawlTaskModel(TimestampMixin, Base):
         nullable=False,
     )
     source_id: Mapped[int | None] = mapped_column(ForeignKey("lt_crawl_sources.id", ondelete="SET NULL"))
+    scheduled_crawl_id: Mapped[int | None] = mapped_column(
+        ForeignKey("lt_scheduled_crawls.id", ondelete="SET NULL")
+    )
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     target: Mapped[str] = mapped_column(Text, nullable=False)
     mode: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
@@ -249,6 +253,7 @@ class ProductModel(TimestampMixin, Base):
         Index("ix_lt_product_store_listing_listed", "store_id", "review_status", "rakuten_listing_status", "listed_at"),
         Index("ix_lt_product_parent_status", "parent_product_id", "review_status"),
         Index("ix_lt_product_listing_task", "listing_task_id"),
+        Index("ix_lt_product_scheduled_crawl_status", "scheduled_crawl_id", "review_status"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -258,6 +263,9 @@ class ProductModel(TimestampMixin, Base):
         nullable=False,
     )
     task_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("lt_crawl_tasks.id", ondelete="SET NULL"))
+    scheduled_crawl_id: Mapped[int | None] = mapped_column(
+        ForeignKey("lt_scheduled_crawls.id", ondelete="SET NULL")
+    )
     parent_product_id: Mapped[int | None] = mapped_column(ForeignKey("lt_products.id", ondelete="SET NULL"))
     listing_task_id: Mapped[str | None] = mapped_column(String(64))
     store_id: Mapped[int | None] = mapped_column(ForeignKey("lt_stores.id", ondelete="SET NULL"))
