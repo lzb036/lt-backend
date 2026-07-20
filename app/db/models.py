@@ -233,6 +233,8 @@ class CrawlTaskModel(TimestampMixin, Base):
     success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     warning_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    saved_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     message: Mapped[str] = mapped_column(Text, nullable=False, default="")
     error_detail: Mapped[str | None] = mapped_column(Text)
     warning_detail: Mapped[str | None] = mapped_column(Text)

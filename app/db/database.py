@@ -1310,6 +1310,10 @@ def ensure_schema_compatibility() -> None:
         if crawl_task_columns:
             if "warning_count" not in crawl_task_columns:
                 connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN warning_count INT NOT NULL DEFAULT 0"))
+            if "saved_count" not in crawl_task_columns:
+                connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN saved_count INT NOT NULL DEFAULT 0"))
+            if "skipped_count" not in crawl_task_columns:
+                connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN skipped_count INT NOT NULL DEFAULT 0"))
             if "warning_detail" not in crawl_task_columns:
                 connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN warning_detail TEXT NULL"))
             if "queue_job_id" not in crawl_task_columns:

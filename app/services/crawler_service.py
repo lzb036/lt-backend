@@ -906,7 +906,28 @@ def source_to_public(row: CrawlSourceModel) -> dict[str, Any]:
     }
 
 
+def crawl_task_storage_counts(row: CrawlTaskModel) -> tuple[int, int]:
+    saved_count = max(0, int(getattr(row, "saved_count", 0) or 0))
+    skipped_count = max(0, int(getattr(row, "skipped_count", 0) or 0))
+    if saved_count == 0 and skipped_count == 0:
+        match = re.search(r"入库\s*(\d+)\s*条，跳过\s*(\d+)\s*条", normalize_text(row.message))
+        if match:
+            saved_count = int(match.group(1))
+            skipped_count = int(match.group(2))
+    return saved_count, skipped_count
+
+
 def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
+    saved_count, skipped_count = crawl_task_storage_counts(row)
+    warning_count = max(0, int(getattr(row, "warning_count", 0) or 0))
+    warning_detail = task_public_warning_detail(row)
+    if skipped_count > 0 and warning_count == 0:
+        warning_count = skipped_count
+    if skipped_count > 0 and not warning_detail:
+        warning_detail = (
+            f"本次有 {skipped_count} 条商品未入库，可能已存在于商品管理"
+            "或低于采集价格门槛。重新采集后将显示具体跳过原因。"
+        )
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -918,11 +939,13 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
         "totalCount": row.total_count,
         "successCount": row.success_count,
         "failedCount": row.failed_count,
-        "warningCount": getattr(row, "warning_count", 0) or 0,
+        "warningCount": warning_count,
+        "savedCount": saved_count,
+        "skippedCount": skipped_count,
         "cancelRequested": task_cancel_requested(row),
         "message": row.message,
         "errorDetail": task_public_error_detail(row),
-        "warningDetail": task_public_warning_detail(row),
+        "warningDetail": warning_detail,
         "startedAt": row.started_at.isoformat(sep=" ") if row.started_at else None,
         "finishedAt": row.finished_at.isoformat(sep=" ") if row.finished_at else None,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
@@ -2675,6 +2698,8 @@ def update_task_progress(
     success_count: int | None = None,
     failed_count: int | None = None,
     warning_count: int | None = None,
+    saved_count: int | None = None,
+    skipped_count: int | None = None,
     message: str | None = None,
     status: str | None = None,
     error_detail: Any = _TASK_DETAIL_UNSET,
@@ -2696,6 +2721,10 @@ def update_task_progress(
                     task.failed_count = max(0, int(failed_count))
                 if warning_count is not None and hasattr(task, "warning_count"):
                     task.warning_count = max(0, int(warning_count))
+                if saved_count is not None and hasattr(task, "saved_count"):
+                    task.saved_count = max(0, int(saved_count))
+                if skipped_count is not None and hasattr(task, "skipped_count"):
+                    task.skipped_count = max(0, int(skipped_count))
                 if message is not None and not cancel_requested:
                     task.message = message
                 if status is not None and not cancel_requested:
@@ -15865,6 +15894,8 @@ def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
         task.success_count = 0
         task.failed_count = 0
         task.warning_count = 0
+        task.saved_count = 0
+        task.skipped_count = 0
         task.message = "等待重新执行"
         task.error_detail = None
         task.warning_detail = None
@@ -15998,6 +16029,8 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
             success_count=0,
             failed_count=0,
             warning_count=0,
+            saved_count=0,
+            skipped_count=0,
             message=f"采集中，已处理 0 / {total_count} 条",
             error_detail=current_error_detail(),
             warning_detail=current_warning_detail(),
@@ -16035,6 +16068,9 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
                 elif skipped:
                     skipped_count += 1
                     success_count += 1
+                    if save_error:
+                        warning_count += 1
+                        warnings.append(save_error)
                 else:
                     failed_count += 1
                     if item_error:
@@ -16051,7 +16087,13 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
                     success_count=success_count,
                     failed_count=failed_count,
                     warning_count=warning_count,
-                    message=f"采集中，批次 {batch_index} / {len(batches)}，已处理 {processed_count} / {total_count} 条",
+                    saved_count=saved_count,
+                    skipped_count=skipped_count,
+                    message=(
+                        f"采集中，批次 {batch_index} / {len(batches)}，"
+                        f"已处理 {processed_count} / {total_count} 条，"
+                        f"入库 {saved_count} 条，跳过 {skipped_count} 条"
+                    ),
                     error_detail=current_error_detail(),
                     warning_detail=current_warning_detail(),
                 )
@@ -16065,6 +16107,8 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
             task.success_count = success_count
             task.failed_count = failed_count
             task.warning_count = warning_count
+            task.saved_count = saved_count
+            task.skipped_count = skipped_count
             task.status = resolve_crawl_task_status("success", len(items), success_count, failed_count)
             task.finished_at = datetime.now()
             task.message = f"完成，采集 {len(items)} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条，跳过 {skipped_count} 条"
@@ -16080,6 +16124,8 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
             task.success_count = success_count
             task.failed_count = failed_count
             task.warning_count = warning_count
+            task.saved_count = saved_count
+            task.skipped_count = skipped_count
             task.status = "cancelled"
             task.finished_at = datetime.now()
             task.message = f"已终止，采集已处理 {success_count + failed_count} / {task.total_count or total_count} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条，跳过 {skipped_count} 条"
@@ -16096,6 +16142,8 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
             task.status = "failed"
             task.failed_count = max(1, failed_count)
             task.warning_count = warning_count
+            task.saved_count = saved_count
+            task.skipped_count = skipped_count
             task.finished_at = datetime.now()
             task.message = "采集失败"
             task.error_detail = current_error_detail()
@@ -16126,10 +16174,20 @@ def save_collected_item(
         duplicated_product = find_existing_collected_product(session, owner_username, item)
         if duplicated_product is not None:
             display_name = normalize_text(item.get("title") or duplicated_product.title or duplicated_product.source_url)
+            status_label = {
+                "pending": "待审核商品",
+                "approved": "已审核商品",
+                "error": "异常商品",
+                "listed_master": "已上架商品",
+                "rejected": "已拒绝商品",
+            }.get(duplicated_product.review_status, "商品管理")
             return {
                 "saved": False,
                 "skipped": True,
-                "error": f"{display_name}: 商品已存在于商品管理，已跳过。",
+                "error": (
+                    f"{display_name}: 已存在于{status_label}"
+                    f"（商品ID：{duplicated_product.id}），本次未重复入库。"
+                ),
             }
         prepared_item = prepare_product_upsert_item(session, item, active_words=active_words)
         saved = upsert_product(
