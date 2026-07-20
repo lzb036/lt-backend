@@ -10064,7 +10064,7 @@ def delete_scheduled_crawls(
                 )
             ).all()
             for product in product_rows:
-                if delete_collected_products and product.review_status in {"pending", "approved", "error"}:
+                if delete_collected_products and product.review_status in {"pending", "approved"}:
                     deleted_product_ids.append(int(product.id))
                     session.delete(product)
                 else:
