@@ -16187,8 +16187,7 @@ def save_collected_item(
                 "saved": False,
                 "skipped": True,
                 "error": (
-                    f"{display_name}: 已存在于{status_label}"
-                    f"（商品ID：{duplicated_product.id}），本次未重复入库。"
+                    f"{display_name}: 已存在于{status_label}，本次未重复入库。"
                 ),
             }
         prepared_item = prepare_product_upsert_item(session, item, active_words=active_words)
@@ -16911,8 +16910,11 @@ def collect_product_detail(url: str) -> dict[str, Any]:
 
 def collect_product_detail_from_html(normalized_url: str, html: str, *, source: str = "http") -> dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
-    if parse_rakuten_fashion_product_code(normalized_url):
-        result = collect_rakuten_fashion_product_detail(normalized_url, html, soup)
+    fashion_url = normalized_url if parse_rakuten_fashion_product_code(normalized_url) else canonical_url(soup)
+    if parse_rakuten_fashion_product_code(fashion_url):
+        result = collect_rakuten_fashion_product_detail(fashion_url, html, soup)
+        if normalized_url != fashion_url:
+            result["source_url"] = normalized_url
     else:
         result = collect_rakuten_market_product_detail(normalized_url, html, soup)
     raw = result.get("raw")
