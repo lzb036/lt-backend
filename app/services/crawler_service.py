@@ -6773,6 +6773,7 @@ def list_products(
     price_max: Decimal | None = None,
     collected_at_from: str | None = None,
     collected_at_to: str | None = None,
+    genre_status: str | None = None,
     sales_period_days: int | None = None,
     sales_period_from: str | None = None,
     sales_period_to: str | None = None,
@@ -6834,6 +6835,25 @@ def list_products(
             query = query.where(ProductModel.created_at >= collected_at_from_value)
         if collected_at_to_value is not None:
             query = query.where(ProductModel.created_at <= collected_at_to_value)
+        if product_status == "pending" and genre_status == "missing":
+            valid_genre_ids = list(
+                (load_rakuten_attribute_rules().get("genres") or {}).keys()
+            )
+            if valid_genre_ids:
+                query = query.where(
+                    or_(
+                        ProductModel.genre_id == "",
+                        ProductModel.genre_id.is_(None),
+                        ProductModel.genre_id.notin_(valid_genre_ids),
+                    )
+                )
+            else:
+                query = query.where(
+                    or_(
+                        ProductModel.genre_id == "",
+                        ProductModel.genre_id.is_(None),
+                    )
+                )
         if listed_at_from_value is not None:
             query = query.where(ProductModel.listed_at >= listed_at_from_value)
         if listed_at_to_value is not None:
