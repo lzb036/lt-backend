@@ -118,6 +118,15 @@ class ProductGenrePayload(BaseModel):
     genreId: str = Field(pattern=r"^\d{6}$")
 
 
+class ProductGenreBatchItem(BaseModel):
+    productId: int
+    genreId: str = Field(pattern=r"^\d{6}$")
+
+
+class ProductGenreBatchPayload(BaseModel):
+    products: list[ProductGenreBatchItem] = Field(default_factory=list)
+
+
 class ProductDeletePayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
 
@@ -623,6 +632,21 @@ def list_product_genre_children(
     user: dict = Depends(require_products_permission),
 ) -> dict:
     return {"genres": crawler_service.list_rakuten_genre_children(parentPath)}
+
+
+@router.put("/products/genres/batch")
+def update_product_genres(
+    payload: ProductGenreBatchPayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        products = crawler_service.update_pending_product_genres(
+            user["username"],
+            payload.products,
+        )
+        return {"products": products}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.put("/products/{product_id}/genre")

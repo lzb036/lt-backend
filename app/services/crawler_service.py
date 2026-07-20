@@ -10925,6 +10925,46 @@ def update_pending_product_genre(owner_username: str, product_id: int, genre_id:
         return product_to_public(row)
 
 
+def update_pending_product_genres(owner_username: str, products: list[Any]) -> list[dict[str, Any]]:
+    normalized: dict[int, str] = {}
+    for item in products or []:
+        try:
+            product_id = int(getattr(item, "productId", 0) or 0)
+        except (TypeError, ValueError):
+            product_id = 0
+        genre_id = normalize_text(getattr(item, "genreId", ""))
+        if product_id <= 0:
+            raise RuntimeError("商品信息不完整，请重新打开品类设置。")
+        if not re.fullmatch(r"\d{6}", genre_id) or not rakuten_genre_path(genre_id):
+            raise RuntimeError(f"商品 {product_id} 请选择有效品类。")
+        normalized[product_id] = genre_id
+    if not normalized:
+        raise RuntimeError("请先为商品选择品类。")
+
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.id.in_(normalized),
+            )
+        ).all()
+        rows_by_id = {int(row.id): row for row in rows}
+        missing_ids = [product_id for product_id in normalized if product_id not in rows_by_id]
+        if missing_ids:
+            raise RuntimeError("部分商品不存在或无权操作，请刷新后重试。")
+        if any(row.review_status != "pending" for row in rows):
+            raise RuntimeError("只有待审核商品可以修改品类。")
+
+        for product_id, genre_id in normalized.items():
+            row = rows_by_id[product_id]
+            raw_payload = product_raw_payload(row)
+            raw_payload["genreId"] = genre_id
+            row.genre_id = genre_id
+            row.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+        session.flush()
+        return [product_to_public(rows_by_id[product_id]) for product_id in normalized]
+
+
 def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, Any]:
     normalized_ids = [int(value) for value in (product_ids or [])]
     if not normalized_ids:
