@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.core.auth import require_authenticated_account
-from app.services import profile_service
+from app.services import profile_service, user_service
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -29,6 +29,10 @@ class SecretProfileUpdate(BaseModel):
     autoCrawlIntervalMinutes: int | None = Field(default=None, ge=5, le=1440)
 
 
+class CrawlSettingsUpdate(BaseModel):
+    crawlMinPrice: int
+
+
 @router.get("/secrets")
 def get_profile(user: dict = Depends(require_authenticated_account)) -> dict:
     return {"profile": profile_service.get_profile(user["username"])}
@@ -45,3 +49,24 @@ def update_profile(payload: SecretProfileUpdate, user: dict = Depends(require_au
 @router.post("/secrets/verify")
 def verify_profile(user: dict = Depends(require_authenticated_account)) -> dict:
     return {"profile": profile_service.mark_profile_verified(user["username"])}
+
+
+@router.get("/crawl-settings")
+def get_crawl_settings(user: dict = Depends(require_authenticated_account)) -> dict:
+    return {"settings": user_service.get_crawl_settings(user["username"])}
+
+
+@router.put("/crawl-settings")
+def update_crawl_settings(
+    payload: CrawlSettingsUpdate,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return {
+            "settings": user_service.update_crawl_settings(
+                user["username"],
+                payload.crawlMinPrice,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

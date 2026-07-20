@@ -20,7 +20,6 @@ class UpdateUserRequest(BaseModel):
     displayName: str | None = None
     enabled: bool | None = None
     permissions: list[str] | None = None
-    crawlMinPrice: int | None = None
 
 
 class ResetPasswordRequest(BaseModel):
@@ -56,7 +55,6 @@ def update_user(username: str, payload: UpdateUserRequest, _: dict = Depends(req
             display_name=payload.displayName,
             enabled=payload.enabled,
             permissions=payload.permissions,
-            crawl_min_price=payload.crawlMinPrice,
         )
         return {"user": user}
     except RuntimeError as exc:

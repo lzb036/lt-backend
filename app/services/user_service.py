@@ -193,6 +193,24 @@ def require_existing_account(username: str) -> dict[str, Any]:
         return account_to_public(row)
 
 
+def get_crawl_settings(username: str) -> dict[str, int]:
+    with session_scope() as session:
+        row = session.get(UserAccountModel, normalize_username(username))
+        if row is None or not row.enabled:
+            raise RuntimeError("用户不存在或已停用。")
+        return {"crawlMinPrice": normalize_crawl_min_price(row.crawl_min_price)}
+
+
+def update_crawl_settings(username: str, crawl_min_price: Any) -> dict[str, int]:
+    with session_scope() as session:
+        row = session.get(UserAccountModel, normalize_username(username))
+        if row is None or not row.enabled:
+            raise RuntimeError("用户不存在或已停用。")
+        row.crawl_min_price = normalize_crawl_min_price(crawl_min_price)
+        session.flush()
+        return {"crawlMinPrice": row.crawl_min_price}
+
+
 def list_users(*, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
     ensure_initial_superadmin()
     with session_scope() as session:
@@ -231,7 +249,6 @@ def update_user(
     display_name: str | None = None,
     enabled: bool | None = None,
     permissions: Any = None,
-    crawl_min_price: int | None = None,
 ) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(UserAccountModel, normalize_username(username))
@@ -245,8 +262,6 @@ def update_user(
             row.enabled = bool(enabled)
         if permissions is not None and row.role != "superadmin":
             row.permissions_json = json.dumps(normalize_permissions(permissions, role=row.role), ensure_ascii=False)
-        if crawl_min_price is not None:
-            row.crawl_min_price = normalize_crawl_min_price(crawl_min_price)
         session.flush()
         return account_to_public(row)
 
