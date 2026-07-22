@@ -13,13 +13,11 @@ class CreateUserRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=6)
     displayName: str = ""
-    permissions: list[str] | None = None
 
 
 class UpdateUserRequest(BaseModel):
     displayName: str | None = None
     enabled: bool | None = None
-    permissions: list[str] | None = None
 
 
 class ResetPasswordRequest(BaseModel):
@@ -41,7 +39,7 @@ def list_user_accounts(
 @router.post("")
 def create_user(payload: CreateUserRequest, _: dict = Depends(require_superadmin)) -> dict:
     try:
-        user = user_service.create_user(payload.username, payload.password, payload.displayName, payload.permissions)
+        user = user_service.create_user(payload.username, payload.password, payload.displayName)
         return {"user": user}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -54,7 +52,6 @@ def update_user(username: str, payload: UpdateUserRequest, _: dict = Depends(req
             username,
             display_name=payload.displayName,
             enabled=payload.enabled,
-            permissions=payload.permissions,
         )
         return {"user": user}
     except RuntimeError as exc:

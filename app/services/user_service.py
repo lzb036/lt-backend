@@ -15,7 +15,13 @@ from app.db.models import UserAccountModel, UserSecretProfileModel
 
 PASSWORD_ITERATIONS = 240000
 MAX_PAGE_SIZE = 500
-DEFAULT_USER_PERMISSIONS = ["crawler.manage", "products.manage", "stores.manage"]
+DEFAULT_USER_PERMISSIONS = [
+    "crawler.manage",
+    "products.manage",
+    "stores.manage",
+    "settings.manage",
+    "ai.manage",
+]
 SUPERADMIN_PERMISSIONS = [
     "users.manage",
     "crawler.manage",
@@ -93,6 +99,12 @@ def normalize_permissions(values: Any, *, role: str = "operator") -> list[str]:
         if permission in KNOWN_PERMISSIONS and permission not in normalized and permission != "users.manage":
             normalized.append(permission)
     return normalized
+
+
+def fixed_permissions_for_role(role: str) -> list[str]:
+    if role == "superadmin":
+        return list(SUPERADMIN_PERMISSIONS)
+    return list(DEFAULT_USER_PERMISSIONS)
 
 
 def parse_permissions_json(value: str | None, *, role: str = "operator") -> list[str]:
@@ -188,7 +200,7 @@ def crawl_min_price_from_rule(rule: dict[str, Any]) -> int:
 
 
 def account_to_public(row: UserAccountModel) -> dict[str, Any]:
-    permissions = parse_permissions_json(row.permissions_json, role=row.role)
+    permissions = fixed_permissions_for_role(row.role)
     crawl_price_rule = account_crawl_price_rule(row)
     return {
         "username": row.username,
@@ -297,7 +309,7 @@ def list_users(*, page: int | None = None, page_size: int | None = None) -> list
         return paginate_query(session, select(UserAccountModel), page=page, page_size=page_size)
 
 
-def create_user(username: str, password: str, display_name: str = "", permissions: Any = None) -> dict[str, Any]:
+def create_user(username: str, password: str, display_name: str = "") -> dict[str, Any]:
     username = normalize_username(username)
     if not username:
         raise RuntimeError("用户名不能为空。")
@@ -312,7 +324,7 @@ def create_user(username: str, password: str, display_name: str = "", permission
             display_name=(display_name or username).strip(),
             role="operator",
             enabled=True,
-            permissions_json=json.dumps(normalize_permissions(permissions), ensure_ascii=False),
+            permissions_json=json.dumps(DEFAULT_USER_PERMISSIONS, ensure_ascii=False),
             password_salt_b64=password_record["salt_b64"],
             password_hash_b64=password_record["hash_b64"],
             password_iterations=password_record["iterations"],
@@ -328,7 +340,6 @@ def update_user(
     *,
     display_name: str | None = None,
     enabled: bool | None = None,
-    permissions: Any = None,
 ) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(UserAccountModel, normalize_username(username))
@@ -340,8 +351,8 @@ def update_user(
             row.display_name = display_name.strip() or row.username
         if enabled is not None:
             row.enabled = bool(enabled)
-        if permissions is not None and row.role != "superadmin":
-            row.permissions_json = json.dumps(normalize_permissions(permissions, role=row.role), ensure_ascii=False)
+        if row.role != "superadmin":
+            row.permissions_json = json.dumps(DEFAULT_USER_PERMISSIONS, ensure_ascii=False)
         session.flush()
         return account_to_public(row)
 
