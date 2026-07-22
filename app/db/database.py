@@ -1463,7 +1463,7 @@ def wait_for_database_ready(
     *,
     timeout_seconds: float = 60,
     retry_interval_seconds: float = 2,
-    required_table: str = "lt_users",
+    required_table: str = "lt_user_accounts",
 ) -> None:
     deadline = time.monotonic() + max(0.0, float(timeout_seconds))
     last_error: Exception | None = None

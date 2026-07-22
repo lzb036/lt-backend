@@ -30,7 +30,7 @@ class _Engine:
 def test_wait_for_database_ready_retries_until_required_table_exists(
     monkeypatch,
 ) -> None:
-    fake_engine = _Engine([set(), {"lt_users"}])
+    fake_engine = _Engine([set(), {"lt_user_accounts"}])
     monkeypatch.setattr(database, "engine", fake_engine)
     monkeypatch.setattr(
         database,
