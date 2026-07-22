@@ -6,6 +6,7 @@ import uuid
 import base64
 import binascii
 import hashlib
+import hmac
 import logging
 import mimetypes
 import random
@@ -456,6 +457,14 @@ CRAWLER_SESSION_LOCAL = threading.local()
 CRAWLER_LAST_REQUEST_AT = 0.0
 RAKUTEN_CABINET_LAST_REQUEST_AT = 0.0
 SCHEDULE_RUNNER_STARTED = False
+SCHEDULE_RUNNER_HEALTH_LOCK = threading.Lock()
+SCHEDULE_RUNNER_HEALTH: dict[str, Any] = {
+    "lastTickAt": None,
+    "lastSuccessfulTickAt": None,
+    "lastError": "",
+    "consecutiveFailures": 0,
+}
+SCHEDULE_RUNNER_REDIS_LOCK_NAME = "lt:schedule-runner:tick"
 DRAFT_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 TASK_CANCEL_REQUESTED_MARKER = "__LT_CANCEL_REQUESTED__"
@@ -10892,6 +10901,69 @@ def cleanup_orphan_product_image_dirs_if_due() -> int:
     return cleanup_orphan_product_image_dirs()
 
 
+def schedule_runner_health() -> dict[str, Any]:
+    with SCHEDULE_RUNNER_HEALTH_LOCK:
+        return dict(SCHEDULE_RUNNER_HEALTH)
+
+
+def _record_schedule_runner_tick(*, errors: list[str]) -> None:
+    tick_at = datetime.now()
+    with SCHEDULE_RUNNER_HEALTH_LOCK:
+        SCHEDULE_RUNNER_HEALTH["lastTickAt"] = datetime_to_public(tick_at)
+        if errors:
+            SCHEDULE_RUNNER_HEALTH["lastError"] = "; ".join(errors)
+            SCHEDULE_RUNNER_HEALTH["consecutiveFailures"] = (
+                int(SCHEDULE_RUNNER_HEALTH["consecutiveFailures"]) + 1
+            )
+            return
+        SCHEDULE_RUNNER_HEALTH["lastSuccessfulTickAt"] = datetime_to_public(tick_at)
+        SCHEDULE_RUNNER_HEALTH["lastError"] = ""
+        SCHEDULE_RUNNER_HEALTH["consecutiveFailures"] = 0
+
+
+def run_schedule_runner_tick() -> bool:
+    tasks = (
+        ("scheduled crawls", run_due_scheduled_crawls_once),
+        ("sales order syncs", run_due_sales_order_syncs_once),
+        ("store product syncs", run_due_store_product_syncs_once),
+        ("periodic maintenance", run_periodic_maintenance_once),
+    )
+    errors: list[str] = []
+    for task_name, task in tasks:
+        try:
+            task()
+        except Exception as exc:
+            errors.append(f"{task_name}: {type(exc).__name__}")
+            logger.exception("Schedule runner task failed: %s", task_name)
+    _record_schedule_runner_tick(errors=errors)
+    return not errors
+
+
+def _run_schedule_runner_tick_with_lock(interval_seconds: int) -> bool:
+    if settings.task_queue_mode != "redis":
+        return run_schedule_runner_tick()
+    try:
+        from app.core.task_queue import redis_connection
+
+        lock = redis_connection().lock(
+            SCHEDULE_RUNNER_REDIS_LOCK_NAME,
+            timeout=max(30, int(interval_seconds) * 2),
+            blocking_timeout=0,
+        )
+        if not lock.acquire(blocking=False):
+            return False
+    except Exception:
+        logger.exception("Failed to acquire the schedule runner Redis lock")
+        return False
+    try:
+        return run_schedule_runner_tick()
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            logger.exception("Failed to release the schedule runner Redis lock")
+
+
 def start_schedule_runner(interval_seconds: int = 60) -> None:
     global SCHEDULE_RUNNER_STARTED
     if SCHEDULE_RUNNER_STARTED:
@@ -10900,13 +10972,7 @@ def start_schedule_runner(interval_seconds: int = 60) -> None:
 
     def loop() -> None:
         while True:
-            try:
-                run_due_scheduled_crawls_once()
-                run_due_sales_order_syncs_once()
-                run_due_store_product_syncs_once()
-                run_periodic_maintenance_once()
-            except Exception:
-                pass
+            _run_schedule_runner_tick_with_lock(interval_seconds)
             time.sleep(max(10, interval_seconds))
 
     threading.Thread(target=loop, name="lt-schedule-runner", daemon=True).start()
@@ -14718,7 +14784,46 @@ def local_product_image_url(product_id: int, filename: str) -> str:
 
 
 def local_product_image_draft_url(product_id: int, filename: str) -> str:
-    return f"{LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX}/{int(product_id)}/{quote(filename, safe='')}"
+    normalized_product_id = int(product_id)
+    normalized_filename = str(filename)
+    expires_at = int(time.time()) + settings.product_image_draft_url_ttl_seconds
+    signature = product_image_draft_signature(
+        normalized_product_id,
+        normalized_filename,
+        expires_at,
+    )
+    query = urlencode({"expires": expires_at, "signature": signature})
+    return (
+        f"{LOCAL_PRODUCT_IMAGE_DRAFT_URL_PREFIX}/{normalized_product_id}/"
+        f"{quote(normalized_filename, safe='')}?{query}"
+    )
+
+
+def product_image_draft_signature(
+    product_id: int,
+    filename: str,
+    expires_at: int,
+) -> str:
+    payload = f"{int(product_id)}:{filename}:{int(expires_at)}".encode("utf-8")
+    return hmac.new(
+        settings.session_secret.encode("utf-8"),
+        payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_product_image_draft_access(
+    product_id: int,
+    filename: str,
+    expires_at: int,
+    signature: str,
+    *,
+    now: int | None = None,
+) -> bool:
+    if int(expires_at) <= int(time.time() if now is None else now):
+        return False
+    expected = product_image_draft_signature(product_id, filename, expires_at)
+    return hmac.compare_digest(expected, str(signature or ""))
 
 
 def validate_product_image_url_ownership(product_id: int, image_url: str) -> None:

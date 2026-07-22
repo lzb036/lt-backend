@@ -280,26 +280,24 @@ def get_dashboard_summary(user: dict = Depends(require_any_permission("crawler.m
 
 
 @router.get("/settings/time")
-def get_time_settings(user: dict = Depends(require_any_permission("crawler.manage", "settings.manage"))) -> dict:
-    include_queue_health = user.get("role") == "superadmin"
+def get_time_settings(user: dict = Depends(require_superadmin)) -> dict:
     return {
         "settings": visible_time_settings(
             user,
-            crawler_service.get_time_settings(include_queue_health=include_queue_health),
+            crawler_service.get_time_settings(include_queue_health=True),
         )
     }
 
 
 @router.put("/settings/time")
-def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(require_settings_permission)) -> dict:
+def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(require_superadmin)) -> dict:
     try:
-        include_queue_health = user.get("role") == "superadmin"
         return {
             "settings": visible_time_settings(
                 user,
                 crawler_service.save_time_settings(
                     payload,
-                    include_queue_health=include_queue_health,
+                    include_queue_health=True,
                 ),
             )
         }
@@ -308,14 +306,13 @@ def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(requ
 
 
 @router.post("/settings/time/scheduled-task-cleanup/run")
-def run_scheduled_task_cleanup(user: dict = Depends(require_settings_permission)) -> dict:
+def run_scheduled_task_cleanup(user: dict = Depends(require_superadmin)) -> dict:
     try:
-        include_queue_health = user.get("role") == "superadmin"
         return {
             "settings": visible_time_settings(
                 user,
                 crawler_service.run_completed_scheduled_crawl_tasks_cleanup_now(
-                    include_queue_health=include_queue_health,
+                    include_queue_health=True,
                 ),
             )
         }
@@ -324,11 +321,10 @@ def run_scheduled_task_cleanup(user: dict = Depends(require_settings_permission)
 
 
 @router.post("/settings/time/unlisted-products/run")
-def run_unlisted_product_cleanup(user: dict = Depends(require_settings_permission)) -> dict:
+def run_unlisted_product_cleanup(user: dict = Depends(require_superadmin)) -> dict:
     try:
-        include_queue_health = user.get("role") == "superadmin"
         result = crawler_service.run_store_unlisted_product_cleanup_now(
-            include_queue_health=include_queue_health,
+            include_queue_health=True,
         )
         return {
             **result,

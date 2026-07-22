@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -1597,6 +1598,11 @@ def test_init_database_preflights_sales_parent_before_create_all(
         database_module,
         "SessionLocal",
         _Session,
+    )
+    monkeypatch.setattr(
+        database_module,
+        "database_initialization_lock",
+        nullcontext,
     )
 
     database_module.init_database()

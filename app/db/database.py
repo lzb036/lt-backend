@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+import time
 
 from sqlalchemy import (
     ForeignKeyConstraint,
@@ -1403,6 +1404,36 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 
 
+@contextmanager
+def database_initialization_lock(timeout_seconds: int = 60) -> Iterator[None]:
+    if engine.dialect.name != "mysql":
+        yield
+        return
+    connection = engine.connect()
+    lock_name = "lt:database-initialization"
+    acquired = False
+    try:
+        acquired = bool(
+            connection.execute(
+                text("SELECT GET_LOCK(:lock_name, :timeout_seconds)"),
+                {
+                    "lock_name": lock_name,
+                    "timeout_seconds": max(0, int(timeout_seconds)),
+                },
+            ).scalar()
+        )
+        if not acquired:
+            raise RuntimeError("等待数据库初始化锁超时。")
+        yield
+    finally:
+        if acquired:
+            connection.execute(
+                text("SELECT RELEASE_LOCK(:lock_name)"),
+                {"lock_name": lock_name},
+            )
+        connection.close()
+
+
 def init_database() -> None:
     if settings.database_auto_create:
         ensure_mysql_database_exists()
@@ -1411,20 +1442,43 @@ def init_database() -> None:
     from app.services.sensitive_word_service import seed_default_sensitive_words
     from app.services.user_service import ensure_initial_superadmin
 
-    ensure_sales_parent_keys_before_create_all()
-    Base.metadata.create_all(bind=engine)
-    ensure_schema_compatibility()
-    ensure_initial_superadmin()
-    ensure_default_roles()
-    session = SessionLocal()
-    try:
-        seed_default_sensitive_words(session)
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    with database_initialization_lock():
+        ensure_sales_parent_keys_before_create_all()
+        Base.metadata.create_all(bind=engine)
+        ensure_schema_compatibility()
+        ensure_initial_superadmin()
+        ensure_default_roles()
+        session = SessionLocal()
+        try:
+            seed_default_sensitive_words(session)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+
+def wait_for_database_ready(
+    *,
+    timeout_seconds: float = 60,
+    retry_interval_seconds: float = 2,
+    required_table: str = "lt_users",
+) -> None:
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    last_error: Exception | None = None
+    while True:
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+                if required_table and required_table not in _table_names(connection):
+                    raise RuntimeError(f"数据库关键表尚未就绪: {required_table}")
+            return
+        except (SQLAlchemyError, RuntimeError) as exc:
+            last_error = exc
+        if time.monotonic() >= deadline:
+            raise RuntimeError("等待数据库就绪超时。") from last_error
+        time.sleep(max(0.05, float(retry_interval_seconds)))
 
 
 @contextmanager

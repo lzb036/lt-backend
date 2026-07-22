@@ -164,6 +164,7 @@ class ProductGenreServiceTests(unittest.TestCase):
         genre_id, genre_path = sample_genre()
         row = product(1, genre_id=genre_id)
         row.task_id = None
+        row.scheduled_crawl_id = None
         row.parent_product_id = None
         row.listing_task_id = None
         row.store_id = None

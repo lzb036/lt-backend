@@ -19,7 +19,6 @@ DEFAULT_USER_PERMISSIONS = [
     "crawler.manage",
     "products.manage",
     "stores.manage",
-    "settings.manage",
     "ai.manage",
 ]
 SUPERADMIN_PERMISSIONS = [

@@ -53,6 +53,7 @@ def _env_int(name: str, default: int) -> int:
 class Settings(BaseModel):
     app_name: str = "LT Product Collector API"
     app_version: str = "0.1.0"
+    api_docs_enabled: bool = False
     backend_dir: Path = BACKEND_DIR
     database_url: str
     database_echo: bool = False
@@ -61,7 +62,7 @@ class Settings(BaseModel):
     database_max_overflow: int = 20
     database_pool_timeout: int = 30
     session_cookie_name: str = "lt_session"
-    session_cookie_secure: bool = False
+    session_cookie_secure: bool = True
     session_duration_seconds: int = 60 * 60 * 24 * 7
     login_max_failed_attempts: int = 5
     login_lockout_seconds: int = 15 * 60
@@ -90,6 +91,7 @@ class Settings(BaseModel):
     proxy_usage_cache_seconds: int = 300
     mihomo_config_path: str = "/etc/mihomo/config.yaml"
     product_image_draft_retention_days: int = 7
+    product_image_draft_url_ttl_seconds: int = 24 * 60 * 60
     product_image_orphan_retention_days: int = 7
     product_image_storage: str = "local"
     oss_bucket: str = ""
@@ -165,13 +167,14 @@ def build_settings() -> Settings:
             raise RuntimeError("LT_OSS_ENDPOINT 在 OSS 模式下必须使用 HTTPS。")
     return Settings(
         database_url=database_url,
+        api_docs_enabled=_env_bool("LT_API_DOCS_ENABLED", False),
         database_echo=_env_bool("LT_DATABASE_ECHO", False),
         database_auto_create=_env_bool("LT_DATABASE_AUTO_CREATE", True),
         database_pool_size=max(1, _env_int("LT_DATABASE_POOL_SIZE", 10)),
         database_max_overflow=max(0, _env_int("LT_DATABASE_MAX_OVERFLOW", 20)),
         database_pool_timeout=max(1, _env_int("LT_DATABASE_POOL_TIMEOUT", 30)),
         session_cookie_name=_env_text("LT_SESSION_COOKIE_NAME", "lt_session"),
-        session_cookie_secure=_env_bool("LT_SESSION_COOKIE_SECURE", False),
+        session_cookie_secure=_env_bool("LT_SESSION_COOKIE_SECURE", True),
         session_duration_seconds=_env_int("LT_SESSION_DURATION_SECONDS", 60 * 60 * 24 * 7),
         login_max_failed_attempts=max(1, _env_int("LT_LOGIN_MAX_FAILED_ATTEMPTS", 5)),
         login_lockout_seconds=max(60, _env_int("LT_LOGIN_LOCKOUT_SECONDS", 15 * 60)),
@@ -200,6 +203,10 @@ def build_settings() -> Settings:
         proxy_usage_cache_seconds=max(60, _env_int("LT_PROXY_USAGE_CACHE_SECONDS", 300)),
         mihomo_config_path=_env_text("LT_MIHOMO_CONFIG_PATH", "/etc/mihomo/config.yaml"),
         product_image_draft_retention_days=max(1, _env_int("LT_PRODUCT_IMAGE_DRAFT_RETENTION_DAYS", 7)),
+        product_image_draft_url_ttl_seconds=max(
+            60,
+            _env_int("LT_PRODUCT_IMAGE_DRAFT_URL_TTL_SECONDS", 24 * 60 * 60),
+        ),
         product_image_orphan_retention_days=max(1, _env_int("LT_PRODUCT_IMAGE_ORPHAN_RETENTION_DAYS", 7)),
         product_image_storage=product_image_storage,
         oss_bucket=oss_bucket,

@@ -642,15 +642,22 @@ class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
                 review_status="approved",
                 raw_payload_json="{}",
             )
-            session.add_all([store, parent])
+            store_product = ProductModel(
+                owner_username="alice",
+                parent_product_id=None,
+                title="旧店铺商品",
+                source_url="https://item.rakuten.co.jp/demo/it-1/",
+                source_url_hash="store-product-hash-1",
+                review_status="listed",
+                raw_payload_json="{}",
+                rakuten_manage_number="MN-1",
+                item_number="IT-1",
+                listed_at=linked_at,
+            )
+            session.add_all([store, parent, store_product])
             session.flush()
-
-            previous_store_links = {
-                "MN-1": {
-                    "parentProductId": parent.id,
-                    "listedAt": linked_at,
-                }
-            }
+            store_product.store_id = store.id
+            store_product.parent_product_id = parent.id
             first_item = {
                 "manageNumber": "MN-1",
                 "itemNumber": "IT-1",
@@ -668,7 +675,6 @@ class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
                     "alice",
                     store,
                     first_item,
-                    previous_store_links=previous_store_links,
                     active_words=["【】", "即納"],
                 )
                 second_saved = crawler_service.upsert_store_product(
@@ -676,7 +682,6 @@ class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
                     "alice",
                     store,
                     second_item,
-                    previous_store_links=previous_store_links,
                     active_words=["【】", "即納"],
                 )
             session.flush()
