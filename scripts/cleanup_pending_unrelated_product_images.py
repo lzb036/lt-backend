@@ -165,6 +165,7 @@ def main() -> int:
 
         if args.apply:
             referenced_urls: list[str] = []
+            unused_removed_images: list[str] = []
             with session_scope() as session:
                 product = session.get(ProductModel, product_id)
                 if (
@@ -179,7 +180,17 @@ def main() -> int:
                 product.raw_payload_json = updated_payload_json
                 product.image_url = updated_image_url
                 referenced_urls = crawler_service.collect_local_product_image_urls(updated_payload)
+                referenced_url_set = set(referenced_urls)
+                unused_removed_images = [
+                    image_url
+                    for image_url in removed_images
+                    if image_url not in referenced_url_set
+                ]
                 session.flush()
+            crawler_service.cleanup_product_image_urls(
+                product_id,
+                unused_removed_images,
+            )
             crawler_service.remove_unused_local_product_images(product_id, referenced_urls)
 
         if stats["processed"] % max(1, args.progress_every) == 0:
