@@ -408,6 +408,33 @@ class SyncTaskModel(TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
 
 
+class DeletedProductImageCleanupModel(TimestampMixin, Base):
+    __tablename__ = "lt_deleted_product_image_cleanups"
+    __table_args__ = (
+        UniqueConstraint("owner_username", "original_product_id", name="uq_lt_deleted_image_cleanup_product"),
+        Index("ix_lt_deleted_image_cleanup_status", "status"),
+        Index("ix_lt_deleted_image_cleanup_owner_store", "owner_username", "store_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("lt_stores.id", ondelete="SET NULL"))
+    store_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    original_product_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    product_code: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    cabinet_targets_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="[]")
+    local_image_urls_json: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False, default="[]")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", server_default="pending")
+    sync_task_id: Mapped[str | None] = mapped_column(String(64))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False, default=datetime.now)
+    cleaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+
+
 class ScheduledCrawlModel(TimestampMixin, Base):
     __tablename__ = "lt_scheduled_crawls"
     __table_args__ = (

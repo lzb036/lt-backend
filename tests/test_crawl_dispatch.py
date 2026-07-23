@@ -582,6 +582,11 @@ class CrawlRecoveryTests(CrawlDispatchDatabaseTestCase):
             ),
             patch.object(
                 crawler_service,
+                "cleanup_deleted_product_images",
+                return_value={"taskCount": 0, "productCount": 0},
+            ),
+            patch.object(
+                crawler_service,
                 "dispatch_queued_crawl_tasks_safely",
                 refill,
             ),

@@ -244,6 +244,9 @@ class TimeSettingsPayload(BaseModel):
     productSyncWeekday: int = Field(default=6, ge=0, le=6)
     productSyncTime: str = Field(default="21:00", pattern=r"^\d{2}:\d{2}$")
     unlistedCleanupEnabled: bool = True
+    deletedImageCleanupEnabled: bool = True
+    deletedImageCleanupWeekday: int = Field(default=5, ge=0, le=6)
+    deletedImageCleanupTime: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
 
 
 def visible_time_settings(user: dict, settings_payload: dict) -> dict:
@@ -330,6 +333,23 @@ def run_unlisted_product_cleanup(user: dict = Depends(require_superadmin)) -> di
             **result,
             "settings": visible_time_settings(user, result["settings"]),
         }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/settings/time/deleted-product-images")
+def list_deleted_product_image_cleanups(
+    page: int = Query(default=1, ge=1),
+    pageSize: int = Query(default=30, ge=1, le=500),
+    user: dict = Depends(require_superadmin),
+) -> dict:
+    return crawler_service.list_deleted_product_image_cleanups(page=page, page_size=pageSize)
+
+
+@router.post("/settings/time/deleted-product-images/run")
+def run_deleted_product_image_cleanup(user: dict = Depends(require_superadmin)) -> dict:
+    try:
+        return crawler_service.run_deleted_product_image_cleanup_now(include_queue_health=True)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

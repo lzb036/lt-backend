@@ -45,6 +45,7 @@ from app.db.models import (
     CrawlLogModel,
     CrawlSourceModel,
     CrawlTaskModel,
+    DeletedProductImageCleanupModel,
     ListingTaskModel,
     ProductSalesDailyModel,
     ProductModel,
@@ -452,6 +453,7 @@ SALES_ORDER_SYNC_RUN_LOCK = threading.Lock()
 STORE_PRODUCT_SYNC_SCHEDULE_LOCK = threading.Lock()
 SCHEDULED_CRAWL_TASK_CLEANUP_LOCK = threading.Lock()
 STORE_UNLISTED_PRODUCT_CLEANUP_LOCK = threading.Lock()
+DELETED_PRODUCT_IMAGE_CLEANUP_LOCK = threading.Lock()
 CRAWLER_REQUEST_LOCK = threading.Lock()
 RAKUTEN_CABINET_REQUEST_LOCK = threading.Lock()
 CRAWLER_SESSION_LOCAL = threading.local()
@@ -492,6 +494,8 @@ STORE_PRODUCT_SYNC_DEFAULT_WEEKDAY = 6
 STORE_PRODUCT_SYNC_DEFAULT_TIME = "21:00"
 STORE_UNLISTED_PRODUCT_CLEANUP_MONTH_DAY = 1
 STORE_UNLISTED_PRODUCT_CLEANUP_TIME = "01:00"
+DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_WEEKDAY = 5
+DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_TIME = "09:00"
 SALES_ORDER_SYNC_INTERVAL = timedelta(minutes=30)
 SALES_ORDER_SYNC_FAILURE_COOLDOWN = timedelta(minutes=30)
 SALES_ORDER_SYNC_BATCH_SIZE = 20
@@ -2662,7 +2666,8 @@ def listing_task_to_public(
 def sync_task_payload_product_count(payload: Any) -> int:
     if not isinstance(payload, dict):
         return 0
-    return len(normalize_listing_task_product_ids(payload.get("productIds")))
+    values = payload.get("cleanupRecordIds") if payload.get("cleanupRecordIds") is not None else payload.get("productIds")
+    return len(normalize_listing_task_product_ids(values))
 
 
 def sync_task_known_total_count(row: SyncTaskModel, payload: Any | None = None) -> int:
@@ -2840,6 +2845,8 @@ def sync_task_action_label(row: SyncTaskModel) -> str:
     task_type = row.task_type or "store_sync"
     if task_type == "product_delete":
         return "删除"
+    if task_type == "deleted_product_image_cleanup":
+        return "图片清理"
     if task_type in {"listing_status", "product_listing_status"}:
         payload = sync_task_payload(row)
         listing_status = normalize_text(payload.get("listingStatus"))
@@ -5928,6 +5935,11 @@ def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any
         STORE_UNLISTED_PRODUCT_CLEANUP_TIME,
         now=reference,
     )
+    next_deleted_image_cleanup_at = next_weekly_run_at(
+        DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_WEEKDAY,
+        DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_TIME,
+        now=reference,
+    )
     return {
         "cleanupWeekday": SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY,
         "cleanupTime": SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME,
@@ -5949,6 +5961,13 @@ def default_time_settings_value(*, now: datetime | None = None) -> dict[str, Any
         "unlistedLastCleanupAt": None,
         "unlistedLastDeletedCount": 0,
         "unlistedLastTaskCount": 0,
+        "deletedImageCleanupEnabled": True,
+        "deletedImageCleanupWeekday": DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_WEEKDAY,
+        "deletedImageCleanupTime": DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_TIME,
+        "deletedImageCleanupNextAt": datetime_to_public(next_deleted_image_cleanup_at),
+        "deletedImageCleanupLastAt": None,
+        "deletedImageCleanupLastProductCount": 0,
+        "deletedImageCleanupLastTaskCount": 0,
     }
 
 
@@ -6028,6 +6047,28 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         unlisted_last_task_count = max(0, int(unlisted_last_task_count or 0))
     except (TypeError, ValueError):
         unlisted_last_task_count = 0
+    deleted_image_cleanup_enabled = payload.get("deletedImageCleanupEnabled", True)
+    if not isinstance(deleted_image_cleanup_enabled, bool):
+        deleted_image_cleanup_enabled = True
+    try:
+        deleted_image_cleanup_weekday = normalize_cleanup_weekday(
+            payload.get("deletedImageCleanupWeekday", DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_WEEKDAY)
+        )
+    except RuntimeError:
+        deleted_image_cleanup_weekday = DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_WEEKDAY
+    try:
+        deleted_image_cleanup_time = normalize_schedule_time(
+            payload.get("deletedImageCleanupTime", DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_TIME)
+        )
+    except RuntimeError:
+        deleted_image_cleanup_time = DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_TIME
+    deleted_image_cleanup_next_at = parse_public_datetime(payload.get("deletedImageCleanupNextAt"))
+    if deleted_image_cleanup_next_at is None:
+        deleted_image_cleanup_next_at = next_weekly_run_at(
+            deleted_image_cleanup_weekday,
+            deleted_image_cleanup_time,
+            now=reference,
+        )
 
     return {
         "cleanupWeekday": cleanup_weekday,
@@ -6050,6 +6091,13 @@ def load_time_settings_payload(row: SystemSettingModel | None, *, now: datetime 
         "unlistedLastCleanupAt": datetime_to_public(parse_public_datetime(payload.get("unlistedLastCleanupAt"))),
         "unlistedLastDeletedCount": unlisted_last_deleted_count,
         "unlistedLastTaskCount": unlisted_last_task_count,
+        "deletedImageCleanupEnabled": deleted_image_cleanup_enabled,
+        "deletedImageCleanupWeekday": deleted_image_cleanup_weekday,
+        "deletedImageCleanupTime": deleted_image_cleanup_time,
+        "deletedImageCleanupNextAt": datetime_to_public(deleted_image_cleanup_next_at),
+        "deletedImageCleanupLastAt": datetime_to_public(parse_public_datetime(payload.get("deletedImageCleanupLastAt"))),
+        "deletedImageCleanupLastProductCount": max(0, int(payload.get("deletedImageCleanupLastProductCount") or 0)),
+        "deletedImageCleanupLastTaskCount": max(0, int(payload.get("deletedImageCleanupLastTaskCount") or 0)),
     }
 
 
@@ -6100,6 +6148,13 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
         getattr(payload, "productSyncTime", STORE_PRODUCT_SYNC_DEFAULT_TIME)
     )
     unlisted_cleanup_enabled = bool(getattr(payload, "unlistedCleanupEnabled", True))
+    deleted_image_cleanup_enabled = bool(getattr(payload, "deletedImageCleanupEnabled", True))
+    deleted_image_cleanup_weekday = normalize_cleanup_weekday(
+        getattr(payload, "deletedImageCleanupWeekday", DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_WEEKDAY)
+    )
+    deleted_image_cleanup_time = normalize_schedule_time(
+        getattr(payload, "deletedImageCleanupTime", DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_TIME)
+    )
     now = datetime.now()
     with session_scope() as session:
         row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
@@ -6118,6 +6173,12 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
                 next_weekly_run_at(product_sync_weekday, product_sync_time, now=now)
             ),
             "unlistedCleanupEnabled": unlisted_cleanup_enabled,
+            "deletedImageCleanupEnabled": deleted_image_cleanup_enabled,
+            "deletedImageCleanupWeekday": deleted_image_cleanup_weekday,
+            "deletedImageCleanupTime": deleted_image_cleanup_time,
+            "deletedImageCleanupNextAt": datetime_to_public(
+                next_weekly_run_at(deleted_image_cleanup_weekday, deleted_image_cleanup_time, now=now)
+            ),
         }
         row = upsert_time_settings_row(session, updated_payload)
         session.flush()
@@ -6345,6 +6406,255 @@ def run_store_unlisted_product_cleanup_now(*, include_queue_health: bool = True)
             "productCount": summary["productCount"],
         },
     }
+
+
+def cleanup_record_json_list(row: DeletedProductImageCleanupModel, field: str) -> list[Any]:
+    try:
+        value = json.loads(getattr(row, field) or "[]")
+    except ValueError:
+        return []
+    return value if isinstance(value, list) else []
+
+
+def deleted_product_image_cleanup_to_public(row: DeletedProductImageCleanupModel) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "ownerUsername": row.owner_username,
+        "storeId": row.store_id,
+        "storeName": row.store_name,
+        "originalProductId": row.original_product_id,
+        "productCode": row.product_code,
+        "cabinetImageCount": len(cleanup_record_json_list(row, "cabinet_targets_json")),
+        "localImageCount": len(cleanup_record_json_list(row, "local_image_urls_json")),
+        "status": row.status,
+        "syncTaskId": row.sync_task_id,
+        "lastError": row.last_error,
+        "deletedAt": datetime_to_public(row.deleted_at),
+        "createdAt": datetime_to_public(row.created_at),
+        "updatedAt": datetime_to_public(row.updated_at),
+    }
+
+
+def list_deleted_product_image_cleanups(
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+) -> dict[str, Any]:
+    with session_scope() as session:
+        return paginate_query(
+            session,
+            select(DeletedProductImageCleanupModel),
+            order_by=(DeletedProductImageCleanupModel.deleted_at.desc(), DeletedProductImageCleanupModel.id.desc()),
+            page=page,
+            page_size=page_size,
+            response_key="records",
+            serializer=deleted_product_image_cleanup_to_public,
+        )
+
+
+def create_deleted_product_image_cleanup_tasks(session: Any, now: datetime) -> tuple[list[tuple[str, str]], int]:
+    queued_rows = session.scalars(
+        select(DeletedProductImageCleanupModel).where(
+            DeletedProductImageCleanupModel.status == "queued"
+        )
+    ).all()
+    for row in queued_rows:
+        task = session.get(SyncTaskModel, row.sync_task_id) if row.sync_task_id else None
+        if task is None or task.status not in {"queued", "running"}:
+            row.status = "failed"
+            row.sync_task_id = None
+            row.last_error = "上次图片清理任务未完成，已重新进入待清理队列。"
+    rows = session.scalars(
+        select(DeletedProductImageCleanupModel)
+        .where(DeletedProductImageCleanupModel.status.in_(("pending", "failed")))
+        .order_by(
+            DeletedProductImageCleanupModel.owner_username.asc(),
+            DeletedProductImageCleanupModel.store_id.asc(),
+            DeletedProductImageCleanupModel.id.asc(),
+        )
+    ).all()
+    groups: dict[tuple[str, int], list[DeletedProductImageCleanupModel]] = {}
+    for row in rows:
+        if row.store_id is None:
+            row.status = "failed"
+            row.last_error = "店铺已不存在，无法清理 R-Cabinet 图片。"
+            continue
+        groups.setdefault((row.owner_username, int(row.store_id)), []).append(row)
+
+    task_refs: list[tuple[str, str]] = []
+    record_count = 0
+    for (owner_username, store_id), group_rows in groups.items():
+        store = session.get(StoreModel, store_id)
+        if store is None or store.owner_username != owner_username or not store.enabled:
+            for row in group_rows:
+                row.status = "failed"
+                row.last_error = "店铺不存在或已停用，无法创建图片清理任务。"
+            continue
+        chunks = [group_rows[index:index + BATCH_TASK_PRODUCT_LIMIT] for index in range(0, len(group_rows), BATCH_TASK_PRODUCT_LIMIT)]
+        for index, chunk_rows in enumerate(chunks, start=1):
+            task_id = uuid.uuid4().hex
+            cleanup_ids = [int(row.id) for row in chunk_rows]
+            part_label = "" if len(chunks) == 1 else f" {index}/{len(chunks)}"
+            task = SyncTaskModel(
+                id=task_id,
+                owner_username=owner_username,
+                store_id=store_id,
+                store_name=store.alias_name or store.store_name,
+                task_name=f"已删除商品图片清理{part_label} {store.alias_name or store.store_name} {now:%Y-%m-%d %H:%M}",
+                task_type="deleted_product_image_cleanup",
+                payload_json=json.dumps({"cleanupRecordIds": cleanup_ids}, ensure_ascii=False),
+                status="queued",
+                total_count=len(cleanup_ids),
+                message="等待清理已删除商品图片",
+            )
+            session.add(task)
+            for row in chunk_rows:
+                row.status = "queued"
+                row.sync_task_id = task_id
+                row.last_error = None
+            task_refs.append((owner_username, task_id))
+            record_count += len(cleanup_ids)
+    return task_refs, record_count
+
+
+def cleanup_deleted_product_images(*, force: bool = False) -> dict[str, int]:
+    if not DELETED_PRODUCT_IMAGE_CLEANUP_LOCK.acquire(blocking=False):
+        return {"taskCount": 0, "productCount": 0}
+    try:
+        now = datetime.now()
+        with session_scope() as session:
+            settings_row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+            payload = load_time_settings_payload(settings_row, now=now)
+            settings_row = upsert_time_settings_row(session, payload)
+            next_at = parse_public_datetime(payload.get("deletedImageCleanupNextAt"))
+            if not force and (
+                not payload["deletedImageCleanupEnabled"]
+                or (next_at is not None and next_at > now)
+            ):
+                return {"taskCount": 0, "productCount": 0}
+            task_refs, product_count = create_deleted_product_image_cleanup_tasks(session, now)
+            payload["deletedImageCleanupLastAt"] = datetime_to_public(now)
+            payload["deletedImageCleanupLastProductCount"] = product_count
+            payload["deletedImageCleanupLastTaskCount"] = len(task_refs)
+            payload["deletedImageCleanupNextAt"] = datetime_to_public(
+                next_weekly_run_at(
+                    payload["deletedImageCleanupWeekday"],
+                    payload["deletedImageCleanupTime"],
+                    now=now,
+                )
+            )
+            settings_row.value_json = json.dumps(payload, ensure_ascii=False)
+        if task_refs:
+            dispatch_next_sync_task()
+        return {"taskCount": len(task_refs), "productCount": product_count}
+    finally:
+        DELETED_PRODUCT_IMAGE_CLEANUP_LOCK.release()
+
+
+def run_deleted_product_image_cleanup_now(*, include_queue_health: bool = True) -> dict[str, Any]:
+    summary = cleanup_deleted_product_images(force=True)
+    return {
+        "settings": get_time_settings(include_queue_health=include_queue_health),
+        "summary": summary,
+    }
+
+
+def perform_deleted_product_image_cleanup(
+    owner_username: str,
+    store_id: int,
+    cleanup_ids: list[int],
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    if not cleanup_ids:
+        raise RuntimeError("图片清理任务缺少待清理记录。")
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        if store is None or store.owner_username != owner_username:
+            raise RuntimeError("图片清理任务关联店铺不存在。")
+        service_secret = decrypt_text(store.rakuten_service_secret_encrypted)
+        license_key = decrypt_text(store.rakuten_license_key_encrypted)
+        rows = session.scalars(
+            select(DeletedProductImageCleanupModel).where(
+                DeletedProductImageCleanupModel.owner_username == owner_username,
+                DeletedProductImageCleanupModel.store_id == store_id,
+                DeletedProductImageCleanupModel.id.in_(cleanup_ids),
+            )
+        ).all()
+        rows_by_id = {int(row.id): row for row in rows}
+        success_ids: list[int] = []
+        failed_ids: list[int] = []
+        errors: list[str] = []
+        cancelled = False
+        for index, cleanup_id in enumerate(cleanup_ids, start=1):
+            if task_id and is_task_cancel_requested(SyncTaskModel, task_id):
+                cancelled = True
+                break
+            row = rows_by_id.get(cleanup_id)
+            if row is None:
+                failed_ids.append(cleanup_id)
+                errors.append(f"记录 {cleanup_id}：待清理记录不存在")
+                continue
+            try:
+                _, warnings = delete_cabinet_targets(
+                    service_secret,
+                    license_key,
+                    [target for target in cleanup_record_json_list(row, "cabinet_targets_json") if isinstance(target, dict)],
+                )
+                if warnings:
+                    raise RuntimeError("；".join(warnings[:10]))
+                cleanup_queued_local_image_urls(
+                    int(row.original_product_id),
+                    [str(value) for value in cleanup_record_json_list(row, "local_image_urls_json")],
+                )
+                success_ids.append(cleanup_id)
+                session.delete(row)
+            except Exception as exc:
+                row.status = "failed"
+                row.sync_task_id = task_id
+                row.last_error = str(exc)
+                failed_ids.append(cleanup_id)
+                errors.append(f"{row.product_code or cleanup_id}：{exc}")
+            if task_id:
+                update_task_progress(
+                    SyncTaskModel,
+                    task_id,
+                    total_count=len(cleanup_ids),
+                    success_count=len(success_ids),
+                    failed_count=len(failed_ids),
+                    message=f"图片清理中，已处理 {index} / {len(cleanup_ids)} 个商品",
+                )
+        if cancelled:
+            processed = set(success_ids) | set(failed_ids)
+            for cleanup_id in cleanup_ids:
+                row = rows_by_id.get(cleanup_id)
+                if row is not None and cleanup_id not in processed:
+                    row.status = "pending"
+                    row.sync_task_id = None
+        return {
+            "totalCount": len(cleanup_ids),
+            "successCount": len(success_ids),
+            "failedCount": len(failed_ids),
+            "successIds": success_ids,
+            "failedIds": failed_ids,
+            "errors": errors,
+            "cancelled": cancelled,
+        }
+
+
+def cleanup_queued_local_image_urls(product_id: int, image_urls: list[str]) -> None:
+    errors: list[str] = []
+    for image_url in unique_texts(image_urls):
+        try:
+            remove_local_product_image_if_unused(
+                image_url,
+                [],
+                expected_product_id=product_id,
+            )
+        except Exception as exc:
+            errors.append(f"{image_url}: {exc}")
+    if errors:
+        raise RuntimeError("；".join(errors[:10]))
 
 
 def cancel_crawl_task(owner_username: str, task_id: str) -> dict[str, Any]:
@@ -8933,6 +9243,23 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
                 [*list(result.get("errors") or []), *list(result.get("warnings") or [])],
                 limit=50,
             )
+        elif task_type == "deleted_product_image_cleanup":
+            cleanup_ids = normalize_product_ids(list(payload.get("cleanupRecordIds") or []))
+            result = perform_deleted_product_image_cleanup(owner_username, store_id, cleanup_ids, task_id=task_id)
+            payload["result"] = {
+                "successIds": list(result.get("successIds") or []),
+                "failedIds": list(result.get("failedIds") or []),
+            }
+            total_count = int(result.get("totalCount") or 0)
+            success_count = int(result.get("successCount") or 0)
+            failed_count = int(result.get("failedCount") or 0)
+            status = "cancelled" if result.get("cancelled") else ("success" if failed_count == 0 else "partial")
+            message = (
+                cancelled_task_progress_message("图片清理", total_count, success_count, failed_count)
+                if result.get("cancelled")
+                else f"完成，清理成功 {success_count} 个商品，异常 {failed_count} 个"
+            )
+            error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
         else:
             result = perform_store_sync(owner_username, store_id, task_id=task_id)
             total_count = int(result.get("totalCount") or 0)
@@ -9023,6 +9350,8 @@ def sync_task_running_message(task: SyncTaskModel) -> str:
         return f"正在执行{'全部' if task_type == 'listing_status' else '批量'}{action_label}"
     if task_type == "product_delete":
         return "正在执行批量删除"
+    if task_type == "deleted_product_image_cleanup":
+        return "正在清理已删除商品图片"
     return "正在同步店铺商品"
 
 
@@ -9243,7 +9572,6 @@ def perform_product_delete_sync(
             "warnings": warnings,
             "cancelled": cancelled,
         }
-    cleanup_product_image_ids(success_ids)
     return result
 
 
@@ -9268,6 +9596,15 @@ def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
             if not retry_ids:
                 raise RuntimeError("该同步任务没有可重试的失败商品。")
             payload["productIds"] = retry_ids
+            task.total_count = len(retry_ids)
+        elif task.task_type == "deleted_product_image_cleanup":
+            original_ids = normalize_product_ids(list(payload.get("cleanupRecordIds") or []))
+            failed_ids = normalize_product_ids(list(result_payload.get("failedIds") or []))
+            success_ids = set(normalize_product_ids(list(result_payload.get("successIds") or [])))
+            retry_ids = failed_ids or [record_id for record_id in original_ids if record_id not in success_ids]
+            if not retry_ids:
+                raise RuntimeError("该同步任务没有可重试的失败记录。")
+            payload["cleanupRecordIds"] = retry_ids
             task.total_count = len(retry_ids)
         else:
             task.total_count = 0
@@ -10882,6 +11219,7 @@ def run_periodic_maintenance_once() -> None:
     cleanup_orphan_product_image_dirs_if_due()
     cleanup_completed_scheduled_crawl_tasks_if_due()
     cleanup_store_unlisted_products_if_due()
+    cleanup_deleted_product_images(force=False)
 
 
 def cleanup_expired_product_image_drafts_if_due() -> int:
@@ -11212,9 +11550,45 @@ def delete_store_product_from_rakuten(
     store, service_secret, license_key = credentials
     raw_payload = product_raw_payload(product)
     delete_rakuten_item(service_secret, license_key, manage_number)
-    deleted_count, warnings = delete_product_cabinet_images(service_secret, license_key, raw_payload, store.store_code)
-    setattr(product, "_deleted_cabinet_count", deleted_count)
-    setattr(product, "_delete_warnings", warnings)
+    queue_deleted_product_image_cleanup(session, product, store, raw_payload)
+    setattr(product, "_deleted_cabinet_count", 0)
+    setattr(product, "_delete_warnings", [])
+
+
+def queue_deleted_product_image_cleanup(
+    session: Any,
+    product: ProductModel,
+    store: StoreModel,
+    raw_payload: dict[str, Any],
+) -> None:
+    cabinet_targets = product_cabinet_file_targets(raw_payload, store.store_code)
+    local_image_urls = []
+    for image_url in product_images_for_edit(product):
+        stored_image = parse_product_image_url(image_url)
+        if stored_image is not None and stored_image.product_id == int(product.id):
+            local_image_urls.append(image_url)
+    existing = session.scalar(
+        select(DeletedProductImageCleanupModel).where(
+            DeletedProductImageCleanupModel.owner_username == product.owner_username,
+            DeletedProductImageCleanupModel.original_product_id == product.id,
+        )
+    )
+    row = existing or DeletedProductImageCleanupModel(
+        owner_username=product.owner_username,
+        original_product_id=product.id,
+    )
+    if existing is None:
+        session.add(row)
+    row.store_id = store.id
+    row.store_name = store.alias_name or store.store_name
+    row.product_code = productCodeForError(product)
+    row.cabinet_targets_json = json.dumps(cabinet_targets, ensure_ascii=False)
+    row.local_image_urls_json = json.dumps(unique_texts(local_image_urls), ensure_ascii=False)
+    row.status = "pending"
+    row.sync_task_id = None
+    row.last_error = None
+    row.deleted_at = datetime.now()
+    row.cleaned_at = None
 
 
 def delete_product_cabinet_images(
@@ -11224,6 +11598,14 @@ def delete_product_cabinet_images(
     shop_code: str,
 ) -> tuple[int, list[str]]:
     targets = product_cabinet_file_targets(raw_payload, shop_code)
+    return delete_cabinet_targets(service_secret, license_key, targets)
+
+
+def delete_cabinet_targets(
+    service_secret: str,
+    license_key: str,
+    targets: list[dict[str, Any]],
+) -> tuple[int, list[str]]:
     deleted_ids: set[int] = set()
     warnings: list[str] = []
     for target in targets:

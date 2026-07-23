@@ -18,6 +18,8 @@ class ResourceVisibilityTests(unittest.TestCase):
             ("PUT", "/crawler/settings/time"),
             ("POST", "/crawler/settings/time/scheduled-task-cleanup/run"),
             ("POST", "/crawler/settings/time/unlisted-products/run"),
+            ("GET", "/crawler/settings/time/deleted-product-images"),
+            ("POST", "/crawler/settings/time/deleted-product-images/run"),
         }
         for method, path in expected_routes:
             route = next(
