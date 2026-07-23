@@ -15,6 +15,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 import time
 import threading
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -17112,7 +17113,13 @@ def collect_rakuten_market_product_detail(normalized_url: str, html: str, soup: 
     if not image_urls:
         image_urls = extract_image_urls_from_soup(soup, shop_code=shop_code, item_number=item_number)
     image_urls = unique_texts(image_urls)
-    descriptions = market_product_descriptions(product_json, soup, embedded_item)
+    descriptions = market_product_descriptions(
+        product_json,
+        soup,
+        embedded_item,
+        shop_code=shop_code,
+        item_number=item_number,
+    )
     offers = product_json.get("offers") if isinstance(product_json, dict) else None
     variants = market_item_variants(embedded_item) or variants_from_json_ld_offers(offers)
     price = price_from_rakuten_item({"variants": variants}) or price_from_rakuten_item(embedded_item)
@@ -17151,6 +17158,11 @@ def collect_rakuten_market_product_detail(normalized_url: str, html: str, soup: 
         "meta": meta,
         "collectedAt": datetime.now().isoformat(timespec="seconds"),
     }
+    raw = remove_cross_item_rakuten_image_links_from_payload(
+        raw,
+        shop_code=shop_code,
+        item_number=item_number,
+    )
     return {
         "title": title[:500] or normalized_url,
         "source_url": normalized_url,
@@ -17454,6 +17466,9 @@ def market_product_descriptions(
     product_json: dict[str, Any],
     soup: BeautifulSoup,
     embedded_item: dict[str, Any] | None = None,
+    *,
+    shop_code: str = "",
+    item_number: str = "",
 ) -> list[dict[str, str]]:
     descriptions: list[dict[str, str]] = []
     description = first_text_from_keys(product_json, ("description",)) if isinstance(product_json, dict) else ""
@@ -17466,7 +17481,13 @@ def market_product_descriptions(
             ("PC用 販売説明文", embedded_item.get("salesDescription")),
         )
         for label, value in embedded_descriptions:
-            html_value = normalize_detail_html(value)
+            html_value = normalize_detail_html(
+                remove_cross_item_rakuten_image_links(
+                    value,
+                    shop_code=shop_code,
+                    item_number=item_number,
+                )
+            )
             if html_value and all(description_content_key(item["value"]) != description_content_key(html_value) for item in descriptions):
                 descriptions.append({"label": label, "value": html_value})
     for selector, label in (
@@ -17480,6 +17501,100 @@ def market_product_descriptions(
             if text_value and all(description_content_key(item["value"]) != description_content_key(text_value) for item in descriptions):
                 descriptions.append({"label": label, "value": text_value})
     return clean_market_product_descriptions(descriptions, keep_empty_labels=RAKUTEN_DESCRIPTION_FIELD_LABELS)
+
+
+def remove_cross_item_rakuten_image_links(
+    value: Any,
+    *,
+    shop_code: str,
+    item_number: str,
+) -> str:
+    html = str(value or "")
+    normalized_item_number = normalize_text(item_number).lower()
+    if not html.strip() or not normalized_item_number:
+        return html
+    normalized_shop_code = normalize_shop_code(shop_code).lower()
+    soup = BeautifulSoup(html, "lxml")
+    removed = False
+    for link in soup.select("a[href]"):
+        if link.select_one("img, source") is None:
+            continue
+        target = linked_rakuten_item_target(link.get("href"))
+        if target is None:
+            continue
+        target_shop_code, target_item_number = target
+        if normalized_shop_code and target_shop_code.lower() != normalized_shop_code:
+            continue
+        if target_item_number.lower() != normalized_item_number:
+            link.decompose()
+            removed = True
+    if not removed:
+        return html
+    body = soup.body
+    if body is not None:
+        return body.decode_contents()
+    return str(soup)
+
+
+def remove_cross_item_rakuten_image_links_from_payload(
+    payload: dict[str, Any],
+    *,
+    shop_code: str,
+    item_number: str,
+) -> dict[str, Any]:
+    updated_payload = deepcopy(payload)
+
+    def clean(value: Any) -> str:
+        return remove_cross_item_rakuten_image_links(
+            value,
+            shop_code=shop_code,
+            item_number=item_number,
+        )
+
+    product_description = updated_payload.get("productDescription")
+    if isinstance(product_description, dict):
+        for key in ("pc", "sp", "smartphone", "value"):
+            if key in product_description:
+                product_description[key] = clean(product_description.get(key))
+    elif "productDescription" in updated_payload:
+        updated_payload["productDescription"] = clean(product_description)
+
+    for key in ("description", "pcDescription", "spDescription", "smartphoneDescription", "salesDescription"):
+        if key in updated_payload:
+            updated_payload[key] = clean(updated_payload.get(key))
+
+    descriptions = updated_payload.get("descriptions")
+    if isinstance(descriptions, list):
+        for item in descriptions:
+            if isinstance(item, dict) and "value" in item:
+                item["value"] = clean(item.get("value"))
+
+    embedded_item = updated_payload.get("embeddedItem")
+    if isinstance(embedded_item, dict):
+        pc_fields = embedded_item.get("pcFields")
+        if isinstance(pc_fields, dict) and "productDescription" in pc_fields:
+            pc_fields["productDescription"] = clean(pc_fields.get("productDescription"))
+        for key in ("newProductDescription", "salesDescription"):
+            if key in embedded_item:
+                embedded_item[key] = clean(embedded_item.get(key))
+
+    return updated_payload
+
+
+def linked_rakuten_item_target(value: Any) -> tuple[str, str] | None:
+    url = normalize_text(value)
+    if not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return None
+    if parsed.netloc.lower() not in {"item.rakuten.co.jp", "soko.rms.rakuten.co.jp"}:
+        return None
+    parts = [unquote(part.strip()) for part in parsed.path.split("/") if part.strip()]
+    if len(parts) < 2:
+        return None
+    return parts[0], parts[1]
 
 
 RAKUTEN_DESCRIPTION_FIELD_LABELS = (
@@ -17772,9 +17887,6 @@ def market_item_image_urls(item: dict[str, Any], *, shop_code: str, item_number:
     for sku in item.get("sku") if isinstance(item.get("sku"), list) else []:
         if isinstance(sku, dict):
             collect(sku.get("images"))
-    for description in (item.get("newProductDescription"), item.get("salesDescription")):
-        for match in re.findall(r"https?://[^\s\"'<>)]*\.(?:apng|avif|bmp|gif|jpe?g|png|webp)(?:\?[^\"'<>)]*)?", str(description or ""), flags=re.I):
-            collect(match)
     return urls
 
 

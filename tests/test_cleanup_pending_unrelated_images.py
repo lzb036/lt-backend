@@ -59,6 +59,33 @@ class PendingUnrelatedImageCleanupTests(unittest.TestCase):
         self.assertEqual(removed, [])
         self.assertEqual(trusted, [])
 
+    def test_payload_cleanup_removes_other_item_recommendations_only(self):
+        payload = {
+            "itemNumber": "y0219871",
+            "embeddedItem": {
+                "newProductDescription": (
+                    '<a href="https://www.rakuten.ne.jp/gold/gadgery/">'
+                    '<img src="shop-notice.jpg"></a>'
+                    '<a href="https://item.rakuten.co.jp/gadgery/y14406056/">'
+                    '<img src="other-product.jpg"></a>'
+                ),
+            },
+        }
+
+        cleaned = (
+            cleanup_pending_unrelated_product_images.crawler_service
+            .remove_cross_item_rakuten_image_links_from_payload(
+                payload,
+                shop_code="gadgery",
+                item_number="y0219871",
+            )
+        )
+
+        description = cleaned["embeddedItem"]["newProductDescription"]
+        self.assertIn("shop-notice.jpg", description)
+        self.assertNotIn("other-product.jpg", description)
+        self.assertNotEqual(cleaned, payload)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -213,6 +213,61 @@ class ProductImageStorageIntegrationTests(unittest.TestCase):
             [product_url],
         )
 
+    def test_market_item_images_ignore_description_recommendations(self):
+        product_url = "https://image.rakuten.co.jp/gadgery/cabinet/06209451/y0219871.jpg"
+        recommended_url = "https://image.rakuten.co.jp/gadgery/cabinet/ladys/y14406056.jpg"
+        item = {
+            "pcFields": {
+                "images": [{"location": "/06209451/y0219871.jpg"}],
+            },
+            "newProductDescription": (
+                '<a href="https://item.rakuten.co.jp/gadgery/y14406056/">'
+                f'<img src="{recommended_url}"></a>'
+            ),
+        }
+
+        self.assertEqual(
+            crawler_service.market_item_image_urls(
+                item,
+                shop_code="gadgery",
+                item_number="y0219871",
+            ),
+            [product_url],
+        )
+
+    def test_market_descriptions_remove_cross_item_image_links(self):
+        shop_banner = "https://image.rakuten.co.jp/gadgery/cabinet/shop/banner.jpg"
+        current_image = "https://image.rakuten.co.jp/gadgery/cabinet/06209451/y0219871_1.jpg"
+        recommended_image = "https://image.rakuten.co.jp/gadgery/cabinet/ladys/y14406056.jpg"
+        item = {
+            "newProductDescription": (
+                '<a href="https://www.rakuten.ne.jp/gold/gadgery/">'
+                f'<img src="{shop_banner}"></a>'
+                '<a href="https://item.rakuten.co.jp/gadgery/y0219871/">'
+                f'<img src="{current_image}"></a>'
+                '<a href="https://item.rakuten.co.jp/gadgery/y14406056/">'
+                f'<img src="{recommended_image}"></a>'
+            ),
+        }
+
+        descriptions = crawler_service.market_product_descriptions(
+            {},
+            crawler_service.BeautifulSoup("<html></html>", "lxml"),
+            item,
+            shop_code="gadgery",
+            item_number="y0219871",
+        )
+
+        description = next(
+            row["value"]
+            for row in descriptions
+            if row["label"] == "スマートフォン用 商品説明文"
+        )
+        self.assertIn(shop_banner, description)
+        self.assertIn(current_image, description)
+        self.assertNotIn(recommended_image, description)
+        self.assertNotIn("y14406056", description)
+
     def test_trusted_product_main_images_use_only_whitelisted_embedded_fields(self):
         primary_url = "https://tshop.r10s.jp/shop/cabinet/product/main.jpg"
         sku_url = "https://tshop.r10s.jp/shop/cabinet/product/sku.jpg"

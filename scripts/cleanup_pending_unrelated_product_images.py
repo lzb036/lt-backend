@@ -111,6 +111,7 @@ def main() -> int:
         "processed": 0,
         "changedProducts": 0,
         "removedMainRefs": 0,
+        "cleanedDescriptionProducts": 0,
         "skippedWithoutTrustedImages": 0,
         "concurrentSkips": 0,
     }
@@ -124,30 +125,43 @@ def main() -> int:
             original_image_url = product.image_url
             payload = crawler_service.product_raw_payload(product)
             shop_code = crawler_service.product_shop_code(product, payload)
+            item_number = crawler_service.first_text_from_keys(
+                payload,
+                ("itemNumber", "manageNumber"),
+            ) or product.item_number
             current_images = crawler_service.product_editable_image_urls(
                 payload,
                 shop_code=shop_code,
             )
+            cleaned_payload = crawler_service.remove_cross_item_rakuten_image_links_from_payload(
+                payload,
+                shop_code=shop_code,
+                item_number=item_number,
+            )
+            description_changed = cleaned_payload != payload
 
         kept_images, removed_images, trusted_sources = cleanup_image_references(
-            payload,
+            cleaned_payload,
             current_images,
             shop_code=shop_code,
         )
         stats["processed"] += 1
         if not trusted_sources:
             stats["skippedWithoutTrustedImages"] += 1
-        if not removed_images:
+        if not removed_images and not description_changed:
             if stats["processed"] % max(1, args.progress_every) == 0:
                 print(json.dumps(stats, ensure_ascii=False), flush=True)
             continue
 
-        updated_payload = crawler_service.set_product_image_urls(payload, kept_images)
-        updated_payload["ltOriginalImages"] = trusted_sources
+        updated_payload = crawler_service.set_product_image_urls(cleaned_payload, kept_images)
+        if trusted_sources:
+            updated_payload["ltOriginalImages"] = trusted_sources
         updated_payload_json = json.dumps(updated_payload, ensure_ascii=False)
         updated_image_url = kept_images[0] if kept_images else ""
         stats["changedProducts"] += 1
         stats["removedMainRefs"] += len(removed_images)
+        if description_changed:
+            stats["cleanedDescriptionProducts"] += 1
 
         if args.apply:
             referenced_urls: list[str] = []
