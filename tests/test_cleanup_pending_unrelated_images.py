@@ -62,6 +62,15 @@ class PendingUnrelatedImageCleanupTests(unittest.TestCase):
     def test_payload_cleanup_removes_other_item_recommendations_only(self):
         payload = {
             "itemNumber": "y0219871",
+            "descriptions": [
+                {
+                    "label": "スマートフォン用 商品説明文",
+                    "value": (
+                        '<a href="https://item.rakuten.co.jp/gadgery/y14406056/">'
+                        '<img src="list-other-product.jpg"></a>'
+                    ),
+                },
+            ],
             "embeddedItem": {
                 "newProductDescription": (
                     '<a href="https://www.rakuten.ne.jp/gold/gadgery/">'
@@ -103,6 +112,10 @@ class PendingUnrelatedImageCleanupTests(unittest.TestCase):
             ["pcFields"]["productDescription"]
         )
         self.assertNotIn("nested-other-product.jpg", nested_description)
+        self.assertNotIn(
+            "list-other-product.jpg",
+            cleaned["descriptions"][0]["value"],
+        )
         self.assertNotEqual(cleaned, payload)
 
 

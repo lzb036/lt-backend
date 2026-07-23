@@ -17545,6 +17545,7 @@ def remove_cross_item_rakuten_image_links_from_payload(
     updated_payload = deepcopy(payload)
     description_keys = {
         "description",
+        "descriptions",
         "newproductdescription",
         "pcdescription",
         "productdescription",
