@@ -130,8 +130,10 @@ RAKUTEN_INVENTORY_BULK_UPSERT_URL = "https://api.rms.rakuten.co.jp/es/2.1/invent
 RAKUTEN_ITEM_SEARCH_HITS = 100
 RAKUTEN_ITEM_SEARCH_MAX_FETCHED_ITEMS = 10000
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
-RAKUTEN_WRITE_MAX_RETRIES = 3
+RAKUTEN_WRITE_MAX_RETRIES = 5
 RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+RAKUTEN_WRITE_QPS_BACKOFF_SECONDS = (1.5, 3.0, 5.0, 8.0)
+RAKUTEN_ITEM_DELETE_MIN_INTERVAL_SECONDS = 0.35
 RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT = 400
 BATCH_TASK_PRODUCT_LIMIT = 50
 LISTED_STORE_NONE_FILTER = "__none__"
@@ -457,9 +459,11 @@ STORE_UNLISTED_PRODUCT_CLEANUP_LOCK = threading.Lock()
 DELETED_PRODUCT_IMAGE_CLEANUP_LOCK = threading.Lock()
 CRAWLER_REQUEST_LOCK = threading.Lock()
 RAKUTEN_CABINET_REQUEST_LOCK = threading.Lock()
+RAKUTEN_ITEM_DELETE_REQUEST_LOCK = threading.Lock()
 CRAWLER_SESSION_LOCAL = threading.local()
 CRAWLER_LAST_REQUEST_AT = 0.0
 RAKUTEN_CABINET_LAST_REQUEST_AT = 0.0
+RAKUTEN_ITEM_DELETE_LAST_REQUEST_AT = 0.0
 SCHEDULE_RUNNER_STARTED = False
 SCHEDULE_RUNNER_HEALTH_LOCK = threading.Lock()
 SCHEDULE_RUNNER_HEALTH: dict[str, Any] = {
@@ -4872,9 +4876,11 @@ def delete_rakuten_item(service_secret: str, license_key: str, manage_number: st
     if not normalized_manage_number:
         raise RuntimeError("商品管理编号为空，不能删除乐天商品。")
 
-    response = requests.delete(
+    wait_for_rakuten_item_delete_slot()
+    response = request_rakuten_write(
+        "DELETE",
         RAKUTEN_ITEM_PATCH_URL.format(manageNumber=quote(normalized_manage_number, safe="")),
-        timeout=settings.crawler_timeout_seconds,
+        operation=f"乐天商品 {normalized_manage_number} 删除",
         headers={
             "Authorization": build_rakuten_authorization_header(service_secret, license_key),
             "Accept": "application/json",
@@ -12113,14 +12119,52 @@ def request_rakuten_write(
                 continue
             raise RuntimeError(f"{operation}超时或连接失败，已重试 {RAKUTEN_WRITE_MAX_RETRIES} 次：{exc}") from exc
 
-        if response.status_code in RAKUTEN_WRITE_RETRY_STATUS_CODES and attempt < RAKUTEN_WRITE_MAX_RETRIES - 1:
+        qps_limited = is_rakuten_write_qps_limited_response(response)
+        retryable = response.status_code in RAKUTEN_WRITE_RETRY_STATUS_CODES or qps_limited
+        if retryable and attempt < RAKUTEN_WRITE_MAX_RETRIES - 1:
             response.close()
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(rakuten_write_backoff_seconds(attempt, qps_limited=qps_limited))
             continue
         return response
     if last_error is not None:
         raise RuntimeError(f"{operation}失败：{last_error}") from last_error
     raise RuntimeError(f"{operation}失败。")
+
+
+def wait_for_rakuten_item_delete_slot(
+    min_interval_seconds: float = RAKUTEN_ITEM_DELETE_MIN_INTERVAL_SECONDS,
+) -> None:
+    global RAKUTEN_ITEM_DELETE_LAST_REQUEST_AT
+    min_interval = max(0.0, float(min_interval_seconds or 0.0))
+    if min_interval <= 0:
+        return
+    with RAKUTEN_ITEM_DELETE_REQUEST_LOCK:
+        elapsed = time.monotonic() - RAKUTEN_ITEM_DELETE_LAST_REQUEST_AT
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        RAKUTEN_ITEM_DELETE_LAST_REQUEST_AT = time.monotonic()
+
+
+def is_rakuten_write_qps_limited_response(response: requests.Response) -> bool:
+    if int(getattr(response, "status_code", 0) or 0) == 429:
+        return True
+    detail = normalize_text(getattr(response, "text", "")).upper()
+    return any(
+        marker in detail
+        for marker in (
+            "GA0003",
+            "QPSLIMIT",
+            "QPS LIMIT",
+            "EXCEEDED QPS",
+        )
+    )
+
+
+def rakuten_write_backoff_seconds(attempt: int, *, qps_limited: bool = False) -> float:
+    if not qps_limited:
+        return 1.5 * (max(0, int(attempt)) + 1)
+    index = max(0, min(len(RAKUTEN_WRITE_QPS_BACKOFF_SECONDS) - 1, int(attempt)))
+    return float(RAKUTEN_WRITE_QPS_BACKOFF_SECONDS[index])
 
 
 def put_rakuten_item(
