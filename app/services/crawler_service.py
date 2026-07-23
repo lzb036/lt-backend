@@ -6106,9 +6106,11 @@ def time_settings_to_public(
     payload: dict[str, Any],
     *,
     include_queue_health: bool = True,
+    deleted_image_cleanup_pending_count: int = 0,
 ) -> dict[str, Any]:
     result = {
         **payload,
+        "deletedImageCleanupPendingCount": max(0, int(deleted_image_cleanup_pending_count)),
         "serverNow": datetime_to_public(datetime.now()),
         "updatedAt": datetime_to_public(row.updated_at if row is not None else None),
     }
@@ -6133,7 +6135,15 @@ def get_time_settings(*, include_queue_health: bool = True) -> dict[str, Any]:
         if row is None or (row.value_json or "") != json.dumps(payload, ensure_ascii=False):
             row = upsert_time_settings_row(session, payload)
             session.flush()
-        return time_settings_to_public(row, payload, include_queue_health=include_queue_health)
+        pending_count = session.scalar(
+            select(func.count()).select_from(DeletedProductImageCleanupModel)
+        ) or 0
+        return time_settings_to_public(
+            row,
+            payload,
+            include_queue_health=include_queue_health,
+            deleted_image_cleanup_pending_count=pending_count,
+        )
 
 
 def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> dict[str, Any]:
@@ -6182,7 +6192,15 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
         }
         row = upsert_time_settings_row(session, updated_payload)
         session.flush()
-        return time_settings_to_public(row, updated_payload, include_queue_health=include_queue_health)
+        pending_count = session.scalar(
+            select(func.count()).select_from(DeletedProductImageCleanupModel)
+        ) or 0
+        return time_settings_to_public(
+            row,
+            updated_payload,
+            include_queue_health=include_queue_health,
+            deleted_image_cleanup_pending_count=pending_count,
+        )
 
 
 def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:

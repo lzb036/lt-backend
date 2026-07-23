@@ -119,6 +119,27 @@ def test_deleted_image_cleanup_tasks_chunk_and_remove_successful_records(monkeyp
         assert session.get(DeletedProductImageCleanupModel, cleanup_ids[0]) is None
 
 
+def test_time_settings_include_deleted_image_cleanup_pending_count(monkeypatch, session_factory):
+    install_session_scope(monkeypatch, session_factory)
+    store_id = seed_owner_store(session_factory)
+    with session_factory() as session:
+        session.add_all([
+            DeletedProductImageCleanupModel(
+                owner_username="alice",
+                store_id=store_id,
+                store_name="Shop",
+                original_product_id=2000 + index,
+                product_code=f"pending-{index}",
+            )
+            for index in range(3)
+        ])
+        session.commit()
+
+    settings = crawler_service.get_time_settings(include_queue_health=False)
+
+    assert settings["deletedImageCleanupPendingCount"] == 3
+
+
 def test_store_product_delete_queues_images_without_deleting_them(monkeypatch, session_factory):
     store_id = seed_owner_store(session_factory)
     monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value)
