@@ -8251,7 +8251,7 @@ def list_sync_tasks(
                 SyncTaskModel.status != "preview_ready",
             ),
         )
-        normalized_task_ids = normalize_task_ids(task_ids or [])
+        normalized_task_ids = normalize_task_ids(task_ids) if task_ids else []
         if normalized_task_ids:
             query = query.where(SyncTaskModel.id.in_(normalized_task_ids))
         return paginate_query(
@@ -15902,7 +15902,7 @@ def list_listing_tasks(
         finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架", owner_username=owner_username)
         reconcile_interrupted_running_tasks(session, ListingTaskModel, owner_username=owner_username)
         query = select(ListingTaskModel).where(ListingTaskModel.owner_username == owner_username)
-        normalized_task_ids = normalize_task_ids(task_ids or [])
+        normalized_task_ids = normalize_task_ids(task_ids) if task_ids else []
         if normalized_task_ids:
             query = query.where(
                 ListingTaskModel.id.in_(normalized_task_ids)
