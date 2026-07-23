@@ -17543,6 +17543,15 @@ def remove_cross_item_rakuten_image_links_from_payload(
     item_number: str,
 ) -> dict[str, Any]:
     updated_payload = deepcopy(payload)
+    description_keys = {
+        "description",
+        "newproductdescription",
+        "pcdescription",
+        "productdescription",
+        "salesdescription",
+        "smartphonedescription",
+        "spdescription",
+    }
 
     def clean(value: Any) -> str:
         return remove_cross_item_rakuten_image_links(
@@ -17551,34 +17560,33 @@ def remove_cross_item_rakuten_image_links_from_payload(
             item_number=item_number,
         )
 
-    product_description = updated_payload.get("productDescription")
-    if isinstance(product_description, dict):
-        for key in ("pc", "sp", "smartphone", "value"):
-            if key in product_description:
-                product_description[key] = clean(product_description.get(key))
-    elif "productDescription" in updated_payload:
-        updated_payload["productDescription"] = clean(product_description)
+    def clean_description_value(value: Any) -> Any:
+        if isinstance(value, str):
+            return clean(value)
+        if isinstance(value, dict):
+            return {
+                key: clean_description_value(child)
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [clean_description_value(child) for child in value]
+        return value
 
-    for key in ("description", "pcDescription", "spDescription", "smartphoneDescription", "salesDescription"):
-        if key in updated_payload:
-            updated_payload[key] = clean(updated_payload.get(key))
+    def walk(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: (
+                    clean_description_value(child)
+                    if str(key).lower() in description_keys
+                    else walk(child)
+                )
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [walk(child) for child in value]
+        return value
 
-    descriptions = updated_payload.get("descriptions")
-    if isinstance(descriptions, list):
-        for item in descriptions:
-            if isinstance(item, dict) and "value" in item:
-                item["value"] = clean(item.get("value"))
-
-    embedded_item = updated_payload.get("embeddedItem")
-    if isinstance(embedded_item, dict):
-        pc_fields = embedded_item.get("pcFields")
-        if isinstance(pc_fields, dict) and "productDescription" in pc_fields:
-            pc_fields["productDescription"] = clean(pc_fields.get("productDescription"))
-        for key in ("newProductDescription", "salesDescription"):
-            if key in embedded_item:
-                embedded_item[key] = clean(embedded_item.get(key))
-
-    return updated_payload
+    return walk(updated_payload)
 
 
 def linked_rakuten_item_target(value: Any) -> tuple[str, str] | None:

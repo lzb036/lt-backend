@@ -69,6 +69,20 @@ class PendingUnrelatedImageCleanupTests(unittest.TestCase):
                     '<a href="https://item.rakuten.co.jp/gadgery/y14406056/">'
                     '<img src="other-product.jpg"></a>'
                 ),
+                "embeddedPayload": {
+                    "api": {
+                        "data": {
+                            "itemInfoSku": {
+                                "pcFields": {
+                                    "productDescription": (
+                                        '<a href="https://item.rakuten.co.jp/gadgery/y14406056/">'
+                                        '<img src="nested-other-product.jpg"></a>'
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                },
             },
         }
 
@@ -84,6 +98,11 @@ class PendingUnrelatedImageCleanupTests(unittest.TestCase):
         description = cleaned["embeddedItem"]["newProductDescription"]
         self.assertIn("shop-notice.jpg", description)
         self.assertNotIn("other-product.jpg", description)
+        nested_description = (
+            cleaned["embeddedItem"]["embeddedPayload"]["api"]["data"]["itemInfoSku"]
+            ["pcFields"]["productDescription"]
+        )
+        self.assertNotIn("nested-other-product.jpg", nested_description)
         self.assertNotEqual(cleaned, payload)
 
 
