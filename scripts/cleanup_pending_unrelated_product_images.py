@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-id", type=int, default=0, help="Do not process product IDs above this value.")
     parser.add_argument("--progress-every", type=int, default=100, help="Print progress every N products.")
     parser.add_argument("--backup", default="", help="JSONL backup path used in apply mode.")
+    parser.add_argument(
+        "--require-description-change",
+        action="store_true",
+        help="Only process products whose descriptions contain removable cross-item image links.",
+    )
     return parser.parse_args()
 
 
@@ -75,6 +80,10 @@ def backup_product(path: Path, product: ProductModel) -> None:
         output.flush()
 
 
+def should_process_product(*, description_changed: bool, require_description_change: bool) -> bool:
+    return description_changed or not require_description_change
+
+
 def main() -> int:
     args = parse_args()
     with session_scope() as session:
@@ -112,6 +121,7 @@ def main() -> int:
         "changedProducts": 0,
         "removedMainRefs": 0,
         "cleanedDescriptionProducts": 0,
+        "descriptionFilterSkips": 0,
         "skippedWithoutTrustedImages": 0,
         "concurrentSkips": 0,
     }
@@ -140,12 +150,21 @@ def main() -> int:
             )
             description_changed = cleaned_payload != payload
 
+        stats["processed"] += 1
+        if not should_process_product(
+            description_changed=description_changed,
+            require_description_change=args.require_description_change,
+        ):
+            stats["descriptionFilterSkips"] += 1
+            if stats["processed"] % max(1, args.progress_every) == 0:
+                print(json.dumps(stats, ensure_ascii=False), flush=True)
+            continue
+
         kept_images, removed_images, trusted_sources = cleanup_image_references(
             cleaned_payload,
             current_images,
             shop_code=shop_code,
         )
-        stats["processed"] += 1
         if not trusted_sources:
             stats["skippedWithoutTrustedImages"] += 1
         if not removed_images and not description_changed:

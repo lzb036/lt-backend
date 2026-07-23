@@ -6,6 +6,26 @@ from scripts import cleanup_pending_unrelated_product_images
 
 
 class PendingUnrelatedImageCleanupTests(unittest.TestCase):
+    def test_high_confidence_filter_requires_description_change(self):
+        self.assertTrue(
+            cleanup_pending_unrelated_product_images.should_process_product(
+                description_changed=True,
+                require_description_change=True,
+            )
+        )
+        self.assertFalse(
+            cleanup_pending_unrelated_product_images.should_process_product(
+                description_changed=False,
+                require_description_change=True,
+            )
+        )
+        self.assertTrue(
+            cleanup_pending_unrelated_product_images.should_process_product(
+                description_changed=False,
+                require_description_change=False,
+            )
+        )
+
     def test_cleanup_keeps_trusted_product_images_and_removes_appended_promotions(self):
         trusted_sources = [
             "https://image.rakuten.co.jp/shop/cabinet/product/a.jpg",
