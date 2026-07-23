@@ -29,8 +29,9 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit,
 
 import requests
 from bs4 import BeautifulSoup, Comment
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import aliased
 
 from app.core.config import settings
 from app.core.secure_storage import decrypt_text, encrypt_text, mask_secret
@@ -7226,57 +7227,224 @@ def list_products(
             query = query.where(ProductModel.listed_at >= listed_at_from_value)
         if listed_at_to_value is not None:
             query = query.where(ProductModel.listed_at <= listed_at_to_value)
+        if product_status == "listed_master" and listed_store_filter is not None:
+            listed_store_product = aliased(ProductModel)
+            listed_store_exists = exists(
+                select(1).where(
+                    listed_store_product.owner_username
+                    == ProductModel.owner_username,
+                    listed_store_product.parent_product_id
+                    == ProductModel.id,
+                    listed_store_product.review_status == "listed",
+                    listed_store_product.store_product_status != "removed",
+                )
+            )
+            if listed_store_filter == LISTED_STORE_NONE_FILTER:
+                query = query.where(~listed_store_exists)
+            else:
+                query = query.where(
+                    listed_store_exists.where(
+                        listed_store_product.store_id
+                        == listed_store_filter
+                    )
+                )
         order_by = product_list_order_by(product_status)
         if (
             product_status == "listed"
             and sales_period_range is not None
         ):
-            rows = session.scalars(query.order_by(*order_by)).all()
+            synced_store_query = select(SalesSyncStateModel.store_id).where(
+                SalesSyncStateModel.owner_username == owner_username,
+                SalesSyncStateModel.initial_sync_completed.is_(True),
+            )
+            if store_id is not None:
+                synced_store_query = synced_store_query.where(
+                    SalesSyncStateModel.store_id == store_id
+                )
+            synced_store_ids = set(session.scalars(synced_store_query).all())
+            cutoff_date, period_end_date = sales_period_range
+            sales_counts = {
+                (int(result.store_id), str(result.manage_number)): int(
+                    result.effective_units or 0
+                )
+                for result in session.execute(
+                    select(
+                        ProductSalesDailyModel.store_id,
+                        ProductSalesDailyModel.manage_number,
+                        func.sum(
+                            ProductSalesDailyModel.effective_units
+                        ).label("effective_units"),
+                    )
+                    .where(
+                        ProductSalesDailyModel.owner_username
+                        == owner_username,
+                        ProductSalesDailyModel.store_id.in_(
+                            synced_store_ids or {-1}
+                        ),
+                        ProductSalesDailyModel.sales_date >= cutoff_date,
+                        ProductSalesDailyModel.sales_date
+                        <= period_end_date,
+                    )
+                    .group_by(
+                        ProductSalesDailyModel.store_id,
+                        ProductSalesDailyModel.manage_number,
+                    )
+                )
+            }
+            identity_query = query.with_only_columns(
+                ProductModel.id,
+                ProductModel.store_id,
+                ProductModel.rakuten_manage_number,
+                ProductModel.item_number,
+                maintain_column_froms=True,
+            )
+
+            def identity_sales_count(identity: Any) -> int | None:
+                identity_store_id = (
+                    int(identity.store_id)
+                    if identity.store_id is not None
+                    else None
+                )
+                if identity_store_id not in synced_store_ids:
+                    return None
+                product_key = canonical_sales_order_item_product_key(
+                    manage_number=identity.rakuten_manage_number,
+                    item_number=identity.item_number,
+                )
+                return sales_counts.get(
+                    (identity_store_id, product_key),
+                    0,
+                )
+
+            needs_all_identities = (
+                sales_min is not None
+                or sales_max is not None
+                or normalized_sales_sort is not None
+                or normalized_page_size is None
+            )
+            if needs_all_identities:
+                identities = session.execute(
+                    identity_query.order_by(*order_by)
+                ).all()
+                identities_with_sales = [
+                    (identity, identity_sales_count(identity))
+                    for identity in identities
+                ]
+                if sales_min is not None or sales_max is not None:
+                    identities_with_sales = [
+                        (identity, period_sales_count)
+                        for identity, period_sales_count
+                        in identities_with_sales
+                        if period_sales_count is not None
+                        and (
+                            sales_min is None
+                            or period_sales_count >= sales_min
+                        )
+                        and (
+                            sales_max is None
+                            or period_sales_count <= sales_max
+                        )
+                    ]
+                if normalized_sales_sort is not None:
+                    identities_with_sales.sort(
+                        key=lambda item: (
+                            item[1] is None,
+                            (
+                                int(item[1] or 0)
+                                if normalized_sales_sort == "asc"
+                                else -int(item[1] or 0)
+                            ),
+                            int(item[0].id),
+                        )
+                    )
+                total = len(identities_with_sales)
+                if normalized_page_size:
+                    if total:
+                        max_page = max(
+                            1,
+                            (
+                                total + normalized_page_size - 1
+                            )
+                            // normalized_page_size,
+                        )
+                        normalized_page = min(
+                            normalized_page,
+                            max_page,
+                        )
+                    start = (
+                        normalized_page - 1
+                    ) * normalized_page_size
+                    identities_with_sales = identities_with_sales[
+                        start:start + normalized_page_size
+                    ]
+            else:
+                total = int(
+                    session.scalar(
+                        query.with_only_columns(
+                            func.count(),
+                            maintain_column_froms=True,
+                        ).order_by(None)
+                    )
+                    or 0
+                )
+                if total:
+                    max_page = max(
+                        1,
+                        (
+                            total + normalized_page_size - 1
+                        )
+                        // normalized_page_size,
+                    )
+                    normalized_page = min(
+                        normalized_page,
+                        max_page,
+                    )
+                identities = session.execute(
+                    identity_query.order_by(*order_by)
+                    .offset(
+                        (
+                            normalized_page - 1
+                        )
+                        * normalized_page_size
+                    )
+                    .limit(normalized_page_size)
+                ).all()
+                identities_with_sales = [
+                    (identity, identity_sales_count(identity))
+                    for identity in identities
+                ]
+
+            page_ids = [
+                int(identity.id)
+                for identity, _ in identities_with_sales
+            ]
+            rows_by_id = {
+                int(row.id): row
+                for row in session.scalars(
+                    select(ProductModel).where(
+                        ProductModel.id.in_(page_ids or [-1]),
+                        ProductModel.owner_username == owner_username,
+                    )
+                ).all()
+            }
+            rows = [
+                rows_by_id[product_id]
+                for product_id in page_ids
+                if product_id in rows_by_id
+            ]
+            period_sales_counts = {
+                int(identity.id): period_sales_count
+                for identity, period_sales_count
+                in identities_with_sales
+            }
             public_rows = _products_to_public_with_period_sales(
                 session,
                 rows,
                 owner_username,
                 sales_period_range,
+                period_sales_counts=period_sales_counts,
             )
-            if sales_min is not None or sales_max is not None:
-                public_rows = [
-                    row
-                    for row in public_rows
-                    if row["periodSalesCount"] is not None
-                    and (
-                        sales_min is None
-                        or int(row["periodSalesCount"]) >= sales_min
-                    )
-                    and (
-                        sales_max is None
-                        or int(row["periodSalesCount"]) <= sales_max
-                    )
-                ]
-            if normalized_sales_sort is not None:
-                public_rows.sort(
-                    key=lambda row: (
-                        row["periodSalesCount"] is None,
-                        (
-                            int(row["periodSalesCount"] or 0)
-                            if normalized_sales_sort == "asc"
-                            else -int(row["periodSalesCount"] or 0)
-                        ),
-                        int(row["id"]),
-                    )
-                )
-            total = len(public_rows)
             if normalized_page_size:
-                if total:
-                    max_page = max(
-                        1,
-                        (total + normalized_page_size - 1)
-                        // normalized_page_size,
-                    )
-                    normalized_page = min(normalized_page, max_page)
-                start = (normalized_page - 1) * normalized_page_size
-                public_rows = public_rows[
-                    start:start + normalized_page_size
-                ]
                 return {
                     "products": public_rows,
                     "total": total,
@@ -7284,46 +7452,39 @@ def list_products(
                     "pageSize": normalized_page_size,
                 }
             return public_rows
-        if product_status == "listed_master" and listed_store_filter is not None:
-            rows = session.scalars(query.order_by(*order_by)).all()
-            filtered_rows = [
-                row for row in rows
-                if product_matches_listed_store_filter(row, listed_store_filter)
-            ]
-            total = len(filtered_rows)
-            if normalized_page_size:
-                if total:
-                    max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
-                    normalized_page = min(normalized_page, max_page)
-                start = (normalized_page - 1) * normalized_page_size
-                page_rows = filtered_rows[start:start + normalized_page_size]
-                return {
-                    "products": _products_to_public_with_period_sales(
-                        session,
-                        page_rows,
-                        owner_username,
-                        sales_period_range,
-                    ),
-                    "total": total,
-                    "page": normalized_page,
-                    "pageSize": normalized_page_size,
-                }
-            return _products_to_public_with_period_sales(
-                session,
-                filtered_rows,
-                owner_username,
-                sales_period_range,
-            )
         if normalized_page_size:
-            total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
+            total = session.scalar(
+                query.with_only_columns(
+                    func.count(),
+                    maintain_column_froms=True,
+                ).order_by(None)
+            ) or 0
             if total:
                 max_page = max(1, (int(total) + normalized_page_size - 1) // normalized_page_size)
                 normalized_page = min(normalized_page, max_page)
-            rows = session.scalars(
-                query.order_by(*order_by)
+            page_ids = session.scalars(
+                query.with_only_columns(
+                    ProductModel.id,
+                    maintain_column_froms=True,
+                )
+                .order_by(*order_by)
                 .offset((normalized_page - 1) * normalized_page_size)
                 .limit(normalized_page_size)
             ).all()
+            rows_by_id = {
+                int(row.id): row
+                for row in session.scalars(
+                    select(ProductModel).where(
+                        ProductModel.id.in_(page_ids or [-1]),
+                        ProductModel.owner_username == owner_username,
+                    )
+                ).all()
+            }
+            rows = [
+                rows_by_id[int(product_id)]
+                for product_id in page_ids
+                if int(product_id) in rows_by_id
+            ]
             return {
                 "products": _products_to_public_with_period_sales(
                     session,
@@ -7350,6 +7511,8 @@ def _products_to_public_with_period_sales(
     rows: list[ProductModel],
     owner_username: str,
     sales_period_range: tuple[date, date] | None,
+    *,
+    period_sales_counts: dict[int, int | None] | None = None,
 ) -> list[dict[str, Any]]:
     if not rows:
         return []
@@ -7359,7 +7522,7 @@ def _products_to_public_with_period_sales(
         owner_username,
         [int(row.id) for row in rows],
     )
-    if sales_period_range is None:
+    if sales_period_range is None and period_sales_counts is None:
         return [
             product_to_public(
                 row,
@@ -7384,70 +7547,81 @@ def _products_to_public_with_period_sales(
         )
     }
 
-    store_ids = {
-        int(row.store_id)
-        for row in rows
-        if row.store_id is not None
-    }
-    synced_store_ids = set(
-        session.scalars(
-            select(SalesSyncStateModel.store_id).where(
-                SalesSyncStateModel.owner_username == owner_username,
-                SalesSyncStateModel.store_id.in_(store_ids or {-1}),
-                SalesSyncStateModel.initial_sync_completed.is_(True),
-            )
-        ).all()
-    )
-    product_keys = {
-        canonical_sales_order_item_product_key(
-            manage_number=row.rakuten_manage_number,
-            item_number=row.item_number,
+    sales_counts: dict[tuple[int, str], int] = {}
+    synced_store_ids: set[int] = set()
+    if period_sales_counts is None:
+        store_ids = {
+            int(row.store_id)
+            for row in rows
+            if row.store_id is not None
+        }
+        synced_store_ids = set(
+            session.scalars(
+                select(SalesSyncStateModel.store_id).where(
+                    SalesSyncStateModel.owner_username == owner_username,
+                    SalesSyncStateModel.store_id.in_(store_ids or {-1}),
+                    SalesSyncStateModel.initial_sync_completed.is_(True),
+                )
+            ).all()
         )
-        for row in rows
-        if row.store_id in synced_store_ids
-    }
-    cutoff_date, period_end_date = sales_period_range
-    sales_counts = {
-        (int(result.store_id), str(result.manage_number)): int(
-            result.effective_units or 0
-        )
-        for result in session.execute(
-            select(
-                ProductSalesDailyModel.store_id,
-                ProductSalesDailyModel.manage_number,
-                func.sum(
-                    ProductSalesDailyModel.effective_units
-                ).label("effective_units"),
+        product_keys = {
+            canonical_sales_order_item_product_key(
+                manage_number=row.rakuten_manage_number,
+                item_number=row.item_number,
             )
-            .where(
-                ProductSalesDailyModel.owner_username == owner_username,
-                ProductSalesDailyModel.store_id.in_(synced_store_ids or {-1}),
-                ProductSalesDailyModel.manage_number.in_(product_keys or {""}),
-                ProductSalesDailyModel.sales_date >= cutoff_date,
-                ProductSalesDailyModel.sales_date <= period_end_date,
+            for row in rows
+            if row.store_id in synced_store_ids
+        }
+        cutoff_date, period_end_date = sales_period_range
+        sales_counts = {
+            (int(result.store_id), str(result.manage_number)): int(
+                result.effective_units or 0
             )
-            .group_by(
-                ProductSalesDailyModel.store_id,
-                ProductSalesDailyModel.manage_number,
+            for result in session.execute(
+                select(
+                    ProductSalesDailyModel.store_id,
+                    ProductSalesDailyModel.manage_number,
+                    func.sum(
+                        ProductSalesDailyModel.effective_units
+                    ).label("effective_units"),
+                )
+                .where(
+                    ProductSalesDailyModel.owner_username == owner_username,
+                    ProductSalesDailyModel.store_id.in_(
+                        synced_store_ids or {-1}
+                    ),
+                    ProductSalesDailyModel.manage_number.in_(
+                        product_keys or {""}
+                    ),
+                    ProductSalesDailyModel.sales_date >= cutoff_date,
+                    ProductSalesDailyModel.sales_date <= period_end_date,
+                )
+                .group_by(
+                    ProductSalesDailyModel.store_id,
+                    ProductSalesDailyModel.manage_number,
+                )
             )
-        )
-    }
+        }
     return [
         product_to_public(
             row,
             period_sales_count=(
-                sales_counts.get(
-                    (
-                        int(row.store_id),
-                        canonical_sales_order_item_product_key(
-                            manage_number=row.rakuten_manage_number,
-                            item_number=row.item_number,
+                period_sales_counts.get(int(row.id))
+                if period_sales_counts is not None
+                else (
+                    sales_counts.get(
+                        (
+                            int(row.store_id),
+                            canonical_sales_order_item_product_key(
+                                manage_number=row.rakuten_manage_number,
+                                item_number=row.item_number,
+                            ),
                         ),
-                    ),
-                    0,
+                        0,
+                    )
+                    if row.store_id in synced_store_ids
+                    else None
                 )
-                if row.store_id in synced_store_ids
-                else None
             ),
             title_optimization_count=title_optimization_counts.get(int(row.id), 0),
             title_optimization_task_id=title_optimization_task_ids.get(int(row.id)),
@@ -8059,7 +8233,13 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
     return result
 
 
-def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
+def list_sync_tasks(
+    owner_username: str,
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    task_ids: list[str] | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
     dispatch_next_sync_task_safely()
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步", owner_username=owner_username)
@@ -8071,6 +8251,9 @@ def list_sync_tasks(owner_username: str, *, page: int | None = None, page_size: 
                 SyncTaskModel.status != "preview_ready",
             ),
         )
+        normalized_task_ids = normalize_task_ids(task_ids or [])
+        if normalized_task_ids:
+            query = query.where(SyncTaskModel.id.in_(normalized_task_ids))
         return paginate_query(
             session,
             query,
@@ -15707,12 +15890,23 @@ def listing_status_result_summary(result: dict[str, Any], total_count: int, *, c
     }
 
 
-def list_listing_tasks(owner_username: str, *, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
+def list_listing_tasks(
+    owner_username: str,
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    task_ids: list[str] | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
     dispatch_next_listing_task_safely()
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架", owner_username=owner_username)
         reconcile_interrupted_running_tasks(session, ListingTaskModel, owner_username=owner_username)
         query = select(ListingTaskModel).where(ListingTaskModel.owner_username == owner_username)
+        normalized_task_ids = normalize_task_ids(task_ids or [])
+        if normalized_task_ids:
+            query = query.where(
+                ListingTaskModel.id.in_(normalized_task_ids)
+            )
         normalized_page, normalized_page_size = normalize_page_params(page, page_size)
         order_by = ListingTaskModel.created_at.desc()
         if not normalized_page_size:

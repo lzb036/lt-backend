@@ -22,6 +22,22 @@ from app.services.user_service import require_existing_account
 
 router = APIRouter(prefix="/crawler", tags=["crawler"])
 
+
+def parse_task_ids_filter(value: str | None) -> list[str] | None:
+    if not value:
+        return None
+    task_ids = list(dict.fromkeys(
+        item.strip()
+        for item in value.split(",")
+        if item.strip()
+    ))
+    if len(task_ids) > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="单次最多查询 100 个任务。",
+        )
+    return task_ids or None
+
 require_crawler_permission = require_permission("crawler.manage")
 require_products_permission = require_permission("products.manage")
 require_stores_permission = require_permission("stores.manage")
@@ -1319,9 +1335,15 @@ def list_store_empty_cabinet_folders(
 def list_sync_tasks(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
+    taskIds: str | None = Query(default=None),
     user: dict = Depends(require_products_or_stores_permission),
 ) -> dict:
-    result = crawler_service.list_sync_tasks(user["username"], page=page, page_size=pageSize)
+    result = crawler_service.list_sync_tasks(
+        user["username"],
+        page=page,
+        page_size=pageSize,
+        task_ids=parse_task_ids_filter(taskIds),
+    )
     if isinstance(result, dict):
         return result
     return {"syncTasks": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
@@ -1538,9 +1560,15 @@ def run_schedule(schedule_id: int, user: dict = Depends(require_crawler_permissi
 def list_listing_tasks(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
+    taskIds: str | None = Query(default=None),
     user: dict = Depends(require_products_permission),
 ) -> dict:
-    result = crawler_service.list_listing_tasks(user["username"], page=page, page_size=pageSize)
+    result = crawler_service.list_listing_tasks(
+        user["username"],
+        page=page,
+        page_size=pageSize,
+        task_ids=parse_task_ids_filter(taskIds),
+    )
     if isinstance(result, dict):
         return result
     return {"listingTasks": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
