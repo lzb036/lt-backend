@@ -85,6 +85,7 @@ def test_list_store_products_aggregates_effective_sales_for_selected_period(
                 rakuten_manage_number="manage-1",
                 item_number="item-1",
                 review_status="listed",
+                listed_at=datetime(2026, 7, 18, 10, 0, 0),
             ),
             ProductModel(
                 owner_username="alice",
@@ -95,6 +96,7 @@ def test_list_store_products_aggregates_effective_sales_for_selected_period(
                 rakuten_manage_number="manage-2",
                 item_number="item-2",
                 review_status="listed",
+                listed_at=datetime(2026, 7, 1, 10, 0, 0),
             ),
         ])
         session.add_all([
@@ -144,6 +146,16 @@ def test_list_store_products_aggregates_effective_sales_for_selected_period(
 
     assert sorted(row["periodSalesCount"] for row in week) == [1, 3]
     assert sorted(row["periodSalesCount"] for row in year) == [1, 8]
+    assert [row["rakutenManageNumber"] for row in week] == ["manage-2", "manage-1"]
+
+    sales_sorted = crawler_service.list_products(
+        "alice",
+        status="listed",
+        store_id=store_id,
+        sales_period_days=7,
+        sales_sort="desc",
+    )
+    assert [row["rakutenManageNumber"] for row in sales_sorted] == ["manage-1", "manage-2"]
 
     filtered = crawler_service.list_products(
         "alice",

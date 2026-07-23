@@ -7174,9 +7174,9 @@ def product_matches_listed_store_filter(row: ProductModel, listed_store_filter: 
 def product_list_order_by(status: str | None) -> tuple[Any, ...]:
     if status == "listed":
         return (
-            ProductModel.listed_at.desc(),
-            ProductModel.updated_at.desc(),
-            ProductModel.id.desc(),
+            ProductModel.listed_at.is_(None).asc(),
+            ProductModel.listed_at.asc(),
+            ProductModel.id.asc(),
         )
     return (ProductModel.created_at.desc(), ProductModel.id.desc())
 
