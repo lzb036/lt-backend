@@ -128,7 +128,7 @@ RAKUTEN_CABINET_FOLDERS_GET_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/
 RAKUTEN_CABINET_FOLDER_INSERT_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/folder/insert"
 RAKUTEN_INVENTORY_BULK_UPSERT_URL = "https://api.rms.rakuten.co.jp/es/2.1/inventories/bulk-upsert"
 RAKUTEN_ITEM_SEARCH_HITS = 100
-RAKUTEN_ITEM_SEARCH_MAX_FETCHED_ITEMS = 10000
+RAKUTEN_PRODUCT_COUNT_WARNING_THRESHOLD = 10000
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 RAKUTEN_WRITE_MAX_RETRIES = 5
 RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -4488,13 +4488,16 @@ def fetch_rakuten_store_items_with_total(
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     offset = 0
-    total_count: int | None = None
-    while offset < RAKUTEN_ITEM_SEARCH_MAX_FETCHED_ITEMS:
+    reported_total_count: int | None = None
+    while True:
         payload = request_rakuten_items_page(headers, offset)
-        total_count = total_count if total_count is not None else parse_rakuten_total_count(payload)
+        reported_total_count = (
+            reported_total_count
+            if reported_total_count is not None
+            else parse_rakuten_total_count(payload)
+        )
 
         page_items = extract_rakuten_item_candidates(payload)
-        new_count = 0
         for item in page_items:
             item_key = normalize_text(
                 first_text_from_keys(item, ("manageNumber", "itemNumber", "itemUrl", "itemPageUrl"))
@@ -4503,15 +4506,21 @@ def fetch_rakuten_store_items_with_total(
                 continue
             seen.add(item_key)
             items.append(item)
-            new_count += 1
+
+        raw_results = payload.get("results")
+        raw_page_count = len(raw_results) if isinstance(raw_results, list) else len(page_items)
         offset += RAKUTEN_ITEM_SEARCH_HITS
-        if not page_items:
+        if raw_page_count == 0:
             break
-        if total_count is not None and offset >= total_count:
+        if reported_total_count is not None and offset >= reported_total_count:
             break
-        if len(page_items) < RAKUTEN_ITEM_SEARCH_HITS:
+        if reported_total_count is None and raw_page_count < RAKUTEN_ITEM_SEARCH_HITS:
             break
-    return items, total_count
+
+    # Search results can temporarily contain manage-number-only entries for
+    # recently deleted products. They are not readable products and must not
+    # inflate store totals or prevent a complete local reconciliation.
+    return items, len(items)
 
 
 def request_rakuten_items_page(headers: dict[str, str], offset: int) -> dict[str, Any]:
@@ -7973,8 +7982,8 @@ def verify_store_credentials(
     if include_cabinet_usage:
         update_store_cabinet_usage(row, service_secret, license_key, checked_at=checked_at)
     if include_product_counts:
-        items, rakuten_total_count = fetch_rakuten_store_items_with_total(service_secret, license_key)
-        apply_store_product_counts(row, items, rakuten_total_count=rakuten_total_count, checked_at=checked_at)
+        items, _ = fetch_rakuten_store_items_with_total(service_secret, license_key)
+        apply_store_product_counts(row, items, checked_at=checked_at)
     row.last_checked_at = checked_at
     row.last_error = None
 
@@ -8010,18 +8019,15 @@ def apply_store_product_counts(
     row: StoreModel,
     items: list[dict[str, Any]],
     *,
-    rakuten_total_count: int | None = None,
     checked_at: datetime | None = None,
 ) -> None:
     fetched_count = len(items)
-    total_count = max(rakuten_total_count or fetched_count, fetched_count)
+    total_count = fetched_count
     listed_count = sum(1 for item in items if rakuten_listing_status_from_item(item) == "listed")
     row.rakuten_product_total_count = total_count
     row.rakuten_product_listed_count = listed_count
     row.rakuten_product_unlisted_count = max(0, fetched_count - listed_count)
-    row.rakuten_product_total_exceeds_limit = bool(
-        rakuten_total_count is not None and rakuten_total_count > RAKUTEN_ITEM_SEARCH_MAX_FETCHED_ITEMS
-    )
+    row.rakuten_product_total_exceeds_limit = total_count > RAKUTEN_PRODUCT_COUNT_WARNING_THRESHOLD
     row.last_checked_at = checked_at or datetime.now()
 
 
@@ -8098,7 +8104,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
         license_key = decrypt_text(row.rakuten_license_key_encrypted)
         verify_store_credentials(row, include_product_counts=False)
         items, rakuten_total_count = fetch_rakuten_store_items_with_total(service_secret, license_key)
-        apply_store_product_counts(row, items, rakuten_total_count=rakuten_total_count)
+        apply_store_product_counts(row, items)
         active_words = active_sensitive_words(session)
         local_rows = session.scalars(
             select(ProductModel).where(
