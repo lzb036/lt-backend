@@ -59,7 +59,6 @@ def test_store_product_counts_use_only_readable_items():
         rakuten_product_total_count=None,
         rakuten_product_listed_count=None,
         rakuten_product_unlisted_count=None,
-        rakuten_product_total_exceeds_limit=False,
         last_checked_at=None,
     )
     items = [
@@ -72,4 +71,3 @@ def test_store_product_counts_use_only_readable_items():
     assert row.rakuten_product_total_count == 2
     assert row.rakuten_product_listed_count == 1
     assert row.rakuten_product_unlisted_count == 1
-    assert row.rakuten_product_total_exceeds_limit is False

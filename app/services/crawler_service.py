@@ -128,7 +128,6 @@ RAKUTEN_CABINET_FOLDERS_GET_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/
 RAKUTEN_CABINET_FOLDER_INSERT_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/folder/insert"
 RAKUTEN_INVENTORY_BULK_UPSERT_URL = "https://api.rms.rakuten.co.jp/es/2.1/inventories/bulk-upsert"
 RAKUTEN_ITEM_SEARCH_HITS = 100
-RAKUTEN_PRODUCT_COUNT_WARNING_THRESHOLD = 10000
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 RAKUTEN_WRITE_MAX_RETRIES = 5
 RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -2440,7 +2439,6 @@ def store_to_public(
         "rakutenProductTotalCount": row.rakuten_product_total_count,
         "rakutenProductListedCount": row.rakuten_product_listed_count,
         "rakutenProductUnlistedCount": row.rakuten_product_unlisted_count,
-        "rakutenProductTotalExceedsLimit": bool(row.rakuten_product_total_exceeds_limit),
         "lastCheckedAt": checked_at.isoformat(sep=" ") if checked_at else None,
         "lastProductSyncedAt": product_synced_at.isoformat(sep=" ") if product_synced_at else None,
         "lastSyncedAt": product_synced_at.isoformat(sep=" ") if product_synced_at else None,
@@ -8027,7 +8025,6 @@ def apply_store_product_counts(
     row.rakuten_product_total_count = total_count
     row.rakuten_product_listed_count = listed_count
     row.rakuten_product_unlisted_count = max(0, fetched_count - listed_count)
-    row.rakuten_product_total_exceeds_limit = total_count > RAKUTEN_PRODUCT_COUNT_WARNING_THRESHOLD
     row.last_checked_at = checked_at or datetime.now()
 
 
