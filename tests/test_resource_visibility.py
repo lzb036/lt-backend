@@ -7,7 +7,7 @@ from unittest.mock import patch
 from fastapi.routing import APIRoute
 
 from app.api import crawler as crawler_api
-from app.core.auth import require_superadmin
+from app.core.auth import require_authenticated_account, require_superadmin
 from app.services import crawler_service
 
 
@@ -18,8 +18,6 @@ class ResourceVisibilityTests(unittest.TestCase):
             ("PUT", "/crawler/settings/time"),
             ("POST", "/crawler/settings/time/scheduled-task-cleanup/run"),
             ("POST", "/crawler/settings/time/unlisted-products/run"),
-            ("GET", "/crawler/settings/time/deleted-product-images"),
-            ("POST", "/crawler/settings/time/deleted-product-images/run"),
         }
         for method, path in expected_routes:
             route = next(
@@ -29,6 +27,26 @@ class ResourceVisibilityTests(unittest.TestCase):
             )
             dependency_calls = [dependency.call for dependency in route.dependant.dependencies]
             self.assertIn(require_superadmin, dependency_calls, f"{method} {path} should require superadmin")
+
+    def test_deleted_image_cleanup_routes_allow_authenticated_users(self) -> None:
+        expected_routes = {
+            ("GET", "/crawler/settings/time/deleted-product-images"),
+            ("GET", "/crawler/settings/time/deleted-product-images/config"),
+            ("PUT", "/crawler/settings/time/deleted-product-images/config"),
+            ("POST", "/crawler/settings/time/deleted-product-images/run"),
+        }
+        for method, path in expected_routes:
+            route = next(
+                route
+                for route in crawler_api.router.routes
+                if isinstance(route, APIRoute) and route.path == path and method in route.methods
+            )
+            dependency_calls = [dependency.call for dependency in route.dependant.dependencies]
+            self.assertIn(
+                require_authenticated_account,
+                dependency_calls,
+                f"{method} {path} should allow authenticated users",
+            )
 
     def test_superadmin_time_settings_include_queue_health(self) -> None:
         with patch.object(

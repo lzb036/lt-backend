@@ -12,7 +12,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from decimal import Decimal
 
-from app.core.auth import has_permission, require_any_permission, require_permission, require_superadmin
+from app.core.auth import (
+    has_permission,
+    require_any_permission,
+    require_authenticated_account,
+    require_permission,
+    require_superadmin,
+)
 from app.services import (
     crawler_service,
     sales_order_sync_history_service,
@@ -270,6 +276,12 @@ class TimeSettingsPayload(BaseModel):
     deletedImageCleanupTime: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
 
 
+class DeletedImageCleanupSettingsPayload(BaseModel):
+    deletedImageCleanupEnabled: bool = True
+    deletedImageCleanupWeekday: int = Field(default=5, ge=0, le=6)
+    deletedImageCleanupTime: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
+
+
 def visible_time_settings(user: dict, settings_payload: dict) -> dict:
     result = dict(settings_payload)
     if user.get("role") != "superadmin":
@@ -362,15 +374,51 @@ def run_unlisted_product_cleanup(user: dict = Depends(require_superadmin)) -> di
 def list_deleted_product_image_cleanups(
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=30, ge=1, le=500),
-    user: dict = Depends(require_superadmin),
+    user: dict = Depends(require_authenticated_account),
 ) -> dict:
-    return crawler_service.list_deleted_product_image_cleanups(page=page, page_size=pageSize)
+    return crawler_service.list_deleted_product_image_cleanups(
+        owner_username=None if user.get("role") == "superadmin" else user["username"],
+        page=page,
+        page_size=pageSize,
+    )
+
+
+@router.get("/settings/time/deleted-product-images/config")
+def get_deleted_product_image_cleanup_settings(
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    return {
+        "settings": crawler_service.get_deleted_product_image_cleanup_settings(
+            user["username"],
+        )
+    }
+
+
+@router.put("/settings/time/deleted-product-images/config")
+def update_deleted_product_image_cleanup_settings(
+    payload: DeletedImageCleanupSettingsPayload,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return {
+            "settings": crawler_service.save_deleted_product_image_cleanup_settings(
+                user["username"],
+                payload,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/settings/time/deleted-product-images/run")
-def run_deleted_product_image_cleanup(user: dict = Depends(require_superadmin)) -> dict:
+def run_deleted_product_image_cleanup(
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
     try:
-        return crawler_service.run_deleted_product_image_cleanup_now(include_queue_health=True)
+        return crawler_service.run_deleted_product_image_cleanup_now(
+            owner_username=None if user.get("role") == "superadmin" else user["username"],
+            include_queue_health=user.get("role") == "superadmin",
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

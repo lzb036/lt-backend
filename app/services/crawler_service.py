@@ -494,6 +494,7 @@ SCHEDULE_FALLBACK_SHOP_URL_KEY = "fallbackShopUrl"
 SCHEDULE_IMPORTED_NOTE_KEY = "importedSchedule"
 SCHEDULE_FALLBACK_TARGET_PREFIX = "__LT_FALLBACK_SHOP_URL__:"
 SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY = "scheduledCrawlTaskCleanup"
+DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX = "deletedProductImageCleanup:"
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY = 6
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME = "09:00"
 SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS = 7
@@ -6606,15 +6607,175 @@ def deleted_product_image_cleanup_to_public(row: DeletedProductImageCleanupModel
     }
 
 
+def deleted_product_image_cleanup_user_setting_key(owner_username: str) -> str:
+    return f"{DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX}{normalize_text(owner_username)}"
+
+
+def load_deleted_product_image_cleanup_user_payload(
+    row: SystemSettingModel | None,
+    fallback_payload: dict[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    try:
+        stored = json.loads(row.value_json or "{}") if row is not None else {}
+    except ValueError:
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}
+    enabled = bool(
+        stored.get(
+            "deletedImageCleanupEnabled",
+            fallback_payload.get("deletedImageCleanupEnabled", True),
+        )
+    )
+    weekday = normalize_cleanup_weekday(
+        stored.get(
+            "deletedImageCleanupWeekday",
+            fallback_payload.get(
+                "deletedImageCleanupWeekday",
+                DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_WEEKDAY,
+            ),
+        )
+    )
+    cleanup_time = normalize_schedule_time(
+        stored.get(
+            "deletedImageCleanupTime",
+            fallback_payload.get(
+                "deletedImageCleanupTime",
+                DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_TIME,
+            ),
+        )
+    )
+    next_at = parse_public_datetime(stored.get("deletedImageCleanupNextAt"))
+    if next_at is None:
+        next_at = next_weekly_run_at(weekday, cleanup_time, now=now)
+    return {
+        **stored,
+        "deletedImageCleanupEnabled": enabled,
+        "deletedImageCleanupWeekday": weekday,
+        "deletedImageCleanupTime": cleanup_time,
+        "deletedImageCleanupNextAt": datetime_to_public(next_at),
+        "deletedImageCleanupLastAt": datetime_to_public(
+            parse_public_datetime(stored.get("deletedImageCleanupLastAt"))
+        ),
+        "deletedImageCleanupLastProductCount": max(
+            0,
+            int(stored.get("deletedImageCleanupLastProductCount") or 0),
+        ),
+        "deletedImageCleanupLastTaskCount": max(
+            0,
+            int(stored.get("deletedImageCleanupLastTaskCount") or 0),
+        ),
+    }
+
+
+def get_deleted_product_image_cleanup_settings(
+    owner_username: str,
+) -> dict[str, Any]:
+    now = datetime.now()
+    base_settings = get_time_settings(include_queue_health=False)
+    with session_scope() as session:
+        global_row = session.get(
+            SystemSettingModel,
+            SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
+        )
+        fallback_payload = load_time_settings_payload(global_row, now=now)
+        setting_key = deleted_product_image_cleanup_user_setting_key(owner_username)
+        row = session.get(SystemSettingModel, setting_key)
+        personal_payload = load_deleted_product_image_cleanup_user_payload(
+            row,
+            fallback_payload,
+            now=now,
+        )
+        if row is None:
+            row = SystemSettingModel(
+                key=setting_key,
+                value_json=json.dumps(personal_payload, ensure_ascii=False),
+            )
+            session.add(row)
+            session.flush()
+        pending_count = session.scalar(
+            select(func.count())
+            .select_from(DeletedProductImageCleanupModel)
+            .where(DeletedProductImageCleanupModel.owner_username == owner_username)
+        ) or 0
+        return {
+            **base_settings,
+            **personal_payload,
+            "deletedImageCleanupPendingCount": max(0, int(pending_count)),
+            "queueHealth": None,
+            "updatedAt": datetime_to_public(row.updated_at),
+            "serverNow": datetime_to_public(now),
+        }
+
+
+def save_deleted_product_image_cleanup_settings(
+    owner_username: str,
+    payload: Any,
+) -> dict[str, Any]:
+    now = datetime.now()
+    weekday = normalize_cleanup_weekday(
+        getattr(
+            payload,
+            "deletedImageCleanupWeekday",
+            DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_WEEKDAY,
+        )
+    )
+    cleanup_time = normalize_schedule_time(
+        getattr(
+            payload,
+            "deletedImageCleanupTime",
+            DELETED_PRODUCT_IMAGE_CLEANUP_DEFAULT_TIME,
+        )
+    )
+    with session_scope() as session:
+        global_row = session.get(
+            SystemSettingModel,
+            SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
+        )
+        fallback_payload = load_time_settings_payload(global_row, now=now)
+        setting_key = deleted_product_image_cleanup_user_setting_key(owner_username)
+        row = session.get(SystemSettingModel, setting_key)
+        personal_payload = load_deleted_product_image_cleanup_user_payload(
+            row,
+            fallback_payload,
+            now=now,
+        )
+        personal_payload.update(
+            {
+                "deletedImageCleanupEnabled": bool(
+                    getattr(payload, "deletedImageCleanupEnabled", True)
+                ),
+                "deletedImageCleanupWeekday": weekday,
+                "deletedImageCleanupTime": cleanup_time,
+                "deletedImageCleanupNextAt": datetime_to_public(
+                    next_weekly_run_at(weekday, cleanup_time, now=now)
+                ),
+            }
+        )
+        if row is None:
+            row = SystemSettingModel(key=setting_key)
+            session.add(row)
+        row.value_json = json.dumps(personal_payload, ensure_ascii=False)
+    return get_deleted_product_image_cleanup_settings(owner_username)
+
+
 def list_deleted_product_image_cleanups(
     *,
+    owner_username: str | None = None,
     page: int | None = None,
     page_size: int | None = None,
 ) -> dict[str, Any]:
     with session_scope() as session:
+        query = select(DeletedProductImageCleanupModel)
+        if owner_username is not None:
+            query = query.where(
+                DeletedProductImageCleanupModel.owner_username == owner_username
+            )
         return paginate_query(
             session,
-            select(DeletedProductImageCleanupModel),
+            query,
             order_by=(DeletedProductImageCleanupModel.deleted_at.desc(), DeletedProductImageCleanupModel.id.desc()),
             page=page,
             page_size=page_size,
@@ -6623,21 +6784,48 @@ def list_deleted_product_image_cleanups(
         )
 
 
-def create_deleted_product_image_cleanup_tasks(session: Any, now: datetime) -> tuple[list[tuple[str, str]], int]:
-    queued_rows = session.scalars(
-        select(DeletedProductImageCleanupModel).where(
-            DeletedProductImageCleanupModel.status == "queued"
+def create_deleted_product_image_cleanup_tasks(
+    session: Any,
+    now: datetime,
+    *,
+    owner_username: str | None = None,
+    excluded_owner_usernames: set[str] | None = None,
+) -> tuple[list[tuple[str, str]], int]:
+    queued_query = select(DeletedProductImageCleanupModel).where(
+        DeletedProductImageCleanupModel.status == "queued"
+    )
+    if owner_username is not None:
+        queued_query = queued_query.where(
+            DeletedProductImageCleanupModel.owner_username == owner_username
         )
-    ).all()
+    elif excluded_owner_usernames:
+        queued_query = queued_query.where(
+            DeletedProductImageCleanupModel.owner_username.notin_(
+                excluded_owner_usernames
+            )
+        )
+    queued_rows = session.scalars(queued_query).all()
     for row in queued_rows:
         task = session.get(SyncTaskModel, row.sync_task_id) if row.sync_task_id else None
         if task is None or task.status not in {"queued", "running"}:
             row.status = "failed"
             row.sync_task_id = None
             row.last_error = "上次图片清理任务未完成，已重新进入待清理队列。"
+    pending_query = select(DeletedProductImageCleanupModel).where(
+        DeletedProductImageCleanupModel.status.in_(("pending", "failed"))
+    )
+    if owner_username is not None:
+        pending_query = pending_query.where(
+            DeletedProductImageCleanupModel.owner_username == owner_username
+        )
+    elif excluded_owner_usernames:
+        pending_query = pending_query.where(
+            DeletedProductImageCleanupModel.owner_username.notin_(
+                excluded_owner_usernames
+            )
+        )
     rows = session.scalars(
-        select(DeletedProductImageCleanupModel)
-        .where(DeletedProductImageCleanupModel.status.in_(("pending", "failed")))
+        pending_query
         .order_by(
             DeletedProductImageCleanupModel.owner_username.asc(),
             DeletedProductImageCleanupModel.store_id.asc(),
@@ -6688,48 +6876,140 @@ def create_deleted_product_image_cleanup_tasks(session: Any, now: datetime) -> t
     return task_refs, record_count
 
 
-def cleanup_deleted_product_images(*, force: bool = False) -> dict[str, int]:
+def cleanup_deleted_product_images_scope(
+    *,
+    force: bool,
+    owner_username: str | None,
+    excluded_owner_usernames: set[str] | None = None,
+) -> tuple[dict[str, int], list[tuple[str, str]]]:
+    now = datetime.now()
+    with session_scope() as session:
+        global_row = session.get(
+            SystemSettingModel,
+            SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
+        )
+        global_payload = load_time_settings_payload(global_row, now=now)
+        if owner_username is None:
+            settings_row = upsert_time_settings_row(session, global_payload)
+            payload = global_payload
+        else:
+            setting_key = deleted_product_image_cleanup_user_setting_key(
+                owner_username
+            )
+            settings_row = session.get(SystemSettingModel, setting_key)
+            payload = load_deleted_product_image_cleanup_user_payload(
+                settings_row,
+                global_payload,
+                now=now,
+            )
+            if settings_row is None:
+                settings_row = SystemSettingModel(key=setting_key)
+                session.add(settings_row)
+        next_at = parse_public_datetime(payload.get("deletedImageCleanupNextAt"))
+        if not force and (
+            not payload["deletedImageCleanupEnabled"]
+            or (next_at is not None and next_at > now)
+        ):
+            return {"taskCount": 0, "productCount": 0}, []
+        task_refs, product_count = create_deleted_product_image_cleanup_tasks(
+            session,
+            now,
+            owner_username=owner_username,
+            excluded_owner_usernames=excluded_owner_usernames,
+        )
+        payload["deletedImageCleanupLastAt"] = datetime_to_public(now)
+        payload["deletedImageCleanupLastProductCount"] = product_count
+        payload["deletedImageCleanupLastTaskCount"] = len(task_refs)
+        payload["deletedImageCleanupNextAt"] = datetime_to_public(
+            next_weekly_run_at(
+                payload["deletedImageCleanupWeekday"],
+                payload["deletedImageCleanupTime"],
+                now=now,
+            )
+        )
+        settings_row.value_json = json.dumps(payload, ensure_ascii=False)
+    return {
+        "taskCount": len(task_refs),
+        "productCount": product_count,
+    }, task_refs
+
+
+def cleanup_deleted_product_images(
+    *,
+    force: bool = False,
+    owner_username: str | None = None,
+) -> dict[str, int]:
     if not DELETED_PRODUCT_IMAGE_CLEANUP_LOCK.acquire(blocking=False):
         return {"taskCount": 0, "productCount": 0}
     try:
-        now = datetime.now()
-        with session_scope() as session:
-            settings_row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
-            payload = load_time_settings_payload(settings_row, now=now)
-            settings_row = upsert_time_settings_row(session, payload)
-            next_at = parse_public_datetime(payload.get("deletedImageCleanupNextAt"))
-            if not force and (
-                not payload["deletedImageCleanupEnabled"]
-                or (next_at is not None and next_at > now)
-            ):
-                return {"taskCount": 0, "productCount": 0}
-            task_refs, product_count = create_deleted_product_image_cleanup_tasks(session, now)
-            payload["deletedImageCleanupLastAt"] = datetime_to_public(now)
-            payload["deletedImageCleanupLastProductCount"] = product_count
-            payload["deletedImageCleanupLastTaskCount"] = len(task_refs)
-            payload["deletedImageCleanupNextAt"] = datetime_to_public(
-                next_weekly_run_at(
-                    payload["deletedImageCleanupWeekday"],
-                    payload["deletedImageCleanupTime"],
-                    now=now,
-                )
+        summaries: list[dict[str, int]] = []
+        task_refs: list[tuple[str, str]] = []
+        if owner_username is not None or force:
+            summary, scoped_refs = cleanup_deleted_product_images_scope(
+                force=force,
+                owner_username=owner_username,
             )
-            settings_row.value_json = json.dumps(payload, ensure_ascii=False)
-        for owner_username, task_id in task_refs:
+            summaries.append(summary)
+            task_refs.extend(scoped_refs)
+        else:
+            with session_scope() as session:
+                setting_keys = session.scalars(
+                    select(SystemSettingModel.key).where(
+                        SystemSettingModel.key.like(
+                            f"{DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX}%"
+                        )
+                    )
+                ).all()
+            personal_owners = {
+                str(key)[len(DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX):]
+                for key in setting_keys
+                if str(key).startswith(
+                    DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX
+                )
+            }
+            summary, scoped_refs = cleanup_deleted_product_images_scope(
+                force=False,
+                owner_username=None,
+                excluded_owner_usernames=personal_owners,
+            )
+            summaries.append(summary)
+            task_refs.extend(scoped_refs)
+            for personal_owner in sorted(personal_owners):
+                summary, scoped_refs = cleanup_deleted_product_images_scope(
+                    force=False,
+                    owner_username=personal_owner,
+                )
+                summaries.append(summary)
+                task_refs.extend(scoped_refs)
+        for task_owner, task_id in task_refs:
             dispatch_sync_task(
-                owner_username,
+                task_owner,
                 task_id,
                 task_type="deleted_product_image_cleanup",
             )
-        return {"taskCount": len(task_refs), "productCount": product_count}
+        return {
+            "taskCount": sum(item["taskCount"] for item in summaries),
+            "productCount": sum(item["productCount"] for item in summaries),
+        }
     finally:
         DELETED_PRODUCT_IMAGE_CLEANUP_LOCK.release()
 
 
-def run_deleted_product_image_cleanup_now(*, include_queue_health: bool = True) -> dict[str, Any]:
-    summary = cleanup_deleted_product_images(force=True)
+def run_deleted_product_image_cleanup_now(
+    *,
+    owner_username: str | None = None,
+    include_queue_health: bool = True,
+) -> dict[str, Any]:
+    summary = cleanup_deleted_product_images(
+        force=True,
+        owner_username=owner_username,
+    )
     return {
-        "settings": get_time_settings(include_queue_health=include_queue_health),
+        "settings": (
+            get_time_settings(include_queue_health=include_queue_health)
+            if owner_username is None
+            else get_deleted_product_image_cleanup_settings(owner_username)
+        ),
         "summary": summary,
     }
 
