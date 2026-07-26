@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from typing import Any
 
@@ -32,6 +33,8 @@ SUPERADMIN_PERMISSIONS = [
 KNOWN_PERMISSIONS = set(SUPERADMIN_PERMISSIONS)
 CRAWL_PRICE_OPERATORS = {"all", "gt", "gte", "lt", "lte", "range"}
 CRAWL_PRICE_MAX_VALUE = 10_000_000
+PAGINATION_PREFERENCE_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9:._-]{0,127}$")
+MAX_PAGINATION_PREFERENCES = 100
 
 
 def normalize_username(value: Any) -> str:
@@ -118,6 +121,37 @@ def parse_permissions_json(value: str | None, *, role: str = "operator") -> list
     return normalize_permissions(raw_value, role=role)
 
 
+def normalize_pagination_preferences(value: Any) -> dict[str, int]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "{}")
+        except ValueError:
+            value = {}
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, int] = {}
+    for raw_key, raw_page_size in value.items():
+        key = str(raw_key or "").strip()
+        if not PAGINATION_PREFERENCE_KEY_PATTERN.fullmatch(key):
+            continue
+        try:
+            page_size = int(raw_page_size)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= page_size <= MAX_PAGE_SIZE:
+            normalized[key] = page_size
+        if len(normalized) >= MAX_PAGINATION_PREFERENCES:
+            break
+    return normalized
+
+
+def normalize_pagination_preference_key(value: Any) -> str:
+    key = str(value or "").strip()
+    if not PAGINATION_PREFERENCE_KEY_PATTERN.fullmatch(key):
+        raise RuntimeError("分页列表标识无效。")
+    return key
+
+
 def permissions_to_flags(permissions: list[str], *, role: str) -> dict[str, bool]:
     permission_set = set(permissions)
     return {
@@ -198,10 +232,14 @@ def crawl_min_price_from_rule(rule: dict[str, Any]) -> int:
     return 0
 
 
-def account_to_public(row: UserAccountModel) -> dict[str, Any]:
+def account_to_public(
+    row: UserAccountModel,
+    *,
+    include_pagination_preferences: bool = False,
+) -> dict[str, Any]:
     permissions = fixed_permissions_for_role(row.role)
     crawl_price_rule = account_crawl_price_rule(row)
-    return {
+    payload = {
         "username": row.username,
         "displayName": row.display_name or row.username,
         "role": row.role,
@@ -213,6 +251,11 @@ def account_to_public(row: UserAccountModel) -> dict[str, Any]:
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
         "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
     }
+    if include_pagination_preferences:
+        payload["paginationPreferences"] = normalize_pagination_preferences(
+            row.pagination_preferences_json
+        )
+    return payload
 
 
 def ensure_initial_superadmin() -> None:
@@ -254,7 +297,7 @@ def verify_account_login(username: str, password: str) -> dict[str, Any] | None:
             iterations=row.password_iterations,
         ):
             return None
-        return account_to_public(row)
+        return account_to_public(row, include_pagination_preferences=True)
 
 
 def require_existing_account(username: str) -> dict[str, Any]:
@@ -262,7 +305,7 @@ def require_existing_account(username: str) -> dict[str, Any]:
         row = session.get(UserAccountModel, normalize_username(username))
         if row is None or not row.enabled:
             raise RuntimeError("用户不存在或已停用。")
-        return account_to_public(row)
+        return account_to_public(row, include_pagination_preferences=True)
 
 
 def get_crawl_settings(username: str) -> dict[str, Any]:
@@ -300,6 +343,26 @@ def update_crawl_settings(
             "crawlMinPrice": row.crawl_min_price,
             "crawlPriceRule": rule,
         }
+
+
+def update_pagination_preference(username: str, list_key: Any, page_size: Any) -> dict[str, int]:
+    normalized_key = normalize_pagination_preference_key(list_key)
+    try:
+        normalized_page_size = int(page_size)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("分页数量必须是整数。") from exc
+    if normalized_page_size < 1 or normalized_page_size > MAX_PAGE_SIZE:
+        raise RuntimeError(f"分页数量必须在 1 至 {MAX_PAGE_SIZE} 之间。")
+
+    with session_scope() as session:
+        row = session.get(UserAccountModel, normalize_username(username))
+        if row is None or not row.enabled:
+            raise RuntimeError("用户不存在或已停用。")
+        preferences = normalize_pagination_preferences(row.pagination_preferences_json)
+        preferences[normalized_key] = normalized_page_size
+        row.pagination_preferences_json = json.dumps(preferences, ensure_ascii=False, sort_keys=True)
+        session.flush()
+        return preferences
 
 
 def list_users(*, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:

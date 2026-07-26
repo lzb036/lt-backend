@@ -43,6 +43,11 @@ class CrawlSettingsUpdate(BaseModel):
     crawlPriceRule: CrawlPriceRuleUpdate | None = None
 
 
+class PaginationPreferenceUpdate(BaseModel):
+    listKey: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9:._-]*$")
+    pageSize: int = Field(ge=1, le=500)
+
+
 @router.get("/secrets")
 def get_profile(user: dict = Depends(require_authenticated_account)) -> dict:
     return {"profile": profile_service.get_profile(user["username"])}
@@ -77,6 +82,23 @@ def update_crawl_settings(
                 user["username"],
                 crawl_price_rule=payload.crawlPriceRule.model_dump() if payload.crawlPriceRule else None,
                 crawl_min_price=payload.crawlMinPrice,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/pagination-preferences")
+def update_pagination_preference(
+    payload: PaginationPreferenceUpdate,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    try:
+        return {
+            "paginationPreferences": user_service.update_pagination_preference(
+                user["username"],
+                payload.listKey,
+                payload.pageSize,
             )
         }
     except RuntimeError as exc:

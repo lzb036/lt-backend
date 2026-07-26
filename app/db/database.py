@@ -965,6 +965,20 @@ def ensure_schema_compatibility() -> None:
                 )
             )
             connection.execute(text("ALTER TABLE lt_user_accounts MODIFY COLUMN crawl_price_rule_json TEXT NOT NULL"))
+        if user_columns and "pagination_preferences_json" not in user_columns:
+            connection.execute(text("ALTER TABLE lt_user_accounts ADD COLUMN pagination_preferences_json TEXT NULL"))
+            connection.execute(
+                text(
+                    """
+                    UPDATE lt_user_accounts
+                    SET pagination_preferences_json = '{}'
+                    WHERE pagination_preferences_json IS NULL OR pagination_preferences_json = ''
+                    """
+                )
+            )
+            connection.execute(
+                text("ALTER TABLE lt_user_accounts MODIFY COLUMN pagination_preferences_json TEXT NOT NULL")
+            )
 
         store_columns = set(
             connection.execute(
