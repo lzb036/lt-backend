@@ -594,7 +594,7 @@ def list_products(
     salesMax: int | None = Query(default=None, ge=0),
     zeroFilter: str | None = Query(
         default=None,
-        pattern="^(sales|optimization|sales_and_optimization)$",
+        pattern="^(|sales|optimization|sales_and_optimization)$",
     ),
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
