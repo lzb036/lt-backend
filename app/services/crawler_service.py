@@ -3666,18 +3666,18 @@ def specialized_sync_task_wait_reason(
             .where(UserAccountModel.username == task.owner_username)
             .with_for_update()
         ).first()
-        running_count = int(
-            session.scalar(
-                select(func.count()).where(
-                    SyncTaskModel.owner_username == task.owner_username,
-                    SyncTaskModel.task_type.in_(TITLE_OPTIMIZATION_TASK_TYPES),
-                    SyncTaskModel.status == "running",
-                    SyncTaskModel.id != task.id,
-                )
+        running_task_id = session.scalar(
+            select(SyncTaskModel.id)
+            .where(
+                SyncTaskModel.owner_username == task.owner_username,
+                SyncTaskModel.task_type.in_(TITLE_OPTIMIZATION_TASK_TYPES),
+                SyncTaskModel.status == "running",
+                SyncTaskModel.id != task.id,
             )
-            or 0
+            .limit(1)
+            .with_for_update()
         )
-        if running_count > 0:
+        if running_task_id is not None:
             return "排队中，等待该用户当前标题优化任务完成"
     if task_type in IMAGE_CLEANUP_TASK_TYPES and task.store_id is not None:
         session.execute(
@@ -3685,18 +3685,18 @@ def specialized_sync_task_wait_reason(
             .where(StoreModel.id == task.store_id)
             .with_for_update()
         ).first()
-        running_count = int(
-            session.scalar(
-                select(func.count()).where(
-                    SyncTaskModel.store_id == task.store_id,
-                    SyncTaskModel.task_type.in_(IMAGE_CLEANUP_TASK_TYPES),
-                    SyncTaskModel.status == "running",
-                    SyncTaskModel.id != task.id,
-                )
+        running_task_id = session.scalar(
+            select(SyncTaskModel.id)
+            .where(
+                SyncTaskModel.store_id == task.store_id,
+                SyncTaskModel.task_type.in_(IMAGE_CLEANUP_TASK_TYPES),
+                SyncTaskModel.status == "running",
+                SyncTaskModel.id != task.id,
             )
-            or 0
+            .limit(1)
+            .with_for_update()
         )
-        if running_count > 0:
+        if running_task_id is not None:
             return "排队中，等待该店铺当前图片清理任务完成"
     return ""
 

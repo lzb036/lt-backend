@@ -6,6 +6,7 @@ import json
 
 import pytest
 from sqlalchemy import create_engine, select
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
@@ -329,6 +330,32 @@ def test_specialized_wait_rules_are_scoped_by_user_and_store(
             session,
             session.get(SyncTaskModel, "image-other-store"),
         ) == ""
+
+
+def test_specialized_running_task_reads_use_mysql_row_locks():
+    title_query = (
+        select(SyncTaskModel.id)
+        .where(
+            SyncTaskModel.owner_username == "alice",
+            SyncTaskModel.task_type.in_(crawler_service.TITLE_OPTIMIZATION_TASK_TYPES),
+            SyncTaskModel.status == "running",
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    image_query = (
+        select(SyncTaskModel.id)
+        .where(
+            SyncTaskModel.store_id == 7,
+            SyncTaskModel.task_type.in_(crawler_service.IMAGE_CLEANUP_TASK_TYPES),
+            SyncTaskModel.status == "running",
+        )
+        .limit(1)
+        .with_for_update()
+    )
+
+    assert "FOR UPDATE" in str(title_query.compile(dialect=mysql.dialect()))
+    assert "FOR UPDATE" in str(image_query.compile(dialect=mysql.dialect()))
 
 
 def test_task_groups_keep_normal_sync_separate(
