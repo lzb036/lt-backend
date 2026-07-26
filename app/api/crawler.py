@@ -44,6 +44,11 @@ require_stores_permission = require_permission("stores.manage")
 require_settings_permission = require_permission("settings.manage")
 require_ai_permission = require_permission("ai.manage")
 require_products_or_stores_permission = require_any_permission("products.manage", "stores.manage")
+require_task_management_permission = require_any_permission(
+    "products.manage",
+    "stores.manage",
+    "ai.manage",
+)
 
 
 def serialize_sse_event(event: dict) -> bytes:
@@ -1341,13 +1346,21 @@ def list_sync_tasks(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
     taskIds: str | None = Query(default=None),
-    user: dict = Depends(require_products_or_stores_permission),
+    taskGroup: str = Query(
+        default="sync",
+        pattern="^(sync|title_optimization|image_cleanup)$",
+    ),
+    user: dict = Depends(require_task_management_permission),
 ) -> dict:
+    if taskGroup == "image_cleanup" and user.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="需要超级管理员权限")
     result = crawler_service.list_sync_tasks(
         user["username"],
         page=page,
         page_size=pageSize,
         task_ids=parse_task_ids_filter(taskIds),
+        task_group=taskGroup,
+        all_owners=taskGroup == "image_cleanup" and user.get("role") == "superadmin",
     )
     if isinstance(result, dict):
         return result
@@ -1355,27 +1368,39 @@ def list_sync_tasks(
 
 
 @router.post("/sync-tasks/{task_id}/retry")
-def retry_sync_task(task_id: str, user: dict = Depends(require_products_or_stores_permission)) -> dict:
+def retry_sync_task(task_id: str, user: dict = Depends(require_task_management_permission)) -> dict:
     try:
-        task = crawler_service.retry_sync_task(user["username"], task_id)
+        task = crawler_service.retry_sync_task(
+            user["username"],
+            task_id,
+            allow_all_owners=user.get("role") == "superadmin",
+        )
         return {"syncTask": task}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/sync-tasks/{task_id}/cancel")
-def cancel_sync_task(task_id: str, user: dict = Depends(require_products_or_stores_permission)) -> dict:
+def cancel_sync_task(task_id: str, user: dict = Depends(require_task_management_permission)) -> dict:
     try:
-        task = crawler_service.cancel_sync_task(user["username"], task_id)
+        task = crawler_service.cancel_sync_task(
+            user["username"],
+            task_id,
+            allow_all_owners=user.get("role") == "superadmin",
+        )
         return {"syncTask": task}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.api_route("/sync-tasks", methods=["DELETE"])
-def delete_sync_tasks(payload: TaskDeletePayload, user: dict = Depends(require_products_or_stores_permission)) -> dict:
+def delete_sync_tasks(payload: TaskDeletePayload, user: dict = Depends(require_task_management_permission)) -> dict:
     try:
-        return crawler_service.delete_sync_tasks(user["username"], payload.taskIds)
+        return crawler_service.delete_sync_tasks(
+            user["username"],
+            payload.taskIds,
+            allow_all_owners=user.get("role") == "superadmin",
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

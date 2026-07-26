@@ -140,6 +140,43 @@ def test_time_settings_include_deleted_image_cleanup_pending_count(monkeypatch, 
     assert settings["deletedImageCleanupPendingCount"] == 3
 
 
+def test_deleted_image_cleanup_dispatches_each_batch_to_specialized_queue(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    store_id = seed_owner_store(session_factory)
+    with session_factory() as session:
+        session.add_all([
+            DeletedProductImageCleanupModel(
+                owner_username="alice",
+                store_id=store_id,
+                store_name="Shop",
+                original_product_id=3000 + index,
+                product_code=f"queued-{index}",
+            )
+            for index in range(51)
+        ])
+        session.commit()
+
+    dispatched = []
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_sync_task",
+        lambda owner, task_id, **kwargs: dispatched.append((owner, task_id, kwargs)),
+    )
+
+    summary = crawler_service.cleanup_deleted_product_images(force=True)
+
+    assert summary == {"taskCount": 2, "productCount": 51}
+    assert len(dispatched) == 2
+    assert all(owner == "alice" for owner, _, _ in dispatched)
+    assert all(
+        kwargs == {"task_type": "deleted_product_image_cleanup"}
+        for _, _, kwargs in dispatched
+    )
+
+
 def test_store_product_delete_queues_images_without_deleting_them(monkeypatch, session_factory):
     store_id = seed_owner_store(session_factory)
     monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value)

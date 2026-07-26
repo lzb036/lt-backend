@@ -481,6 +481,9 @@ TASK_START_RETRY_DELAY_SECONDS = 5.0
 TASK_STALE_CANCEL_REQUEST_SECONDS = 10 * 60
 TASK_REDIS_MISSING_JOB_GRACE_SECONDS = 60
 TASK_QUEUED_REDIS_MISSING_JOB_GRACE_SECONDS = 2 * 60
+TITLE_OPTIMIZATION_TASK_TYPES = frozenset({"title_optimization"})
+IMAGE_CLEANUP_TASK_TYPES = frozenset({"deleted_product_image_cleanup"})
+SPECIALIZED_SYNC_TASK_TYPES = TITLE_OPTIMIZATION_TASK_TYPES | IMAGE_CLEANUP_TASK_TYPES
 CRAWL_DISPATCH_LOCK_NAME = "lt:crawl-dispatch"
 CRAWL_DISPATCH_LOCK_TIMEOUT_SECONDS = 30
 CRAWL_DISPATCH_LOCK_BLOCKING_TIMEOUT_SECONDS = 3
@@ -689,15 +692,47 @@ def dispatch_queued_crawl_tasks_safely(owner_username: str | None = None) -> int
         return 0
 
 
-def dispatch_sync_task(owner_username: str, task_id: str, *, delay_seconds: float = 0.0) -> None:
+def sync_task_queue_kind(task_type: str | None) -> str:
+    normalized_type = normalize_text(task_type)
+    if normalized_type in TITLE_OPTIMIZATION_TASK_TYPES:
+        return "title-optimization"
+    if normalized_type in IMAGE_CLEANUP_TASK_TYPES:
+        return "image-cleanup"
+    return "sync"
+
+
+def sync_task_type_label(task_type: str | None) -> str:
+    normalized_type = normalize_text(task_type)
+    if normalized_type in TITLE_OPTIMIZATION_TASK_TYPES:
+        return "标题优化任务"
+    if normalized_type in IMAGE_CLEANUP_TASK_TYPES:
+        return "图片清理任务"
+    return "同步任务"
+
+
+def sync_task_type_for_id(task_id: str) -> str:
+    with session_scope() as session:
+        task = session.get(SyncTaskModel, task_id)
+        return normalize_text(task.task_type) if task is not None else ""
+
+
+def dispatch_sync_task(
+    owner_username: str,
+    task_id: str,
+    *,
+    task_type: str | None = None,
+    delay_seconds: float = 0.0,
+) -> None:
+    resolved_task_type = normalize_text(task_type) or sync_task_type_for_id(task_id)
+    queue_kind = sync_task_queue_kind(resolved_task_type)
     if should_use_redis_task_queue():
         try:
             enqueue = enqueue_task_in if delay_seconds > 0 else enqueue_task
             enqueue_args = (delay_seconds, run_sync_task, owner_username, task_id) if delay_seconds > 0 else (run_sync_task, owner_username, task_id)
             enqueue(
                 *enqueue_args,
-                description=f"同步任务 {task_id}",
-                queue_name=task_queue_name_for_kind("sync"),
+                description=f"{sync_task_type_label(resolved_task_type)} {task_id}",
+                queue_name=task_queue_name_for_kind(queue_kind),
             )
         except Exception as exc:
             mark_background_task_dispatch_failed(SyncTaskModel, task_id, exc)
@@ -706,18 +741,25 @@ def dispatch_sync_task(owner_username: str, task_id: str, *, delay_seconds: floa
     start_background_task(run_sync_task, owner_username, task_id, delay_seconds=delay_seconds)
 
 
-def sync_task_has_active_background_job(task_id: str) -> bool:
+def sync_task_has_active_background_job(task_id: str, task_type: str | None = None) -> bool:
     if not should_use_redis_task_queue():
         return False
     try:
-        state = redis_task_states({str(task_id)}, "sync", job_id_prefixes=task_model_job_id_prefixes(SyncTaskModel)).get(str(task_id))
+        queue_kind = sync_task_queue_kind(
+            normalize_text(task_type) or sync_task_type_for_id(task_id)
+        )
+        state = redis_task_states(
+            {str(task_id)},
+            queue_kind,
+            job_id_prefixes=task_model_job_id_prefixes(SyncTaskModel),
+        ).get(str(task_id))
     except Exception:
         return False
     return state is not None and state.get("status") in {"queued", "started", "deferred", "scheduled"}
 
 
 def dispatch_next_sync_task() -> None:
-    next_task: tuple[str, str] | None = None
+    next_task: tuple[str, str, str] | None = None
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步")
         reconcile_interrupted_running_tasks(session, SyncTaskModel)
@@ -725,7 +767,10 @@ def dispatch_next_sync_task() -> None:
             return
         rows = session.scalars(
             select(SyncTaskModel)
-            .where(SyncTaskModel.status == "queued")
+            .where(
+                SyncTaskModel.status == "queued",
+                SyncTaskModel.task_type.notin_(SPECIALIZED_SYNC_TASK_TYPES),
+            )
             .order_by(SyncTaskModel.created_at.asc(), SyncTaskModel.id.asc())
         ).all()
         for task in rows:
@@ -735,15 +780,15 @@ def dispatch_next_sync_task() -> None:
                 task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
                 task.finished_at = datetime.now()
                 continue
-            if sync_task_has_active_background_job(task.id):
+            if sync_task_has_active_background_job(task.id, task.task_type):
                 return
             if running_store_task_count(session, task.store_id, exclude_sync_task_id=task.id) > 0:
                 task.message = "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
                 continue
-            next_task = (task.owner_username, task.id)
+            next_task = (task.owner_username, task.id, task.task_type or "store_sync")
             break
     if next_task:
-        dispatch_sync_task(next_task[0], next_task[1])
+        dispatch_sync_task(next_task[0], next_task[1], task_type=next_task[2])
 
 
 def dispatch_next_sync_task_safely() -> None:
@@ -2846,6 +2891,8 @@ def sync_task_payload(row: SyncTaskModel) -> dict[str, Any]:
 
 def sync_task_action_label(row: SyncTaskModel) -> str:
     task_type = row.task_type or "store_sync"
+    if task_type == "title_optimization":
+        return "标题优化"
     if task_type == "product_delete":
         return "删除"
     if task_type == "deleted_product_image_cleanup":
@@ -2945,9 +2992,30 @@ def reconcile_interrupted_running_tasks(
     rows = session.scalars(query).all()
     if not rows:
         return 0
-    task_ids = {str(row.id) for row in rows}
     try:
-        task_states = redis_task_states(task_ids, queue_kind, job_id_prefixes=task_model_job_id_prefixes(model))
+        if model is SyncTaskModel:
+            task_states: dict[str, dict[str, Any]] = {}
+            rows_by_queue: dict[str, set[str]] = {}
+            for row in rows:
+                rows_by_queue.setdefault(
+                    sync_task_queue_kind(row.task_type),
+                    set(),
+                ).add(str(row.id))
+            for row_queue_kind, task_ids in rows_by_queue.items():
+                task_states.update(
+                    redis_task_states(
+                        task_ids,
+                        row_queue_kind,
+                        job_id_prefixes=task_model_job_id_prefixes(model),
+                    )
+                )
+        else:
+            task_ids = {str(row.id) for row in rows}
+            task_states = redis_task_states(
+                task_ids,
+                queue_kind,
+                job_id_prefixes=task_model_job_id_prefixes(model),
+            )
     except Exception:
         return 0
     finalized = 0
@@ -3123,9 +3191,30 @@ def reconcile_missing_queued_tasks(
             and (state := reserved_crawl_job_state(connection, row.queue_job_id)) is not None
         }
     else:
-        task_ids = {str(row.id) for row in rows}
         try:
-            task_states = redis_task_states(task_ids, queue_kind, job_id_prefixes=task_model_job_id_prefixes(model))
+            if model is SyncTaskModel:
+                task_states = {}
+                rows_by_queue: dict[str, set[str]] = {}
+                for row in rows:
+                    rows_by_queue.setdefault(
+                        sync_task_queue_kind(row.task_type),
+                        set(),
+                    ).add(str(row.id))
+                for row_queue_kind, task_ids in rows_by_queue.items():
+                    task_states.update(
+                        redis_task_states(
+                            task_ids,
+                            row_queue_kind,
+                            job_id_prefixes=task_model_job_id_prefixes(model),
+                        )
+                    )
+            else:
+                task_ids = {str(row.id) for row in rows}
+                task_states = redis_task_states(
+                    task_ids,
+                    queue_kind,
+                    job_id_prefixes=task_model_job_id_prefixes(model),
+                )
         except Exception:
             return 0
     requeued = 0
@@ -3557,10 +3646,59 @@ def running_user_task_count(
 
 
 def running_sync_task_count(session: Any, *, exclude_task_id: str | None = None) -> int:
-    query = select(func.count()).where(SyncTaskModel.status == "running")
+    query = select(func.count()).where(
+        SyncTaskModel.status == "running",
+        SyncTaskModel.task_type.notin_(SPECIALIZED_SYNC_TASK_TYPES),
+    )
     if exclude_task_id:
         query = query.where(SyncTaskModel.id != exclude_task_id)
     return int(session.scalar(query) or 0)
+
+
+def specialized_sync_task_wait_reason(
+    session: Any,
+    task: SyncTaskModel,
+) -> str:
+    task_type = normalize_text(task.task_type)
+    if task_type in TITLE_OPTIMIZATION_TASK_TYPES:
+        session.execute(
+            select(UserAccountModel.username)
+            .where(UserAccountModel.username == task.owner_username)
+            .with_for_update()
+        ).first()
+        running_count = int(
+            session.scalar(
+                select(func.count()).where(
+                    SyncTaskModel.owner_username == task.owner_username,
+                    SyncTaskModel.task_type.in_(TITLE_OPTIMIZATION_TASK_TYPES),
+                    SyncTaskModel.status == "running",
+                    SyncTaskModel.id != task.id,
+                )
+            )
+            or 0
+        )
+        if running_count > 0:
+            return "排队中，等待该用户当前标题优化任务完成"
+    if task_type in IMAGE_CLEANUP_TASK_TYPES and task.store_id is not None:
+        session.execute(
+            select(StoreModel.id)
+            .where(StoreModel.id == task.store_id)
+            .with_for_update()
+        ).first()
+        running_count = int(
+            session.scalar(
+                select(func.count()).where(
+                    SyncTaskModel.store_id == task.store_id,
+                    SyncTaskModel.task_type.in_(IMAGE_CLEANUP_TASK_TYPES),
+                    SyncTaskModel.status == "running",
+                    SyncTaskModel.id != task.id,
+                )
+            )
+            or 0
+        )
+        if running_count > 0:
+            return "排队中，等待该店铺当前图片清理任务完成"
+    return ""
 
 
 def running_listing_task_count(session: Any, *, exclude_task_id: str | None = None) -> int:
@@ -3614,6 +3752,7 @@ def running_store_task_count(
     sync_query = select(func.count()).where(
         SyncTaskModel.store_id == store_id,
         SyncTaskModel.status == "running",
+        SyncTaskModel.task_type.notin_(SPECIALIZED_SYNC_TASK_TYPES),
     )
     if exclude_sync_task_id:
         sync_query = sync_query.where(SyncTaskModel.id != exclude_sync_task_id)
@@ -6576,8 +6715,12 @@ def cleanup_deleted_product_images(*, force: bool = False) -> dict[str, int]:
                 )
             )
             settings_row.value_json = json.dumps(payload, ensure_ascii=False)
-        if task_refs:
-            dispatch_next_sync_task()
+        for owner_username, task_id in task_refs:
+            dispatch_sync_task(
+                owner_username,
+                task_id,
+                task_type="deleted_product_image_cleanup",
+            )
         return {"taskCount": len(task_refs), "productCount": product_count}
     finally:
         DELETED_PRODUCT_IMAGE_CLEANUP_LOCK.release()
@@ -7088,8 +7231,25 @@ def cancel_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
     return result
 
 
-def cancel_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
-    result = request_task_cancel(SyncTaskModel, owner_username, task_id, serializer=sync_task_to_public)
+def cancel_sync_task(
+    owner_username: str,
+    task_id: str,
+    *,
+    allow_all_owners: bool = False,
+) -> dict[str, Any]:
+    task_owner = owner_username
+    if allow_all_owners:
+        with session_scope() as session:
+            task = session.get(SyncTaskModel, task_id)
+            if task is None:
+                raise RuntimeError("同步任务不存在。")
+            task_owner = task.owner_username
+    result = request_task_cancel(
+        SyncTaskModel,
+        task_owner,
+        task_id,
+        serializer=sync_task_to_public,
+    )
     dispatch_next_sync_task_safely()
     dispatch_next_listing_task_safely()
     return result
@@ -8276,21 +8436,48 @@ def list_sync_tasks(
     page: int | None = None,
     page_size: int | None = None,
     task_ids: list[str] | None = None,
+    task_group: str = "sync",
+    all_owners: bool = False,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     dispatch_next_sync_task_safely()
+    normalized_group = normalize_text(task_group) or "sync"
+    if normalized_group not in {"sync", "title_optimization", "image_cleanup"}:
+        raise RuntimeError("任务分组无效。")
     with session_scope() as session:
-        finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步", owner_username=owner_username)
-        reconcile_interrupted_running_tasks(session, SyncTaskModel, owner_username=owner_username)
-        query = select(SyncTaskModel).where(
-            SyncTaskModel.owner_username == owner_username,
-            or_(
-                SyncTaskModel.task_type != "product_replace",
-                SyncTaskModel.status != "preview_ready",
-            ),
+        scoped_owner = None if all_owners else owner_username
+        finalize_stale_cancel_requested_tasks(
+            session,
+            SyncTaskModel,
+            action_label="任务",
+            owner_username=scoped_owner,
         )
+        reconcile_interrupted_running_tasks(
+            session,
+            SyncTaskModel,
+            owner_username=scoped_owner,
+        )
+        query = select(SyncTaskModel)
+        if not all_owners:
+            query = query.where(SyncTaskModel.owner_username == owner_username)
         normalized_task_ids = normalize_task_ids(task_ids) if task_ids else []
         if normalized_task_ids:
             query = query.where(SyncTaskModel.id.in_(normalized_task_ids))
+        elif normalized_group == "title_optimization":
+            query = query.where(
+                SyncTaskModel.task_type.in_(TITLE_OPTIMIZATION_TASK_TYPES)
+            )
+        elif normalized_group == "image_cleanup":
+            query = query.where(
+                SyncTaskModel.task_type.in_(IMAGE_CLEANUP_TASK_TYPES)
+            )
+        else:
+            query = query.where(
+                SyncTaskModel.task_type.notin_(SPECIALIZED_SYNC_TASK_TYPES),
+                or_(
+                    SyncTaskModel.task_type != "product_replace",
+                    SyncTaskModel.status != "preview_ready",
+                ),
+            )
         return paginate_query(
             session,
             query,
@@ -8306,15 +8493,20 @@ def sync_task_visible_in_list(task_type: str, status: str) -> bool:
     return not (normalize_text(task_type) == "product_replace" and normalize_text(status) == "preview_ready")
 
 
-def delete_sync_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
+def delete_sync_tasks(
+    owner_username: str,
+    task_ids: list[str],
+    *,
+    allow_all_owners: bool = False,
+) -> dict[str, Any]:
     normalized_ids = normalize_task_ids(task_ids)
     with session_scope() as session:
-        rows = session.scalars(
-            select(SyncTaskModel).where(
-                SyncTaskModel.owner_username == owner_username,
-                SyncTaskModel.id.in_(normalized_ids),
-            )
-        ).all()
+        query = select(SyncTaskModel).where(
+            SyncTaskModel.id.in_(normalized_ids),
+        )
+        if not allow_all_owners:
+            query = query.where(SyncTaskModel.owner_username == owner_username)
+        rows = session.scalars(query).all()
         found_ids = {row.id for row in rows}
         for row in rows:
             session.delete(row)
@@ -8484,7 +8676,11 @@ def create_product_title_optimization_task(
         session.add(task)
         session.flush()
 
-    dispatch_next_sync_task()
+    dispatch_sync_task(
+        owner_username,
+        task_id,
+        task_type="title_optimization",
+    )
     return created_sync_tasks_response(
         [task_id],
         message="批量标题优化任务已创建",
@@ -9361,7 +9557,12 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
             task.finished_at = datetime.now()
             return
-        wait_reason = sync_task_start_wait_reason(session, task_id, task.store_id)
+        task_type = task.task_type or "store_sync"
+        wait_reason = (
+            specialized_sync_task_wait_reason(session, task)
+            if task_type in SPECIALIZED_SYNC_TASK_TYPES
+            else sync_task_start_wait_reason(session, task_id, task.store_id)
+        )
         if wait_reason:
             task.message = wait_reason
             defer_start = True
@@ -9372,14 +9573,21 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
             task.started_at = datetime.now()
             task.finished_at = None
         store_id = task.store_id
-        task_type = task.task_type or "store_sync"
         try:
             payload = json.loads(task.payload_json or "{}")
         except ValueError:
             payload = {}
 
     if defer_start:
-        dispatch_next_sync_task_safely()
+        if task_type in SPECIALIZED_SYNC_TASK_TYPES:
+            dispatch_sync_task(
+                owner_username,
+                task_id,
+                task_type=task_type,
+                delay_seconds=TASK_START_RETRY_DELAY_SECONDS,
+            )
+        else:
+            dispatch_next_sync_task_safely()
         return
 
     try:
@@ -9813,24 +10021,44 @@ def perform_product_delete_sync(
     return result
 
 
-def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
+def retry_sync_task(
+    owner_username: str,
+    task_id: str,
+    *,
+    allow_all_owners: bool = False,
+) -> dict[str, Any]:
     with session_scope() as session:
         task = session.get(SyncTaskModel, task_id)
         if task is None:
             raise RuntimeError("同步任务不存在。")
-        if task.owner_username != owner_username:
+        if task.owner_username != owner_username and not allow_all_owners:
             raise RuntimeError("不能重试其他用户的同步任务。")
+        task_owner = task.owner_username
+        task_type = task.task_type
         if task.status in {"queued", "running"}:
             raise RuntimeError("同步任务正在执行中，不能重试。")
         if task.status == "success":
             raise RuntimeError("成功的同步任务不需要重试。")
         payload = sync_task_payload(task)
         result_payload = payload.get("result") if isinstance(payload.get("result"), dict) else {}
-        if task.task_type in {"product_delete", "product_listing_status"}:
+        if task.task_type in {
+            "product_delete",
+            "product_listing_status",
+            "title_optimization",
+        }:
             original_ids = normalize_product_ids(list(payload.get("productIds") or []))
             failed_ids = normalize_product_ids(list(result_payload.get("failedIds") or []))
             success_ids = set(normalize_product_ids(list(result_payload.get("successIds") or [])))
-            retry_ids = failed_ids or [product_id for product_id in original_ids if product_id not in success_ids]
+            retry_ids = normalize_product_ids(
+                [
+                    *failed_ids,
+                    *[
+                        product_id
+                        for product_id in original_ids
+                        if product_id not in success_ids
+                    ],
+                ]
+            )
             if not retry_ids:
                 raise RuntimeError("该同步任务没有可重试的失败商品。")
             payload["productIds"] = retry_ids
@@ -9839,7 +10067,16 @@ def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
             original_ids = normalize_product_ids(list(payload.get("cleanupRecordIds") or []))
             failed_ids = normalize_product_ids(list(result_payload.get("failedIds") or []))
             success_ids = set(normalize_product_ids(list(result_payload.get("successIds") or [])))
-            retry_ids = failed_ids or [record_id for record_id in original_ids if record_id not in success_ids]
+            retry_ids = normalize_product_ids(
+                [
+                    *failed_ids,
+                    *[
+                        record_id
+                        for record_id in original_ids
+                        if record_id not in success_ids
+                    ],
+                ]
+            )
             if not retry_ids:
                 raise RuntimeError("该同步任务没有可重试的失败记录。")
             payload["cleanupRecordIds"] = retry_ids
@@ -9855,7 +10092,14 @@ def retry_sync_task(owner_username: str, task_id: str) -> dict[str, Any]:
         task.failed_count = 0
         task.started_at = None
         task.finished_at = None
-    dispatch_next_sync_task()
+    if task_type in SPECIALIZED_SYNC_TASK_TYPES:
+        dispatch_sync_task(
+            task_owner,
+            task_id,
+            task_type=task_type,
+        )
+    else:
+        dispatch_next_sync_task()
     with session_scope() as session:
         task = session.get(SyncTaskModel, task_id)
         return sync_task_to_public(task) if task else {"id": task_id}

@@ -104,6 +104,8 @@ class Settings(BaseModel):
     task_queue_name: str = "lt-tasks"
     task_queue_crawl_name: str = "lt-tasks-crawl"
     task_queue_sync_name: str = "lt-tasks-sync"
+    task_queue_title_optimization_name: str = "lt-tasks-title-optimization"
+    task_queue_image_cleanup_name: str = "lt-tasks-image-cleanup"
     task_queue_listing_name: str = "lt-tasks-listing"
     task_queue_schedule_name: str = "lt-tasks-schedule"
     task_queue_job_timeout_seconds: int = TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS
@@ -219,6 +221,14 @@ def build_settings() -> Settings:
         task_queue_name=(base_task_queue_name := _env_text("LT_TASK_QUEUE_NAME", "lt-tasks")),
         task_queue_crawl_name=_env_text("LT_TASK_QUEUE_CRAWL_NAME", f"{base_task_queue_name}-crawl"),
         task_queue_sync_name=_env_text("LT_TASK_QUEUE_SYNC_NAME", f"{base_task_queue_name}-sync"),
+        task_queue_title_optimization_name=_env_text(
+            "LT_TASK_QUEUE_TITLE_OPTIMIZATION_NAME",
+            f"{base_task_queue_name}-title-optimization",
+        ),
+        task_queue_image_cleanup_name=_env_text(
+            "LT_TASK_QUEUE_IMAGE_CLEANUP_NAME",
+            f"{base_task_queue_name}-image-cleanup",
+        ),
         task_queue_listing_name=_env_text("LT_TASK_QUEUE_LISTING_NAME", f"{base_task_queue_name}-listing"),
         task_queue_schedule_name=_env_text("LT_TASK_QUEUE_SCHEDULE_NAME", f"{base_task_queue_name}-schedule"),
         task_queue_job_timeout_seconds=max(
