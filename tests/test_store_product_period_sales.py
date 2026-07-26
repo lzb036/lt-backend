@@ -11,6 +11,7 @@ from app.db.database import Base
 from app.db.models import (
     ProductModel,
     ProductSalesDailyModel,
+    ProductTitleVersionModel,
     SalesSyncStateModel,
     StoreModel,
     UserAccountModel,
@@ -351,6 +352,120 @@ def test_zero_sales_filter_excludes_store_without_completed_initial_sync(
     assert unfiltered["products"][0]["periodSalesCount"] is None
     assert zero_sales["total"] == 0
     assert zero_sales["products"] == []
+
+
+def test_store_product_zero_filter_supports_sales_optimization_and_both(
+    monkeypatch,
+    session_factory,
+):
+    now = datetime(2026, 7, 18, 12, 0, 0)
+
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    with session_factory() as session:
+        session.add(UserAccountModel(
+            username="alice",
+            display_name="Alice",
+            password_salt_b64="salt",
+            password_hash_b64="hash",
+        ))
+        session.flush()
+        store = StoreModel(
+            owner_username="alice",
+            store_code="shop",
+            store_name="Shop",
+        )
+        session.add(store)
+        session.flush()
+        session.add(SalesSyncStateModel(
+            owner_username="alice",
+            store_id=store.id,
+            initial_sync_completed=True,
+            sync_status="idle",
+        ))
+        products = [
+            ProductModel(
+                owner_username="alice",
+                store_id=store.id,
+                title="Sales zero and optimization zero",
+                source_url="https://example.com/product-1",
+                source_url_hash="hash-1",
+                rakuten_manage_number="manage-1",
+                item_number="item-1",
+                review_status="listed",
+            ),
+            ProductModel(
+                owner_username="alice",
+                store_id=store.id,
+                title="Sales zero only",
+                source_url="https://example.com/product-2",
+                source_url_hash="hash-2",
+                rakuten_manage_number="manage-2",
+                item_number="item-2",
+                review_status="listed",
+            ),
+            ProductModel(
+                owner_username="alice",
+                store_id=store.id,
+                title="Optimization zero only",
+                source_url="https://example.com/product-3",
+                source_url_hash="hash-3",
+                rakuten_manage_number="manage-3",
+                item_number="item-3",
+                review_status="listed",
+            ),
+        ]
+        session.add_all(products)
+        session.flush()
+        session.add(ProductTitleVersionModel(
+            product_id=products[1].id,
+            owner_username="alice",
+            title="Optimized title",
+            source="ai",
+            created_by="alice",
+        ))
+        session.add(ProductSalesDailyModel(
+            owner_username="alice",
+            store_id=store.id,
+            sales_date=date(2026, 7, 18),
+            manage_number="manage-3",
+            sku_key="",
+            effective_units=2,
+        ))
+        store_id = store.id
+        session.commit()
+
+    monkeypatch.setattr(crawler_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(crawler_service, "sales_now_naive", lambda: now)
+
+    def filtered_manage_numbers(zero_filter: str) -> set[str]:
+        result = crawler_service.list_products(
+            "alice",
+            status="listed",
+            store_id=store_id,
+            sales_period_days=365,
+            zero_filter=zero_filter,
+            page=1,
+            page_size=30,
+        )
+        return {
+            row["rakutenManageNumber"]
+            for row in result["products"]
+        }
+
+    assert filtered_manage_numbers("sales") == {"manage-1", "manage-2"}
+    assert filtered_manage_numbers("optimization") == {"manage-1", "manage-3"}
+    assert filtered_manage_numbers("sales_and_optimization") == {"manage-1"}
 
 
 def test_product_page_serializes_only_current_page(

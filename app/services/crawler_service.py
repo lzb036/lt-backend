@@ -7162,6 +7162,7 @@ def list_products(
     sales_sort: str | None = None,
     sales_min: int | None = None,
     sales_max: int | None = None,
+    zero_filter: str | None = None,
     page: int | None = None,
     page_size: int | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -7186,11 +7187,38 @@ def list_products(
         normalized_sales_sort = (
             sales_sort if sales_sort in {"asc", "desc"} else None
         )
+        normalized_zero_filter = normalize_text(zero_filter)
+        if normalized_zero_filter not in {
+            "",
+            "sales",
+            "optimization",
+            "sales_and_optimization",
+        }:
+            raise ValueError("零值筛选条件无效")
+        if normalized_zero_filter and product_status != "listed":
+            raise ValueError("零值筛选仅支持店铺商品")
+        if normalized_zero_filter in {"sales", "sales_and_optimization"}:
+            sales_min = 0
+            sales_max = 0
         listed_store_filter = normalize_listed_store_filter(listed_store_id)
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
         if product_status == "listed":
             query = query.where(ProductModel.store_product_status != "removed")
+            if normalized_zero_filter in {
+                "optimization",
+                "sales_and_optimization",
+            }:
+                optimized_version_exists = exists(
+                    select(1).where(
+                        ProductTitleVersionModel.owner_username
+                        == ProductModel.owner_username,
+                        ProductTitleVersionModel.product_id
+                        == ProductModel.id,
+                        ProductTitleVersionModel.source != "original",
+                    )
+                )
+                query = query.where(~optimized_version_exists)
         if normalize_text(task_id):
             query = query.where(
                 ProductModel.task_id == normalize_text(task_id),

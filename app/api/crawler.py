@@ -592,6 +592,10 @@ def list_products(
     salesSort: str | None = Query(default=None),
     salesMin: int | None = Query(default=None, ge=0),
     salesMax: int | None = Query(default=None, ge=0),
+    zeroFilter: str | None = Query(
+        default=None,
+        pattern="^(sales|optimization|sales_and_optimization)$",
+    ),
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
     user: dict = Depends(require_products_or_stores_permission),
@@ -622,6 +626,7 @@ def list_products(
             sales_sort=salesSort,
             sales_min=salesMin,
             sales_max=salesMax,
+            zero_filter=zeroFilter,
             page=page,
             page_size=pageSize,
         )
