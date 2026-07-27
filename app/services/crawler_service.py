@@ -5016,6 +5016,23 @@ def patch_local_item_detail(raw_payload: dict[str, Any], *, title: str, tagline:
     return updated_payload
 
 
+def rakuten_item_delete_target_missing(response: requests.Response) -> bool:
+    try:
+        payload = json.loads(response.text or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    errors = payload.get("errors")
+    if not isinstance(errors, list):
+        return False
+    return any(
+        isinstance(error, dict)
+        and normalize_text(error.get("code")).upper() == "GE0014"
+        for error in errors
+    )
+
+
 def delete_rakuten_item(service_secret: str, license_key: str, manage_number: str) -> None:
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 或乐天 Key 未配置。")
@@ -5036,6 +5053,8 @@ def delete_rakuten_item(service_secret: str, license_key: str, manage_number: st
     try:
         response.raise_for_status()
     except requests.RequestException as exc:
+        if rakuten_item_delete_target_missing(response):
+            return
         detail = normalize_text(response.text)
         message = f"乐天商品 {normalized_manage_number} 删除失败"
         if detail:

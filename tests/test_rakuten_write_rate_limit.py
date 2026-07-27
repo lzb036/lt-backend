@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from app.services import crawler_service
 
 
@@ -75,3 +77,48 @@ def test_delete_rakuten_item_uses_throttled_write_request(monkeypatch) -> None:
     assert requests[0]["method"] == "DELETE"
     assert requests[0]["operation"] == "乐天商品 manage number 删除"
     assert requests[0]["url"].endswith("/manage-numbers/manage%20number")
+
+
+def test_delete_rakuten_item_treats_ge0014_as_idempotent_success(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        crawler_service,
+        "wait_for_rakuten_item_delete_slot",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "request_rakuten_write",
+        lambda *args, **kwargs: FakeResponse(
+            404,
+            '{"errors":[{"code":"GE0014","message":"Not found for inputs"}]}',
+        ),
+    )
+
+    crawler_service.delete_rakuten_item("secret", "key", "missing-manage")
+
+
+def test_delete_rakuten_item_keeps_other_errors_as_failures(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        crawler_service,
+        "wait_for_rakuten_item_delete_slot",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "request_rakuten_write",
+        lambda *args, **kwargs: FakeResponse(
+            400,
+            '{"errors":[{"code":"GE9999","message":"Invalid request"}]}',
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="missing-manage 删除失败"):
+        crawler_service.delete_rakuten_item(
+            "secret",
+            "key",
+            "missing-manage",
+        )
