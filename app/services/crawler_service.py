@@ -8904,6 +8904,8 @@ def create_product_title_optimization_task(
     normalized_ids = normalize_product_ids(product_ids)
     if not normalized_ids:
         raise RuntimeError("请先选择商品。")
+    chunks = chunk_product_ids(normalized_ids)
+    task_ids: list[str] = []
     with session_scope() as session:
         products = session.scalars(
             select(ProductModel).where(
@@ -8940,29 +8942,37 @@ def create_product_title_optimization_task(
         if duplicated_ids:
             raise RuntimeError("所选商品中有标题优化任务正在执行，请等待任务完成后再试。")
 
-        task_id = uuid.uuid4().hex
-        task = SyncTaskModel(
-            id=task_id,
-            owner_username=owner_username,
-            store_id=store.id,
-            store_name=store.alias_name or store.store_name,
-            task_name=f"批量优化标题 {store.alias_name or store.store_name} {datetime.now():%Y-%m-%d %H:%M}",
-            task_type="title_optimization",
-            payload_json=json.dumps({"productIds": normalized_ids}, ensure_ascii=False),
-            status="queued",
-            total_count=len(normalized_ids),
-            message="等待执行标题优化",
-        )
-        session.add(task)
+        created_at = datetime.now()
+        for index, chunk_ids in enumerate(chunks, start=1):
+            task_id = uuid.uuid4().hex
+            part_label = "" if len(chunks) == 1 else f" {index}/{len(chunks)}"
+            task = SyncTaskModel(
+                id=task_id,
+                owner_username=owner_username,
+                store_id=store.id,
+                store_name=store.alias_name or store.store_name,
+                task_name=(
+                    f"批量优化标题{part_label} "
+                    f"{store.alias_name or store.store_name} {created_at:%Y-%m-%d %H:%M}"
+                ),
+                task_type="title_optimization",
+                payload_json=json.dumps({"productIds": chunk_ids}, ensure_ascii=False),
+                status="queued",
+                total_count=len(chunk_ids),
+                message="等待执行标题优化",
+            )
+            session.add(task)
+            task_ids.append(task_id)
         session.flush()
 
-    dispatch_sync_task(
-        owner_username,
-        task_id,
-        task_type="title_optimization",
-    )
+    for task_id in task_ids:
+        dispatch_sync_task(
+            owner_username,
+            task_id,
+            task_type="title_optimization",
+        )
     return created_sync_tasks_response(
-        [task_id],
+        task_ids,
         message="批量标题优化任务已创建",
         total=len(normalized_ids),
     )

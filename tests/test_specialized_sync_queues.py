@@ -191,6 +191,40 @@ def test_title_creation_dispatches_directly_to_specialized_queue(
     assert dispatched[0][2] == {"task_type": "title_optimization"}
 
 
+def test_title_creation_splits_tasks_into_batches_of_fifty(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    seed_users(session_factory, "alice")
+    product_ids = seed_store_products(session_factory, product_count=121)
+    dispatched = []
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_sync_task",
+        lambda owner, task_id, **kwargs: dispatched.append((owner, task_id, kwargs)),
+    )
+
+    result = crawler_service.create_product_title_optimization_task(
+        "alice",
+        product_ids,
+    )
+
+    assert len(result["syncTasks"]) == 3
+    assert [task["totalCount"] for task in result["syncTasks"]] == [50, 50, 21]
+    assert [task["taskName"].split()[1] for task in result["syncTasks"]] == [
+        "1/3",
+        "2/3",
+        "3/3",
+    ]
+    assert len(dispatched) == 3
+    assert all(owner == "alice" for owner, _, _ in dispatched)
+    assert all(
+        kwargs == {"task_type": "title_optimization"}
+        for _, _, kwargs in dispatched
+    )
+
+
 def test_product_delete_creation_stays_on_normal_dispatcher(
     monkeypatch,
     session_factory,
