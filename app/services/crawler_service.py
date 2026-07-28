@@ -447,7 +447,7 @@ RAKUTEN_MACHINE_DEPENDENT_TRANSLATION = str.maketrans(
     }
 )
 RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集支持普通乐天商品链接、Rakuten Fashion 商品链接、带参数链接、店铺编码/商品编号。"
-RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺展示名称、店铺url代码、店铺url或sid。"
+RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺url代码、店铺url或sid，不能只填写店铺展示名称。"
 RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
 CRAWLER_HTTP_RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
 SCHEDULE_RUN_LOCK = threading.Lock()
@@ -17589,15 +17589,8 @@ def initial_crawl_task_total_count(source_type: str, target: str) -> int:
 def collect_items(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
     if source_type == "shop":
         primary_target, fallback_target = split_shop_fallback_target(target)
-        try:
-            items = collect_items_for_target(source_type, primary_target, task_id=task_id)
-        except Exception as exc:
-            if isinstance(exc, TaskCancelled) or not fallback_target:
-                raise
-            return collect_items_for_target(source_type, fallback_shop_target(primary_target, fallback_target), task_id=task_id)
-        if items or not fallback_target:
-            return items
-        return collect_items_for_target(source_type, fallback_shop_target(primary_target, fallback_target), task_id=task_id)
+        strict_target = fallback_shop_target(primary_target, fallback_target) if fallback_target else primary_target
+        return collect_items_for_target(source_type, strict_target, task_id=task_id)
     return collect_items_for_target(source_type, target, task_id=task_id)
 
 
@@ -17629,14 +17622,20 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
     if source_type == "shop":
         target, limit, period = parse_ranking_target(strip_shop_ranking_prefix(target))
         normalized_shop_target = normalize_rakuten_shop_target(target)
-        if looks_like_rakuten_shop_code(normalized_shop_target) and not re.fullmatch(r"[0-9]+", normalized_shop_target):
+        if re.fullmatch(r"[0-9]+", normalized_shop_target):
+            target = normalized_shop_target
+        elif looks_like_rakuten_shop_code(normalized_shop_target):
             shop_code_filter = normalize_shop_code(normalized_shop_target)
-        target = resolve_rakuten_shop_search_keyword(target)
+            target = resolve_rakuten_shop_search_keyword(normalized_shop_target)
+        else:
+            raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR)
     elif source_type == "ranking":
         target, limit, period = parse_ranking_target(target)
     else:
         period = "daily"
-    if source_type == "ranking":
+    if source_type == "shop" and re.fullmatch(r"[0-9]+", normalize_text(target)):
+        url = build_source_url(source_type, target)
+    elif source_type == "ranking":
         url = build_ranking_source_url(target, period)
     elif source_type == "shop" and period == "realtime":
         url = build_ranking_source_url(target, period)
