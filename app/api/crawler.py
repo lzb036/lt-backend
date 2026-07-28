@@ -135,6 +135,17 @@ class SensitiveWordPayload(BaseModel):
     enabled: bool = True
 
 
+class CollectionGenreConfigPayload(BaseModel):
+    defaultPolicy: Literal["allow", "deny"] = "allow"
+    unknownGenrePolicy: Literal["allow", "deny"] = "allow"
+
+
+class CollectionGenreRulePayload(BaseModel):
+    genrePath: str = Field(min_length=1, max_length=2000)
+    genreId: str = Field(default="", max_length=64)
+    policy: Literal["allow", "deny"]
+
+
 class ProductStatusPayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
     status: str = Field(pattern="^(pending|approved|error|listed|listed_master|rejected)$")
@@ -442,6 +453,95 @@ def list_sensitive_words(
     _: dict = Depends(require_superadmin),
 ) -> dict:
     return sensitive_word_service.list_sensitive_words(page=page, page_size=pageSize, keyword=keyword or "")
+
+
+@router.get("/settings/collection-genres/config")
+def get_collection_genre_config(user: dict = Depends(require_crawler_permission)) -> dict:
+    return {"config": crawler_service.user_collection_genre_config(user["username"])}
+
+
+@router.put("/settings/collection-genres/config")
+def update_collection_genre_config(
+    payload: CollectionGenreConfigPayload,
+    user: dict = Depends(require_crawler_permission),
+) -> dict:
+    try:
+        return {
+            "config": crawler_service.save_user_collection_genre_config(
+                user["username"],
+                default_policy=payload.defaultPolicy,
+                unknown_genre_policy=payload.unknownGenrePolicy,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/settings/collection-genres/children")
+def get_collection_genre_children(
+    parentPath: str = Query(default=""),
+    user: dict = Depends(require_crawler_permission),
+) -> dict:
+    return {
+        "genres": crawler_service.list_user_collection_genre_children(
+            user["username"],
+            parentPath,
+        )
+    }
+
+
+@router.get("/settings/collection-genres/search")
+def search_collection_genres(
+    keyword: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=100),
+    user: dict = Depends(require_crawler_permission),
+) -> dict:
+    return {
+        "genres": crawler_service.search_user_collection_genres(
+            user["username"],
+            keyword,
+            limit,
+        )
+    }
+
+
+@router.put("/settings/collection-genres/rules")
+def save_collection_genre_rule(
+    payload: CollectionGenreRulePayload,
+    user: dict = Depends(require_crawler_permission),
+) -> dict:
+    try:
+        return {
+            "genre": crawler_service.save_user_collection_genre_rule(
+                user["username"],
+                genre_path=payload.genrePath,
+                genre_id=payload.genreId,
+                policy=payload.policy,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/settings/collection-genres/rules/{rule_id}")
+def delete_collection_genre_rule(
+    rule_id: int,
+    user: dict = Depends(require_crawler_permission),
+) -> dict:
+    if crawler_service.delete_user_collection_genre_rule(user["username"], rule_id):
+        return {"deleted": True}
+    raise HTTPException(status_code=404, detail="采集品类规则不存在。")
+
+
+@router.get("/settings/collection-genres/pending-impact")
+def get_collection_genre_pending_impact(
+    user: dict = Depends(require_crawler_permission),
+) -> dict:
+    return {
+        "impact": crawler_service.user_collection_genre_pending_impact(
+            user["username"],
+        )
+    }
 
 
 @router.post("/settings/sensitive-words")

@@ -59,6 +59,8 @@ from app.db.models import (
     SyncTaskModel,
     SystemSettingModel,
     UserAccountModel,
+    UserCollectionGenreRuleModel,
+    UserCollectionGenreSettingModel,
     canonical_sales_order_item_product_key,
     make_source_url_hash,
 )
@@ -101,6 +103,13 @@ class PreparedProductUpsertItem:
     source_url_hash_key: str
     rakuten_manage_number: str | None
     error: str = ""
+
+
+@dataclass(frozen=True)
+class CollectionGenrePolicySnapshot:
+    default_policy: str = "allow"
+    unknown_genre_policy: str = "allow"
+    rules_by_path: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -13092,6 +13101,7 @@ def extract_invalid_selective_attribute_value_errors(error_text: str) -> list[di
 
 _RAKUTEN_ATTRIBUTE_RULES_CACHE: dict[str, Any] | None = None
 _RAKUTEN_GENRE_ZH_MAP_CACHE: dict[str, str] | None = None
+_RAKUTEN_GENRE_NODE_INDEX_CACHE: dict[str, dict[str, Any]] | None = None
 
 
 def load_rakuten_attribute_rules() -> dict[str, Any]:
@@ -13212,6 +13222,338 @@ def list_rakuten_genre_children(parent_path: str = "") -> list[dict[str, Any]]:
         elif genre_path == child_path:
             node["genreId"] = normalize_text(genre_id)
     return sorted(nodes.values(), key=lambda item: normalize_text(item["label"]).casefold())
+
+
+def normalize_collection_genre_policy(value: Any, *, field_label: str = "品类策略") -> str:
+    policy = normalize_text(value).lower()
+    if policy not in {"allow", "deny"}:
+        raise RuntimeError(f"{field_label}必须是允许采集或禁止采集。")
+    return policy
+
+
+def collection_genre_path_hash(genre_path: Any) -> str:
+    return hashlib.sha256(normalize_text(genre_path).encode("utf-8")).hexdigest()
+
+
+def rakuten_genre_node_index() -> dict[str, dict[str, Any]]:
+    global _RAKUTEN_GENRE_NODE_INDEX_CACHE
+    if _RAKUTEN_GENRE_NODE_INDEX_CACHE is not None:
+        return _RAKUTEN_GENRE_NODE_INDEX_CACHE
+    rules = load_rakuten_attribute_rules()
+    genres = rules.get("genres") if isinstance(rules.get("genres"), dict) else {}
+    nodes: dict[str, dict[str, Any]] = {}
+    translations = load_rakuten_genre_zh_map()
+    for genre_id, genre in genres.items():
+        if not isinstance(genre, dict):
+            continue
+        genre_path = normalize_text(genre.get("genrePath"))
+        parts = [normalize_text(part) for part in genre_path.split(">") if normalize_text(part)]
+        for index, label in enumerate(parts):
+            path_parts = parts[:index + 1]
+            path = ">".join(path_parts)
+            node = nodes.setdefault(
+                path,
+                {
+                    "label": label,
+                    "labelZh": translations.get(label, label),
+                    "genrePath": path,
+                    "genrePathZh": rakuten_genre_zh_path(path),
+                    "genreId": "",
+                    "leaf": True,
+                },
+            )
+            if index < len(parts) - 1:
+                node["leaf"] = False
+            elif genre_path == path:
+                node["genreId"] = normalize_text(genre_id)
+    _RAKUTEN_GENRE_NODE_INDEX_CACHE = nodes
+    return _RAKUTEN_GENRE_NODE_INDEX_CACHE
+
+
+def collection_genre_ancestor_paths(genre_path: Any) -> list[str]:
+    parts = [normalize_text(part) for part in normalize_text(genre_path).split(">") if normalize_text(part)]
+    return [">".join(parts[:index]) for index in range(1, len(parts) + 1)]
+
+
+def collection_genre_policy_snapshot(session: Any, owner_username: str) -> CollectionGenrePolicySnapshot:
+    setting = session.get(UserCollectionGenreSettingModel, owner_username)
+    default_policy = normalize_collection_genre_policy(
+        setting.default_policy if setting is not None else "allow",
+        field_label="默认品类策略",
+    )
+    unknown_genre_policy = normalize_collection_genre_policy(
+        setting.unknown_genre_policy if setting is not None else "allow",
+        field_label="未识别品类策略",
+    )
+    rows = session.scalars(
+        select(UserCollectionGenreRuleModel).where(
+            UserCollectionGenreRuleModel.owner_username == owner_username,
+        )
+    ).all()
+    return CollectionGenrePolicySnapshot(
+        default_policy=default_policy,
+        unknown_genre_policy=unknown_genre_policy,
+        rules_by_path={
+            normalize_text(row.genre_path): normalize_collection_genre_policy(row.policy)
+            for row in rows
+            if normalize_text(row.genre_path)
+        },
+    )
+
+
+def resolve_collection_genre_policy(
+    snapshot: CollectionGenrePolicySnapshot,
+    *,
+    genre_id: Any = "",
+    genre_path: Any = "",
+) -> dict[str, Any]:
+    normalized_genre_id = normalize_text(genre_id)
+    normalized_genre_path = normalize_text(genre_path) or rakuten_genre_path(normalized_genre_id)
+    if not normalized_genre_path:
+        return {
+            "allowed": snapshot.unknown_genre_policy == "allow",
+            "policy": snapshot.unknown_genre_policy,
+            "genreId": normalized_genre_id,
+            "genrePath": "",
+            "genrePathZh": "",
+            "sourcePath": "",
+            "sourcePathZh": "",
+            "sourceType": "unknown",
+        }
+    effective_policy = snapshot.default_policy
+    source_path = ""
+    rules_by_path = snapshot.rules_by_path or {}
+    for ancestor_path in collection_genre_ancestor_paths(normalized_genre_path):
+        policy = rules_by_path.get(ancestor_path)
+        if policy in {"allow", "deny"}:
+            effective_policy = policy
+            source_path = ancestor_path
+    return {
+        "allowed": effective_policy == "allow",
+        "policy": effective_policy,
+        "genreId": normalized_genre_id,
+        "genrePath": normalized_genre_path,
+        "genrePathZh": rakuten_genre_zh_path(normalized_genre_path),
+        "sourcePath": source_path,
+        "sourcePathZh": rakuten_genre_zh_path(source_path),
+        "sourceType": "rule" if source_path else "default",
+    }
+
+
+def collected_item_genre_policy_decision(
+    item: dict[str, Any],
+    snapshot: CollectionGenrePolicySnapshot,
+) -> dict[str, Any]:
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    genre_id = (
+        first_text_from_keys(item, ("genreId", "genre_id", "genre"))
+        or first_text_from_keys(raw, ("genreId", "genre_id", "genre", "rCategoryId"))
+    )
+    return resolve_collection_genre_policy(snapshot, genre_id=genre_id)
+
+
+def user_collection_genre_config(owner_username: str) -> dict[str, Any]:
+    with session_scope() as session:
+        snapshot = collection_genre_policy_snapshot(session, owner_username)
+        rule_count = session.scalar(
+            select(func.count(UserCollectionGenreRuleModel.id)).where(
+                UserCollectionGenreRuleModel.owner_username == owner_username,
+            )
+        )
+    return {
+        "defaultPolicy": snapshot.default_policy,
+        "unknownGenrePolicy": snapshot.unknown_genre_policy,
+        "ruleCount": int(rule_count or 0),
+    }
+
+
+def save_user_collection_genre_config(
+    owner_username: str,
+    *,
+    default_policy: Any,
+    unknown_genre_policy: Any,
+) -> dict[str, Any]:
+    normalized_default = normalize_collection_genre_policy(default_policy, field_label="默认品类策略")
+    normalized_unknown = normalize_collection_genre_policy(unknown_genre_policy, field_label="未识别品类策略")
+    with session_scope() as session:
+        row = session.get(UserCollectionGenreSettingModel, owner_username)
+        if row is None:
+            row = UserCollectionGenreSettingModel(owner_username=owner_username)
+            session.add(row)
+        row.default_policy = normalized_default
+        row.unknown_genre_policy = normalized_unknown
+        session.flush()
+        rule_count = session.scalar(
+            select(func.count(UserCollectionGenreRuleModel.id)).where(
+                UserCollectionGenreRuleModel.owner_username == owner_username,
+            )
+        )
+    return {
+        "defaultPolicy": normalized_default,
+        "unknownGenrePolicy": normalized_unknown,
+        "ruleCount": int(rule_count or 0),
+    }
+
+
+def collection_genre_rule_rows_by_path(session: Any, owner_username: str) -> dict[str, UserCollectionGenreRuleModel]:
+    rows = session.scalars(
+        select(UserCollectionGenreRuleModel).where(
+            UserCollectionGenreRuleModel.owner_username == owner_username,
+        )
+    ).all()
+    return {normalize_text(row.genre_path): row for row in rows if normalize_text(row.genre_path)}
+
+
+def collection_genre_node_to_public(
+    node: dict[str, Any],
+    snapshot: CollectionGenrePolicySnapshot,
+    rule_rows_by_path: dict[str, UserCollectionGenreRuleModel],
+) -> dict[str, Any]:
+    genre_path = normalize_text(node.get("genrePath"))
+    decision = resolve_collection_genre_policy(
+        snapshot,
+        genre_id=node.get("genreId"),
+        genre_path=genre_path,
+    )
+    rule = rule_rows_by_path.get(genre_path)
+    return {
+        **node,
+        "ruleId": int(rule.id) if rule is not None else None,
+        "explicitPolicy": normalize_collection_genre_policy(rule.policy) if rule is not None else "inherit",
+        "effectivePolicy": decision["policy"],
+        "inheritedFromPath": decision["sourcePath"],
+        "inheritedFromPathZh": decision["sourcePathZh"],
+        "policySourceType": decision["sourceType"],
+    }
+
+
+def list_user_collection_genre_children(owner_username: str, parent_path: str = "") -> list[dict[str, Any]]:
+    nodes = list_rakuten_genre_children(parent_path)
+    with session_scope() as session:
+        snapshot = collection_genre_policy_snapshot(session, owner_username)
+        rule_rows = collection_genre_rule_rows_by_path(session, owner_username)
+        return [collection_genre_node_to_public(node, snapshot, rule_rows) for node in nodes]
+
+
+def search_user_collection_genres(
+    owner_username: str,
+    keyword: str = "",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    folded_keyword = normalize_text(keyword).casefold()
+    bounded_limit = min(max(int(limit or 50), 1), 100)
+    nodes = list(rakuten_genre_node_index().values())
+    if folded_keyword:
+        nodes = [
+            node
+            for node in nodes
+            if (
+                folded_keyword in normalize_text(node.get("genreId")).casefold()
+                or folded_keyword in normalize_text(node.get("genrePath")).casefold()
+                or folded_keyword in normalize_text(node.get("genrePathZh")).casefold()
+            )
+        ]
+    nodes.sort(
+        key=lambda node: (
+            0 if normalize_text(node.get("genreId")) == normalize_text(keyword) else 1,
+            len(collection_genre_ancestor_paths(node.get("genrePath"))),
+            normalize_text(node.get("genrePathZh") or node.get("genrePath")).casefold(),
+        )
+    )
+    with session_scope() as session:
+        snapshot = collection_genre_policy_snapshot(session, owner_username)
+        rule_rows = collection_genre_rule_rows_by_path(session, owner_username)
+        return [
+            collection_genre_node_to_public(node, snapshot, rule_rows)
+            for node in nodes[:bounded_limit]
+        ]
+
+
+def save_user_collection_genre_rule(
+    owner_username: str,
+    *,
+    genre_path: Any,
+    genre_id: Any = "",
+    policy: Any,
+) -> dict[str, Any]:
+    normalized_path = normalize_text(genre_path)
+    node = rakuten_genre_node_index().get(normalized_path)
+    if node is None:
+        raise RuntimeError("采集品类不存在或路径无效。")
+    normalized_policy = normalize_collection_genre_policy(policy)
+    normalized_genre_id = normalize_text(genre_id)
+    canonical_genre_id = normalize_text(node.get("genreId"))
+    if normalized_genre_id and canonical_genre_id and normalized_genre_id != canonical_genre_id:
+        raise RuntimeError("品类编号与品类路径不匹配。")
+    path_hash = collection_genre_path_hash(normalized_path)
+    with session_scope() as session:
+        row = session.scalar(
+            select(UserCollectionGenreRuleModel).where(
+                UserCollectionGenreRuleModel.owner_username == owner_username,
+                UserCollectionGenreRuleModel.genre_path_hash == path_hash,
+            )
+        )
+        if row is None:
+            row = UserCollectionGenreRuleModel(
+                owner_username=owner_username,
+                genre_path=normalized_path,
+                genre_path_hash=path_hash,
+            )
+            session.add(row)
+        row.genre_path = normalized_path
+        row.genre_path_hash = path_hash
+        row.genre_id = canonical_genre_id
+        row.policy = normalized_policy
+        session.flush()
+        snapshot = collection_genre_policy_snapshot(session, owner_username)
+        rule_rows = collection_genre_rule_rows_by_path(session, owner_username)
+        return collection_genre_node_to_public(node, snapshot, rule_rows)
+
+
+def delete_user_collection_genre_rule(owner_username: str, rule_id: int) -> bool:
+    with session_scope() as session:
+        row = session.get(UserCollectionGenreRuleModel, int(rule_id))
+        if row is None or row.owner_username != owner_username:
+            return False
+        session.delete(row)
+        return True
+
+
+def user_collection_genre_pending_impact(owner_username: str, sample_limit: int = 20) -> dict[str, Any]:
+    with session_scope() as session:
+        snapshot = collection_genre_policy_snapshot(session, owner_username)
+        rows = session.scalars(
+            select(ProductModel)
+            .where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.review_status == "pending",
+            )
+            .order_by(ProductModel.id.desc())
+        ).all()
+    denied_count = 0
+    unknown_count = 0
+    samples: list[dict[str, Any]] = []
+    for row in rows:
+        decision = resolve_collection_genre_policy(snapshot, genre_id=row.genre_id)
+        if not decision["genrePath"]:
+            unknown_count += 1
+        if decision["allowed"]:
+            continue
+        denied_count += 1
+        if len(samples) < max(1, min(int(sample_limit or 20), 50)):
+            samples.append({
+                "productId": int(row.id),
+                "title": row.title,
+                "genreId": normalize_text(row.genre_id),
+                "genrePath": decision["genrePath"],
+                "genrePathZh": decision["genrePathZh"],
+            })
+    return {
+        "totalPendingCount": len(rows),
+        "deniedCount": denied_count,
+        "unknownGenreCount": unknown_count,
+        "samples": samples,
+    }
 
 
 def rakuten_attribute_group_rule_for_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -17389,9 +17731,11 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
         processed_count = 0
         batches = list(chunk_items(items, batch_size))
         active_words = []
+        collection_genre_policy = CollectionGenrePolicySnapshot()
         if batches:
             with session_scope() as session:
                 active_words = active_sensitive_words(session)
+                collection_genre_policy = collection_genre_policy_snapshot(session, owner_username)
         for batch_index, batch_items in enumerate(batches, start=1):
             raise_if_task_cancelled(CrawlTaskModel, task_id)
             for item in batch_items:
@@ -17403,6 +17747,7 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
                     task_id,
                     item,
                     active_words=active_words,
+                    collection_genre_policy=collection_genre_policy,
                     scheduled_crawl_id=scheduled_crawl_id,
                 )
                 saved = bool(save_result.get("saved"))
@@ -17510,6 +17855,7 @@ def save_collected_item(
     item: dict[str, Any],
     *,
     active_words: list[str] | None = None,
+    collection_genre_policy: CollectionGenrePolicySnapshot | None = None,
     scheduled_crawl_id: int | None = None,
 ) -> dict[str, Any]:
     product_id: int | None = None
@@ -17520,6 +17866,26 @@ def save_collected_item(
             "skipped": True,
             "error": normalize_text(item.get("_crawlPriceFilterReason"))
             or f"商品价格 {price} 日元不符合用户设置的采集价格条件，已跳过。",
+        }
+    genre_decision = collected_item_genre_policy_decision(
+        item,
+        collection_genre_policy or CollectionGenrePolicySnapshot(),
+    )
+    if not genre_decision["allowed"]:
+        display_name = normalize_text(item.get("title") or item.get("source_url") or "商品")
+        genre_label = normalize_text(
+            genre_decision.get("genrePathZh")
+            or genre_decision.get("genrePath")
+            or genre_decision.get("genreId")
+            or "未识别品类"
+        )
+        genre_id = normalize_text(genre_decision.get("genreId"))
+        if genre_id and genre_id not in genre_label:
+            genre_label = f"{genre_label}（{genre_id}）"
+        return {
+            "saved": False,
+            "skipped": True,
+            "error": f"{display_name}: 品类“{genre_label}”已被当前用户设置为禁止采集，本次未入库。",
         }
     with session_scope() as session:
         duplicated_product = find_existing_collected_product(session, owner_username, item)

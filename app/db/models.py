@@ -143,6 +143,46 @@ class SensitiveWordModel(TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
 
 
+class UserCollectionGenreSettingModel(TimestampMixin, Base):
+    __tablename__ = "lt_user_collection_genre_settings"
+
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    default_policy: Mapped[str] = mapped_column(String(16), nullable=False, default="allow", server_default="allow")
+    unknown_genre_policy: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="allow",
+        server_default="allow",
+    )
+
+
+class UserCollectionGenreRuleModel(TimestampMixin, Base):
+    __tablename__ = "lt_user_collection_genre_rules"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_username",
+            "genre_path_hash",
+            name="uq_lt_user_collection_genre_rule_owner_path_hash",
+        ),
+        Index("ix_lt_user_collection_genre_rule_owner", "owner_username"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    genre_path: Mapped[str] = mapped_column(Text, nullable=False)
+    genre_path_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    genre_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    policy: Mapped[str] = mapped_column(String(16), nullable=False)
+
+
 class StoreModel(TimestampMixin, Base):
     __tablename__ = "lt_stores"
     __table_args__ = (
