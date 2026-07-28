@@ -12942,9 +12942,34 @@ def patch_payload_for_invalid_selective_attribute_values(payload: dict[str, Any]
         return payload
     rule_map = rakuten_attribute_rule_map_for_payload(patched)
     changed = False
+    optional_attribute_names = {
+        attribute_name
+        for error in errors
+        if (attribute_name := normalize_text(error.get("attributeName")))
+        and attribute_name != RAKUTEN_REPRESENTATIVE_COLOR_ATTRIBUTE
+        and not bool(rule_map.get(attribute_name, {}).get("required"))
+    }
+    if optional_attribute_names:
+        for variant in patched_variants.values():
+            if not isinstance(variant, dict):
+                continue
+            attributes = variant.get("attributes")
+            if not isinstance(attributes, list):
+                continue
+            next_attributes = [
+                attribute
+                for attribute in attributes
+                if not (
+                    isinstance(attribute, dict)
+                    and normalize_text(attribute.get("name")) in optional_attribute_names
+                )
+            ]
+            if len(next_attributes) != len(attributes):
+                variant["attributes"] = next_attributes
+                changed = True
     for error in errors:
         attribute_name = normalize_text(error.get("attributeName"))
-        if not attribute_name:
+        if not attribute_name or attribute_name in optional_attribute_names:
             continue
         variant = patched_variants.get(normalize_text(error.get("variantId")))
         if not isinstance(variant, dict):
@@ -12989,10 +13014,6 @@ def patch_payload_for_invalid_selective_attribute_values(payload: dict[str, Any]
                     attribute.pop("unit", None)
                     changed = True
                 continue
-            rule = rule_map.get(attribute_name, {})
-            if not bool(rule.get("required")) and attribute in attributes:
-                attributes.remove(attribute)
-                changed = True
     return patched if changed else payload
 
 
