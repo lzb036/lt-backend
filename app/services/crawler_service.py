@@ -8,6 +8,7 @@ import binascii
 import hashlib
 import hmac
 import logging
+import math
 import mimetypes
 import random
 import shutil
@@ -467,6 +468,7 @@ RAKUTEN_MACHINE_DEPENDENT_TRANSLATION = str.maketrans(
 )
 RAKUTEN_PRODUCT_TARGET_ERROR = "单个商品采集支持普通乐天商品链接、Rakuten Fashion 商品链接、带参数链接、店铺编码/商品编号。"
 RAKUTEN_SHOP_TARGET_ERROR = "店铺采集请输入店铺url代码、店铺url或sid，不能只填写店铺展示名称。"
+WHOLE_SHOP_TARGET_ERROR = "整店采集请输入店铺url代码、店铺url、商品url或sid，不能只填写店铺展示名称。"
 RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
 CRAWLER_HTTP_RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
 SCHEDULE_RUN_LOCK = threading.Lock()
@@ -17860,6 +17862,10 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
             raise RuntimeError("采集类型和目标不能为空。")
         if source_type == "product_url":
             target = "\n".join(normalize_rakuten_product_targets(target))
+        elif source_type == "whole_shop":
+            sid, _ = resolve_whole_shop_identity(target)
+            whole_shop_filter = normalize_whole_shop_filter(getattr(payload, "wholeShopFilter", None))
+            target = build_whole_shop_task_target(sid, whole_shop_filter)
         elif source_type == "shop":
             primary_target, fallback_target = split_shop_fallback_target(target)
             parsed_target, existing_limit, existing_period = parse_ranking_target(strip_shop_ranking_prefix(primary_target))
@@ -18292,6 +18298,8 @@ def initial_crawl_task_total_count(source_type: str, target: str) -> int:
         return 0
     if normalized_source_type == "product_url":
         return len(normalize_rakuten_product_targets(target))
+    if normalized_source_type == "whole_shop":
+        return 0
     if normalized_source_type in {"shop", "ranking"}:
         _, limit, _ = parse_ranking_target(
             strip_shop_ranking_prefix(normalized_target) if normalized_source_type == "shop" else normalized_target
@@ -18331,6 +18339,31 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
                     }
                 )
         return items
+    if source_type == "whole_shop":
+        sid, whole_shop_filter = parse_whole_shop_task_target(target)
+        url = build_whole_shop_search_url(sid, whole_shop_filter)
+        items = collect_listing_items(
+            url,
+            None,
+            task_id=task_id,
+            progress_label="整店商品",
+        )
+        for item in items:
+            mark_collected_item_price_filter(item, price_rule)
+        if task_id:
+            update_task_progress(
+                CrawlTaskModel,
+                task_id,
+                total_count=len(items),
+                message=f"已发现 {len(items)} 个整店商品，开始采集详情",
+            )
+        existing_source_hashes = existing_collected_source_hashes_for_task(items, task_id)
+        return enrich_collected_items_with_detail(
+            items,
+            task_id=task_id,
+            existing_source_hashes=existing_source_hashes,
+            price_rule=price_rule,
+        )
     limit: int | None = 30
     shop_code_filter = ""
     if source_type == "shop":
@@ -18384,7 +18417,13 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
     )
 
 
-def collect_listing_items(url: str, requested_limit: int | None, *, task_id: str | None = None) -> list[dict[str, Any]]:
+def collect_listing_items(
+    url: str,
+    requested_limit: int | None,
+    *,
+    task_id: str | None = None,
+    progress_label: str = "",
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     ranking_total: int | None = None
@@ -18410,6 +18449,14 @@ def collect_listing_items(url: str, requested_limit: int | None, *, task_id: str
                 return items
             if ranking_total is not None and len(items) >= ranking_total:
                 return items
+        if task_id and progress_label:
+            total_text = f" / {ranking_total}" if ranking_total is not None else ""
+            update_task_progress(
+                CrawlTaskModel,
+                task_id,
+                total_count=int(ranking_total or len(items)),
+                message=f"正在发现{progress_label}：{len(items)}{total_text}",
+            )
         if not should_fetch_next_ranking_page(
             page_items=page_items,
             new_count=new_count,
@@ -18442,6 +18489,7 @@ def should_fetch_next_ranking_page(
 def parse_ranking_total_count(html: str) -> int | None:
     text = normalize_text(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
     patterns = (
+        r"検索結果\s*[0-9,，]+\s*[〜~\-－]\s*[0-9,，]+\s*件\s*[（(]\s*([0-9,，]+)\s*件\s*[）)]",
         r"(?:共|全)\s*([0-9,，]+)\s*(?:个|件)",
         r"\(\s*(?:共|全)\s*([0-9,，]+)\s*(?:个|件)\s*\)",
         r"([0-9,，]+)\s*(?:個|件)\s*(?:中|$)",
@@ -18453,7 +18501,129 @@ def parse_ranking_total_count(html: str) -> int | None:
         number = int(match.group(1).replace(",", "").replace("，", ""))
         if number > 0:
             return number
+    state_match = re.search(r'"pagination"\s*:\s*\{[^{}]*"numFound"\s*:\s*([0-9]+)', html or "")
+    if state_match:
+        number = int(state_match.group(1))
+        if number >= 0:
+            return number
     return None
+
+
+def normalize_whole_shop_filter(value: Any) -> str:
+    normalized = normalize_text(value).lower()
+    if normalized in {"", "all", "全店采集", "全部"}:
+        return "all"
+    if normalized in {"reviewed", "评论采集", "有评论"}:
+        return "reviewed"
+    raise RuntimeError("整店采集过滤方式不正确。")
+
+
+def whole_shop_filter_label(value: Any) -> str:
+    return "评论采集" if normalize_whole_shop_filter(value) == "reviewed" else "全店采集"
+
+
+def parse_rakuten_shop_sid(html: str) -> str:
+    soup = BeautifulSoup(html or "", "lxml")
+    for link in soup.select("a[href*='search.rakuten.co.jp/search/mall']"):
+        try:
+            sid = normalize_text((parse_qs(urlsplit(str(link.get("href") or "")).query).get("sid") or [""])[0])
+        except Exception:
+            sid = ""
+        if re.fullmatch(r"[0-9]+", sid):
+            return sid
+    patterns = (
+        r'"shopId"\s*:\s*([0-9]+)',
+        r"(?:[?&]sid=)([0-9]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, html or "")
+        if match:
+            return match.group(1)
+    return ""
+
+
+def resolve_whole_shop_identity(target: str) -> tuple[str, str]:
+    try:
+        normalized_target = normalize_rakuten_shop_target(target)
+    except RuntimeError as exc:
+        raise RuntimeError(WHOLE_SHOP_TARGET_ERROR) from exc
+    if re.fullmatch(r"[0-9]+", normalized_target):
+        return normalized_target, ""
+    if not looks_like_rakuten_shop_code(normalized_target):
+        raise RuntimeError(WHOLE_SHOP_TARGET_ERROR)
+    try:
+        store_html = fetch_html(build_rakuten_store_url(normalized_target))
+    except requests.RequestException as exc:
+        raise RuntimeError(f"无法访问该乐天店铺：{exc}") from exc
+    sid = parse_rakuten_shop_sid(store_html)
+    if not sid:
+        raise RuntimeError("未能从店铺页面识别 sid，无法进行整店采集。")
+    return sid, parse_rakuten_shop_display_name(store_html)
+
+
+def build_whole_shop_task_target(sid: str, whole_shop_filter: str) -> str:
+    normalized_sid = normalize_text(sid)
+    if not re.fullmatch(r"[0-9]+", normalized_sid):
+        raise RuntimeError(WHOLE_SHOP_TARGET_ERROR)
+    return f"整店:{normalized_sid} {whole_shop_filter_label(whole_shop_filter)}"
+
+
+def parse_whole_shop_task_target(target: str) -> tuple[str, str]:
+    normalized = normalize_text(target)
+    match = re.fullmatch(r"整店[:：]\s*([0-9]+)\s+(全店采集|评论采集)", normalized)
+    if not match:
+        raise RuntimeError("整店采集任务参数不正确。")
+    return match.group(1), normalize_whole_shop_filter(match.group(2))
+
+
+def build_whole_shop_search_url(sid: str, whole_shop_filter: str) -> str:
+    normalized_sid = normalize_text(sid)
+    if not re.fullmatch(r"[0-9]+", normalized_sid):
+        raise RuntimeError(WHOLE_SHOP_TARGET_ERROR)
+    query: dict[str, str] = {"sid": normalized_sid}
+    if normalize_whole_shop_filter(whole_shop_filter) == "reviewed":
+        query["review"] = "1"
+    return f"{RAKUTEN_SEARCH_BASE}?{urlencode(query)}"
+
+
+def whole_shop_preview_page(url: str) -> tuple[str, int, int]:
+    html = fetch_listing_html(url)
+    assert_listing_page_available(html, url)
+    page_items = parse_search_items(html, url)
+    total_count = parse_ranking_total_count(html)
+    if total_count is None:
+        raise RuntimeError("未能从乐天搜索页读取商品总数，请稍后重试。")
+    if total_count > 0 and not page_items:
+        raise RuntimeError("乐天搜索页显示存在商品，但未能解析商品列表。")
+    page_size = max(1, len(page_items) or 45)
+    return html, total_count, math.ceil(total_count / page_size)
+
+
+def preview_whole_shop_crawl(owner_username: str, target: str, whole_shop_filter: str) -> dict[str, Any]:
+    del owner_username
+    normalized_filter = normalize_whole_shop_filter(whole_shop_filter)
+    sid, resolved_shop_name = resolve_whole_shop_identity(target)
+    all_url = build_whole_shop_search_url(sid, "all")
+    all_html, total_found, all_page_count = whole_shop_preview_page(all_url)
+    shop_name = resolved_shop_name or parse_rakuten_search_shop_name(all_html) or sid
+    collectable_count = total_found
+    page_count = all_page_count
+    reviewed_count = 0
+    if normalized_filter == "reviewed":
+        reviewed_url = build_whole_shop_search_url(sid, "reviewed")
+        _, reviewed_count, page_count = whole_shop_preview_page(reviewed_url)
+        collectable_count = reviewed_count
+    return {
+        "valid": True,
+        "shopName": shop_name,
+        "sid": sid,
+        "filter": normalized_filter,
+        "totalFound": total_found,
+        "collectableCount": collectable_count,
+        "reviewedCount": reviewed_count,
+        "pageCount": page_count,
+        "message": f"本次预计采集 {collectable_count} 个商品",
+    }
 
 
 def ranking_page_url(url: str, page_number: int) -> str:
@@ -18831,10 +19001,13 @@ def parse_search_items(html: str, page_url: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "lxml")
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
+    review_counts = parse_search_item_review_counts(soup, page_url)
     for item in parse_search_items_from_json_ld(soup, page_url):
         source_url = normalize_text(item.get("source_url"))
         if not source_url or source_url in seen:
             continue
+        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        item["raw"] = {**raw, "reviewCount": review_counts.get(source_url, 0)}
         seen.add(source_url)
         items.append(item)
     for link in soup.select("a[href*='item.rakuten.co.jp'], a[href*='brandavenue.rakuten.co.jp/item/']"):
@@ -18860,10 +19033,34 @@ def parse_search_items(html: str, page_url: str) -> list[dict[str, Any]]:
                 "shop_name": "",
                 "item_number": extract_item_number(href),
                 "genre_id": "",
-                "raw": {"pageUrl": page_url},
+                "raw": {
+                    "pageUrl": page_url,
+                    "reviewCount": review_counts.get(href, 0),
+                },
             }
         )
     return items
+
+
+def parse_search_item_review_counts(soup: BeautifulSoup, page_url: str) -> dict[str, int]:
+    review_counts: dict[str, int] = {}
+    for container in soup.select(".searchresultitem"):
+        product_link = container.select_one(
+            "a[href*='item.rakuten.co.jp'], a[href*='brandavenue.rakuten.co.jp/item/']"
+        )
+        if product_link is None:
+            continue
+        source_url = normalize_product_href(str(product_link.get("href") or ""), page_url)
+        if not source_url:
+            continue
+        count = 0
+        review_link = container.select_one("a[href*='review.rakuten.co.jp/item/']")
+        if review_link is not None:
+            match = re.search(r"[（(]\s*([0-9,，]+)\s*件\s*[）)]", normalize_text(review_link.get_text(" ", strip=True)))
+            if match:
+                count = int(match.group(1).replace(",", "").replace("，", ""))
+        review_counts[source_url] = count
+    return review_counts
 
 
 def parse_search_items_from_json_ld(soup: BeautifulSoup, page_url: str) -> list[dict[str, Any]]:

@@ -75,11 +75,21 @@ class CrawlSourcePayload(BaseModel):
 
 class CreateTaskPayload(BaseModel):
     sourceId: int | None = None
-    sourceType: str | None = None
+    sourceType: str | None = Field(
+        default=None,
+        pattern="^(keyword|shop|ranking|product_url|whole_shop)$",
+    )
     target: str | None = None
     rankingPeriod: str | None = Field(default=None, pattern="^(daily|weekly|monthly)$")
     crawlLimit: int | str | None = None
+    wholeShopFilter: str | None = Field(default=None, pattern="^(all|reviewed)$")
     mode: str = "manual"
+
+
+class WholeShopPreviewPayload(BaseModel):
+    sourceType: str = Field(default="whole_shop", pattern="^whole_shop$")
+    target: str = Field(min_length=1)
+    wholeShopFilter: str = Field(default="all", pattern="^(all|reviewed)$")
 
 
 class TaskDeletePayload(BaseModel):
@@ -668,6 +678,20 @@ def create_task(payload: CreateTaskPayload, user: dict = Depends(require_crawler
     try:
         task = crawler_service.create_task(user["username"], payload)
         return {"task": task}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/tasks/preview")
+def preview_task(payload: WholeShopPreviewPayload, user: dict = Depends(require_crawler_permission)) -> dict:
+    try:
+        return {
+            "preview": crawler_service.preview_whole_shop_crawl(
+                user["username"],
+                payload.target,
+                payload.wholeShopFilter,
+            )
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
