@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 import time
 import threading
 from copy import deepcopy
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -102,6 +102,13 @@ class PreparedProductUpsertItem:
     title: str
     source_url_hash_key: str
     rakuten_manage_number: str | None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class ListingProductAttemptResult:
+    product_id: int
+    success: bool
     error: str = ""
 
 
@@ -208,7 +215,9 @@ RAKUTEN_SP_DESCRIPTION_DROP_TAGS = {
 RAKUTEN_CABINET_FOLDER_PAGE_SIZE = 100
 RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT = 500
 RAKUTEN_CABINET_FOLDER_CREATE_ATTEMPTS = 10
-RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS = 0.45
+RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS = 0.35
+RAKUTEN_CABINET_QPS_COOLDOWN_INTERVAL_SECONDS = 0.6
+RAKUTEN_CABINET_QPS_COOLDOWN_SECONDS = 5 * 60
 RAKUTEN_CABINET_REQUEST_MAX_RETRIES = 6
 RAKUTEN_CABINET_QPS_BACKOFF_SECONDS = (1.5, 3.0, 5.0, 8.0, 13.0)
 DEFAULT_PAGE_SIZE = 30
@@ -527,6 +536,10 @@ SALES_ORDER_SYNC_EXECUTOR = ThreadPoolExecutor(
         min(4, int(settings.max_running_sync_tasks_per_user)),
     ),
     thread_name_prefix="lt-order-sync",
+)
+LISTING_IMAGE_PREPARE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, int(settings.listing_image_prepare_workers)),
+    thread_name_prefix="listing-image-prepare",
 )
 SALES_ORDER_SYNC_LOCAL_SLOTS = threading.BoundedSemaphore(
     SALES_ORDER_SYNC_LOCAL_MAX_PENDING
@@ -4243,9 +4256,34 @@ def wait_for_distributed_request_slot(bucket: str, min_interval: float) -> bool:
                 pass
 
 
+def rakuten_cabinet_request_interval(account_key: str) -> float:
+    normal_interval = max(0.0, RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS)
+    if not should_use_redis_task_queue():
+        return normal_interval
+    try:
+        if redis_connection().exists(f"lt:request-rate:cabinet:{account_key}:cooldown"):
+            return max(normal_interval, RAKUTEN_CABINET_QPS_COOLDOWN_INTERVAL_SECONDS)
+    except Exception:
+        pass
+    return normal_interval
+
+
+def mark_rakuten_cabinet_qps_limited(account_key: str) -> None:
+    if not should_use_redis_task_queue():
+        return
+    try:
+        redis_connection().set(
+            f"lt:request-rate:cabinet:{account_key}:cooldown",
+            "1",
+            ex=RAKUTEN_CABINET_QPS_COOLDOWN_SECONDS,
+        )
+    except Exception:
+        pass
+
+
 def throttle_rakuten_cabinet_request(account_key: str = "default") -> None:
     global RAKUTEN_CABINET_LAST_REQUEST_AT
-    min_interval = max(0.0, RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS)
+    min_interval = rakuten_cabinet_request_interval(account_key)
     if min_interval <= 0:
         return
     if wait_for_distributed_request_slot(f"cabinet:{account_key}", min_interval):
@@ -4261,10 +4299,9 @@ def throttle_rakuten_cabinet_request(account_key: str = "default") -> None:
 def rakuten_cabinet_request(method: str, url: str, **kwargs: Any) -> requests.Response:
     attempts = max(1, RAKUTEN_CABINET_REQUEST_MAX_RETRIES)
     last_exc: requests.RequestException | None = None
+    account_key = rakuten_request_account_key(kwargs.get("headers"))
     for attempt in range(1, attempts + 1):
-        throttle_rakuten_cabinet_request(
-            rakuten_request_account_key(kwargs.get("headers")),
-        )
+        throttle_rakuten_cabinet_request(account_key)
         try:
             response = requests.request(method, url, **kwargs)
         except requests.RequestException as exc:
@@ -4274,6 +4311,7 @@ def rakuten_cabinet_request(method: str, url: str, **kwargs: Any) -> requests.Re
             time.sleep(rakuten_cabinet_backoff_seconds(attempt))
             continue
         if is_rakuten_cabinet_qps_limited_response(response):
+            mark_rakuten_cabinet_qps_limited(account_key)
             if attempt >= attempts:
                 raise RuntimeError(f"R-Cabinet 请求触发 QPSLimit，已重试 {attempts} 次：{normalize_text(response.text)[:500]}")
             response.close()
@@ -14816,11 +14854,14 @@ def prepare_rakuten_listing_images(
     if worker_count <= 1:
         prepared = [prepare_rakuten_listing_image(image_url) for image_url in image_urls]
     else:
-        with ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="listing-image-prepare",
-        ) as executor:
-            prepared = list(executor.map(prepare_rakuten_listing_image, image_urls))
+        futures = [
+            LISTING_IMAGE_PREPARE_EXECUTOR.submit(
+                prepare_rakuten_listing_image,
+                image_url,
+            )
+            for image_url in image_urls
+        ]
+        prepared = [future.result() for future in futures]
     if cancel_check and cancel_check():
         raise TaskCancelled(TASK_CANCELLED_MESSAGE)
     return [image for image in prepared if image is not None]
@@ -17280,6 +17321,74 @@ def run_listing_task(owner_username: str, task_id: str) -> None:
         dispatch_next_sync_task_safely()
 
 
+def run_listing_product_attempt(
+    owner_username: str,
+    task_id: str,
+    store_id: int,
+    product_id: int,
+    service_secret: str,
+    license_key: str,
+    cabinet_usage: dict[str, Any] | None,
+) -> ListingProductAttemptResult:
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        product = session.get(ProductModel, product_id)
+        if store is None or product is None or product.owner_username != owner_username:
+            return ListingProductAttemptResult(
+                product_id=product_id,
+                success=False,
+                error=f"{product_id}: 商品或店铺不存在，不能上架。",
+            )
+        product_label = productCodeForError(product)
+        store_label = store.alias_name or store.store_name or f"店铺 {store.id}"
+        if product.review_status not in {"approved", "listed_master"} or (
+            product.listing_task_id not in {None, task_id}
+        ):
+            product.last_error = "商品状态已变化或不属于当前上架任务，不能上架。"
+            clear_listing_product_lock(product, task_id)
+            return ListingProductAttemptResult(
+                product_id=product_id,
+                success=False,
+                error=f"{product_label} / {store_label}: {product.last_error}",
+            )
+        if any(
+            int(item.get("storeId") or 0) == int(store.id)
+            for item in product_listed_stores(product_raw_payload(product))
+        ):
+            product.last_error = None
+            return ListingProductAttemptResult(product_id=product_id, success=True)
+        try:
+            listing_result = create_store_product_on_rakuten(
+                service_secret,
+                license_key,
+                store,
+                product,
+                cabinet_context={"usage": dict(cabinet_usage or {})},
+                cancel_check=lambda: listing_task_cancel_requested(task_id),
+            )
+            listed_product = upsert_listed_store_product_from_listing_result(
+                session,
+                owner_username,
+                product,
+                store,
+                listing_result,
+            )
+            session.flush()
+            record_product_listed_store(product, listed_product, store, listing_result)
+            return ListingProductAttemptResult(product_id=product_id, success=True)
+        except TaskCancelled:
+            raise
+        except Exception as exc:
+            error_text = str(exc)
+            clear_listing_product_lock(product, task_id)
+            product.last_error = error_text
+            return ListingProductAttemptResult(
+                product_id=product_id,
+                success=False,
+                error=f"{product_label} / {store_label}: {error_text}",
+            )
+
+
 def _run_listing_task(owner_username: str, task_id: str) -> None:
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
@@ -17391,12 +17500,11 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                 )
             continue
 
-        cabinet_context: dict[str, Any] = {}
+        cabinet_usage: dict[str, Any] = {}
         try:
             raise_if_task_cancelled(ListingTaskModel, task_id)
             cabinet_usage = fetch_rakuten_cabinet_usage(service_secret, license_key)
             raise_if_task_cancelled(ListingTaskModel, task_id)
-            cabinet_context["usage"] = cabinet_usage
             with session_scope() as session:
                 current_store = session.get(StoreModel, task_store_id)
                 if current_store is not None:
@@ -17411,77 +17519,95 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     next_error_detail = summarize_task_errors(errors, limit=50)
                     task.error_detail = with_task_cancel_marker(next_error_detail) if task_cancel_requested(task) else next_error_detail
 
-        for product_id in ordered_product_ids:
-            processed_attempts += 1
-            cancel_after_progress = False
-            raise_if_task_cancelled(ListingTaskModel, task_id)
-            with session_scope() as session:
-                store = session.get(StoreModel, task_store_id)
-                product = session.get(ProductModel, product_id)
-                if store is None or product is None or product.owner_username != owner_username:
-                    failed_attempt_count += 1
-                    failed_product_ids.add(product_id)
-                    errors.append(f"{product_id} / {store_label}: 商品或店铺不存在，不能上架。")
-                elif product.review_status not in {"approved", "listed_master"} or (
-                    product.listing_task_id not in {None, task_id}
-                ):
-                    product.last_error = "商品状态已变化或不属于当前上架任务，不能上架。"
-                    clear_listing_product_lock(product, task_id)
-                    failed_attempt_count += 1
-                    failed_product_ids.add(product.id)
-                    errors.append(f"{productCodeForError(product)} / {store_label}: {product.last_error}")
-                elif any(int(item.get("storeId") or 0) == int(store.id) for item in product_listed_stores(product_raw_payload(product))):
-                    success_attempt_count += 1
-                    success_product_ids.add(product.id)
-                    product.last_error = None
-                else:
-                    try:
-                        listing_result = create_store_product_on_rakuten(
-                            service_secret,
-                            license_key,
-                            store,
-                            product,
-                            cabinet_context=cabinet_context,
-                            cancel_check=lambda: listing_task_cancel_requested(task_id),
-                        )
-                        listed_product = upsert_listed_store_product_from_listing_result(session, owner_username, product, store, listing_result)
-                        session.flush()
-                        record_product_listed_store(product, listed_product, store, listing_result)
-                        success_attempt_count += 1
-                        success_product_ids.add(product.id)
-                    except TaskCancelled:
-                        raise
-                    except Exception as exc:
-                        error_text = str(exc)
-                        clear_listing_product_lock(product, task_id)
-                        product.last_error = error_text
-                        failed_attempt_count += 1
-                        failed_product_ids.add(product.id)
-                        errors.append(f"{productCodeForError(product)} / {store_label}: {error_text}")
-                task = session.get(ListingTaskModel, task_id)
-                if task is not None:
-                    final_failed_product_ids = [product_id for product_id in failed_product_ids if product_id not in success_product_ids]
-                    cancel_requested = task_cancel_requested(task) or listing_task_cancel_requested(task_id)
-                    task.total_count = total_count
-                    task.success_count = max(success_attempt_count, len(success_product_ids))
-                    task.failed_count = failed_attempt_count
-                    task.message = TASK_CANCEL_REQUESTED_MESSAGE if cancel_requested else f"上架中，已处理 {processed_attempts} / {run_total_count} 条"
-                    next_error_detail = summarize_task_errors(errors, limit=50)
-                    task.error_detail = with_task_cancel_marker(next_error_detail) if cancel_requested else next_error_detail
-                    task.product_ids_json = json.dumps(
-                        listing_task_result_payload(
-                            all_product_ids,
-                            list(success_product_ids),
-                            final_failed_product_ids,
-                            retry_ids=retry_product_ids or None,
-                            store_ids=task_store_ids,
-                        ),
-                        ensure_ascii=False,
+        worker_count = min(
+            len(ordered_product_ids),
+            max(1, int(settings.listing_product_workers)),
+        )
+        cancellation_error: TaskCancelled | None = None
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix=f"listing-products-{task_id[:8]}",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    run_listing_product_attempt,
+                    owner_username,
+                    task_id,
+                    task_store_id,
+                    product_id,
+                    service_secret,
+                    license_key,
+                    cabinet_usage,
+                ): product_id
+                for product_id in ordered_product_ids
+            }
+            for future in as_completed(futures):
+                product_id = futures[future]
+                processed_attempts += 1
+                try:
+                    attempt = future.result()
+                except TaskCancelled as exc:
+                    cancellation_error = exc
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    break
+                except Exception as exc:
+                    attempt = ListingProductAttemptResult(
+                        product_id=product_id,
+                        success=False,
+                        error=f"{product_id} / {store_label}: {exc}",
                     )
-                    cancel_after_progress = cancel_requested
-            if cancel_after_progress:
-                raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-            raise_if_task_cancelled(ListingTaskModel, task_id)
+                if attempt.success:
+                    success_attempt_count += 1
+                    success_product_ids.add(attempt.product_id)
+                    failed_product_ids.discard(attempt.product_id)
+                else:
+                    failed_attempt_count += 1
+                    failed_product_ids.add(attempt.product_id)
+                    if attempt.error:
+                        errors.append(attempt.error)
+                cancel_after_progress = False
+                with session_scope() as session:
+                    task = session.get(ListingTaskModel, task_id)
+                    if task is not None:
+                        final_failed_product_ids = [
+                            failed_product_id
+                            for failed_product_id in failed_product_ids
+                            if failed_product_id not in success_product_ids
+                        ]
+                        cancel_requested = task_cancel_requested(task) or listing_task_cancel_requested(task_id)
+                        task.total_count = total_count
+                        task.success_count = max(success_attempt_count, len(success_product_ids))
+                        task.failed_count = failed_attempt_count
+                        task.message = (
+                            TASK_CANCEL_REQUESTED_MESSAGE
+                            if cancel_requested
+                            else f"上架中，已处理 {processed_attempts} / {run_total_count} 条"
+                        )
+                        next_error_detail = summarize_task_errors(errors, limit=50)
+                        task.error_detail = (
+                            with_task_cancel_marker(next_error_detail)
+                            if cancel_requested
+                            else next_error_detail
+                        )
+                        task.product_ids_json = json.dumps(
+                            listing_task_result_payload(
+                                all_product_ids,
+                                list(success_product_ids),
+                                final_failed_product_ids,
+                                retry_ids=retry_product_ids or None,
+                                store_ids=task_store_ids,
+                            ),
+                            ensure_ascii=False,
+                        )
+                        cancel_after_progress = cancel_requested
+                if cancel_after_progress:
+                    cancellation_error = TaskCancelled(TASK_CANCELLED_MESSAGE)
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    break
+        if cancellation_error is not None:
+            raise cancellation_error
     raise_if_task_cancelled(ListingTaskModel, task_id)
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)

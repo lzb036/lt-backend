@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +11,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import ListingTaskModel, StoreModel, UserAccountModel
+from app.db.models import ListingTaskModel, ProductModel, StoreModel, UserAccountModel
 from app.services import crawler_service
 
 
@@ -204,7 +206,7 @@ def test_listing_dispatch_uses_global_user_and_store_capacity(
     monkeypatch.setattr(crawler_service, "should_use_redis_task_queue", lambda: False)
     monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_global", 5)
     monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_user", 2)
-    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_store", 2)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_store", 1)
     dispatched: list[tuple[str, str]] = []
     monkeypatch.setattr(
         crawler_service,
@@ -224,19 +226,24 @@ def test_listing_dispatch_uses_global_user_and_store_capacity(
         ])
         alice_store = StoreModel(
             owner_username="alice",
-            store_code="alice-store",
-            store_name="Alice Store",
+            store_code="alice-store-1",
+            store_name="Alice Store 1",
+        )
+        alice_store_two = StoreModel(
+            owner_username="alice",
+            store_code="alice-store-2",
+            store_name="Alice Store 2",
         )
         bob_store = StoreModel(
             owner_username="bob",
             store_code="bob-store",
             store_name="Bob Store",
         )
-        session.add_all([alice_store, bob_store])
+        session.add_all([alice_store, alice_store_two, bob_store])
         session.flush()
         task_specs = [
             ("a1", "alice", alice_store.id),
-            ("a2", "alice", alice_store.id),
+            ("a2", "alice", alice_store_two.id),
             ("a3", "alice", alice_store.id),
             ("b1", "bob", bob_store.id),
         ]
@@ -267,3 +274,106 @@ def test_listing_dispatch_uses_global_user_and_store_capacity(
         delayed = session.get(ListingTaskModel, "a3")
         assert delayed is not None
         assert "并发额度" in delayed.message
+
+
+def test_listing_task_processes_four_products_concurrently(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    monkeypatch.setattr(crawler_service.settings, "listing_product_workers", 4)
+    monkeypatch.setattr(crawler_service, "listing_task_start_wait_reason", lambda *_args: "")
+    monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value)
+    monkeypatch.setattr(crawler_service, "fetch_rakuten_cabinet_usage", lambda *_args: {})
+    monkeypatch.setattr(crawler_service, "apply_store_cabinet_usage", lambda *_args: None)
+    monkeypatch.setattr(crawler_service, "raise_if_task_cancelled", lambda *_args: None)
+    monkeypatch.setattr(crawler_service, "listing_task_cancel_requested", lambda *_args: False)
+    monkeypatch.setattr(crawler_service, "update_task_progress", lambda *_args, **_kwargs: None)
+
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+
+    def fake_attempt(
+        _owner,
+        _task_id,
+        _store_id,
+        product_id,
+        _secret,
+        _key,
+        _cabinet_usage,
+    ):
+        nonlocal active, max_active
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with active_lock:
+            active -= 1
+        return crawler_service.ListingProductAttemptResult(
+            product_id=product_id,
+            success=True,
+        )
+
+    monkeypatch.setattr(crawler_service, "run_listing_product_attempt", fake_attempt)
+
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        store = StoreModel(
+            owner_username="alice",
+            store_code="alice-store",
+            store_name="Alice Store",
+            enabled=True,
+            rakuten_service_secret_encrypted="secret",
+            rakuten_license_key_encrypted="key",
+        )
+        session.add(store)
+        session.flush()
+        products = [
+            ProductModel(
+                owner_username="alice",
+                title=f"Product {index}",
+                source_url=f"https://example.com/{index}",
+                source_url_hash=f"hash-{index}",
+                review_status="approved",
+                listing_task_id="listing-task",
+            )
+            for index in range(6)
+        ]
+        session.add_all(products)
+        session.flush()
+        product_ids = [int(product.id) for product in products]
+        session.add(
+            ListingTaskModel(
+                id="listing-task",
+                owner_username="alice",
+                store_id=store.id,
+                task_name="Listing task",
+                status="queued",
+                total_count=6,
+                product_ids_json=json.dumps({
+                    "productIds": product_ids,
+                    "successIds": [],
+                    "failedIds": [],
+                    "storeIds": [store.id],
+                }),
+            )
+        )
+        session.commit()
+
+    crawler_service._run_listing_task("alice", "listing-task")
+
+    assert max_active == 4
+    with session_factory() as session:
+        task = session.get(ListingTaskModel, "listing-task")
+        assert task is not None
+        assert task.status == "success"
+        assert task.success_count == 6
+        assert task.failed_count == 0
