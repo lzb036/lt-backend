@@ -276,12 +276,12 @@ def test_listing_dispatch_uses_global_user_and_store_capacity(
         assert "并发额度" in delayed.message
 
 
-def test_listing_task_processes_four_products_concurrently(
+def test_listing_task_processes_six_products_concurrently(
     monkeypatch,
     session_factory,
 ):
     install_session_scope(monkeypatch, session_factory)
-    monkeypatch.setattr(crawler_service.settings, "listing_product_workers", 4)
+    monkeypatch.setattr(crawler_service.settings, "listing_product_workers", 6)
     monkeypatch.setattr(crawler_service, "listing_task_start_wait_reason", lambda *_args: "")
     monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value)
     monkeypatch.setattr(crawler_service, "fetch_rakuten_cabinet_usage", lambda *_args: {})
@@ -370,7 +370,7 @@ def test_listing_task_processes_four_products_concurrently(
 
     crawler_service._run_listing_task("alice", "listing-task")
 
-    assert max_active == 4
+    assert max_active == 6
     with session_factory() as session:
         task = session.get(ListingTaskModel, "listing-task")
         assert task is not None
