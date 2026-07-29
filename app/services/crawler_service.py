@@ -141,6 +141,7 @@ RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
 RAKUTEN_WRITE_MAX_RETRIES = 5
 RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 RAKUTEN_WRITE_QPS_BACKOFF_SECONDS = (1.5, 3.0, 5.0, 8.0)
+RAKUTEN_WRITE_REQUEST_MIN_INTERVAL_SECONDS = 0.2
 RAKUTEN_ITEM_DELETE_MIN_INTERVAL_SECONDS = 0.35
 RAKUTEN_INVENTORY_BULK_UPSERT_LIMIT = 400
 BATCH_TASK_PRODUCT_LIMIT = 50
@@ -467,10 +468,12 @@ STORE_UNLISTED_PRODUCT_CLEANUP_LOCK = threading.Lock()
 DELETED_PRODUCT_IMAGE_CLEANUP_LOCK = threading.Lock()
 CRAWLER_REQUEST_LOCK = threading.Lock()
 RAKUTEN_CABINET_REQUEST_LOCK = threading.Lock()
+RAKUTEN_WRITE_REQUEST_LOCK = threading.Lock()
 RAKUTEN_ITEM_DELETE_REQUEST_LOCK = threading.Lock()
 CRAWLER_SESSION_LOCAL = threading.local()
 CRAWLER_LAST_REQUEST_AT = 0.0
 RAKUTEN_CABINET_LAST_REQUEST_AT = 0.0
+RAKUTEN_WRITE_LAST_REQUEST_AT_BY_ACCOUNT: dict[str, float] = {}
 RAKUTEN_ITEM_DELETE_LAST_REQUEST_AT = 0.0
 SCHEDULE_RUNNER_STARTED = False
 SCHEDULE_RUNNER_HEALTH_LOCK = threading.Lock()
@@ -835,19 +838,67 @@ def listing_task_has_active_background_job(task_id: str) -> bool:
     return state is not None and state.get("status") in {"queued", "started", "deferred", "scheduled"}
 
 
+def listing_task_store_ids(task: ListingTaskModel) -> list[int]:
+    payload = listing_task_product_ids_payload(task.product_ids_json)
+    store_ids = payload["storeIds"]
+    if store_ids:
+        return store_ids
+    return [int(task.store_id)] if task.store_id else []
+
+
 def dispatch_next_listing_task() -> None:
-    next_task: tuple[str, str] | None = None
+    next_tasks: list[tuple[str, str]] = []
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架")
         reconcile_interrupted_running_tasks(session, ListingTaskModel)
-        if running_listing_task_count(session) > 0:
-            return
-        rows = session.scalars(
+        running_rows = session.scalars(
+            select(ListingTaskModel).where(ListingTaskModel.status == "running")
+        ).all()
+        queued_rows = session.scalars(
             select(ListingTaskModel)
             .where(ListingTaskModel.status == "queued")
             .order_by(ListingTaskModel.created_at.asc(), ListingTaskModel.id.asc())
         ).all()
-        for task in rows:
+        active_job_ids: set[str] = set()
+        if queued_rows and should_use_redis_task_queue():
+            try:
+                states = redis_task_states(
+                    {str(task.id) for task in queued_rows},
+                    "listing",
+                    job_id_prefixes=task_model_job_id_prefixes(ListingTaskModel),
+                )
+                active_job_ids = {
+                    task_id
+                    for task_id, state in states.items()
+                    if state.get("status") in {"queued", "started", "deferred", "scheduled"}
+                }
+            except Exception:
+                active_job_ids = {
+                    str(task.id)
+                    for task in queued_rows
+                    if listing_task_has_active_background_job(task.id)
+                }
+
+        active_rows_by_id = {str(task.id): task for task in running_rows}
+        active_rows_by_id.update({
+            str(task.id): task
+            for task in queued_rows
+            if str(task.id) in active_job_ids
+        })
+        owner_counts: dict[str, int] = {}
+        store_counts: dict[int, int] = {}
+        for task in active_rows_by_id.values():
+            owner_counts[task.owner_username] = owner_counts.get(task.owner_username, 0) + 1
+            for store_id in listing_task_store_ids(task):
+                store_counts[store_id] = store_counts.get(store_id, 0) + 1
+
+        available_slots = max(
+            0,
+            int(settings.max_running_listing_tasks_global) - len(active_rows_by_id),
+        )
+        for task in queued_rows:
+            if available_slots <= 0:
+                break
             if task_cancel_requested(task):
                 release_listing_task_locks(session, task.owner_username, task)
                 task.status = "cancelled"
@@ -855,15 +906,31 @@ def dispatch_next_listing_task() -> None:
                 task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
                 task.finished_at = datetime.now()
                 continue
-            if listing_task_has_active_background_job(task.id):
-                return
-            if running_store_task_count(session, task.store_id, exclude_listing_task_id=task.id) > 0:
-                task.message = "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
+            if str(task.id) in active_job_ids:
                 continue
-            next_task = (task.owner_username, task.id)
-            break
-    if next_task:
-        dispatch_listing_task(next_task[0], next_task[1])
+            if owner_counts.get(task.owner_username, 0) >= int(settings.max_running_listing_tasks_per_user):
+                task.message = "排队中，等待该用户当前上架任务释放并发额度"
+                continue
+            task_store_ids = listing_task_store_ids(task)
+            if any(
+                store_counts.get(store_id, 0) >= int(settings.max_running_listing_tasks_per_store)
+                for store_id in task_store_ids
+            ):
+                task.message = "排队中，等待该店铺当前上架任务释放并发额度"
+                continue
+            if any(
+                running_store_sync_task_count(session, store_id) > 0
+                for store_id in task_store_ids
+            ):
+                task.message = "排队中，等待该店铺当前同步、上下架或删除任务完成"
+                continue
+            next_tasks.append((task.owner_username, task.id))
+            owner_counts[task.owner_username] = owner_counts.get(task.owner_username, 0) + 1
+            for store_id in task_store_ids:
+                store_counts[store_id] = store_counts.get(store_id, 0) + 1
+            available_slots -= 1
+    for owner_username, task_id in next_tasks:
+        dispatch_listing_task(owner_username, task_id)
 
 
 def dispatch_next_listing_task_safely() -> None:
@@ -3719,6 +3786,46 @@ def running_listing_task_count(session: Any, *, exclude_task_id: str | None = No
     return int(session.scalar(query) or 0)
 
 
+def running_user_listing_task_count(
+    session: Any,
+    owner_username: str,
+    *,
+    exclude_task_id: str | None = None,
+) -> int:
+    query = select(func.count()).where(
+        ListingTaskModel.owner_username == owner_username,
+        ListingTaskModel.status == "running",
+    )
+    if exclude_task_id:
+        query = query.where(ListingTaskModel.id != exclude_task_id)
+    return int(session.scalar(query) or 0)
+
+
+def running_store_listing_task_count(
+    session: Any,
+    store_id: int,
+    *,
+    exclude_task_id: str | None = None,
+) -> int:
+    query = select(func.count()).where(
+        ListingTaskModel.store_id == store_id,
+        ListingTaskModel.status == "running",
+    )
+    if exclude_task_id:
+        query = query.where(ListingTaskModel.id != exclude_task_id)
+    return int(session.scalar(query) or 0)
+
+
+def running_store_sync_task_count(session: Any, store_id: int) -> int:
+    return int(session.scalar(
+        select(func.count()).where(
+            SyncTaskModel.store_id == store_id,
+            SyncTaskModel.status == "running",
+            SyncTaskModel.task_type.notin_(SPECIALIZED_SYNC_TASK_TYPES),
+        )
+    ) or 0)
+
+
 def sync_task_start_wait_reason(session: Any, task_id: str, store_id: int | None) -> str:
     finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步")
     finalize_stale_store_cancel_requested_tasks(session, store_id)
@@ -3735,19 +3842,42 @@ def sync_task_start_wait_reason(session: Any, task_id: str, store_id: int | None
     return ""
 
 
-def listing_task_start_wait_reason(session: Any, task_id: str, store_id: int | None) -> str:
+def listing_task_start_wait_reason(session: Any, task: ListingTaskModel) -> str:
+    task_id = str(task.id)
     finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架")
-    finalize_stale_store_cancel_requested_tasks(session, store_id)
     reconcile_interrupted_running_tasks(session, ListingTaskModel)
-    if running_listing_task_count(session, exclude_task_id=task_id) > 0:
-        return "排队中，等待当前上架任务完成"
-    store_running_count = running_store_task_count(
+    session.execute(
+        select(UserAccountModel.username)
+        .where(UserAccountModel.username == task.owner_username)
+        .with_for_update()
+    ).first()
+    store_ids = listing_task_store_ids(task)
+    if store_ids:
+        session.execute(
+            select(StoreModel.id)
+            .where(StoreModel.id.in_(store_ids))
+            .order_by(StoreModel.id.asc())
+            .with_for_update()
+        ).all()
+    for store_id in store_ids:
+        finalize_stale_store_cancel_requested_tasks(session, store_id)
+    if running_listing_task_count(session, exclude_task_id=task_id) >= int(settings.max_running_listing_tasks_global):
+        return "排队中，等待全局上架并发额度"
+    if running_user_listing_task_count(
         session,
-        store_id,
-        exclude_listing_task_id=task_id,
-    )
-    if store_running_count > 0:
-        return "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
+        task.owner_username,
+        exclude_task_id=task_id,
+    ) >= int(settings.max_running_listing_tasks_per_user):
+        return "排队中，等待该用户当前上架任务释放并发额度"
+    for store_id in store_ids:
+        if running_store_sync_task_count(session, store_id) > 0:
+            return "排队中，等待该店铺当前同步、上下架或删除任务完成"
+        if running_store_listing_task_count(
+            session,
+            store_id,
+            exclude_task_id=task_id,
+        ) >= int(settings.max_running_listing_tasks_per_store):
+            return "排队中，等待该店铺当前上架任务释放并发额度"
     return ""
 
 
@@ -4076,10 +4206,49 @@ def build_rakuten_authorization_header(service_secret: str, license_key: str) ->
     return f"ESA {authorization}"
 
 
-def throttle_rakuten_cabinet_request() -> None:
+def rakuten_request_account_key(headers: Any) -> str:
+    authorization = normalize_text(headers.get("Authorization")) if isinstance(headers, dict) else ""
+    return hashlib.sha256(authorization.encode("utf-8")).hexdigest()[:24] if authorization else "default"
+
+
+def wait_for_distributed_request_slot(bucket: str, min_interval: float) -> bool:
+    if not should_use_redis_task_queue() or min_interval <= 0:
+        return False
+    connection = None
+    lock = None
+    try:
+        connection = redis_connection()
+        lock = connection.lock(
+            f"lt:request-rate:{bucket}:lock",
+            timeout=max(5.0, min_interval * 10),
+            blocking_timeout=max(5.0, min_interval * 10),
+        )
+        if not lock.acquire(blocking=True):
+            return False
+        timestamp_key = f"lt:request-rate:{bucket}:last"
+        raw_last = connection.get(timestamp_key)
+        last_at = float(raw_last or 0.0)
+        wait_seconds = max(0.0, min_interval - (time.time() - last_at))
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        connection.set(timestamp_key, str(time.time()), ex=max(60, int(min_interval * 100)))
+        return True
+    except Exception:
+        return False
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
+def throttle_rakuten_cabinet_request(account_key: str = "default") -> None:
     global RAKUTEN_CABINET_LAST_REQUEST_AT
     min_interval = max(0.0, RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS)
     if min_interval <= 0:
+        return
+    if wait_for_distributed_request_slot(f"cabinet:{account_key}", min_interval):
         return
     with RAKUTEN_CABINET_REQUEST_LOCK:
         now = time.monotonic()
@@ -4093,7 +4262,9 @@ def rakuten_cabinet_request(method: str, url: str, **kwargs: Any) -> requests.Re
     attempts = max(1, RAKUTEN_CABINET_REQUEST_MAX_RETRIES)
     last_exc: requests.RequestException | None = None
     for attempt in range(1, attempts + 1):
-        throttle_rakuten_cabinet_request()
+        throttle_rakuten_cabinet_request(
+            rakuten_request_account_key(kwargs.get("headers")),
+        )
         try:
             response = requests.request(method, url, **kwargs)
         except requests.RequestException as exc:
@@ -12703,6 +12874,8 @@ def request_rakuten_write(
 ) -> requests.Response:
     timeout = max(int(settings.rakuten_write_timeout_seconds), int(settings.crawler_timeout_seconds))
     last_error: Exception | None = None
+    account_key = rakuten_request_account_key(headers)
+    throttle_rakuten_write_request(account_key)
     for attempt in range(RAKUTEN_WRITE_MAX_RETRIES):
         try:
             response = requests.request(method, url, timeout=timeout, headers=headers, **kwargs)
@@ -12723,6 +12896,21 @@ def request_rakuten_write(
     if last_error is not None:
         raise RuntimeError(f"{operation}失败：{last_error}") from last_error
     raise RuntimeError(f"{operation}失败。")
+
+
+def throttle_rakuten_write_request(account_key: str = "default") -> None:
+    min_interval = max(0.0, RAKUTEN_WRITE_REQUEST_MIN_INTERVAL_SECONDS)
+    if min_interval <= 0:
+        return
+    if wait_for_distributed_request_slot(f"write:{account_key}", min_interval):
+        return
+    with RAKUTEN_WRITE_REQUEST_LOCK:
+        now = time.monotonic()
+        last_at = RAKUTEN_WRITE_LAST_REQUEST_AT_BY_ACCOUNT.get(account_key, 0.0)
+        elapsed = now - last_at
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        RAKUTEN_WRITE_LAST_REQUEST_AT_BY_ACCOUNT[account_key] = time.monotonic()
 
 
 def wait_for_rakuten_item_delete_slot(
@@ -14329,19 +14517,6 @@ def create_store_product_on_rakuten(
     try:
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-        payload = build_rakuten_item_upsert_payload(
-            product,
-            raw_payload,
-            [],
-            manage_number=manage_number,
-            hide_item=True,
-        )
-        if cancel_check and cancel_check():
-            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-        payload = put_rakuten_item_with_attribute_retry(service_secret, license_key, manage_number, payload)
-        item_write_started = True
-        if cancel_check and cancel_check():
-            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         uploaded_product_images = upload_product_images_to_rakuten(
             service_secret,
             license_key,
@@ -14372,11 +14547,12 @@ def create_store_product_on_rakuten(
             raw_payload,
             uploaded_product_images,
             manage_number=manage_number,
-            hide_item=True,
+            hide_item=False,
         )
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         payload = put_rakuten_item_with_attribute_retry(service_secret, license_key, manage_number, payload)
+        item_write_started = True
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         inventory_payloads = build_rakuten_inventory_upsert_payloads(
@@ -14384,9 +14560,6 @@ def create_store_product_on_rakuten(
             payload.get("variants") if isinstance(payload.get("variants"), dict) else {},
         )
         bulk_upsert_rakuten_inventories(service_secret, license_key, inventory_payloads)
-        if cancel_check and cancel_check():
-            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-        patch_rakuten_item_visibility(service_secret, license_key, manage_number, hide_item=False)
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         payload["hideItem"] = False
@@ -14606,6 +14779,53 @@ def build_listing_manage_number(product_id: int, *, store_id: int = 0, listed_at
     return f"{LISTING_MANAGE_NUMBER_PREFIX}{store_text}{date_text}{product_text}"[:32]
 
 
+def prepare_rakuten_listing_image(image_url: str) -> dict[str, Any] | None:
+    try:
+        image_data = prepare_rakuten_cabinet_image(
+            load_product_image_bytes(
+                image_url,
+                max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+                size_error_message="图片下载大小不能超过 20MB。",
+            )
+        )
+    except ProductImageUnavailableError:
+        return None
+    except RuntimeError as exc:
+        if should_skip_listing_image_error(exc):
+            return None
+        raise
+    return {
+        **image_data,
+        "sourceUrl": image_url,
+    }
+
+
+def prepare_rakuten_listing_images(
+    image_urls: list[str],
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[dict[str, Any]]:
+    if not image_urls:
+        return []
+    if cancel_check and cancel_check():
+        raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+    worker_count = min(
+        len(image_urls),
+        max(1, int(settings.listing_image_prepare_workers)),
+    )
+    if worker_count <= 1:
+        prepared = [prepare_rakuten_listing_image(image_url) for image_url in image_urls]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="listing-image-prepare",
+        ) as executor:
+            prepared = list(executor.map(prepare_rakuten_listing_image, image_urls))
+    if cancel_check and cancel_check():
+        raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+    return [image for image in prepared if image is not None]
+
+
 def upload_product_images_to_rakuten(
     service_secret: str,
     license_key: str,
@@ -14626,25 +14846,11 @@ def upload_product_images_to_rakuten(
     upload_cabinet_context = cabinet_context if isinstance(cabinet_context, dict) else {}
     image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
-        for index, image_url in enumerate(images, start=1):
+        prepared_images = prepare_rakuten_listing_images(images, cancel_check=cancel_check)
+        for index, image_data in enumerate(prepared_images, start=1):
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-            try:
-                image_data = prepare_rakuten_cabinet_image(
-                    load_product_image_bytes(
-                        image_url,
-                        max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
-                        size_error_message="图片下载大小不能超过 20MB。",
-                    )
-                )
-            except ProductImageUnavailableError:
-                continue
-            except RuntimeError as exc:
-                if should_skip_listing_image_error(exc):
-                    continue
-                raise
-            if cancel_check and cancel_check():
-                raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+            image_url = normalize_text(image_data.get("sourceUrl"))
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="p")
             file_name = listing_cabinet_upload_file_name(file_path)
@@ -14736,27 +14942,21 @@ def upload_product_description_images_to_rakuten(
     upload_cabinet_context = cabinet_context if isinstance(cabinet_context, dict) else {}
     image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
-        for index, image_url in enumerate(image_urls, start=1):
+        prepared_images = prepare_rakuten_listing_images(image_urls, cancel_check=cancel_check)
+        prepared_source_urls = {
+            normalize_text(image_data.get("sourceUrl"))
+            for image_data in prepared_images
+            if normalize_text(image_data.get("sourceUrl"))
+        }
+        removed_image_urls.extend(
+            image_url
+            for image_url in image_urls
+            if image_url not in prepared_source_urls
+        )
+        for index, image_data in enumerate(prepared_images, start=1):
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-            try:
-                image_data = prepare_rakuten_cabinet_image(
-                    load_product_image_bytes(
-                        image_url,
-                        max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
-                        size_error_message="图片下载大小不能超过 20MB。",
-                    )
-                )
-            except ProductImageUnavailableError:
-                removed_image_urls.append(image_url)
-                continue
-            except RuntimeError as exc:
-                if should_skip_listing_image_error(exc):
-                    removed_image_urls.append(image_url)
-                    continue
-                raise
-            if cancel_check and cancel_check():
-                raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+            image_url = normalize_text(image_data.get("sourceUrl"))
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="d")
             file_name = listing_cabinet_upload_file_name(file_path)
@@ -17093,7 +17293,7 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             return
         if task_cancel_requested(task):
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-        wait_reason = listing_task_start_wait_reason(session, task_id, task.store_id)
+        wait_reason = listing_task_start_wait_reason(session, task)
         if wait_reason:
             task.message = wait_reason
             session.flush()
