@@ -3326,6 +3326,18 @@ def reserved_crawl_job_state(connection: Any, job_id: str) -> dict[str, Any] | N
     return rq_job_state(job, status or "unknown")
 
 
+def task_queue_health_kind_by_name() -> dict[str, str]:
+    return {
+        task_queue_name_for_kind("crawl"): "采集",
+        task_queue_name_for_kind("sync"): "同步",
+        task_queue_name_for_kind("title-optimization"): "标题优化",
+        task_queue_name_for_kind("image-cleanup"): "图片清理",
+        task_queue_name_for_kind("listing"): "上架",
+        task_queue_name_for_kind("schedule"): "定时",
+        settings.task_queue_name: "默认",
+    }
+
+
 def task_queue_health() -> dict[str, Any]:
     checked_at = datetime.now()
     base = {
@@ -3361,19 +3373,8 @@ def task_queue_health() -> dict[str, Any]:
                 if queue_name:
                     worker_count_by_queue[queue_name] = worker_count_by_queue.get(queue_name, 0) + 1
 
-        expected_queue_names = {
-            task_queue_name_for_kind("crawl"),
-            task_queue_name_for_kind("sync"),
-            task_queue_name_for_kind("listing"),
-            task_queue_name_for_kind("schedule"),
-        }
-        queue_kind_by_name = {
-            task_queue_name_for_kind("crawl"): "采集",
-            task_queue_name_for_kind("sync"): "同步",
-            task_queue_name_for_kind("listing"): "上架",
-            task_queue_name_for_kind("schedule"): "定时",
-            settings.task_queue_name: "默认",
-        }
+        queue_kind_by_name = task_queue_health_kind_by_name()
+        expected_queue_names = set(queue_kind_by_name) - {settings.task_queue_name}
         queues: list[dict[str, Any]] = []
         issues: list[str] = []
         for queue_name in all_task_queue_names():

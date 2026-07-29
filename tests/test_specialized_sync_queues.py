@@ -126,6 +126,13 @@ def test_sync_task_queue_kind(task_type, expected_kind):
     assert crawler_service.sync_task_queue_kind(task_type) == expected_kind
 
 
+def test_queue_health_uses_business_labels_for_specialized_queues():
+    labels = crawler_service.task_queue_health_kind_by_name()
+
+    assert labels[crawler_service.task_queue_name_for_kind("title-optimization")] == "标题优化"
+    assert labels[crawler_service.task_queue_name_for_kind("image-cleanup")] == "图片清理"
+
+
 def test_dispatch_sync_task_routes_each_task_type(monkeypatch):
     queued = []
     monkeypatch.setattr(crawler_service, "should_use_redis_task_queue", lambda: True)
