@@ -79,6 +79,7 @@ class Settings(BaseModel):
     max_running_listing_tasks_per_store: int = 1
     listing_product_workers: int = 6
     listing_image_prepare_workers: int = 12
+    listing_creation_image_limit: int = 1
     crawler_browser_fallback_enabled: bool = False
     crawler_browser_timeout_seconds: int = 35
     crawler_max_ranking_pages: int = 200
@@ -110,6 +111,7 @@ class Settings(BaseModel):
     task_queue_sync_name: str = "lt-tasks-sync"
     task_queue_title_optimization_name: str = "lt-tasks-title-optimization"
     task_queue_image_cleanup_name: str = "lt-tasks-image-cleanup"
+    task_queue_listing_image_upload_name: str = "lt-tasks-listing-image-upload"
     task_queue_listing_name: str = "lt-tasks-listing"
     task_queue_schedule_name: str = "lt-tasks-schedule"
     task_queue_job_timeout_seconds: int = TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS
@@ -197,6 +199,7 @@ def build_settings() -> Settings:
         max_running_listing_tasks_per_store=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_STORE", 1)),
         listing_product_workers=max(1, _env_int("LT_LISTING_PRODUCT_WORKERS", 6)),
         listing_image_prepare_workers=max(1, _env_int("LT_LISTING_IMAGE_PREPARE_WORKERS", 12)),
+        listing_creation_image_limit=min(20, max(1, _env_int("LT_LISTING_CREATION_IMAGE_LIMIT", 1))),
         crawler_browser_fallback_enabled=_env_bool("LT_CRAWLER_BROWSER_FALLBACK_ENABLED", False),
         crawler_browser_timeout_seconds=_env_int("LT_CRAWLER_BROWSER_TIMEOUT_SECONDS", 35),
         crawler_max_ranking_pages=max(1, _env_int("LT_CRAWLER_MAX_RANKING_PAGES", 200)),
@@ -236,6 +239,10 @@ def build_settings() -> Settings:
         task_queue_image_cleanup_name=_env_text(
             "LT_TASK_QUEUE_IMAGE_CLEANUP_NAME",
             f"{base_task_queue_name}-image-cleanup",
+        ),
+        task_queue_listing_image_upload_name=_env_text(
+            "LT_TASK_QUEUE_LISTING_IMAGE_UPLOAD_NAME",
+            f"{base_task_queue_name}-listing-image-upload",
         ),
         task_queue_listing_name=_env_text("LT_TASK_QUEUE_LISTING_NAME", f"{base_task_queue_name}-listing"),
         task_queue_schedule_name=_env_text("LT_TASK_QUEUE_SCHEDULE_NAME", f"{base_task_queue_name}-schedule"),

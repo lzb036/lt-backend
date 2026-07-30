@@ -111,6 +111,8 @@ class ListingProductAttemptResult:
     product_id: int
     success: bool
     error: str = ""
+    listed_product_id: int | None = None
+    image_completion_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -506,7 +508,12 @@ TASK_REDIS_MISSING_JOB_GRACE_SECONDS = 60
 TASK_QUEUED_REDIS_MISSING_JOB_GRACE_SECONDS = 2 * 60
 TITLE_OPTIMIZATION_TASK_TYPES = frozenset({"title_optimization"})
 IMAGE_CLEANUP_TASK_TYPES = frozenset({"deleted_product_image_cleanup"})
-SPECIALIZED_SYNC_TASK_TYPES = TITLE_OPTIMIZATION_TASK_TYPES | IMAGE_CLEANUP_TASK_TYPES
+LISTING_IMAGE_UPLOAD_TASK_TYPES = frozenset({"listing_image_upload"})
+SPECIALIZED_SYNC_TASK_TYPES = (
+    TITLE_OPTIMIZATION_TASK_TYPES
+    | IMAGE_CLEANUP_TASK_TYPES
+    | LISTING_IMAGE_UPLOAD_TASK_TYPES
+)
 CRAWL_DISPATCH_LOCK_NAME = "lt:crawl-dispatch"
 CRAWL_DISPATCH_LOCK_TIMEOUT_SECONDS = 30
 CRAWL_DISPATCH_LOCK_BLOCKING_TIMEOUT_SECONDS = 3
@@ -726,6 +733,8 @@ def sync_task_queue_kind(task_type: str | None) -> str:
         return "title-optimization"
     if normalized_type in IMAGE_CLEANUP_TASK_TYPES:
         return "image-cleanup"
+    if normalized_type in LISTING_IMAGE_UPLOAD_TASK_TYPES:
+        return "listing-image-upload"
     return "sync"
 
 
@@ -735,6 +744,8 @@ def sync_task_type_label(task_type: str | None) -> str:
         return "标题优化任务"
     if normalized_type in IMAGE_CLEANUP_TASK_TYPES:
         return "图片清理任务"
+    if normalized_type in LISTING_IMAGE_UPLOAD_TASK_TYPES:
+        return "图片上传任务"
     return "同步任务"
 
 
@@ -2989,6 +3000,8 @@ def sync_task_action_label(row: SyncTaskModel) -> str:
         return "删除"
     if task_type == "deleted_product_image_cleanup":
         return "图片清理"
+    if task_type == "listing_image_upload":
+        return "图片上传"
     if task_type in {"listing_status", "product_listing_status"}:
         payload = sync_task_payload(row)
         listing_status = normalize_text(payload.get("listingStatus"))
@@ -3791,6 +3804,27 @@ def specialized_sync_task_wait_reason(
         )
         if running_task_id is not None:
             return "排队中，等待该店铺当前图片清理任务完成"
+    if task_type in LISTING_IMAGE_UPLOAD_TASK_TYPES and task.store_id is not None:
+        active_listing_rows = session.scalars(
+            select(ListingTaskModel).where(
+                ListingTaskModel.status.in_(("queued", "running")),
+            )
+        ).all()
+        if any(int(task.store_id) in listing_task_store_ids(row) for row in active_listing_rows):
+            return "排队中，优先等待该店铺基础上架任务完成"
+        running_task_id = session.scalar(
+            select(SyncTaskModel.id)
+            .where(
+                SyncTaskModel.store_id == task.store_id,
+                SyncTaskModel.task_type.in_(LISTING_IMAGE_UPLOAD_TASK_TYPES),
+                SyncTaskModel.status == "running",
+                SyncTaskModel.id != task.id,
+            )
+            .limit(1)
+            .with_for_update()
+        )
+        if running_task_id is not None:
+            return "排队中，等待该店铺当前图片完善任务完成"
     return ""
 
 
@@ -8961,7 +8995,7 @@ def list_sync_tasks(
 ) -> list[dict[str, Any]] | dict[str, Any]:
     dispatch_next_sync_task_safely()
     normalized_group = normalize_text(task_group) or "sync"
-    if normalized_group not in {"sync", "title_optimization", "image_cleanup"}:
+    if normalized_group not in {"sync", "title_optimization", "image_cleanup", "listing_image_upload"}:
         raise RuntimeError("任务分组无效。")
     with session_scope() as session:
         scoped_owner = None if all_owners else owner_username
@@ -8989,6 +9023,10 @@ def list_sync_tasks(
         elif normalized_group == "image_cleanup":
             query = query.where(
                 SyncTaskModel.task_type.in_(IMAGE_CLEANUP_TASK_TYPES)
+            )
+        elif normalized_group == "listing_image_upload":
+            query = query.where(
+                SyncTaskModel.task_type.in_(LISTING_IMAGE_UPLOAD_TASK_TYPES)
             )
         else:
             query = query.where(
@@ -10236,6 +10274,33 @@ def run_sync_task(owner_username: str, task_id: str) -> None:
                 else f"完成，清理成功 {success_count} 个商品，异常 {failed_count} 个"
             )
             error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
+        elif task_type == "listing_image_upload":
+            product_ids = normalize_product_ids(list(payload.get("productIds") or []))
+            result = perform_listing_image_upload(
+                owner_username,
+                store_id,
+                product_ids,
+                task_id=task_id,
+            )
+            payload["result"] = {
+                "successIds": list(result.get("successIds") or []),
+                "failedIds": list(result.get("failedIds") or []),
+            }
+            total_count = int(result.get("totalCount") or 0)
+            success_count = int(result.get("successCount") or 0)
+            failed_count = int(result.get("failedCount") or 0)
+            if result.get("cancelled"):
+                status = "cancelled"
+                message = cancelled_task_progress_message(
+                    "图片完善",
+                    total_count,
+                    success_count,
+                    failed_count,
+                )
+            else:
+                status = "success" if failed_count == 0 else "partial"
+                message = f"完成，图片完善成功 {success_count} 个商品，异常 {failed_count} 个"
+            error_detail = summarize_task_errors(list(result.get("errors") or []), limit=50)
         else:
             result = perform_store_sync(owner_username, store_id, task_id=task_id)
             total_count = int(result.get("totalCount") or 0)
@@ -10328,6 +10393,8 @@ def sync_task_running_message(task: SyncTaskModel) -> str:
         return "正在执行批量删除"
     if task_type == "deleted_product_image_cleanup":
         return "正在清理已删除商品图片"
+    if task_type == "listing_image_upload":
+        return "正在上传上架商品图片和详情图"
     return "正在同步店铺商品"
 
 
@@ -10575,6 +10642,7 @@ def retry_sync_task(
             "product_delete",
             "product_listing_status",
             "title_optimization",
+            "listing_image_upload",
         }:
             original_ids = normalize_product_ids(list(payload.get("productIds") or []))
             failed_ids = normalize_product_ids(list(result_payload.get("failedIds") or []))
@@ -14547,11 +14615,27 @@ def create_store_product_on_rakuten(
     cabinet_context: dict[str, Any] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    raw_payload = product_raw_payload(product)
+    original_raw_payload = product_raw_payload(product)
+    raw_payload = base_listing_raw_payload(original_raw_payload, store.store_code)
     product._listing_store_id = store.id
     manage_number = generate_listing_manage_number(product, raw_payload)
     uploaded_product_images: list[dict[str, str]] = []
-    uploaded_description_images: list[dict[str, str]] = []
+    all_product_images = [
+        image
+        for image in recover_missing_local_product_images(product, product_images_for_edit(product))
+        if not is_gif_image_url(image)
+    ][:RAKUTEN_LISTING_IMAGE_LIMIT]
+    fast_image_limit = min(
+        RAKUTEN_LISTING_IMAGE_LIMIT,
+        max(1, int(settings.listing_creation_image_limit)),
+    )
+    fast_product_images = all_product_images[:fast_image_limit]
+    remaining_product_images = all_product_images[fast_image_limit:]
+    description_transfer_urls = listing_description_transfer_urls(
+        original_raw_payload,
+        store.store_code,
+    )
+    image_completion_required = bool(remaining_product_images or description_transfer_urls)
     item_write_started = False
     payload: dict[str, Any] = {}
     try:
@@ -14564,22 +14648,9 @@ def create_store_product_on_rakuten(
             product,
             manage_number,
             cabinet_context=cabinet_context,
+            source_images=fast_product_images,
             cancel_check=cancel_check,
         )
-        if cancel_check and cancel_check():
-            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-        description_result = upload_product_description_images_to_rakuten(
-            service_secret,
-            license_key,
-            store,
-            product,
-            manage_number,
-            raw_payload,
-            cabinet_context=cabinet_context,
-            cancel_check=cancel_check,
-        )
-        raw_payload = description_result["rawPayload"]
-        uploaded_description_images = description_result["uploadedImages"]
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         payload = build_rakuten_item_upsert_payload(
@@ -14609,8 +14680,7 @@ def create_store_product_on_rakuten(
                 delete_rakuten_item(service_secret, license_key, manage_number)
             except Exception:
                 pass
-        uploaded_images_for_rollback = [*uploaded_product_images, *uploaded_description_images]
-        rollback_uploaded_listing_images(service_secret, license_key, uploaded_images_for_rollback)
+        rollback_uploaded_listing_images(service_secret, license_key, uploaded_product_images)
         raise
     except Exception as exc:
         if item_write_started:
@@ -14618,8 +14688,7 @@ def create_store_product_on_rakuten(
                 delete_rakuten_item(service_secret, license_key, manage_number)
             except Exception:
                 pass
-        uploaded_images_for_rollback = [*uploaded_product_images, *uploaded_description_images]
-        rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_images_for_rollback)
+        rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_product_images)
         if rollback_message:
             raise RuntimeError(f"{exc}；已回滚本次上传图片：{rollback_message}") from exc
         raise
@@ -14629,7 +14698,7 @@ def create_store_product_on_rakuten(
     updated_payload["manageNumber"] = manage_number
     updated_payload["itemNumber"] = payload.get("itemNumber") or manage_number
     updated_payload["images"] = uploaded_product_images
-    updated_payload["descriptionImages"] = uploaded_description_images
+    updated_payload["descriptionImages"] = []
     updated_payload["ltEditedImages"] = [
         build_rakuten_cabinet_image_url(store.store_code, image["location"])
         for image in uploaded_product_images
@@ -14641,6 +14710,13 @@ def create_store_product_on_rakuten(
         "storeName": store.store_name,
         "aliasName": store.alias_name,
     }
+    updated_payload["listingImageCompletion"] = {
+        "status": "queued" if image_completion_required else "not_required",
+        "fastImageCount": len(uploaded_product_images),
+        "totalMainImageCount": len(all_product_images),
+        "remainingMainImageCount": len(remaining_product_images),
+        "descriptionImageCount": len(description_transfer_urls),
+    }
     updated_payload["created"] = updated_payload.get("created") or now.isoformat(timespec="seconds")
     updated_payload["updated"] = now.isoformat(timespec="seconds")
     return {
@@ -14649,7 +14725,325 @@ def create_store_product_on_rakuten(
         "payload": updated_payload,
         "price": price_from_rakuten_item(updated_payload),
         "imageUrl": build_rakuten_cabinet_image_url(store.store_code, uploaded_product_images[0]["location"]) if uploaded_product_images else product.image_url,
+        "imageCompletionRequired": image_completion_required,
     }
+
+
+def listing_creation_active_for_store(store_id: int) -> bool:
+    with session_scope() as session:
+        active_rows = session.scalars(
+            select(ListingTaskModel).where(
+                ListingTaskModel.status.in_(("queued", "running")),
+            )
+        ).all()
+        return any(int(store_id) in listing_task_store_ids(row) for row in active_rows)
+
+
+def wait_for_listing_creation_priority(
+    store_id: int,
+    *,
+    task_id: str | None = None,
+) -> None:
+    while listing_creation_active_for_store(store_id):
+        if task_id and is_task_cancel_requested(SyncTaskModel, task_id):
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+        time.sleep(TASK_START_RETRY_DELAY_SECONDS)
+
+
+def enrich_listed_product_images(
+    owner_username: str,
+    store_id: int,
+    listed_product_id: int,
+    service_secret: str,
+    license_key: str,
+    *,
+    task_id: str | None = None,
+) -> None:
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        listed_product = session.get(ProductModel, listed_product_id)
+        if (
+            store is None
+            or listed_product is None
+            or listed_product.owner_username != owner_username
+            or int(listed_product.store_id or 0) != int(store_id)
+        ):
+            raise RuntimeError("待完善的店铺商品不存在。")
+        source_product = session.get(ProductModel, listed_product.parent_product_id) if listed_product.parent_product_id else None
+        if source_product is None or source_product.owner_username != owner_username:
+            raise RuntimeError("待完善商品缺少对应的源商品。")
+        manage_number = normalize_text(listed_product.rakuten_manage_number)
+        if not manage_number:
+            raise RuntimeError("待完善商品缺少乐天商品管理编号。")
+        source_raw = product_raw_payload(source_product)
+        listed_raw = product_raw_payload(listed_product)
+        existing_main_images = [
+            image
+            for image in listed_raw.get("images", [])
+            if isinstance(image, dict) and normalize_text(image.get("location"))
+        ]
+        existing_source_urls = {
+            normalize_text(image.get("sourceUrl"))
+            for image in existing_main_images
+            if normalize_text(image.get("sourceUrl"))
+        }
+        all_main_sources = [
+            image
+            for image in recover_missing_local_product_images(
+                source_product,
+                product_images_for_edit(source_product),
+            )
+            if not is_gif_image_url(image)
+        ][:RAKUTEN_LISTING_IMAGE_LIMIT]
+        remaining_main_sources = [
+            image
+            for image in all_main_sources
+            if normalize_text(image) not in existing_source_urls
+        ]
+
+        new_main_images: list[dict[str, str]] = []
+        new_description_images: list[dict[str, str]] = []
+        try:
+            if remaining_main_sources:
+                wait_for_listing_creation_priority(store_id, task_id=task_id)
+                new_main_images = upload_product_images_to_rakuten(
+                    service_secret,
+                    license_key,
+                    store,
+                    source_product,
+                    manage_number,
+                    cabinet_context={},
+                    source_images=remaining_main_sources,
+                    cancel_check=lambda: is_task_cancel_requested(SyncTaskModel, task_id),
+                    start_index=len(existing_main_images) + 1,
+                    before_upload=lambda: wait_for_listing_creation_priority(
+                        store_id,
+                        task_id=task_id,
+                    ),
+                )
+            wait_for_listing_creation_priority(store_id, task_id=task_id)
+            description_result = upload_product_description_images_to_rakuten(
+                service_secret,
+                license_key,
+                store,
+                source_product,
+                manage_number,
+                source_raw,
+                cabinet_context={},
+                cancel_check=lambda: is_task_cancel_requested(SyncTaskModel, task_id),
+                before_upload=lambda: wait_for_listing_creation_priority(
+                    store_id,
+                    task_id=task_id,
+                ),
+            )
+            enriched_raw = description_result["rawPayload"]
+            new_description_images = description_result["uploadedImages"]
+            combined_main_images = [
+                *existing_main_images,
+                *new_main_images,
+            ][:RAKUTEN_LISTING_IMAGE_LIMIT]
+            payload = build_rakuten_item_upsert_payload(
+                source_product,
+                enriched_raw,
+                combined_main_images,
+                manage_number=manage_number,
+                hide_item=False,
+            )
+            wait_for_listing_creation_priority(store_id, task_id=task_id)
+            payload = put_rakuten_item_with_attribute_retry(
+                service_secret,
+                license_key,
+                manage_number,
+                payload,
+            )
+        except TaskCancelled:
+            rollback_uploaded_listing_images(
+                service_secret,
+                license_key,
+                [*new_main_images, *new_description_images],
+            )
+            raise
+        except Exception as exc:
+            rollback_message = rollback_uploaded_listing_images(
+                service_secret,
+                license_key,
+                [*new_main_images, *new_description_images],
+            )
+            if rollback_message:
+                raise RuntimeError(f"{exc}；已回滚本次图片完善上传：{rollback_message}") from exc
+            raise
+
+        updated_payload = dict(enriched_raw)
+        updated_payload.update(payload)
+        updated_payload["manageNumber"] = manage_number
+        updated_payload["itemNumber"] = payload.get("itemNumber") or listed_product.item_number or manage_number
+        updated_payload["images"] = combined_main_images
+        updated_payload["descriptionImages"] = new_description_images
+        updated_payload["ltEditedImages"] = [
+            build_rakuten_cabinet_image_url(store.store_code, image["location"])
+            for image in combined_main_images
+            if image.get("location")
+        ]
+        updated_payload["listingStore"] = listed_raw.get("listingStore") or {
+            "storeId": store.id,
+            "storeCode": store.store_code,
+            "storeName": store.store_name,
+            "aliasName": store.alias_name,
+        }
+        created_at = listed_raw.get("created")
+        if not created_at and listed_product.listed_at is not None:
+            created_at = listed_product.listed_at.isoformat(timespec="seconds")
+        updated_payload["created"] = created_at or datetime.now().isoformat(timespec="seconds")
+        updated_payload["updated"] = datetime.now().isoformat(timespec="seconds")
+        updated_payload["listingImageCompletion"] = {
+            "status": "success",
+            "completedAt": datetime.now().isoformat(timespec="seconds"),
+            "fastImageCount": len(existing_main_images),
+            "totalMainImageCount": len(combined_main_images),
+            "remainingMainImageCount": 0,
+            "descriptionImageCount": len(new_description_images),
+            "taskId": task_id,
+        }
+        listed_product.raw_payload_json = json.dumps(updated_payload, ensure_ascii=False)
+        if updated_payload["ltEditedImages"]:
+            listed_product.image_url = updated_payload["ltEditedImages"][0]
+        listed_product.store_last_seen_at = datetime.now()
+        listed_product.last_error = None
+
+
+def perform_listing_image_upload(
+    owner_username: str,
+    store_id: int,
+    listed_product_ids: list[int],
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    normalized_ids = normalize_product_ids(listed_product_ids)
+    success_ids: list[int] = []
+    failed_ids: list[int] = []
+    errors: list[str] = []
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        if store is None or store.owner_username != owner_username:
+            raise RuntimeError("图片完善任务关联的店铺不存在。")
+        service_secret = decrypt_text(store.rakuten_service_secret_encrypted)
+        license_key = decrypt_text(store.rakuten_license_key_encrypted)
+    if not service_secret or not license_key:
+        raise RuntimeError("图片完善任务关联店铺缺少乐天 Secret 或乐天 Key。")
+
+    for index, product_id in enumerate(normalized_ids, start=1):
+        if task_id and is_task_cancel_requested(SyncTaskModel, task_id):
+            break
+        try:
+            enrich_listed_product_images(
+                owner_username,
+                store_id,
+                product_id,
+                service_secret,
+                license_key,
+                task_id=task_id,
+            )
+            success_ids.append(product_id)
+        except TaskCancelled:
+            raise
+        except Exception as exc:
+            failed_ids.append(product_id)
+            error_text = str(exc)
+            errors.append(f"{product_id}: {error_text}")
+            with session_scope() as session:
+                product = session.get(ProductModel, product_id)
+                if product is not None and product.owner_username == owner_username:
+                    raw_payload = product_raw_payload(product)
+                    completion = (
+                        raw_payload.get("listingImageCompletion")
+                        if isinstance(raw_payload.get("listingImageCompletion"), dict)
+                        else {}
+                    )
+                    raw_payload["listingImageCompletion"] = {
+                        **completion,
+                        "status": "failed",
+                        "taskId": task_id,
+                        "lastError": error_text,
+                    }
+                    product.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+                    product.last_error = f"商品已基础上架，图片完善失败：{error_text}"
+        if task_id:
+            update_task_progress(
+                SyncTaskModel,
+                task_id,
+                total_count=len(normalized_ids),
+                success_count=len(success_ids),
+                failed_count=len(failed_ids),
+                message=f"图片完善中，已处理 {index} / {len(normalized_ids)} 个商品",
+            )
+    return {
+        "totalCount": len(normalized_ids),
+        "successCount": len(success_ids),
+        "failedCount": len(failed_ids),
+        "successIds": success_ids,
+        "failedIds": failed_ids,
+        "errors": errors,
+        "cancelled": bool(task_id and is_task_cancel_requested(SyncTaskModel, task_id)),
+    }
+
+
+def create_listing_image_upload_task(
+    owner_username: str,
+    store_id: int,
+    listing_task_id: str,
+    listed_product_ids: list[int],
+) -> str | None:
+    normalized_ids = normalize_product_ids(listed_product_ids)
+    if not normalized_ids:
+        return None
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        if store is None or store.owner_username != owner_username:
+            raise RuntimeError("不能为其他用户的店铺创建图片完善任务。")
+        task_id = uuid.uuid4().hex
+        session.add(
+            SyncTaskModel(
+                id=task_id,
+                owner_username=owner_username,
+                store_id=store_id,
+                store_name=store.alias_name or store.store_name,
+                task_name=f"上架图片完善 {listing_task_id[:8]}",
+                task_type="listing_image_upload",
+                payload_json=json.dumps(
+                    {
+                        "listingTaskId": listing_task_id,
+                        "productIds": normalized_ids,
+                    },
+                    ensure_ascii=False,
+                ),
+                status="queued",
+                total_count=len(normalized_ids),
+                message="等待完善上架商品图片",
+            )
+        )
+        for product_id in normalized_ids:
+            product = session.get(ProductModel, product_id)
+            if product is None or product.owner_username != owner_username:
+                continue
+            raw_payload = product_raw_payload(product)
+            completion = (
+                raw_payload.get("listingImageCompletion")
+                if isinstance(raw_payload.get("listingImageCompletion"), dict)
+                else {}
+            )
+            raw_payload["listingImageCompletion"] = {
+                **completion,
+                "status": "queued",
+                "taskId": task_id,
+            }
+            product.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+    dispatch_sync_task(
+        owner_username,
+        task_id,
+        task_type="listing_image_upload",
+        delay_seconds=TASK_START_RETRY_DELAY_SECONDS,
+    )
+    return task_id
 
 
 def upsert_listed_store_product_from_listing_result(
@@ -14878,6 +15272,8 @@ def upload_product_images_to_rakuten(
     cabinet_context: dict[str, Any] | None = None,
     source_images: list[str] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    start_index: int = 1,
+    before_upload: Callable[[], None] | None = None,
 ) -> list[dict[str, str]]:
     images = [
         image for image in recover_missing_local_product_images(product, source_images or product_images_for_edit(product))
@@ -14890,9 +15286,11 @@ def upload_product_images_to_rakuten(
     image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
         prepared_images = prepare_rakuten_listing_images(images, cancel_check=cancel_check)
-        for index, image_data in enumerate(prepared_images, start=1):
+        for index, image_data in enumerate(prepared_images, start=max(1, int(start_index or 1))):
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+            if before_upload:
+                before_upload()
             image_url = normalize_text(image_data.get("sourceUrl"))
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="p")
@@ -14960,6 +15358,7 @@ def upload_product_description_images_to_rakuten(
     raw_payload: dict[str, Any],
     cabinet_context: dict[str, Any] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    before_upload: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     description_items = product_descriptions(raw_payload)
     all_description_image_urls = unique_texts([
@@ -14999,6 +15398,8 @@ def upload_product_description_images_to_rakuten(
         for index, image_data in enumerate(prepared_images, start=1):
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+            if before_upload:
+                before_upload()
             image_url = normalize_text(image_data.get("sourceUrl"))
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="d")
@@ -15061,6 +15462,22 @@ def upload_product_description_images_to_rakuten(
         return {"rawPayload": raw_payload, "uploadedImages": []}
     updated_payload = replace_product_description_image_urls(raw_payload, replacement_map)
     return {"rawPayload": updated_payload, "uploadedImages": uploaded_images}
+
+
+def listing_description_transfer_urls(raw_payload: dict[str, Any], store_code: str) -> list[str]:
+    return unique_texts([
+        url
+        for description in product_descriptions(raw_payload)
+        for url in description_image_urls(description.get("value"))
+        if should_transfer_description_image(url, store_code) and not is_gif_image_url(url)
+    ])
+
+
+def base_listing_raw_payload(raw_payload: dict[str, Any], store_code: str) -> dict[str, Any]:
+    description_urls = listing_description_transfer_urls(raw_payload, store_code)
+    if not description_urls:
+        return dict(raw_payload)
+    return remove_product_description_image_urls(dict(raw_payload), description_urls)
 
 
 def description_image_urls(html: Any) -> list[str]:
@@ -17377,7 +17794,12 @@ def run_listing_product_attempt(
             )
             session.flush()
             record_product_listed_store(product, listed_product, store, listing_result)
-            return ListingProductAttemptResult(product_id=product_id, success=True)
+            return ListingProductAttemptResult(
+                product_id=product_id,
+                success=True,
+                listed_product_id=int(listed_product.id),
+                image_completion_required=bool(listing_result.get("imageCompletionRequired")),
+            )
         except TaskCancelled:
             raise
         except Exception as exc:
@@ -17525,6 +17947,7 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             len(ordered_product_ids),
             max(1, int(settings.listing_product_workers)),
         )
+        image_completion_product_ids: list[int] = []
         cancellation_error: TaskCancelled | None = None
         with ThreadPoolExecutor(
             max_workers=worker_count,
@@ -17563,6 +17986,8 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     success_attempt_count += 1
                     success_product_ids.add(attempt.product_id)
                     failed_product_ids.discard(attempt.product_id)
+                    if attempt.image_completion_required and attempt.listed_product_id:
+                        image_completion_product_ids.append(int(attempt.listed_product_id))
                 else:
                     failed_attempt_count += 1
                     failed_product_ids.add(attempt.product_id)
@@ -17608,6 +18033,20 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     for pending_future in futures:
                         pending_future.cancel()
                     break
+        if image_completion_product_ids:
+            try:
+                create_listing_image_upload_task(
+                    owner_username,
+                    task_store_id,
+                    task_id,
+                    image_completion_product_ids,
+                )
+            except Exception:
+                logger.exception(
+                    "图片上传任务创建或派发失败 listing_task_id=%s store_id=%s",
+                    task_id,
+                    task_store_id,
+                )
         if cancellation_error is not None:
             raise cancellation_error
     raise_if_task_cancelled(ListingTaskModel, task_id)

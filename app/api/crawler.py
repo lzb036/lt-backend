@@ -1520,7 +1520,7 @@ def list_sync_tasks(
     taskIds: str | None = Query(default=None),
     taskGroup: str = Query(
         default="sync",
-        pattern="^(sync|title_optimization|image_cleanup)$",
+        pattern="^(sync|title_optimization|image_cleanup|listing_image_upload)$",
     ),
     user: dict = Depends(require_task_management_permission),
 ) -> dict:

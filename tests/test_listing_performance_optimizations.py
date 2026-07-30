@@ -46,6 +46,7 @@ def listing_product_and_store():
     product = SimpleNamespace(
         id=123,
         title="Listing product",
+        source_url="https://item.rakuten.co.jp/source-shop/item-1/",
         image_url="https://example.com/source.jpg",
         raw_payload_json="{}",
         review_status="approved",
@@ -67,11 +68,11 @@ def install_direct_listing_mocks(monkeypatch, *, inventory_error: Exception | No
 
     monkeypatch.setattr(crawler_service, "product_raw_payload", lambda _product: {"variants": {}})
     monkeypatch.setattr(crawler_service, "generate_listing_manage_number", lambda *_args: "manage-1")
-    monkeypatch.setattr(
-        crawler_service,
-        "upload_product_images_to_rakuten",
-        lambda *_args, **_kwargs: uploaded_main,
-    )
+    def upload_main(*_args, **kwargs):
+        calls.append(("main_images", list(kwargs.get("source_images") or [])))
+        return uploaded_main
+
+    monkeypatch.setattr(crawler_service, "upload_product_images_to_rakuten", upload_main)
     monkeypatch.setattr(
         crawler_service,
         "upload_product_description_images_to_rakuten",
@@ -149,6 +150,48 @@ def test_listing_creates_complete_visible_item_with_one_item_write(monkeypatch):
     assert [name for name, _payload in calls].count("inventory") == 1
     assert "visibility" not in [name for name, _payload in calls]
     assert ("build", {"manageNumber": "manage-1", "hideItem": False}) in calls
+    assert ("main_images", ["https://example.com/source.jpg"]) in calls
+    assert result["imageCompletionRequired"] is False
+
+
+def test_listing_creation_uses_one_cover_image_and_defers_remaining_images(monkeypatch):
+    product, store = listing_product_and_store()
+    calls = install_direct_listing_mocks(monkeypatch)
+    source_images = [
+        "https://example.com/1.jpg",
+        "https://example.com/2.jpg",
+        "https://example.com/3.jpg",
+    ]
+    monkeypatch.setattr(crawler_service.settings, "listing_creation_image_limit", 1)
+    monkeypatch.setattr(crawler_service, "product_images_for_edit", lambda _product: source_images)
+    monkeypatch.setattr(
+        crawler_service,
+        "product_raw_payload",
+        lambda _product: {
+            "variants": {},
+            "descriptions": [
+                {"label": "商品説明", "value": '<img src="https://example.com/detail.jpg">'},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "upload_product_description_images_to_rakuten",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("product creation must not upload description images")
+        ),
+    )
+
+    result = crawler_service.create_store_product_on_rakuten(
+        "secret",
+        "key",
+        store,
+        product,
+    )
+
+    assert ("main_images", ["https://example.com/1.jpg"]) in calls
+    assert result["imageCompletionRequired"] is True
+    assert result["payload"]["listingImageCompletion"]["remainingMainImageCount"] == 2
 
 
 def test_listing_inventory_failure_deletes_visible_item_and_rolls_back_images(monkeypatch):

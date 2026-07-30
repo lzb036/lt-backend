@@ -14,6 +14,7 @@ QUEUE_KIND_NAMES = {
     "sync": "task_queue_sync_name",
     "title-optimization": "task_queue_title_optimization_name",
     "image-cleanup": "task_queue_image_cleanup_name",
+    "listing-image-upload": "task_queue_listing_image_upload_name",
     "listing": "task_queue_listing_name",
     "schedule": "task_queue_schedule_name",
 }
@@ -52,6 +53,7 @@ def all_task_queue_names() -> list[str]:
             settings.task_queue_listing_name,
             settings.task_queue_title_optimization_name,
             settings.task_queue_image_cleanup_name,
+            settings.task_queue_listing_image_upload_name,
             settings.task_queue_sync_name,
             settings.task_queue_crawl_name,
             settings.task_queue_schedule_name,
