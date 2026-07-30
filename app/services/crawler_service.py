@@ -4724,7 +4724,7 @@ def ensure_listing_cabinet_folder(
             last_error = exc
             folders = fetch_rakuten_cabinet_folders(service_secret, license_key)
             existing = find_listing_cabinet_folder_by_directory(folders, directory_name)
-            if existing and cabinet_folder_remaining_slots(existing) >= slots:
+            if existing and cabinet_folder_remaining_slots(existing) >= required_slots:
                 return prepare_listing_cabinet_folder(existing)
             continue
         except Exception as exc:

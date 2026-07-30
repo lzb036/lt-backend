@@ -123,6 +123,44 @@ def test_new_folder_uses_today_and_next_daily_sequence(monkeypatch):
     assert folder["folderId"] == 4
 
 
+def test_concurrently_created_folder_is_reused(monkeypatch):
+    freeze_now(monkeypatch, datetime(2026, 7, 30, 12, 0, 0))
+    fetch_results = [
+        [],
+        [
+            {
+                "folderId": 88,
+                "folderName": "YX20260730-1",
+                "directoryName": "yx20260730-1",
+                "fileCount": 12,
+            }
+        ],
+    ]
+    monkeypatch.setattr(
+        crawler_service,
+        "fetch_rakuten_cabinet_folders",
+        lambda *_: fetch_results.pop(0),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "create_rakuten_cabinet_folder",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            crawler_service.CabinetFolderAlreadyExistsError("yx20260730-1")
+        ),
+    )
+
+    folder = crawler_service.ensure_listing_cabinet_folder(
+        "secret",
+        "key",
+        SimpleNamespace(id=2, store_code="japaneden"),
+        1,
+        usage={"remainingFolderCount": 10},
+    )
+
+    assert folder["folderId"] == 88
+    assert folder["directoryName"] == "yx20260730-1"
+
+
 def test_product_images_fill_current_folder_before_switching(monkeypatch):
     first_folder = {
         "folderId": 1,
