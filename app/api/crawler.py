@@ -83,6 +83,7 @@ class CreateTaskPayload(BaseModel):
     rankingPeriod: str | None = Field(default=None, pattern="^(daily|weekly|monthly)$")
     crawlLimit: int | str | None = None
     wholeShopFilter: str | None = Field(default=None, pattern="^(all|reviewed)$")
+    crawlPriceRule: dict[str, Any] | None = None
     mode: str = "manual"
 
 

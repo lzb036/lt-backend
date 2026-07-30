@@ -80,7 +80,7 @@ from app.services.sales_time import (
     iso_sales_datetime,
     sales_now_naive,
 )
-from app.services.user_service import account_crawl_price_rule
+from app.services.user_service import account_crawl_price_rule, normalize_crawl_price_rule
 
 logger = logging.getLogger(__name__)
 
@@ -1084,6 +1084,17 @@ def crawl_task_storage_counts(row: CrawlTaskModel) -> tuple[int, int]:
     return saved_count, skipped_count
 
 
+def task_stored_crawl_price_rule(row: CrawlTaskModel) -> dict[str, Any] | None:
+    raw_rule = getattr(row, "crawl_price_rule_json", None)
+    if not normalize_text(raw_rule):
+        return None
+    try:
+        return normalize_crawl_price_rule(raw_rule)
+    except RuntimeError:
+        logger.warning("Invalid crawl price rule stored on task %s", row.id)
+        return {"operator": "all"}
+
+
 def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
     saved_count, skipped_count = crawl_task_storage_counts(row)
     warning_count = max(0, int(getattr(row, "warning_count", 0) or 0))
@@ -1101,6 +1112,7 @@ def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
         "sourceId": row.source_id,
         "sourceType": row.source_type,
         "target": row.target,
+        "crawlPriceRule": task_stored_crawl_price_rule(row),
         "mode": row.mode,
         "status": resolve_crawl_task_status(row.status, row.total_count, row.success_count, row.failed_count),
         "totalCount": row.total_count,
@@ -18283,6 +18295,12 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
     scheduled_crawl_id = getattr(payload, "scheduledCrawlId", None)
     source_type = str(getattr(payload, "sourceType", "") or "").strip()
     target = str(getattr(payload, "target", "") or "").strip()
+    raw_crawl_price_rule = getattr(payload, "crawlPriceRule", None)
+    crawl_price_rule = (
+        normalize_crawl_price_rule(raw_crawl_price_rule)
+        if raw_crawl_price_rule is not None
+        else None
+    )
     with session_scope() as session:
         schedule = session.get(ScheduledCrawlModel, scheduled_crawl_id) if scheduled_crawl_id else None
         if scheduled_crawl_id and (
@@ -18301,10 +18319,15 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
             raise RuntimeError("采集类型和目标不能为空。")
         if source_type == "product_url":
             target = "\n".join(normalize_rakuten_product_targets(target))
+            crawl_price_rule = {"operator": "all"}
         elif source_type == "whole_shop":
             sid, _ = resolve_whole_shop_identity(target)
             whole_shop_filter = normalize_whole_shop_filter(getattr(payload, "wholeShopFilter", None))
-            target = build_whole_shop_task_target(sid, whole_shop_filter)
+            target = build_whole_shop_task_target(
+                sid,
+                whole_shop_filter,
+                getattr(payload, "crawlLimit", None),
+            )
         elif source_type == "shop":
             primary_target, fallback_target = split_shop_fallback_target(target)
             parsed_target, existing_limit, existing_period = parse_ranking_target(strip_shop_ranking_prefix(primary_target))
@@ -18325,6 +18348,11 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
             scheduled_crawl_id=int(schedule.id) if schedule is not None else None,
             source_type=source_type,
             target=target,
+            crawl_price_rule_json=(
+                json.dumps(crawl_price_rule, ensure_ascii=False)
+                if crawl_price_rule is not None
+                else None
+            ),
             mode=str(getattr(payload, "mode", "") or "manual"),
             status="queued",
             total_count=initial_crawl_task_total_count(source_type, target),
@@ -18738,7 +18766,8 @@ def initial_crawl_task_total_count(source_type: str, target: str) -> int:
     if normalized_source_type == "product_url":
         return len(normalize_rakuten_product_targets(target))
     if normalized_source_type == "whole_shop":
-        return 0
+        _, _, limit = parse_whole_shop_task_options(target)
+        return int(limit or 0)
     if normalized_source_type in {"shop", "ranking"}:
         _, limit, _ = parse_ranking_target(
             strip_shop_ranking_prefix(normalized_target) if normalized_source_type == "shop" else normalized_target
@@ -18779,11 +18808,11 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
                 )
         return items
     if source_type == "whole_shop":
-        sid, whole_shop_filter = parse_whole_shop_task_target(target)
+        sid, whole_shop_filter, limit = parse_whole_shop_task_options(target)
         url = build_whole_shop_search_url(sid, whole_shop_filter)
         items = collect_listing_items(
             url,
-            None,
+            limit,
             task_id=task_id,
             progress_label="整店商品",
         )
@@ -19000,19 +19029,37 @@ def resolve_whole_shop_identity(target: str) -> tuple[str, str]:
     return sid, parse_rakuten_shop_display_name(store_html)
 
 
-def build_whole_shop_task_target(sid: str, whole_shop_filter: str) -> str:
+def build_whole_shop_task_target(
+    sid: str,
+    whole_shop_filter: str,
+    crawl_limit: Any = "all",
+) -> str:
     normalized_sid = normalize_text(sid)
     if not re.fullmatch(r"[0-9]+", normalized_sid):
         raise RuntimeError(WHOLE_SHOP_TARGET_ERROR)
-    return f"整店:{normalized_sid} {whole_shop_filter_label(whole_shop_filter)}"
+    return (
+        f"整店:{normalized_sid} {whole_shop_filter_label(whole_shop_filter)} "
+        f"{crawl_limit_label(crawl_limit)}"
+    )
 
 
 def parse_whole_shop_task_target(target: str) -> tuple[str, str]:
+    sid, whole_shop_filter, _ = parse_whole_shop_task_options(target)
+    return sid, whole_shop_filter
+
+
+def parse_whole_shop_task_options(target: str) -> tuple[str, str, int | None]:
     normalized = normalize_text(target)
-    match = re.fullmatch(r"整店[:：]\s*([0-9]+)\s+(全店采集|评论采集)", normalized)
+    match = re.fullmatch(
+        r"整店[:：]\s*([0-9]+)\s+(全店采集|评论采集)(?:\s+(全部|全量|前\s*[0-9]{1,5}))?",
+        normalized,
+    )
     if not match:
         raise RuntimeError("整店采集任务参数不正确。")
-    return match.group(1), normalize_whole_shop_filter(match.group(2))
+    limit_label = normalize_text(match.group(3))
+    limit_match = re.fullmatch(r"前\s*([0-9]{1,5})", limit_label)
+    limit = max(1, int(limit_match.group(1))) if limit_match else None
+    return match.group(1), normalize_whole_shop_filter(match.group(2)), limit
 
 
 def build_whole_shop_search_url(sid: str, whole_shop_filter: str) -> str:
@@ -19119,6 +19166,11 @@ def crawl_price_rule_for_task(task_id: str | None) -> dict[str, Any]:
         task = session.get(CrawlTaskModel, task_id)
         if task is None:
             return {"operator": "all"}
+        if task.source_type == "product_url":
+            return {"operator": "all"}
+        task_rule = task_stored_crawl_price_rule(task)
+        if task_rule is not None:
+            return task_rule
         account = session.get(UserAccountModel, task.owner_username)
         return account_crawl_price_rule(account) if account is not None else {"operator": "all"}
 

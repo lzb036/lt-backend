@@ -268,6 +268,7 @@ class CrawlTaskModel(TimestampMixin, Base):
     )
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     target: Mapped[str] = mapped_column(Text, nullable=False)
+    crawl_price_rule_json: Mapped[str | None] = mapped_column(Text)
     mode: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     queue_job_id: Mapped[str | None] = mapped_column(String(64))

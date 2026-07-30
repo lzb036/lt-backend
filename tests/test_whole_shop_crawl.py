@@ -65,8 +65,14 @@ def test_parse_search_page_total_and_review_count() -> None:
 
 
 def test_whole_shop_target_and_standard_search_urls() -> None:
-    assert crawler_service.build_whole_shop_task_target("415734", "all") == "整店:415734 全店采集"
+    assert crawler_service.build_whole_shop_task_target("415734", "all") == "整店:415734 全店采集 全部"
+    assert crawler_service.build_whole_shop_task_target("415734", "reviewed", 120) == "整店:415734 评论采集 前 120"
     assert crawler_service.parse_whole_shop_task_target("整店:415734 评论采集") == ("415734", "reviewed")
+    assert crawler_service.parse_whole_shop_task_options("整店:415734 评论采集 前 120") == (
+        "415734",
+        "reviewed",
+        120,
+    )
     assert crawler_service.build_whole_shop_search_url("415734", "all") == (
         "https://search.rakuten.co.jp/search/mall/?sid=415734"
     )
@@ -124,14 +130,14 @@ def test_whole_shop_execution_uses_review_filter_and_shared_listing_collector() 
     ):
         items = crawler_service.collect_items_for_target(
             "whole_shop",
-            "整店:415734 评论采集",
+            "整店:415734 评论采集 前 120",
             task_id="task-id",
         )
 
     assert items == listing_items
     collect_listing.assert_called_once_with(
         "https://search.rakuten.co.jp/search/mall/?sid=415734&review=1",
-        None,
+        120,
         task_id="task-id",
         progress_label="整店商品",
     )
@@ -171,6 +177,8 @@ def test_create_whole_shop_task_persists_normalized_target() -> None:
         sourceType="whole_shop",
         target="https://search.rakuten.co.jp/search/mall/?sid=415734",
         wholeShopFilter="reviewed",
+        crawlLimit=120,
+        crawlPriceRule={"operator": "range", "minPrice": 2500, "maxPrice": 5000},
         mode="manual",
     )
     with (
@@ -185,7 +193,121 @@ def test_create_whole_shop_task_persists_normalized_target() -> None:
 
     assert stored is not None
     assert stored.source_type == "whole_shop"
-    assert stored.target == "整店:415734 评论采集"
+    assert stored.target == "整店:415734 评论采集 前 120"
+    assert stored.crawl_price_rule_json == '{"operator": "range", "minPrice": 2500, "maxPrice": 5000}'
+    assert task["crawlPriceRule"] == {"operator": "range", "minPrice": 2500, "maxPrice": 5000}
+    engine.dispose()
+
+
+def test_task_price_rule_snapshot_overrides_user_global_setting() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+    @contextmanager
+    def local_session_scope():
+        session = factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    with local_session_scope() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="Alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+                crawl_price_rule_json='{"operator": "gte", "value": 3800}',
+            )
+        )
+        session.add(
+            CrawlTaskModel(
+                id="manual-task",
+                owner_username="alice",
+                source_type="shop",
+                target="店铺:example 日榜 全部",
+                crawl_price_rule_json='{"operator": "lte", "value": 2500}',
+                mode="manual",
+                status="queued",
+            )
+        )
+        session.add(
+            CrawlTaskModel(
+                id="legacy-task",
+                owner_username="alice",
+                source_type="shop",
+                target="店铺:example 日榜 全部",
+                mode="manual",
+                status="queued",
+            )
+        )
+
+    with patch.object(crawler_service, "session_scope", local_session_scope):
+        assert crawler_service.crawl_price_rule_for_task("manual-task") == {
+            "operator": "lte",
+            "value": 2500,
+        }
+        assert crawler_service.crawl_price_rule_for_task("legacy-task") == {
+            "operator": "gte",
+            "value": 3800,
+        }
+
+    engine.dispose()
+
+
+def test_product_url_task_always_disables_price_filtering() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+    @contextmanager
+    def local_session_scope():
+        session = factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    with local_session_scope() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="Alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+                crawl_price_rule_json='{"operator": "gte", "value": 3800}',
+            )
+        )
+
+    payload = SimpleNamespace(
+        sourceId=None,
+        scheduledCrawlId=None,
+        sourceType="product_url",
+        target="https://item.rakuten.co.jp/example/item-1/",
+        crawlPriceRule={"operator": "gte", "value": 5000},
+        mode="manual",
+    )
+    with (
+        patch.object(crawler_service, "session_scope", local_session_scope),
+        patch.object(crawler_service, "should_use_redis_task_queue", return_value=True),
+        patch.object(crawler_service, "dispatch_queued_crawl_tasks_safely"),
+    ):
+        task = crawler_service.create_task("alice", payload)
+
+    with patch.object(crawler_service, "session_scope", local_session_scope):
+        assert task["crawlPriceRule"] == {"operator": "all"}
+        assert crawler_service.crawl_price_rule_for_task(task["id"]) == {"operator": "all"}
+
     engine.dispose()
 
 

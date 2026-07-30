@@ -1350,6 +1350,8 @@ def ensure_schema_compatibility() -> None:
                 connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN queue_job_id VARCHAR(64) NULL"))
             if "scheduled_crawl_id" not in crawl_task_columns:
                 connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN scheduled_crawl_id INT NULL"))
+            if "crawl_price_rule_json" not in crawl_task_columns:
+                connection.execute(text("ALTER TABLE lt_crawl_tasks ADD COLUMN crawl_price_rule_json TEXT NULL"))
             if "ix_lt_crawl_task_owner_status" not in crawl_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_crawl_task_owner_status ON lt_crawl_tasks (owner_username, status)"))
             if "ix_lt_crawl_task_owner_created" not in crawl_task_indexes:
