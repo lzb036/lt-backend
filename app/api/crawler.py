@@ -752,6 +752,7 @@ def delete_tasks(payload: TaskDeletePayload, user: dict = Depends(require_crawle
 @router.get("/products")
 def list_products(
     status: str | None = Query(default=None),
+    collectionSource: str | None = Query(default=None, pattern="^(manual|scheduled)$"),
     keyword: str | None = Query(default=None),
     taskId: str | None = Query(default=None),
     storeId: int | None = Query(default=None),
@@ -786,6 +787,7 @@ def list_products(
         result = crawler_service.list_products(
             user["username"],
             status=status,
+            collection_source=collectionSource,
             keyword=keyword,
             task_id=taskId,
             store_id=storeId,

@@ -311,6 +311,12 @@ class ProductModel(TimestampMixin, Base):
     scheduled_crawl_id: Mapped[int | None] = mapped_column(
         ForeignKey("lt_scheduled_crawls.id", ondelete="SET NULL")
     )
+    collection_source: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="manual",
+        server_default="manual",
+    )
     parent_product_id: Mapped[int | None] = mapped_column(ForeignKey("lt_products.id", ondelete="SET NULL"))
     listing_task_id: Mapped[str | None] = mapped_column(String(64))
     store_id: Mapped[int | None] = mapped_column(ForeignKey("lt_stores.id", ondelete="SET NULL"))

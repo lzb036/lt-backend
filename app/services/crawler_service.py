@@ -1174,6 +1174,7 @@ def product_to_public(
         "ownerUsername": row.owner_username,
         "taskId": row.task_id,
         "scheduledCrawlId": row.scheduled_crawl_id,
+        "collectionSource": getattr(row, "collection_source", "manual") or "manual",
         "parentProductId": row.parent_product_id,
         "listingTaskId": row.listing_task_id,
         "storeId": row.store_id,
@@ -7870,6 +7871,7 @@ def list_products(
     owner_username: str,
     *,
     status: str | None = None,
+    collection_source: str | None = None,
     keyword: str | None = None,
     task_id: str | None = None,
     store_id: int | None = None,
@@ -7901,6 +7903,11 @@ def list_products(
         normalized_page = max(1, int(page or 1))
         normalized_page_size = min(500, max(1, int(page_size or 0))) if page_size else None
         product_status = _product_status_filter(status)
+        normalized_collection_source = normalize_text(collection_source).lower()
+        if normalized_collection_source not in {"", "manual", "scheduled"}:
+            raise ValueError("采集来源筛选条件无效")
+        if normalized_collection_source and product_status != "pending":
+            raise ValueError("采集来源筛选仅支持待审核商品")
         sales_period_range = (
             normalize_store_product_sales_range(
                 sales_period_days,
@@ -7929,6 +7936,10 @@ def list_products(
         listed_store_filter = normalize_listed_store_filter(listed_store_id)
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
+        if normalized_collection_source == "manual":
+            query = query.where(ProductModel.collection_source == "manual")
+        elif normalized_collection_source == "scheduled":
+            query = query.where(ProductModel.collection_source == "scheduled")
         if product_status == "listed":
             query = query.where(ProductModel.store_product_status != "removed")
             if normalized_zero_filter in {
@@ -20999,6 +21010,7 @@ def upsert_product(
     row.task_id = task_id
     if scheduled_crawl_id is not None:
         row.scheduled_crawl_id = scheduled_crawl_id
+    row.collection_source = "scheduled" if scheduled_crawl_id is not None else "manual"
     row.store_id = store_id
     row.rakuten_manage_number = prepared.rakuten_manage_number
     row.rakuten_listing_status = str(prepared.item.get("rakuten_listing_status") or row.rakuten_listing_status or "")

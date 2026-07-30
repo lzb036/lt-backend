@@ -1077,6 +1077,23 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN store_id INT NULL"))
         if "scheduled_crawl_id" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN scheduled_crawl_id INT NULL"))
+        if "collection_source" not in product_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE lt_products "
+                    "ADD COLUMN collection_source VARCHAR(16) NOT NULL DEFAULT 'manual'"
+                )
+            )
+        connection.execute(
+            text(
+                """
+                UPDATE lt_products
+                SET collection_source = 'scheduled'
+                WHERE scheduled_crawl_id IS NOT NULL
+                  AND collection_source != 'scheduled'
+                """
+            )
+        )
         if "parent_product_id" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN parent_product_id INT NULL"))
         if "listing_task_id" not in product_columns:
@@ -1368,9 +1385,28 @@ def ensure_schema_compatibility() -> None:
                     """
                     UPDATE lt_products AS product
                     INNER JOIN lt_crawl_tasks AS task ON task.id = product.task_id
-                    SET product.scheduled_crawl_id = task.scheduled_crawl_id
-                    WHERE product.scheduled_crawl_id IS NULL
-                      AND task.scheduled_crawl_id IS NOT NULL
+                    SET
+                        product.scheduled_crawl_id = COALESCE(
+                            product.scheduled_crawl_id,
+                            task.scheduled_crawl_id
+                        ),
+                        product.collection_source = CASE
+                            WHEN task.mode = 'scheduled'
+                              OR task.scheduled_crawl_id IS NOT NULL
+                                THEN 'scheduled'
+                            ELSE product.collection_source
+                        END
+                    WHERE (
+                        product.scheduled_crawl_id IS NULL
+                        AND task.scheduled_crawl_id IS NOT NULL
+                    )
+                    OR (
+                        product.collection_source != 'scheduled'
+                        AND (
+                            task.mode = 'scheduled'
+                            OR task.scheduled_crawl_id IS NOT NULL
+                        )
+                    )
                     """
                 )
             )
