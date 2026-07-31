@@ -14,6 +14,29 @@ from app.db.models import CrawlTaskModel, UserAccountModel
 from app.services import crawler_service
 
 
+def test_listing_progress_total_prefers_limit_until_actual_total_is_lower() -> None:
+    assert crawler_service.listing_progress_total_count(
+        ranking_total=None,
+        requested_limit=3000,
+        collected_count=30,
+    ) == 3000
+    assert crawler_service.listing_progress_total_count(
+        ranking_total=5000,
+        requested_limit=3000,
+        collected_count=30,
+    ) == 3000
+    assert crawler_service.listing_progress_total_count(
+        ranking_total=2000,
+        requested_limit=3000,
+        collected_count=30,
+    ) == 2000
+    assert crawler_service.listing_progress_total_count(
+        ranking_total=5000,
+        requested_limit=None,
+        collected_count=30,
+    ) == 5000
+
+
 def test_single_product_collection_does_not_apply_task_price_rule() -> None:
     with (
         patch.object(

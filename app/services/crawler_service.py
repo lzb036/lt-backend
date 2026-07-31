@@ -18949,12 +18949,16 @@ def collect_listing_items(
             if ranking_total is not None and len(items) >= ranking_total:
                 return items
         if task_id and progress_label:
-            total_text = f" / {ranking_total}" if ranking_total is not None else ""
+            progress_total = listing_progress_total_count(
+                ranking_total=ranking_total,
+                requested_limit=requested_limit,
+                collected_count=len(items),
+            )
             update_task_progress(
                 CrawlTaskModel,
                 task_id,
-                total_count=int(ranking_total or len(items)),
-                message=f"正在发现{progress_label}：{len(items)}{total_text}",
+                total_count=progress_total,
+                message=f"正在发现{progress_label}：{len(items)} / {progress_total}",
             )
         if not should_fetch_next_ranking_page(
             page_items=page_items,
@@ -18966,6 +18970,21 @@ def collect_listing_items(
             break
         page_number += 1
     return items
+
+
+def listing_progress_total_count(
+    *,
+    ranking_total: int | None,
+    requested_limit: int | None,
+    collected_count: int,
+) -> int:
+    if requested_limit is not None:
+        if ranking_total is None:
+            return requested_limit
+        return min(requested_limit, ranking_total)
+    if ranking_total is not None:
+        return ranking_total
+    return collected_count
 
 
 def should_fetch_next_ranking_page(
