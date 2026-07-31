@@ -754,7 +754,14 @@ class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
         with (
             patch.object(crawler_service, "session_scope", self.session_scope),
             patch.object(crawler_service.settings, "task_queue_mode", "thread"),
-            patch.object(crawler_service, "collect_items", return_value=collected_items),
+            patch.object(
+                crawler_service,
+                "collect_item_plan",
+                return_value=crawler_service.CollectedItemPlan(
+                    len(collected_items),
+                    iter(collected_items),
+                ),
+            ),
             patch.object(crawler_service, "localize_collected_product_images", return_value=""),
             patch.object(crawler_service, "log_event", Mock()),
             patch.object(crawler_service, "dispatch_queued_crawl_tasks_safely", Mock()),

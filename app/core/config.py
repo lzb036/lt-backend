@@ -86,6 +86,7 @@ class Settings(BaseModel):
     crawler_min_delay_ms: int = 600
     crawler_max_delay_ms: int = 1600
     crawler_max_retries: int = 3
+    crawler_detail_workers: int = 3
     crawler_batch_size: int = 10
     crawler_batch_pause_seconds: float = 3.0
     crawler_warmup_url: str = "https://www.rakuten.co.jp/"
@@ -206,6 +207,7 @@ def build_settings() -> Settings:
         crawler_min_delay_ms=max(0, _env_int("LT_CRAWLER_MIN_DELAY_MS", 600)),
         crawler_max_delay_ms=max(0, _env_int("LT_CRAWLER_MAX_DELAY_MS", 1600)),
         crawler_max_retries=max(0, _env_int("LT_CRAWLER_MAX_RETRIES", 3)),
+        crawler_detail_workers=min(8, max(1, _env_int("LT_CRAWLER_DETAIL_WORKERS", 3))),
         crawler_batch_size=max(1, _env_int("LT_CRAWLER_BATCH_SIZE", 10)),
         crawler_batch_pause_seconds=max(0, float(_env_text("LT_CRAWLER_BATCH_PAUSE_SECONDS", "3") or "0")),
         crawler_warmup_url=_env_text("LT_CRAWLER_WARMUP_URL", "https://www.rakuten.co.jp/"),

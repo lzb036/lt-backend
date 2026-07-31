@@ -13,7 +13,11 @@ class ShopCollectionScopeTests(unittest.TestCase):
             "__LT_FALLBACK_SHOP_URL__:https://www.rakuten.co.jp/mondeselection/"
         )
 
-        with patch.object(crawler_service, "collect_items_for_target", return_value=[]) as collect:
+        with patch.object(
+            crawler_service,
+            "collect_item_plan_for_target",
+            return_value=crawler_service.CollectedItemPlan(0, ()),
+        ) as collect:
             result = crawler_service.collect_items("shop", target, task_id="task-1")
 
         self.assertEqual(result, [])
@@ -67,8 +71,8 @@ class ShopCollectionScopeTests(unittest.TestCase):
             ),
             patch.object(
                 crawler_service,
-                "enrich_collected_items_with_detail",
-                side_effect=lambda items, **_: items,
+                "iter_enriched_collected_items_with_detail",
+                side_effect=lambda items, **_: iter(items),
             ),
         ):
             result = crawler_service.collect_items_for_target(
@@ -98,8 +102,8 @@ class ShopCollectionScopeTests(unittest.TestCase):
             ),
             patch.object(
                 crawler_service,
-                "enrich_collected_items_with_detail",
-                return_value=[],
+                "iter_enriched_collected_items_with_detail",
+                return_value=iter(()),
             ),
         ):
             result = crawler_service.collect_items_for_target(

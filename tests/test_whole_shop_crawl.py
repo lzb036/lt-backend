@@ -124,7 +124,11 @@ def test_whole_shop_execution_uses_review_filter_and_shared_listing_collector() 
         patch.object(crawler_service, "crawl_price_rule_for_task", return_value={"operator": "all"}),
         patch.object(crawler_service, "collect_listing_items", return_value=listing_items) as collect_listing,
         patch.object(crawler_service, "existing_collected_source_hashes_for_task", return_value=set()),
-        patch.object(crawler_service, "enrich_collected_items_with_detail", return_value=listing_items) as enrich,
+        patch.object(
+            crawler_service,
+            "iter_enriched_collected_items_with_detail",
+            return_value=iter(listing_items),
+        ) as enrich,
         patch.object(crawler_service, "update_task_progress"),
         patch.object(crawler_service, "raise_if_task_cancelled"),
     ):

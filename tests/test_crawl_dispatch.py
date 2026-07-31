@@ -351,13 +351,13 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
             "reserved",
             queue_job_id="crawl-reserved-new",
         )
-        collect = Mock(return_value=[])
+        collect = Mock(return_value=crawler_service.CollectedItemPlan(0, ()))
         refill = Mock(return_value=0)
 
         with (
             patch.object(crawler_service, "session_scope", self.session_scope),
             patch.object(crawler_service.settings, "task_queue_mode", "redis"),
-            patch.object(crawler_service, "collect_items", collect),
+            patch.object(crawler_service, "collect_item_plan", collect),
             patch.object(
                 crawler_service,
                 "dispatch_queued_crawl_tasks_safely",
@@ -373,13 +373,13 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
 
     def test_redis_job_without_reservation_cannot_start_task(self):
         self.add_task("unreserved")
-        collect = Mock(return_value=[])
+        collect = Mock(return_value=crawler_service.CollectedItemPlan(0, ()))
         refill = Mock(return_value=0)
 
         with (
             patch.object(crawler_service, "session_scope", self.session_scope),
             patch.object(crawler_service.settings, "task_queue_mode", "redis"),
-            patch.object(crawler_service, "collect_items", collect),
+            patch.object(crawler_service, "collect_item_plan", collect),
             patch.object(
                 crawler_service,
                 "dispatch_queued_crawl_tasks_safely",
@@ -410,7 +410,11 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
                 "max_running_crawl_tasks_per_user",
                 3,
             ),
-            patch.object(crawler_service, "collect_items", return_value=[]),
+            patch.object(
+                crawler_service,
+                "collect_item_plan",
+                return_value=crawler_service.CollectedItemPlan(0, ()),
+            ),
             patch.object(crawler_service, "log_event"),
             patch.object(
                 crawler_service,

@@ -25,7 +25,7 @@ from html import unescape
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -120,6 +120,12 @@ class CollectionGenrePolicySnapshot:
     default_policy: str = "allow"
     unknown_genre_policy: str = "allow"
     rules_by_path: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class CollectedItemPlan:
+    total_count: int
+    items: Iterable[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -18522,8 +18528,8 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
 
     try:
         raise_if_task_cancelled(CrawlTaskModel, task_id)
-        items = collect_items(source_type, target, task_id=task_id)
-        total_count = len(items)
+        item_plan = collect_item_plan(source_type, target, task_id=task_id)
+        total_count = item_plan.total_count
         raise_if_task_cancelled(CrawlTaskModel, task_id)
         update_task_progress(
             CrawlTaskModel,
@@ -18534,78 +18540,71 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
             warning_count=0,
             saved_count=0,
             skipped_count=0,
-            message=f"采集中，已处理 0 / {total_count} 条",
+            message=f"采集中，正在采集详情并入库 0 / {total_count} 条",
             error_detail=current_error_detail(),
             warning_detail=current_warning_detail(),
         )
-        batch_size = max(1, int(settings.crawler_batch_size))
         processed_count = 0
-        batches = list(chunk_items(items, batch_size))
         active_words = []
         collection_genre_policy = CollectionGenrePolicySnapshot()
-        if batches:
+        if total_count > 0:
             with session_scope() as session:
                 active_words = active_sensitive_words(session)
                 collection_genre_policy = collection_genre_policy_snapshot(session, owner_username)
-        for batch_index, batch_items in enumerate(batches, start=1):
+        for item in item_plan.items:
             raise_if_task_cancelled(CrawlTaskModel, task_id)
-            for item in batch_items:
-                raise_if_task_cancelled(CrawlTaskModel, task_id)
-                processed_count += 1
-                item_error = collected_item_error(item)
-                save_result = save_collected_item(
-                    owner_username,
-                    task_id,
-                    item,
-                    active_words=active_words,
-                    collection_genre_policy=collection_genre_policy,
-                    scheduled_crawl_id=scheduled_crawl_id,
-                )
-                saved = bool(save_result.get("saved"))
-                skipped = bool(save_result.get("skipped"))
-                save_error = normalize_text(save_result.get("error"))
-                if saved:
-                    saved_count += 1
-                    success_count += 1
-                    item_warnings = [message for message in (item_error, save_error) if message]
-                    if item_warnings:
-                        warning_count += 1
-                        warnings.extend(item_warnings)
-                elif skipped:
-                    skipped_count += 1
-                    success_count += 1
-                    if save_error:
-                        warning_count += 1
-                        warnings.append(save_error)
+            processed_count += 1
+            item_error = collected_item_error(item)
+            save_result = save_collected_item(
+                owner_username,
+                task_id,
+                item,
+                active_words=active_words,
+                collection_genre_policy=collection_genre_policy,
+                scheduled_crawl_id=scheduled_crawl_id,
+            )
+            saved = bool(save_result.get("saved"))
+            skipped = bool(save_result.get("skipped"))
+            save_error = normalize_text(save_result.get("error"))
+            if saved:
+                saved_count += 1
+                success_count += 1
+                item_warnings = [message for message in (item_error, save_error) if message]
+                if item_warnings:
+                    warning_count += 1
+                    warnings.extend(item_warnings)
+            elif skipped:
+                skipped_count += 1
+                success_count += 1
+                if save_error:
+                    warning_count += 1
+                    warnings.append(save_error)
+            else:
+                failed_count += 1
+                if item_error:
+                    errors.append(item_error)
+                elif save_error:
+                    errors.append(save_error)
                 else:
-                    failed_count += 1
-                    if item_error:
-                        errors.append(item_error)
-                    elif save_error:
-                        errors.append(save_error)
-                    elif not saved:
-                        name = str(item.get("title") or item.get("source_url") or "商品").strip()
-                        errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
-                update_task_progress(
-                    CrawlTaskModel,
-                    task_id,
-                    total_count=total_count,
-                    success_count=success_count,
-                    failed_count=failed_count,
-                    warning_count=warning_count,
-                    saved_count=saved_count,
-                    skipped_count=skipped_count,
-                    message=(
-                        f"采集中，批次 {batch_index} / {len(batches)}，"
-                        f"已处理 {processed_count} / {total_count} 条，"
-                        f"入库 {saved_count} 条，跳过 {skipped_count} 条"
-                    ),
-                    error_detail=current_error_detail(),
-                    warning_detail=current_warning_detail(),
-                )
-            if batch_index < len(batches) and settings.crawler_batch_pause_seconds > 0:
-                raise_if_task_cancelled(CrawlTaskModel, task_id)
-                time.sleep(settings.crawler_batch_pause_seconds)
+                    name = str(item.get("title") or item.get("source_url") or "商品").strip()
+                    errors.append(f"{name}: 商品未保存，可能缺少商品标题、商品链接，或已存在于店铺商品中。")
+            update_task_progress(
+                CrawlTaskModel,
+                task_id,
+                total_count=total_count,
+                success_count=success_count,
+                failed_count=failed_count,
+                warning_count=warning_count,
+                saved_count=saved_count,
+                skipped_count=skipped_count,
+                message=(
+                    f"采集中，正在采集详情并入库 {processed_count} / {total_count} 条，"
+                    f"成功 {success_count} 条，失败 {failed_count} 条，"
+                    f"入库 {saved_count} 条，跳过 {skipped_count} 条"
+                ),
+                error_detail=current_error_detail(),
+                warning_detail=current_warning_detail(),
+            )
         with session_scope() as session:
             task = session.get(CrawlTaskModel, task_id)
             if task is None:
@@ -18615,9 +18614,10 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
             task.warning_count = warning_count
             task.saved_count = saved_count
             task.skipped_count = skipped_count
-            task.status = resolve_crawl_task_status("success", len(items), success_count, failed_count)
+            task.total_count = total_count
+            task.status = resolve_crawl_task_status("success", total_count, success_count, failed_count)
             task.finished_at = datetime.now()
-            task.message = f"完成，采集 {len(items)} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条，跳过 {skipped_count} 条"
+            task.message = f"完成，采集 {total_count} 条，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条，跳过 {skipped_count} 条"
             task.error_detail = current_error_detail()
             task.warning_detail = current_warning_detail()
         log_event(owner_username, task_id, "info", f"任务完成，成功 {success_count} 条，失败 {failed_count} 条，警告 {warning_count} 条，入库 {saved_count} 条，跳过 {skipped_count} 条商品")
@@ -18626,7 +18626,8 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
             task = session.get(CrawlTaskModel, task_id)
             if task is None:
                 return
-            task.total_count = max(int(task.total_count or 0), total_count)
+            if total_count > 0:
+                task.total_count = total_count
             task.success_count = success_count
             task.failed_count = failed_count
             task.warning_count = warning_count
@@ -18788,36 +18789,49 @@ def initial_crawl_task_total_count(source_type: str, target: str) -> int:
 
 
 def collect_items(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
+    plan = collect_item_plan(source_type, target, task_id=task_id)
+    return list(plan.items)
+
+
+def collect_item_plan(source_type: str, target: str, *, task_id: str | None = None) -> CollectedItemPlan:
     if source_type == "shop":
         primary_target, fallback_target = split_shop_fallback_target(target)
         strict_target = fallback_shop_target(primary_target, fallback_target) if fallback_target else primary_target
-        return collect_items_for_target(source_type, strict_target, task_id=task_id)
-    return collect_items_for_target(source_type, target, task_id=task_id)
+        return collect_item_plan_for_target(source_type, strict_target, task_id=task_id)
+    return collect_item_plan_for_target(source_type, target, task_id=task_id)
 
 
 def collect_items_for_target(source_type: str, target: str, *, task_id: str | None = None) -> list[dict[str, Any]]:
+    plan = collect_item_plan_for_target(source_type, target, task_id=task_id)
+    return list(plan.items)
+
+
+def collect_item_plan_for_target(
+    source_type: str,
+    target: str,
+    *,
+    task_id: str | None = None,
+) -> CollectedItemPlan:
     raise_if_task_cancelled(CrawlTaskModel, task_id)
-    price_rule = crawl_price_rule_for_task(task_id)
     if source_type == "product_url":
-        items: list[dict[str, Any]] = []
-        for product_url in normalize_rakuten_product_targets(target):
-            raise_if_task_cancelled(CrawlTaskModel, task_id)
-            try:
-                detail = collect_product_detail(product_url)
-                mark_collected_item_price_filter(detail, price_rule)
-                items.append(detail)
-            except Exception as exc:
-                items.append(
-                    {
-                        "title": product_url,
-                        "source_url": product_url,
-                        "raw": {
-                            "detailCollected": False,
-                            "detailError": str(exc) or "商品详情采集失败。",
-                        },
-                    }
-                )
-        return items
+        product_urls = normalize_rakuten_product_targets(target)
+        items = [
+            {
+                "title": product_url,
+                "source_url": product_url,
+                "raw": {},
+            }
+            for product_url in product_urls
+        ]
+        return CollectedItemPlan(
+            total_count=len(items),
+            items=iter_enriched_collected_items_with_detail(
+                items,
+                task_id=task_id,
+                price_rule={"operator": "all"},
+            ),
+        )
+    price_rule = crawl_price_rule_for_task(task_id)
     if source_type == "whole_shop":
         sid, whole_shop_filter, limit = parse_whole_shop_task_options(target)
         url = build_whole_shop_search_url(sid, whole_shop_filter)
@@ -18837,11 +18851,14 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
                 message=f"已发现 {len(items)} 个整店商品，开始采集详情",
             )
         existing_source_hashes = existing_collected_source_hashes_for_task(items, task_id)
-        return enrich_collected_items_with_detail(
-            items,
-            task_id=task_id,
-            existing_source_hashes=existing_source_hashes,
-            price_rule=price_rule,
+        return CollectedItemPlan(
+            total_count=len(items),
+            items=iter_enriched_collected_items_with_detail(
+                items,
+                task_id=task_id,
+                existing_source_hashes=existing_source_hashes,
+                price_rule=price_rule,
+            ),
         )
     limit: int | None = 30
     shop_code_filter = ""
@@ -18888,11 +18905,14 @@ def collect_items_for_target(source_type: str, target: str, *, task_id: str | No
             message=f"已发现 {len(limited_items)} 个商品，开始采集详情",
         )
     existing_source_hashes = existing_collected_source_hashes_for_task(limited_items, task_id)
-    return enrich_collected_items_with_detail(
-        limited_items,
-        task_id=task_id,
-        existing_source_hashes=existing_source_hashes,
-        price_rule=price_rule,
+    return CollectedItemPlan(
+        total_count=len(limited_items),
+        items=iter_enriched_collected_items_with_detail(
+            limited_items,
+            task_id=task_id,
+            existing_source_hashes=existing_source_hashes,
+            price_rule=price_rule,
+        ),
     )
 
 
@@ -19230,50 +19250,115 @@ def mark_collected_item_price_filter(item: dict[str, Any], price_rule: dict[str,
         item["_crawlPriceFilterReason"] = reason
 
 
+def enrich_collected_item_with_detail(
+    item: dict[str, Any],
+    *,
+    task_id: str | None = None,
+    existing_source_hashes: set[str] | None = None,
+    price_rule: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    known_hashes = existing_source_hashes or set()
+    active_price_rule = price_rule or {"operator": "all"}
+    raise_if_task_cancelled(CrawlTaskModel, task_id)
+    source_url = normalize_text(item.get("source_url"))
+    if not source_url or item.get("_crawlPriceFiltered"):
+        return item
+    source_hash_key = normalize_text(item.get("source_url_hash_key") or source_url)
+    if make_source_url_hash(source_hash_key) in known_hashes:
+        return item
+    try:
+        detail = collect_product_detail(source_url)
+        raise_if_task_cancelled(CrawlTaskModel, task_id)
+    except Exception as exc:
+        if isinstance(exc, TaskCancelled):
+            raise
+        fallback = dict(item)
+        raw = fallback.get("raw") if isinstance(fallback.get("raw"), dict) else {}
+        fallback["raw"] = {**raw, "detailError": str(exc), "detailCollected": False}
+        return fallback
+    raw = detail.get("raw") if isinstance(detail.get("raw"), dict) else {}
+    list_raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    detail["raw"] = {**raw, "listPage": list_raw.get("pageUrl"), "detailCollected": True}
+    if not detail.get("price"):
+        detail["price"] = item.get("price")
+    if not detail.get("image_url"):
+        detail["image_url"] = item.get("image_url")
+    mark_collected_item_price_filter(detail, active_price_rule)
+    return detail
+
+
+def iter_enriched_collected_items_with_detail(
+    items: Iterable[dict[str, Any]],
+    *,
+    task_id: str | None = None,
+    existing_source_hashes: set[str] | None = None,
+    price_rule: dict[str, Any] | None = None,
+) -> Iterator[dict[str, Any]]:
+    item_iterator = iter(items)
+    worker_count = max(1, int(settings.crawler_detail_workers or 1))
+    if worker_count == 1:
+        for item in item_iterator:
+            yield enrich_collected_item_with_detail(
+                item,
+                task_id=task_id,
+                existing_source_hashes=existing_source_hashes,
+                price_rule=price_rule,
+            )
+        return
+
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="crawl-detail",
+    )
+    pending: set[Any] = set()
+
+    def submit_next() -> bool:
+        try:
+            item = next(item_iterator)
+        except StopIteration:
+            return False
+        pending.add(
+            executor.submit(
+                enrich_collected_item_with_detail,
+                item,
+                task_id=task_id,
+                existing_source_hashes=existing_source_hashes,
+                price_rule=price_rule,
+            )
+        )
+        return True
+
+    try:
+        for _ in range(worker_count):
+            if not submit_next():
+                break
+        while pending:
+            raise_if_task_cancelled(CrawlTaskModel, task_id)
+            future = next(as_completed(tuple(pending)))
+            pending.remove(future)
+            yield future.result()
+            submit_next()
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def enrich_collected_items_with_detail(
-    items: list[dict[str, Any]],
+    items: Iterable[dict[str, Any]],
     *,
     task_id: str | None = None,
     existing_source_hashes: set[str] | None = None,
     price_rule: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    known_hashes = existing_source_hashes or set()
-    active_price_rule = price_rule or {"operator": "all"}
-    enriched_items: list[dict[str, Any]] = []
-    for item in items:
-        raise_if_task_cancelled(CrawlTaskModel, task_id)
-        source_url = normalize_text(item.get("source_url"))
-        if not source_url:
-            enriched_items.append(item)
-            continue
-        if item.get("_crawlPriceFiltered"):
-            enriched_items.append(item)
-            continue
-        source_hash_key = normalize_text(item.get("source_url_hash_key") or source_url)
-        if make_source_url_hash(source_hash_key) in known_hashes:
-            enriched_items.append(item)
-            continue
-        try:
-            detail = collect_product_detail(source_url)
-            raise_if_task_cancelled(CrawlTaskModel, task_id)
-        except Exception as exc:
-            if isinstance(exc, TaskCancelled):
-                raise
-            fallback = dict(item)
-            raw = fallback.get("raw") if isinstance(fallback.get("raw"), dict) else {}
-            fallback["raw"] = {**raw, "detailError": str(exc), "detailCollected": False}
-            enriched_items.append(fallback)
-            continue
-        raw = detail.get("raw") if isinstance(detail.get("raw"), dict) else {}
-        list_raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-        detail["raw"] = {**raw, "listPage": list_raw.get("pageUrl"), "detailCollected": True}
-        if not detail.get("price"):
-            detail["price"] = item.get("price")
-        if not detail.get("image_url"):
-            detail["image_url"] = item.get("image_url")
-        mark_collected_item_price_filter(detail, active_price_rule)
-        enriched_items.append(detail)
-    return enriched_items
+    return list(
+        iter_enriched_collected_items_with_detail(
+            items,
+            task_id=task_id,
+            existing_source_hashes=existing_source_hashes,
+            price_rule=price_rule,
+        )
+    )
 
 
 def strip_shop_ranking_prefix(target: str) -> str:
