@@ -1105,7 +1105,11 @@ def task_stored_crawl_price_rule(row: CrawlTaskModel) -> dict[str, Any] | None:
 def task_to_public(row: CrawlTaskModel) -> dict[str, Any]:
     saved_count, skipped_count = crawl_task_storage_counts(row)
     warning_count = max(0, int(getattr(row, "warning_count", 0) or 0))
-    warning_detail = task_public_warning_detail(row)
+    warning_detail = task_public_warning_detail(
+        row,
+        skipped_count=skipped_count,
+        warning_count=warning_count,
+    )
     if skipped_count > 0 and warning_count == 0:
         warning_count = skipped_count
     if skipped_count > 0 and not warning_detail:
@@ -2946,14 +2950,163 @@ def task_public_error_detail(row: Any | None) -> str | None:
     if row is None:
         return None
     detail = strip_task_cancel_marker(getattr(row, "error_detail", ""))
-    return detail or None
+    return humanize_task_error_detail(detail)
 
 
-def task_public_warning_detail(row: Any | None) -> str | None:
+def task_public_warning_detail(
+    row: Any | None,
+    *,
+    skipped_count: int = 0,
+    warning_count: int = 0,
+) -> str | None:
     if row is None:
         return None
     detail = normalize_task_detail_text(getattr(row, "warning_detail", ""))
-    return detail or None
+    return humanize_task_warning_detail(
+        detail,
+        skipped_count=skipped_count,
+        warning_count=warning_count,
+    )
+
+
+def humanize_task_error_detail(error_detail: Any) -> str | None:
+    detail = normalize_task_detail_text(error_detail)
+    if not detail:
+        return None
+    normalized = detail.lower()
+    if "lock wait timeout exceeded" in normalized or "deadlock found" in normalized:
+        return (
+            "原因：数据库当时正在处理其他写入，商品保存等待超时。\n"
+            "影响：任务提前结束，但此前已经入库的商品不会丢失。\n"
+            "处理建议：请重新执行任务；系统会自动跳过已有商品，并对短暂锁等待自动重试。"
+        )
+    if "duplicate entry" in normalized or ("1062" in normalized and "integrityerror" in normalized):
+        return (
+            "原因：待保存的数据与系统中的现有记录重复。\n"
+            "影响：重复数据没有再次写入。\n"
+            "处理建议：通常无需处理；刷新列表确认原记录即可。"
+        )
+    if (
+        "can't connect to mysql" in normalized
+        or "mysql server has gone away" in normalized
+        or "lost connection to mysql" in normalized
+    ):
+        return (
+            "原因：任务执行时暂时无法连接数据库。\n"
+            "影响：任务未能继续处理。\n"
+            "处理建议：请稍后重新执行；如果连续出现，请联系管理员检查数据库服务。"
+        )
+    if "proxyerror" in normalized or "proxy connection" in normalized:
+        return (
+            "原因：采集代理暂时无法连接目标网站。\n"
+            "影响：部分或全部商品未能获取。\n"
+            "处理建议：请稍后重新执行；如果连续出现，请联系管理员检查代理配置。"
+        )
+    if "too many requests" in normalized or re.search(
+        r"(?:http|status|response)[^0-9]{0,20}429\b",
+        normalized,
+    ):
+        return (
+            "原因：目标网站限制了过于频繁的请求。\n"
+            "影响：部分数据暂时未能获取。\n"
+            "处理建议：请稍后重新执行，系统会继续按照限速规则采集。"
+        )
+    if "unauthorized" in normalized or re.search(
+        r"(?:http|status|response)[^0-9]{0,20}401\b",
+        normalized,
+    ):
+        return (
+            "原因：店铺授权信息无效或已经过期。\n"
+            "影响：系统无法访问对应店铺数据。\n"
+            "处理建议：请检查店铺授权信息并重新保存，然后再次执行任务。"
+        )
+    if "forbidden" in normalized or re.search(
+        r"(?:http|status|response)[^0-9]{0,20}403\b",
+        normalized,
+    ):
+        return (
+            "原因：目标服务拒绝了当前访问请求。\n"
+            "影响：相关数据未能获取或提交。\n"
+            "处理建议：请检查店铺权限、授权范围或采集网络后重新执行。"
+        )
+    if "read timed out" in normalized or "readtimeout" in normalized or "connecttimeout" in normalized:
+        return (
+            "原因：访问目标网站时等待响应超时。\n"
+            "影响：当前请求未完成。\n"
+            "处理建议：请稍后重新执行；已完成的数据不会重复处理。"
+        )
+    if "connection refused" in normalized or "failed to establish a new connection" in normalized:
+        return (
+            "原因：目标服务当前无法连接。\n"
+            "影响：任务未能继续处理。\n"
+            "处理建议：请稍后重新执行；如果连续出现，请联系管理员检查相关服务。"
+        )
+    if "jsondecodeerror" in normalized or "expecting value:" in normalized:
+        return (
+            "原因：目标服务返回的数据格式异常。\n"
+            "影响：当前请求结果无法识别。\n"
+            "处理建议：请稍后重新执行；如果连续出现，请联系管理员。"
+        )
+
+    visible_lines: list[str] = []
+    for line in detail.splitlines():
+        normalized_line = line.strip()
+        if not normalized_line:
+            continue
+        lowered_line = normalized_line.lower()
+        if (
+            normalized_line.startswith("[SQL:")
+            or normalized_line.startswith("[parameters:")
+            or lowered_line.startswith("(background on this error")
+            or lowered_line.startswith("traceback (most recent call last)")
+            or re.match(r'^file ".+", line \d+', lowered_line)
+        ):
+            break
+        visible_lines.append(normalized_line)
+    visible_detail = "\n".join(visible_lines).strip()
+    if visible_detail and re.search(r"[\u4e00-\u9fff]", visible_detail):
+        return visible_detail
+    return (
+        "原因：任务执行过程中发生系统异常。\n"
+        "影响：任务未能继续完成。\n"
+        "处理建议：请稍后重新执行；如果重复出现，请联系管理员并提供任务编号。"
+    )
+
+
+def humanize_task_warning_detail(
+    warning_detail: Any,
+    *,
+    skipped_count: int = 0,
+    warning_count: int = 0,
+) -> str | None:
+    detail = normalize_task_detail_text(warning_detail)
+    if not detail:
+        return None
+    reason_labels: list[str] = []
+    reason_markers = (
+        ("已存在于", "商品此前已经采集，为避免重复入库已自动跳过"),
+        ("不符合", "商品价格不符合本次设置的价格条件"),
+        ("禁止采集", "商品所属品类被当前用户设置为禁止采集"),
+        ("商品详情采集失败", "部分商品详情获取失败，系统使用了列表页可用信息"),
+        ("图片本地化失败", "部分商品图片保存失败，但商品基础信息已经入库"),
+    )
+    for marker, label in reason_markers:
+        if marker in detail and label not in reason_labels:
+            reason_labels.append(label)
+    affected_count = skipped_count or warning_count
+    if affected_count > 0 and reason_labels:
+        reason_text = "\n".join(f"- {label}。" for label in reason_labels)
+        summary = (
+            f"本次有 {skipped_count} 件商品未入库，这些属于正常过滤或可恢复提示，不影响其他商品。"
+            if skipped_count > 0
+            else f"本次有 {warning_count} 件商品需要注意，但任务中的其他商品已正常处理。"
+        )
+        return (
+            f"{summary}\n"
+            f"主要原因：\n{reason_text}\n"
+            "处理建议：重复商品无需处理；如需采集被价格或品类条件过滤的商品，请调整任务设置后重新执行。"
+        )
+    return humanize_task_error_detail(detail)
 
 
 def strip_task_cancel_marker(error_detail: Any) -> str:
