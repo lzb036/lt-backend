@@ -94,6 +94,7 @@ RAKUTEN_IMAGE_CDN_HOSTS = {
 PRODUCT_IMAGE_VISUAL_SIZE = (32, 32)
 PRODUCT_IMAGE_VISUAL_MAX_MEAN_DIFFERENCE = 2.0
 PRODUCT_IMAGE_VISUAL_MAX_ASPECT_RATIO_DIFFERENCE = 0.03
+CRAWL_SAVE_LOCK_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 
 
 @dataclass(frozen=True)
@@ -18555,7 +18556,7 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
             raise_if_task_cancelled(CrawlTaskModel, task_id)
             processed_count += 1
             item_error = collected_item_error(item)
-            save_result = save_collected_item(
+            save_result = save_collected_item_with_lock_retry(
                 owner_username,
                 task_id,
                 item,
@@ -18659,6 +18660,49 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
     finally:
         if should_refill:
             dispatch_queued_crawl_tasks_safely(owner_username)
+
+
+def save_collected_item_with_lock_retry(
+    owner_username: str,
+    task_id: str,
+    item: dict[str, Any],
+    *,
+    active_words: list[str] | None = None,
+    collection_genre_policy: CollectionGenrePolicySnapshot | None = None,
+    scheduled_crawl_id: int | None = None,
+) -> dict[str, Any]:
+    attempts = len(CRAWL_SAVE_LOCK_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(attempts):
+        try:
+            return save_collected_item(
+                owner_username,
+                task_id,
+                item,
+                active_words=active_words,
+                collection_genre_policy=collection_genre_policy,
+                scheduled_crawl_id=scheduled_crawl_id,
+            )
+        except OperationalError as exc:
+            if not is_mysql_lock_wait_timeout(exc):
+                raise
+            if attempt >= attempts - 1:
+                display_name = normalize_text(item.get("title") or item.get("source_url") or "商品")
+                return {
+                    "saved": False,
+                    "skipped": False,
+                    "error": f"{display_name}: 商品入库等待数据库锁超时，重试 {attempts} 次后仍未成功。",
+                }
+            raise_if_task_cancelled(CrawlTaskModel, task_id)
+            delay_seconds = CRAWL_SAVE_LOCK_RETRY_DELAYS_SECONDS[attempt]
+            logger.warning(
+                "crawl item save lock timeout; retrying task_id=%s attempt=%s/%s delay=%ss",
+                task_id,
+                attempt + 1,
+                attempts,
+                delay_seconds,
+            )
+            time.sleep(delay_seconds)
+    raise RuntimeError("商品入库重试流程异常。")
 
 
 def save_collected_item(

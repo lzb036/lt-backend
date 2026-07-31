@@ -7,11 +7,109 @@ from datetime import datetime
 from unittest.mock import patch
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
 from app.db.models import CrawlTaskModel, UserAccountModel
 from app.services import crawler_service
+
+
+def mysql_lock_wait_error() -> OperationalError:
+    return OperationalError(
+        "INSERT INTO lt_products ...",
+        {},
+        RuntimeError(1205, "Lock wait timeout exceeded; try restarting transaction"),
+    )
+
+
+def test_save_collected_item_retries_mysql_lock_wait_with_new_attempts() -> None:
+    item = {
+        "title": "商品 1",
+        "source_url": "https://item.rakuten.co.jp/shop/item-1/",
+    }
+    with (
+        patch.object(
+            crawler_service,
+            "save_collected_item",
+            side_effect=[
+                mysql_lock_wait_error(),
+                mysql_lock_wait_error(),
+                {"saved": True, "skipped": False, "error": ""},
+            ],
+        ) as save_item,
+        patch.object(crawler_service, "raise_if_task_cancelled") as cancel_check,
+        patch.object(crawler_service.time, "sleep") as sleep,
+    ):
+        result = crawler_service.save_collected_item_with_lock_retry(
+            "alice",
+            "task-id",
+            item,
+        )
+
+    assert result["saved"] is True
+    assert save_item.call_count == 3
+    assert cancel_check.call_count == 2
+    assert [call.args[0] for call in sleep.call_args_list] == [0.5, 1.0]
+
+
+def test_save_collected_item_marks_only_item_failed_after_lock_retries_exhausted() -> None:
+    item = {
+        "title": "商品 1",
+        "source_url": "https://item.rakuten.co.jp/shop/item-1/",
+    }
+    with (
+        patch.object(
+            crawler_service,
+            "save_collected_item",
+            side_effect=mysql_lock_wait_error(),
+        ) as save_item,
+        patch.object(crawler_service, "raise_if_task_cancelled"),
+        patch.object(crawler_service.time, "sleep"),
+    ):
+        result = crawler_service.save_collected_item_with_lock_retry(
+            "alice",
+            "task-id",
+            item,
+        )
+
+    assert result["saved"] is False
+    assert result["skipped"] is False
+    assert "重试 4 次" in result["error"]
+    assert save_item.call_count == 4
+
+
+def test_save_collected_item_does_not_retry_other_database_errors() -> None:
+    item = {
+        "title": "商品 1",
+        "source_url": "https://item.rakuten.co.jp/shop/item-1/",
+    }
+    database_error = OperationalError(
+        "INSERT INTO lt_products ...",
+        {},
+        RuntimeError(2006, "MySQL server has gone away"),
+    )
+    with (
+        patch.object(
+            crawler_service,
+            "save_collected_item",
+            side_effect=database_error,
+        ) as save_item,
+        patch.object(crawler_service.time, "sleep") as sleep,
+    ):
+        try:
+            crawler_service.save_collected_item_with_lock_retry(
+                "alice",
+                "task-id",
+                item,
+            )
+        except OperationalError as exc:
+            assert exc is database_error
+        else:
+            raise AssertionError("Expected OperationalError")
+
+    save_item.assert_called_once()
+    sleep.assert_not_called()
 
 
 def test_listing_progress_total_prefers_limit_until_actual_total_is_lower() -> None:
@@ -248,7 +346,11 @@ def test_run_task_saves_and_updates_progress_before_requesting_next_item() -> No
             "collection_genre_policy_snapshot",
             return_value=crawler_service.CollectionGenrePolicySnapshot(),
         ),
-        patch.object(crawler_service, "save_collected_item", side_effect=save_item),
+        patch.object(
+            crawler_service,
+            "save_collected_item_with_lock_retry",
+            side_effect=save_item,
+        ),
         patch.object(crawler_service, "update_task_progress", side_effect=update_progress),
         patch.object(crawler_service, "log_event"),
         patch.object(crawler_service, "raise_if_task_cancelled"),
