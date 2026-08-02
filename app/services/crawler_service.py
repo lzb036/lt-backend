@@ -8096,6 +8096,8 @@ def list_products(
         listed_store_filter = normalize_listed_store_filter(listed_store_id)
         if product_status:
             query = query.where(ProductModel.review_status == product_status)
+        if product_status == "approved":
+            query = query.where(ProductModel.listing_task_id.is_(None))
         if normalized_collection_source == "manual":
             query = query.where(ProductModel.collection_source == "manual")
         elif normalized_collection_source == "scheduled":
