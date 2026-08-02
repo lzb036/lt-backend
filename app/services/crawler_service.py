@@ -5,6 +5,7 @@ import re
 import uuid
 import base64
 import binascii
+import calendar
 import hashlib
 import hmac
 import logging
@@ -44,6 +45,7 @@ from app.core.text_limits import (
 from app.core.task_queue import all_task_queue_names, enqueue_task, enqueue_task_in, redis_connection, task_queue_name_for_kind
 from app.db.database import session_scope
 from app.db.models import (
+    AutoListingScheduleModel,
     CrawlLogModel,
     CrawlSourceModel,
     CrawlTaskModel,
@@ -481,6 +483,7 @@ WHOLE_SHOP_TARGET_ERROR = "整店采集请输入店铺url代码、店铺url、�
 RAKUTEN_FASHION_IMAGE_BASE = "https://tshop.r10s.jp/stylife/cabinet/item"
 CRAWLER_HTTP_RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
 SCHEDULE_RUN_LOCK = threading.Lock()
+AUTO_LISTING_SCHEDULE_LOCK = threading.Lock()
 SALES_ORDER_SYNC_RUN_LOCK = threading.Lock()
 STORE_PRODUCT_SYNC_SCHEDULE_LOCK = threading.Lock()
 SCHEDULED_CRAWL_TASK_CLEANUP_LOCK = threading.Lock()
@@ -2450,13 +2453,36 @@ def next_monthly_run_at(month_day: int, schedule_time: str, *, now: datetime | N
     reference = now or datetime.now()
     normalized_time = normalize_schedule_time(schedule_time)
     hour, minute = [int(part) for part in normalized_time.split(":", 1)]
-    day = max(1, min(28, int(month_day or 1)))
-    candidate = reference.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
+    requested_day = max(1, min(31, int(month_day or 1)))
+    current_day = min(requested_day, calendar.monthrange(reference.year, reference.month)[1])
+    candidate = reference.replace(day=current_day, hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= reference:
         year = reference.year + (1 if reference.month == 12 else 0)
         month = 1 if reference.month == 12 else reference.month + 1
-        candidate = candidate.replace(year=year, month=month, day=day)
+        next_day = min(requested_day, calendar.monthrange(year, month)[1])
+        candidate = candidate.replace(year=year, month=month, day=next_day)
     return candidate
+
+
+def next_auto_listing_run_at(
+    schedule_type: str,
+    schedule_time: str,
+    *,
+    weekday: int | None = None,
+    month_day: int | None = None,
+    now: datetime | None = None,
+) -> datetime:
+    if schedule_type == "daily":
+        return next_daily_run_at(schedule_time, now=now)
+    if schedule_type == "weekly":
+        if weekday is None or weekday < 1 or weekday > 7:
+            raise RuntimeError("请选择每周自动上架的星期。")
+        return next_weekly_run_at(weekday - 1, schedule_time, now=now)
+    if schedule_type == "monthly":
+        if month_day is None or month_day < 1 or month_day > 31:
+            raise RuntimeError("请选择每月自动上架的日期。")
+        return next_monthly_run_at(month_day, schedule_time, now=now)
+    raise RuntimeError("自动上架周期不正确。")
 
 
 def ranking_period_label(value: Any) -> str:
@@ -2641,6 +2667,147 @@ def scheduled_crawl_to_public(row: ScheduledCrawlModel) -> dict[str, Any]:
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
         "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
     }
+
+
+def auto_listing_schedule_to_public(
+    row: AutoListingScheduleModel,
+    store: StoreModel | None = None,
+) -> dict[str, Any]:
+    try:
+        last_task_ids = json.loads(row.last_task_ids_json or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        last_task_ids = []
+    if not isinstance(last_task_ids, list):
+        last_task_ids = []
+    return {
+        "id": row.id,
+        "ownerUsername": row.owner_username,
+        "storeId": row.store_id,
+        "storeName": store.store_name if store is not None else "",
+        "storeAliasName": store.alias_name if store is not None else "",
+        "scheduleType": row.schedule_type,
+        "scheduleTime": row.schedule_time,
+        "weekday": row.weekday,
+        "monthDay": row.month_day,
+        "quantity": row.quantity,
+        "enabled": bool(row.enabled),
+        "status": row.status,
+        "lastRunAt": datetime_to_public(row.last_run_at),
+        "nextRunAt": datetime_to_public(row.next_run_at),
+        "lastTaskIds": [str(value) for value in last_task_ids if str(value).strip()],
+        "lastMessage": row.last_message,
+        "lastError": row.last_error,
+        "createdAt": datetime_to_public(row.created_at),
+        "updatedAt": datetime_to_public(row.updated_at),
+    }
+
+
+def list_auto_listing_schedules(owner_username: str) -> list[dict[str, Any]]:
+    with session_scope() as session:
+        rows = session.execute(
+            select(AutoListingScheduleModel, StoreModel)
+            .join(StoreModel, StoreModel.id == AutoListingScheduleModel.store_id)
+            .where(AutoListingScheduleModel.owner_username == owner_username)
+            .order_by(
+                AutoListingScheduleModel.created_at.desc(),
+                AutoListingScheduleModel.id.desc(),
+            )
+        ).all()
+        return [
+            auto_listing_schedule_to_public(schedule, store)
+            for schedule, store in rows
+        ]
+
+
+def create_auto_listing_schedule(owner_username: str, payload: Any) -> dict[str, Any]:
+    schedule_type = normalize_text(getattr(payload, "scheduleType", None))
+    schedule_time = normalize_schedule_time(getattr(payload, "scheduleTime", None))
+    weekday = getattr(payload, "weekday", None)
+    month_day = getattr(payload, "monthDay", None)
+    quantity = int(getattr(payload, "quantity", 0) or 0)
+    store_id = int(getattr(payload, "storeId", 0) or 0)
+    if quantity < 1 or quantity > 1000:
+        raise RuntimeError("自动上架数量只能设置为 1 到 1000。")
+    next_run_at = next_auto_listing_run_at(
+        schedule_type,
+        schedule_time,
+        weekday=weekday,
+        month_day=month_day,
+    )
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        if store is None or store.owner_username != owner_username:
+            raise RuntimeError("上架店铺不存在或不属于当前用户。")
+        if not store.enabled:
+            raise RuntimeError(f"上架店铺「{store.alias_name or store.store_name}」已停用。")
+        if (
+            not decrypt_text(store.rakuten_service_secret_encrypted)
+            or not decrypt_text(store.rakuten_license_key_encrypted)
+        ):
+            raise RuntimeError(f"上架店铺「{store.alias_name or store.store_name}」缺少乐天 Secret 或乐天 Key。")
+        row = AutoListingScheduleModel(
+            owner_username=owner_username,
+            store_id=store_id,
+            schedule_type=schedule_type,
+            schedule_time=schedule_time,
+            weekday=int(weekday) if schedule_type == "weekly" else None,
+            month_day=int(month_day) if schedule_type == "monthly" else None,
+            quantity=quantity,
+            enabled=True,
+            status="idle",
+            next_run_at=next_run_at,
+        )
+        session.add(row)
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            raise RuntimeError("该店铺已经创建过自动上架任务，不能重复创建。") from exc
+        return auto_listing_schedule_to_public(row, store)
+
+
+def update_auto_listing_schedule_status(
+    owner_username: str,
+    schedule_id: int,
+    enabled: bool,
+) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.scalar(
+            select(AutoListingScheduleModel).where(
+                AutoListingScheduleModel.id == schedule_id,
+                AutoListingScheduleModel.owner_username == owner_username,
+            )
+        )
+        if row is None:
+            raise RuntimeError("自动上架任务不存在。")
+        store = session.get(StoreModel, row.store_id)
+        row.enabled = bool(enabled)
+        row.status = "idle" if enabled else "disabled"
+        row.next_run_at = (
+            next_auto_listing_run_at(
+                row.schedule_type,
+                row.schedule_time,
+                weekday=row.weekday,
+                month_day=row.month_day,
+            )
+            if enabled
+            else None
+        )
+        row.last_error = None
+        session.flush()
+        return auto_listing_schedule_to_public(row, store)
+
+
+def delete_auto_listing_schedule(owner_username: str, schedule_id: int) -> None:
+    with session_scope() as session:
+        row = session.scalar(
+            select(AutoListingScheduleModel).where(
+                AutoListingScheduleModel.id == schedule_id,
+                AutoListingScheduleModel.owner_username == owner_username,
+            )
+        )
+        if row is None:
+            raise RuntimeError("自动上架任务不存在。")
+        session.delete(row)
 
 
 def normalize_listing_task_product_ids(value: Any) -> list[int]:
@@ -12477,6 +12644,135 @@ def run_due_scheduled_crawls_once() -> int:
         SCHEDULE_RUN_LOCK.release()
 
 
+def auto_listing_candidate_product_ids(
+    owner_username: str,
+    store_id: int,
+    quantity: int,
+) -> list[int]:
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        if store is None or store.owner_username != owner_username:
+            raise RuntimeError("自动上架店铺不存在或不属于当前用户。")
+        products = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.review_status == "approved",
+                ProductModel.parent_product_id.is_(None),
+                ProductModel.listing_task_id.is_(None),
+            )
+            .order_by(ProductModel.created_at.asc(), ProductModel.id.asc())
+        ).all()
+        selected_ids: list[int] = []
+        for product in products:
+            listed_store_ids = {
+                int(item.get("storeId") or 0)
+                for item in product_listed_stores(product_raw_payload(product))
+            }
+            if store_id in listed_store_ids:
+                continue
+            if listing_preflight_blocking_messages(
+                [listing_preflight_product_check(product, store)]
+            ):
+                continue
+            selected_ids.append(int(product.id))
+            if len(selected_ids) >= quantity:
+                break
+        return selected_ids
+
+
+def run_due_auto_listing_schedules_once() -> int:
+    if not AUTO_LISTING_SCHEDULE_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        now = datetime.now()
+        with session_scope() as session:
+            rows = session.scalars(
+                select(AutoListingScheduleModel).where(
+                    AutoListingScheduleModel.enabled.is_(True),
+                    AutoListingScheduleModel.next_run_at.is_not(None),
+                    AutoListingScheduleModel.next_run_at <= now,
+                )
+                .order_by(
+                    AutoListingScheduleModel.next_run_at.asc(),
+                    AutoListingScheduleModel.created_at.asc(),
+                    AutoListingScheduleModel.id.asc(),
+                )
+                .limit(max(1, int(settings.scheduled_crawl_dispatch_batch_size)))
+            ).all()
+            due_items = [
+                (int(row.id), row.owner_username, int(row.store_id), int(row.quantity))
+                for row in rows
+            ]
+            for row in rows:
+                row.status = "running"
+                row.last_run_at = now
+                row.next_run_at = next_auto_listing_run_at(
+                    row.schedule_type,
+                    row.schedule_time,
+                    weekday=row.weekday,
+                    month_day=row.month_day,
+                    now=now,
+                )
+                row.last_error = None
+
+        for schedule_id, owner_username, store_id, quantity in due_items:
+            try:
+                product_ids = auto_listing_candidate_product_ids(
+                    owner_username,
+                    store_id,
+                    quantity,
+                )
+                if not product_ids:
+                    with session_scope() as session:
+                        row = session.get(AutoListingScheduleModel, schedule_id)
+                        if row is not None:
+                            row.status = "idle"
+                            row.last_task_ids_json = "[]"
+                            row.last_message = "当前没有可自动上架的已审核商品。"
+                    continue
+                result = create_listing_task(
+                    owner_username,
+                    SimpleNamespace(
+                        productIds=product_ids,
+                        storeIds=[store_id],
+                        taskName=f"自动上架 {now:%Y-%m-%d %H:%M}",
+                    ),
+                )
+                task_rows = result.get("listingTasks") or []
+                task_ids = [
+                    str(item.get("id") or "")
+                    for item in task_rows
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                if not task_ids and isinstance(result.get("listingTask"), dict):
+                    first_task_id = str(result["listingTask"].get("id") or "")
+                    if first_task_id:
+                        task_ids.append(first_task_id)
+                actual_count = int((result.get("summary") or {}).get("total") or len(product_ids))
+                with session_scope() as session:
+                    row = session.get(AutoListingScheduleModel, schedule_id)
+                    if row is not None:
+                        row.status = "idle"
+                        row.last_task_ids_json = json.dumps(task_ids, ensure_ascii=False)
+                        row.last_message = (
+                            f"计划上架 {quantity} 件，实际已创建 {actual_count} 件商品的上架任务"
+                            f"，共 {len(task_ids)} 个任务。"
+                        )
+                        row.last_error = None
+            except Exception as exc:
+                logger.exception("Auto listing schedule failed: %s", schedule_id)
+                with session_scope() as session:
+                    row = session.get(AutoListingScheduleModel, schedule_id)
+                    if row is not None:
+                        row.status = "failed"
+                        row.last_task_ids_json = "[]"
+                        row.last_message = "本次自动上架任务创建失败。"
+                        row.last_error = humanize_task_error_detail(str(exc)) or "自动上架任务创建失败。"
+        return len(due_items)
+    finally:
+        AUTO_LISTING_SCHEDULE_LOCK.release()
+
+
 def run_periodic_maintenance_once() -> None:
     reconcile_interrupted_background_tasks_once()
     dispatch_queued_crawl_tasks_safely()
@@ -12528,6 +12824,7 @@ def _record_schedule_runner_tick(*, errors: list[str]) -> None:
 def run_schedule_runner_tick() -> bool:
     tasks = (
         ("scheduled crawls", run_due_scheduled_crawls_once),
+        ("auto listing schedules", run_due_auto_listing_schedules_once),
         ("sales order syncs", run_due_sales_order_syncs_once),
         ("store product syncs", run_due_store_product_syncs_once),
         ("periodic maintenance", run_periodic_maintenance_once),

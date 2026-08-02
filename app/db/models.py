@@ -511,6 +511,38 @@ class ScheduledCrawlModel(TimestampMixin, Base):
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
 
+class AutoListingScheduleModel(TimestampMixin, Base):
+    __tablename__ = "lt_auto_listing_schedules"
+    __table_args__ = (
+        UniqueConstraint("owner_username", "store_id", name="uq_lt_auto_listing_owner_store"),
+        Index("ix_lt_auto_listing_owner_enabled", "owner_username", "enabled"),
+        Index("ix_lt_auto_listing_enabled_next", "enabled", "next_run_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        nullable=False,
+    )
+    store_id: Mapped[int] = mapped_column(
+        ForeignKey("lt_stores.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    schedule_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    schedule_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    weekday: Mapped[int | None] = mapped_column(Integer)
+    month_day: Mapped[int | None] = mapped_column(Integer)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="idle", server_default="idle")
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    last_task_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    last_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
 class CrawlLogModel(TimestampMixin, Base):
     __tablename__ = "lt_crawl_logs"
     __table_args__ = (Index("ix_lt_crawl_log_owner_task", "owner_username", "task_id"),)
