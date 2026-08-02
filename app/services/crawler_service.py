@@ -8211,6 +8211,7 @@ def list_products(
     collected_at_from: str | None = None,
     collected_at_to: str | None = None,
     genre_status: str | None = None,
+    genre_path: str | None = None,
     sales_period_days: int | None = None,
     sales_period_from: str | None = None,
     sales_period_to: str | None = None,
@@ -8230,6 +8231,12 @@ def list_products(
         normalized_page = max(1, int(page or 1))
         normalized_page_size = min(500, max(1, int(page_size or 0))) if page_size else None
         product_status = _product_status_filter(status)
+        normalized_genre_status = normalize_text(genre_status).lower()
+        normalized_genre_path = normalize_text(genre_path)
+        if normalized_genre_status not in {"", "missing", "present"}:
+            raise ValueError("品类状态筛选条件无效")
+        if (normalized_genre_status or normalized_genre_path) and product_status != "pending":
+            raise ValueError("品类筛选仅支持待审核商品")
         normalized_collection_source = normalize_text(collection_source).lower()
         if normalized_collection_source not in {"", "manual", "scheduled"}:
             raise ValueError("采集来源筛选条件无效")
@@ -8311,24 +8318,46 @@ def list_products(
             query = query.where(ProductModel.created_at >= collected_at_from_value)
         if collected_at_to_value is not None:
             query = query.where(ProductModel.created_at <= collected_at_to_value)
-        if product_status == "pending" and genre_status == "missing":
-            valid_genre_ids = list(
-                (load_rakuten_attribute_rules().get("genres") or {}).keys()
-            )
-            if valid_genre_ids:
-                query = query.where(
-                    or_(
-                        ProductModel.genre_id == "",
-                        ProductModel.genre_id.is_(None),
-                        ProductModel.genre_id.notin_(valid_genre_ids),
+        if product_status == "pending" and (normalized_genre_status or normalized_genre_path):
+            genres = load_rakuten_attribute_rules().get("genres") or {}
+            valid_genre_ids = list(genres.keys())
+            if normalized_genre_path:
+                genre_path_prefix = f"{normalized_genre_path}>"
+                selected_genre_ids = [
+                    normalize_text(genre_id)
+                    for genre_id, genre in genres.items()
+                    if isinstance(genre, dict)
+                    and (
+                        normalize_text(genre.get("genrePath")) == normalized_genre_path
+                        or normalize_text(genre.get("genrePath")).startswith(genre_path_prefix)
                     )
+                ]
+                query = (
+                    query.where(ProductModel.genre_id.in_(selected_genre_ids))
+                    if selected_genre_ids
+                    else query.where(ProductModel.id == -1)
                 )
-            else:
-                query = query.where(
-                    or_(
-                        ProductModel.genre_id == "",
-                        ProductModel.genre_id.is_(None),
+            if normalized_genre_status == "missing":
+                if valid_genre_ids:
+                    query = query.where(
+                        or_(
+                            ProductModel.genre_id == "",
+                            ProductModel.genre_id.is_(None),
+                            ProductModel.genre_id.notin_(valid_genre_ids),
+                        )
                     )
+                else:
+                    query = query.where(
+                        or_(
+                            ProductModel.genre_id == "",
+                            ProductModel.genre_id.is_(None),
+                        )
+                    )
+            elif normalized_genre_status == "present":
+                query = (
+                    query.where(ProductModel.genre_id.in_(valid_genre_ids))
+                    if valid_genre_ids
+                    else query.where(ProductModel.id == -1)
                 )
         if listed_at_from_value is not None:
             query = query.where(ProductModel.listed_at >= listed_at_from_value)
