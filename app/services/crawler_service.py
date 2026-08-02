@@ -8233,8 +8233,8 @@ def list_products(
         normalized_collection_source = normalize_text(collection_source).lower()
         if normalized_collection_source not in {"", "manual", "scheduled"}:
             raise ValueError("采集来源筛选条件无效")
-        if normalized_collection_source and product_status != "pending":
-            raise ValueError("采集来源筛选仅支持待审核商品")
+        if normalized_collection_source and product_status not in {"pending", "approved"}:
+            raise ValueError("采集来源筛选仅支持待审核或已审核商品")
         sales_period_range = (
             normalize_store_product_sales_range(
                 sales_period_days,

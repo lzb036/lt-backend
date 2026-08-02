@@ -68,6 +68,14 @@ def test_pending_products_are_split_by_collection_source(monkeypatch) -> None:
                 review_status="approved",
             ),
             ProductModel(
+                owner_username="alice",
+                title="Alice scheduled approved",
+                source_url="https://example.com/alice-scheduled-approved",
+                source_url_hash="alice-scheduled-approved",
+                collection_source="scheduled",
+                review_status="approved",
+            ),
+            ProductModel(
                 owner_username="bob",
                 title="Bob scheduled",
                 source_url="https://example.com/bob-scheduled",
@@ -117,10 +125,27 @@ def test_pending_products_are_split_by_collection_source(monkeypatch) -> None:
         for item in scheduled_after_source_deletion["products"]
     ] == ["Alice scheduled"]
 
-    with pytest.raises(ValueError, match="仅支持待审核商品"):
+    approved_manual = crawler_service.list_products(
+        "alice",
+        status="approved",
+        collection_source="manual",
+        page=1,
+        page_size=20,
+    )
+    approved_scheduled = crawler_service.list_products(
+        "alice",
+        status="approved",
+        collection_source="scheduled",
+        page=1,
+        page_size=20,
+    )
+    assert [item["title"] for item in approved_manual["products"]] == ["Alice approved"]
+    assert [item["title"] for item in approved_scheduled["products"]] == ["Alice scheduled approved"]
+
+    with pytest.raises(ValueError, match="待审核或已审核"):
         crawler_service.list_products(
             "alice",
-            status="approved",
+            status="error",
             collection_source="manual",
         )
 
