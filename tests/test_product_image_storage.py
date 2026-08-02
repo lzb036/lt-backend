@@ -278,6 +278,42 @@ class ProductImageStorageTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "图片大小不能超过"):
             self.storage.read_bytes("product-images/1/large.jpg", max_bytes=4)
 
+    def test_read_bytes_retries_retryable_server_errors_with_fresh_bucket(self):
+        original_get_object = self.bucket.get_object
+        attempts = 0
+
+        def flaky_get_object(key: str):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise FakeStorageError(503)
+            return original_get_object(key)
+
+        self.bucket.objects["product-images/1/retry.jpg"] = b"image"
+        self.bucket.get_object = flaky_get_object
+
+        result = self.storage.read_bytes("product-images/1/retry.jpg", max_bytes=10)
+
+        self.assertEqual(result, b"image")
+        self.assertEqual(attempts, 3)
+        self.assertEqual(len(self.created_buckets), 3)
+
+    def test_read_bytes_does_not_retry_missing_objects(self):
+        attempts = 0
+        original_get_object = self.bucket.get_object
+
+        def counted_get_object(key: str):
+            nonlocal attempts
+            attempts += 1
+            return original_get_object(key)
+
+        self.bucket.get_object = counted_get_object
+
+        with self.assertRaises(FileNotFoundError):
+            self.storage.read_bytes("product-images/1/missing.jpg", max_bytes=10)
+
+        self.assertEqual(attempts, 1)
+
     def test_open_stream_yields_content_and_closes_result(self):
         self.bucket.objects["product-images/1/a.jpg"] = b"streamed"
 

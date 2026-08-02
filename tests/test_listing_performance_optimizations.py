@@ -234,6 +234,33 @@ def test_listing_image_preparation_preserves_order_and_skips_unavailable(monkeyp
     assert [row["sourceUrl"] for row in prepared] == ["first", "second"]
 
 
+def test_listing_image_preparation_skips_read_failures_without_failing_product(monkeypatch):
+    monkeypatch.setattr(
+        crawler_service,
+        "load_product_image_bytes",
+        lambda image_url, **_kwargs: (
+            (_ for _ in ()).throw(RuntimeError("读取 OSS 商品图片失败。"))
+            if image_url == "temporary-failure"
+            else {
+                "content": b"image",
+                "suffix": ".jpg",
+                "contentType": "image/jpeg",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "prepare_rakuten_cabinet_image",
+        lambda image_data: image_data,
+    )
+
+    prepared = crawler_service.prepare_rakuten_listing_images(
+        ["first", "temporary-failure", "second"],
+    )
+
+    assert [row["sourceUrl"] for row in prepared] == ["first", "second"]
+
+
 def test_listing_task_limit_remains_fifty():
     assert crawler_service.BATCH_TASK_PRODUCT_LIMIT == 50
     assert [len(chunk) for chunk in crawler_service.chunk_product_ids(list(range(1, 102)))] == [50, 50, 1]
@@ -336,6 +363,7 @@ def test_listing_task_processes_six_products_concurrently(
     active = 0
     max_active = 0
     active_lock = threading.Lock()
+    all_workers_started = threading.Barrier(6)
 
     def fake_attempt(
         _owner,
@@ -350,7 +378,7 @@ def test_listing_task_processes_six_products_concurrently(
         with active_lock:
             active += 1
             max_active = max(max_active, active)
-        time.sleep(0.05)
+        all_workers_started.wait(timeout=2)
         with active_lock:
             active -= 1
         return crawler_service.ListingProductAttemptResult(

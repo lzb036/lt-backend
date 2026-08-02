@@ -78,7 +78,7 @@ class Settings(BaseModel):
     max_running_listing_tasks_per_user: int = 2
     max_running_listing_tasks_per_store: int = 1
     listing_product_workers: int = 6
-    listing_image_prepare_workers: int = 12
+    listing_image_prepare_workers: int = 4
     listing_creation_image_limit: int = 1
     crawler_browser_fallback_enabled: bool = False
     crawler_browser_timeout_seconds: int = 35
@@ -199,7 +199,7 @@ def build_settings() -> Settings:
         max_running_listing_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_USER", 2)),
         max_running_listing_tasks_per_store=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_STORE", 1)),
         listing_product_workers=max(1, _env_int("LT_LISTING_PRODUCT_WORKERS", 6)),
-        listing_image_prepare_workers=max(1, _env_int("LT_LISTING_IMAGE_PREPARE_WORKERS", 12)),
+        listing_image_prepare_workers=max(1, _env_int("LT_LISTING_IMAGE_PREPARE_WORKERS", 4)),
         listing_creation_image_limit=min(20, max(1, _env_int("LT_LISTING_CREATION_IMAGE_LIMIT", 1))),
         crawler_browser_fallback_enabled=_env_bool("LT_CRAWLER_BROWSER_FALLBACK_ENABLED", False),
         crawler_browser_timeout_seconds=_env_int("LT_CRAWLER_BROWSER_TIMEOUT_SECONDS", 35),

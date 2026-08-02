@@ -15410,7 +15410,15 @@ def prepare_rakuten_listing_image(image_url: str) -> dict[str, Any] | None:
     except ProductImageUnavailableError:
         return None
     except RuntimeError as exc:
-        if should_skip_listing_image_error(exc):
+        if should_skip_listing_image_error(exc) or is_listing_image_read_error(exc):
+            if is_listing_image_read_error(exc):
+                logger.warning(
+                    "listing image skipped after read failure url=%s error=%s cause=%s",
+                    image_url,
+                    exc,
+                    exc.__cause__,
+                    exc_info=True,
+                )
             return None
         raise
     return {
@@ -15980,6 +15988,19 @@ def should_skip_listing_image_error(exc: Exception) -> bool:
     )
 
 
+def is_listing_image_read_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(
+        marker in message
+        for marker in (
+            "读取 OSS 商品图片失败",
+            "读取商品图片失败",
+            "商品图片文件不存在",
+            "本地图片文件不存在",
+        )
+    )
+
+
 def recover_missing_local_product_images(product: ProductModel, images: list[str]) -> list[str]:
     normalized_images = unique_texts([image for image in images if normalize_product_image_url(image)])
     if not any(is_missing_local_product_image_url(image) for image in normalized_images):
@@ -16074,17 +16095,16 @@ def load_product_image_bytes(
     storage_error: Exception | None = None
     if stored_image is not None and product_image_storage.enabled:
         try:
-            if product_image_storage.exists(stored_image.object_key):
-                content = product_image_storage.read_bytes(
-                    stored_image.object_key,
-                    max_bytes=normalized_max_bytes,
-                )
-                suffix = Path(stored_image.filename).suffix.lower()
-                content_type = mimetypes.guess_type(stored_image.filename)[0] or "application/octet-stream"
-            else:
-                content = b""
-                suffix = ""
-                content_type = ""
+            content = product_image_storage.read_bytes(
+                stored_image.object_key,
+                max_bytes=normalized_max_bytes,
+            )
+            suffix = Path(stored_image.filename).suffix.lower()
+            content_type = mimetypes.guess_type(stored_image.filename)[0] or "application/octet-stream"
+        except FileNotFoundError:
+            content = b""
+            suffix = ""
+            content_type = ""
         except Exception as exc:
             storage_error = exc
             content = b""

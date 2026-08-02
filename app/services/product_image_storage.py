@@ -105,6 +105,7 @@ class ProductImageStorage:
         role_name: str = "",
         connect_timeout: int = 10,
         write_retries: int = 3,
+        read_retries: int = 3,
         bucket_factory: Callable[[], Any] | None = None,
         object_iterator_factory: Callable[[Any, str], Iterable[Any]] | None = None,
     ) -> None:
@@ -115,6 +116,7 @@ class ProductImageStorage:
         self.role_name = str(role_name or "").strip()
         self.connect_timeout = max(1, int(connect_timeout or 10))
         self.write_retries = max(1, int(write_retries or 1))
+        self.read_retries = max(1, int(read_retries or 1))
         self._bucket_factory = bucket_factory
         self._object_iterator_factory = object_iterator_factory
         self._thread_local = threading.local()
@@ -163,6 +165,10 @@ class ProductImageStorage:
             self._thread_local.bucket = bucket
         return bucket
 
+    def _reset_thread_bucket(self) -> None:
+        if hasattr(self._thread_local, "bucket"):
+            del self._thread_local.bucket
+
     @staticmethod
     def _is_not_found(exc: Exception) -> bool:
         if int(getattr(exc, "status", 0) or 0) == 404:
@@ -175,6 +181,22 @@ class ProductImageStorage:
         if status == 429 or 500 <= status < 600:
             return True
         return exc.__class__.__name__ == "RequestError"
+
+    @classmethod
+    def _is_retryable_read_error(cls, exc: Exception) -> bool:
+        if cls._is_not_found(exc):
+            return False
+        status = int(getattr(exc, "status", 0) or 0)
+        if status == 429 or 500 <= status < 600:
+            return True
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        return exc.__class__.__name__ in {
+            "RequestError",
+            "ServerError",
+            "ConnectionError",
+            "TimeoutError",
+        }
 
     def _run_idempotent_write(self, operation: Callable[[], Any]) -> Any:
         for attempt in range(self.write_retries):
@@ -215,10 +237,23 @@ class ProductImageStorage:
         )
 
     def read_bytes(self, key: str, *, max_bytes: int) -> bytes:
-        stream = self.open_stream(key, max_bytes=max_bytes)
-        if stream is None:
-            raise FileNotFoundError(key)
-        return b"".join(stream)
+        for attempt in range(self.read_retries):
+            try:
+                stream = self.open_stream(key, max_bytes=max_bytes)
+                if stream is None:
+                    raise FileNotFoundError(key)
+                return b"".join(stream)
+            except FileNotFoundError:
+                raise
+            except Exception as exc:
+                if (
+                    attempt + 1 >= self.read_retries
+                    or not self._is_retryable_read_error(exc)
+                ):
+                    raise
+                self._reset_thread_bucket()
+                self._retry_sleep(min(2 ** attempt, 5))
+        raise RuntimeError("OSS 读取重试状态异常。")
 
     def open_stream(self, key: str, *, max_bytes: int) -> ObjectStream | None:
         try:
