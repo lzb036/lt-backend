@@ -2726,8 +2726,8 @@ def create_auto_listing_schedule(owner_username: str, payload: Any) -> dict[str,
     month_day = getattr(payload, "monthDay", None)
     quantity = int(getattr(payload, "quantity", 0) or 0)
     store_id = int(getattr(payload, "storeId", 0) or 0)
-    if quantity < 1 or quantity > 1000:
-        raise RuntimeError("自动上架数量只能设置为 1 到 1000。")
+    if quantity < 1 or quantity > 10000:
+        raise RuntimeError("自动上架数量只能设置为 1 到 10000。")
     next_run_at = next_auto_listing_run_at(
         schedule_type,
         schedule_time,

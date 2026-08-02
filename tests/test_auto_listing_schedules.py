@@ -85,11 +85,11 @@ def test_create_schedule_rejects_duplicate_store(database) -> None:
         scheduleTime="10:15",
         weekday=7,
         monthDay=None,
-        quantity=30,
+        quantity=10000,
     )
     created = crawler_service.create_auto_listing_schedule("alice", payload)
     assert created["storeAliasName"] == "A 店"
-    assert created["quantity"] == 30
+    assert created["quantity"] == 10000
     assert created["nextRunAt"]
 
     with pytest.raises(RuntimeError, match="已经创建过"):

@@ -282,7 +282,7 @@ class AutoListingSchedulePayload(BaseModel):
     scheduleTime: str = Field(pattern=r"^\d{2}:\d{2}$")
     weekday: int | None = Field(default=None, ge=1, le=7)
     monthDay: int | None = Field(default=None, ge=1, le=31)
-    quantity: int = Field(ge=1, le=1000)
+    quantity: int = Field(ge=1, le=10000)
 
 
 class AutoListingScheduleStatusPayload(BaseModel):
