@@ -202,3 +202,72 @@ def test_due_schedule_records_no_available_products(database) -> None:
         assert schedule.status == "idle"
         assert schedule.last_message == "当前没有可自动上架的已审核商品。"
         assert schedule.last_task_ids_json == "[]"
+
+
+def test_run_schedule_now_keeps_disabled_schedule_disabled(database, monkeypatch) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+        session.add(
+            AutoListingScheduleModel(
+                owner_username="alice",
+                store_id=store_id,
+                schedule_type="daily",
+                schedule_time="09:00",
+                quantity=10,
+                enabled=False,
+                status="disabled",
+                next_run_at=None,
+            )
+        )
+        session.add(
+            ProductModel(
+                owner_username="alice",
+                title="立即执行商品",
+                source_url="https://example.com/run-now",
+                source_url_hash="run-now",
+                review_status="approved",
+                raw_payload_json="{}",
+            )
+        )
+
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_preflight_product_check",
+        lambda product, store: {"productId": product.id, "issues": []},
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "create_listing_task",
+        lambda owner_username, payload: {
+            "listingTask": {"id": "manual-task"},
+            "listingTasks": [{"id": "manual-task"}],
+            "summary": {"total": len(payload.productIds), "taskCount": 1},
+        },
+    )
+
+    result = crawler_service.run_auto_listing_schedule_now("alice", 1)
+
+    assert result["status"] == "disabled"
+    assert result["nextRunAt"] is None
+    assert result["lastTaskIds"] == ["manual-task"]
+    assert "实际已创建 1 件" in result["lastMessage"]
+
+
+def test_run_schedule_now_is_owner_scoped(database) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+        session.add(
+            AutoListingScheduleModel(
+                owner_username="alice",
+                store_id=store_id,
+                schedule_type="daily",
+                schedule_time="09:00",
+                quantity=10,
+                enabled=True,
+                status="idle",
+                next_run_at=datetime(2026, 8, 4, 9, 0),
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="不存在"):
+        crawler_service.run_auto_listing_schedule_now("bob", 1)

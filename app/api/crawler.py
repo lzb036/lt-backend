@@ -1817,6 +1817,22 @@ def update_auto_listing_schedule_status(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/auto-listing-schedules/{schedule_id}/run")
+def run_auto_listing_schedule(
+    schedule_id: int,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return {
+            "schedule": crawler_service.run_auto_listing_schedule_now(
+                user["username"],
+                schedule_id,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.delete("/auto-listing-schedules/{schedule_id}")
 def delete_auto_listing_schedule(
     schedule_id: int,
