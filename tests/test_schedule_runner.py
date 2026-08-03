@@ -33,6 +33,11 @@ def test_schedule_runner_continues_after_task_failure(monkeypatch, caplog) -> No
     )
     monkeypatch.setattr(
         crawler_service,
+        "run_due_auto_deletion_tasks_once",
+        lambda: calls.append("auto-deletion"),
+    )
+    monkeypatch.setattr(
+        crawler_service,
         "run_due_sales_order_syncs_once",
         lambda: calls.append("sales"),
     )
@@ -50,7 +55,7 @@ def test_schedule_runner_continues_after_task_failure(monkeypatch, caplog) -> No
     with caplog.at_level(logging.ERROR):
         assert crawler_service.run_schedule_runner_tick() is False
 
-    assert calls == ["crawl", "auto-listing", "sales", "products", "maintenance"]
+    assert calls == ["crawl", "auto-listing", "auto-deletion", "sales", "products", "maintenance"]
     assert "Schedule runner task failed: scheduled crawls" in caplog.text
     health = crawler_service.schedule_runner_health()
     assert health["consecutiveFailures"] == 1
@@ -66,6 +71,7 @@ def test_successful_schedule_tick_resets_failure_health(monkeypatch) -> None:
 
     monkeypatch.setattr(crawler_service, "run_due_scheduled_crawls_once", lambda: 0)
     monkeypatch.setattr(crawler_service, "run_due_auto_listing_schedules_once", lambda: 0)
+    monkeypatch.setattr(crawler_service, "run_due_auto_deletion_tasks_once", lambda: 0)
     monkeypatch.setattr(crawler_service, "run_due_sales_order_syncs_once", lambda: 0)
     monkeypatch.setattr(crawler_service, "run_due_store_product_syncs_once", lambda: 0)
     monkeypatch.setattr(crawler_service, "run_periodic_maintenance_once", lambda: None)

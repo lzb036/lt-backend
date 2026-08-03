@@ -45,6 +45,7 @@ from app.core.text_limits import (
 from app.core.task_queue import all_task_queue_names, enqueue_task, enqueue_task_in, redis_connection, task_queue_name_for_kind
 from app.db.database import session_scope
 from app.db.models import (
+    AutoDeletionTaskModel,
     AutoListingScheduleModel,
     CrawlLogModel,
     CrawlSourceModel,
@@ -2868,6 +2869,88 @@ def delete_auto_listing_schedule(owner_username: str, schedule_id: int) -> None:
         )
         if row is None:
             raise RuntimeError("自动上架任务不存在。")
+        session.delete(row)
+
+
+def auto_deletion_task_to_public(row: AutoDeletionTaskModel, store: StoreModel | None = None) -> dict[str, Any]:
+    try:
+        task_ids = json.loads(row.last_task_ids_json or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        task_ids = []
+    return {
+        "id": row.id,
+        "ownerUsername": row.owner_username,
+        "storeId": row.store_id,
+        "storeName": store.store_name if store else "",
+        "storeAliasName": store.alias_name if store else "",
+        "taskType": row.task_type,
+        "scheduleType": row.schedule_type,
+        "scheduleTime": row.schedule_time,
+        "weekday": row.weekday,
+        "monthDay": row.month_day,
+        "quantity": row.quantity,
+        "status": row.status,
+        "lastRunAt": datetime_to_public(row.last_run_at),
+        "nextRunAt": datetime_to_public(row.next_run_at),
+        "lastTaskIds": task_ids if isinstance(task_ids, list) else [],
+        "lastMessage": row.last_message,
+        "lastError": row.last_error,
+        "createdAt": datetime_to_public(row.created_at),
+        "updatedAt": datetime_to_public(row.updated_at),
+    }
+
+
+def list_auto_deletion_tasks(owner_username: str, *, store_id: int | None = None, task_type: str | None = None) -> list[dict[str, Any]]:
+    normalized_type = normalize_text(task_type).lower()
+    if normalized_type not in {"", "automatic", "manual"}:
+        raise RuntimeError("删除任务类型筛选条件无效。")
+    with session_scope() as session:
+        query = select(AutoDeletionTaskModel, StoreModel).join(StoreModel, StoreModel.id == AutoDeletionTaskModel.store_id).where(AutoDeletionTaskModel.owner_username == owner_username)
+        if store_id is not None:
+            query = query.where(AutoDeletionTaskModel.store_id == store_id)
+        if normalized_type:
+            query = query.where(AutoDeletionTaskModel.task_type == normalized_type)
+        rows = session.execute(query.order_by(case((AutoDeletionTaskModel.task_type == "automatic", 0), else_=1), AutoDeletionTaskModel.created_at.desc(), AutoDeletionTaskModel.id.desc())).all()
+        return [auto_deletion_task_to_public(row, store) for row, store in rows]
+
+
+def _validate_deletion_store(session: Any, owner_username: str, store_id: int) -> StoreModel:
+    store = session.get(StoreModel, store_id)
+    if store is None or store.owner_username != owner_username:
+        raise RuntimeError("删除店铺不存在或不属于当前用户。")
+    if not store.enabled:
+        raise RuntimeError(f"店铺「{store.alias_name or store.store_name}」已停用。")
+    if not decrypt_text(store.rakuten_service_secret_encrypted) or not decrypt_text(store.rakuten_license_key_encrypted):
+        raise RuntimeError(f"店铺「{store.alias_name or store.store_name}」缺少乐天 Secret 或乐天 Key。")
+    return store
+
+
+def create_auto_deletion_task(owner_username: str, payload: Any) -> dict[str, Any]:
+    store_id = int(getattr(payload, "storeId", 0) or 0)
+    quantity = int(getattr(payload, "quantity", 0) or 0)
+    schedule_type = normalize_text(getattr(payload, "scheduleType", None))
+    schedule_time = normalize_schedule_time(getattr(payload, "scheduleTime", None))
+    weekday = getattr(payload, "weekday", None)
+    month_day = getattr(payload, "monthDay", None)
+    if quantity < 1 or quantity > 10000:
+        raise RuntimeError("删除数量只能设置为 1 到 10000。")
+    next_run = next_auto_listing_run_at(schedule_type, schedule_time, weekday=weekday, month_day=month_day)
+    with session_scope() as session:
+        store = _validate_deletion_store(session, owner_username, store_id)
+        row = AutoDeletionTaskModel(owner_username=owner_username, store_id=store_id, automatic_store_id=store_id, task_type="automatic", schedule_type=schedule_type, schedule_time=schedule_time, weekday=int(weekday) if schedule_type == "weekly" else None, month_day=int(month_day) if schedule_type == "monthly" else None, quantity=quantity, enabled=True, status="idle", next_run_at=next_run)
+        session.add(row)
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            raise RuntimeError("该店铺已经创建过自动删除任务，不能重复创建。") from exc
+        return auto_deletion_task_to_public(row, store)
+
+
+def delete_auto_deletion_task(owner_username: str, task_id: int) -> None:
+    with session_scope() as session:
+        row = session.scalar(select(AutoDeletionTaskModel).where(AutoDeletionTaskModel.id == task_id, AutoDeletionTaskModel.owner_username == owner_username))
+        if row is None:
+            raise RuntimeError("自动删除任务不存在。")
         session.delete(row)
 
 
@@ -12926,6 +13009,135 @@ def run_due_auto_listing_schedules_once() -> int:
         AUTO_LISTING_SCHEDULE_LOCK.release()
 
 
+def auto_deletion_candidate_product_ids(owner_username: str, store_id: int, quantity: int) -> list[int]:
+    period_end = sales_now_naive().date()
+    cutoff = period_end - timedelta(days=364)
+    sales = (
+        select(
+            ProductSalesDailyModel.store_id.label("store_id"),
+            ProductSalesDailyModel.manage_number.label("manage_number"),
+            func.sum(ProductSalesDailyModel.effective_units).label("effective_units"),
+        )
+        .where(
+            ProductSalesDailyModel.owner_username == owner_username,
+            ProductSalesDailyModel.store_id == store_id,
+            ProductSalesDailyModel.sales_date >= cutoff,
+            ProductSalesDailyModel.sales_date <= period_end,
+        )
+        .group_by(ProductSalesDailyModel.store_id, ProductSalesDailyModel.manage_number)
+        .subquery()
+    )
+    with session_scope() as session:
+        return [
+            int(value)
+            for value in session.scalars(
+                select(ProductModel.id)
+                .outerjoin(
+                    sales,
+                    and_(
+                        sales.c.store_id == ProductModel.store_id,
+                        sales.c.manage_number == ProductModel.rakuten_manage_number,
+                    ),
+                )
+                .where(
+                    ProductModel.owner_username == owner_username,
+                    ProductModel.store_id == store_id,
+                    ProductModel.review_status == "listed",
+                    ProductModel.rakuten_listing_status == "listed",
+                    ProductModel.listed_at.is_not(None),
+                    func.coalesce(sales.c.effective_units, 0) == 0,
+                )
+                .order_by(ProductModel.listed_at.asc(), ProductModel.id.asc())
+                .limit(quantity)
+            ).all()
+        ]
+
+
+def execute_auto_deletion_task(task_id: int, *, owner_username: str | None = None, advance_next_run: bool = False) -> dict[str, Any]:
+    now = datetime.now()
+    with session_scope() as session:
+        query = select(AutoDeletionTaskModel).where(AutoDeletionTaskModel.id == task_id)
+        if owner_username is not None:
+            query = query.where(AutoDeletionTaskModel.owner_username == owner_username)
+        row = session.scalar(query.with_for_update())
+        if row is None:
+            raise RuntimeError("自动删除任务不存在。")
+        if row.status == "running":
+            raise RuntimeError("该自动删除任务正在执行。")
+        resolved_owner = row.owner_username
+        store_id = int(row.store_id)
+        quantity = int(row.quantity)
+        task_type = row.task_type
+        row.status = "running"
+        row.last_run_at = now
+        row.last_error = None
+        if advance_next_run and row.enabled:
+            row.next_run_at = next_auto_listing_run_at(row.schedule_type, row.schedule_time, weekday=row.weekday, month_day=row.month_day, now=now)
+    try:
+        product_ids = auto_deletion_candidate_product_ids(resolved_owner, store_id, quantity)
+        task_ids: list[str] = []
+        if product_ids:
+            result = create_product_delete_sync_task(resolved_owner, product_ids)
+            rows = result.get("syncTasks") or ([result.get("syncTask")] if result.get("syncTask") else [])
+            task_ids = [str(item.get("id")) for item in rows if isinstance(item, dict) and item.get("id")]
+        with session_scope() as session:
+            row = session.get(AutoDeletionTaskModel, task_id)
+            if row is None:
+                raise RuntimeError("自动删除任务不存在。")
+            store = session.get(StoreModel, row.store_id)
+            row.status = "completed" if task_type == "manual" else "idle"
+            row.last_task_ids_json = json.dumps(task_ids, ensure_ascii=False)
+            row.last_message = (
+                f"计划删除 {quantity} 件，实际已创建 {len(product_ids)} 件商品的删除任务，共 {len(task_ids)} 个任务。"
+                if product_ids
+                else "当前没有符合条件的已上架零销量商品。"
+            )
+            return auto_deletion_task_to_public(row, store)
+    except Exception as exc:
+        message = humanize_task_error_detail(str(exc)) or "自动删除任务创建失败。"
+        with session_scope() as session:
+            row = session.get(AutoDeletionTaskModel, task_id)
+            if row is not None:
+                row.status = "failed"
+                row.last_error = message
+                row.last_message = "本次自动删除任务创建失败。"
+        raise RuntimeError(message) from exc
+
+
+def create_manual_deletion_task(owner_username: str, payload: Any) -> dict[str, Any]:
+    store_id = int(getattr(payload, "storeId", 0) or 0)
+    quantity = int(getattr(payload, "quantity", 0) or 0)
+    if quantity < 1 or quantity > 10000:
+        raise RuntimeError("删除数量只能设置为 1 到 10000。")
+    with session_scope() as session:
+        _validate_deletion_store(session, owner_username, store_id)
+        row = AutoDeletionTaskModel(owner_username=owner_username, store_id=store_id, automatic_store_id=None, task_type="manual", quantity=quantity, enabled=False, status="idle")
+        session.add(row)
+        session.flush()
+        task_id = int(row.id)
+    return execute_auto_deletion_task(task_id, owner_username=owner_username)
+
+
+def run_due_auto_deletion_tasks_once() -> int:
+    now = datetime.now()
+    with session_scope() as session:
+        task_ids = session.scalars(
+            select(AutoDeletionTaskModel.id).where(
+                AutoDeletionTaskModel.task_type == "automatic",
+                AutoDeletionTaskModel.enabled.is_(True),
+                AutoDeletionTaskModel.next_run_at.is_not(None),
+                AutoDeletionTaskModel.next_run_at <= now,
+                AutoDeletionTaskModel.status != "running",
+            ).order_by(AutoDeletionTaskModel.next_run_at.asc(), AutoDeletionTaskModel.id.asc()).limit(max(1, int(settings.scheduled_crawl_dispatch_batch_size)))
+        ).all()
+    for task_id in task_ids:
+        try:
+            execute_auto_deletion_task(int(task_id), advance_next_run=True)
+        except RuntimeError:
+            continue
+    return len(task_ids)
+
+
 def run_periodic_maintenance_once() -> None:
     reconcile_interrupted_background_tasks_once()
     dispatch_queued_crawl_tasks_safely()
@@ -12978,6 +13190,7 @@ def run_schedule_runner_tick() -> bool:
     tasks = (
         ("scheduled crawls", run_due_scheduled_crawls_once),
         ("auto listing schedules", run_due_auto_listing_schedules_once),
+        ("auto deletion tasks", run_due_auto_deletion_tasks_once),
         ("sales order syncs", run_due_sales_order_syncs_once),
         ("store product syncs", run_due_store_product_syncs_once),
         ("periodic maintenance", run_periodic_maintenance_once),

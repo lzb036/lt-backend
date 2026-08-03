@@ -294,6 +294,20 @@ class ManualListingTaskPayload(BaseModel):
     quantity: int = Field(ge=1, le=10000)
 
 
+class AutoDeletionTaskPayload(BaseModel):
+    storeId: int
+    scheduleType: Literal["daily", "weekly", "monthly"]
+    scheduleTime: str = Field(pattern=r"^\d{2}:\d{2}$")
+    weekday: int | None = Field(default=None, ge=1, le=7)
+    monthDay: int | None = Field(default=None, ge=1, le=31)
+    quantity: int = Field(ge=1, le=10000)
+
+
+class ManualDeletionTaskPayload(BaseModel):
+    storeId: int
+    quantity: int = Field(ge=1, le=10000)
+
+
 class RolePayload(BaseModel):
     name: str = Field(min_length=1)
     code: str = Field(min_length=1)
@@ -1869,6 +1883,40 @@ def delete_auto_listing_schedule(
 ) -> dict:
     try:
         crawler_service.delete_auto_listing_schedule(user["username"], schedule_id)
+        return {"deleted": True}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/auto-deletion-tasks")
+def list_auto_deletion_tasks(
+    storeId: int | None = Query(default=None),
+    taskType: Literal["automatic", "manual"] | None = Query(default=None),
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    return {"tasks": crawler_service.list_auto_deletion_tasks(user["username"], store_id=storeId, task_type=taskType)}
+
+
+@router.post("/auto-deletion-tasks")
+def create_auto_deletion_task(payload: AutoDeletionTaskPayload, user: dict = Depends(require_products_permission)) -> dict:
+    try:
+        return {"task": crawler_service.create_auto_deletion_task(user["username"], payload)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/auto-deletion-tasks/manual")
+def create_manual_deletion_task(payload: ManualDeletionTaskPayload, user: dict = Depends(require_products_permission)) -> dict:
+    try:
+        return {"task": crawler_service.create_manual_deletion_task(user["username"], payload)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/auto-deletion-tasks/{task_id}")
+def delete_auto_deletion_task(task_id: int, user: dict = Depends(require_products_permission)) -> dict:
+    try:
+        crawler_service.delete_auto_deletion_task(user["username"], task_id)
         return {"deleted": True}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
