@@ -514,8 +514,9 @@ class ScheduledCrawlModel(TimestampMixin, Base):
 class AutoListingScheduleModel(TimestampMixin, Base):
     __tablename__ = "lt_auto_listing_schedules"
     __table_args__ = (
-        UniqueConstraint("owner_username", "store_id", name="uq_lt_auto_listing_owner_store"),
+        UniqueConstraint("owner_username", "automatic_store_id", name="uq_lt_auto_listing_owner_auto_store"),
         Index("ix_lt_auto_listing_owner_enabled", "owner_username", "enabled"),
+        Index("ix_lt_auto_listing_owner_type", "owner_username", "task_type"),
         Index("ix_lt_auto_listing_enabled_next", "enabled", "next_run_at"),
     )
 
@@ -528,6 +529,13 @@ class AutoListingScheduleModel(TimestampMixin, Base):
     store_id: Mapped[int] = mapped_column(
         ForeignKey("lt_stores.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    automatic_store_id: Mapped[int | None] = mapped_column(Integer)
+    task_type: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="automatic",
+        server_default="automatic",
     )
     schedule_type: Mapped[str] = mapped_column(String(16), nullable=False)
     schedule_time: Mapped[str] = mapped_column(String(5), nullable=False)

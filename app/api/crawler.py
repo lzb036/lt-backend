@@ -289,6 +289,11 @@ class AutoListingScheduleStatusPayload(BaseModel):
     enabled: bool
 
 
+class ManualListingTaskPayload(BaseModel):
+    storeId: int
+    quantity: int = Field(ge=1, le=10000)
+
+
 class RolePayload(BaseModel):
     name: str = Field(min_length=1)
     code: str = Field(min_length=1)
@@ -1777,9 +1782,17 @@ def run_schedule(schedule_id: int, user: dict = Depends(require_crawler_permissi
 
 
 @router.get("/auto-listing-schedules")
-def list_auto_listing_schedules(user: dict = Depends(require_products_permission)) -> dict:
+def list_auto_listing_schedules(
+    storeId: int | None = Query(default=None),
+    taskType: Literal["automatic", "manual"] | None = Query(default=None),
+    user: dict = Depends(require_products_permission),
+) -> dict:
     return {
-        "schedules": crawler_service.list_auto_listing_schedules(user["username"]),
+        "schedules": crawler_service.list_auto_listing_schedules(
+            user["username"],
+            store_id=storeId,
+            task_type=taskType,
+        ),
     }
 
 
@@ -1791,6 +1804,22 @@ def create_auto_listing_schedule(
     try:
         return {
             "schedule": crawler_service.create_auto_listing_schedule(
+                user["username"],
+                payload,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/auto-listing-schedules/manual")
+def create_manual_listing_task(
+    payload: ManualListingTaskPayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return {
+            "schedule": crawler_service.create_manual_listing_task(
                 user["username"],
                 payload,
             )

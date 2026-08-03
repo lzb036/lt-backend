@@ -1426,6 +1426,96 @@ def ensure_schema_compatibility() -> None:
         if schedule_columns and "schedule_time" not in schedule_columns:
             connection.execute(text("ALTER TABLE lt_scheduled_crawls ADD COLUMN schedule_time VARCHAR(5) NOT NULL DEFAULT '09:00'"))
 
+        auto_listing_columns = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_auto_listing_schedules'
+                    """
+                )
+            ).scalars()
+        )
+        if auto_listing_columns:
+            if "task_type" not in auto_listing_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE lt_auto_listing_schedules "
+                        "ADD COLUMN task_type VARCHAR(16) NOT NULL DEFAULT 'automatic'"
+                    )
+                )
+            if "automatic_store_id" not in auto_listing_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE lt_auto_listing_schedules "
+                        "ADD COLUMN automatic_store_id INT NULL"
+                    )
+                )
+            connection.execute(
+                text(
+                    """
+                    UPDATE lt_auto_listing_schedules
+                    SET
+                        task_type = 'automatic',
+                        automatic_store_id = store_id
+                    WHERE task_type IS NULL
+                       OR task_type = ''
+                       OR task_type = 'automatic'
+                    """
+                )
+            )
+            auto_listing_constraints = set(
+                connection.execute(
+                    text(
+                        """
+                        SELECT CONSTRAINT_NAME
+                        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                          AND TABLE_NAME = 'lt_auto_listing_schedules'
+                          AND CONSTRAINT_TYPE = 'UNIQUE'
+                        """
+                    )
+                ).scalars()
+            )
+            if "uq_lt_auto_listing_owner_store" in auto_listing_constraints:
+                connection.execute(
+                    text(
+                        "ALTER TABLE lt_auto_listing_schedules "
+                        "DROP INDEX uq_lt_auto_listing_owner_store"
+                    )
+                )
+            if "uq_lt_auto_listing_owner_auto_store" not in auto_listing_constraints:
+                connection.execute(
+                    text(
+                        """
+                        ALTER TABLE lt_auto_listing_schedules
+                        ADD CONSTRAINT uq_lt_auto_listing_owner_auto_store
+                        UNIQUE (owner_username, automatic_store_id)
+                        """
+                    )
+                )
+            auto_listing_indexes = set(
+                connection.execute(
+                    text(
+                        """
+                        SELECT INDEX_NAME
+                        FROM INFORMATION_SCHEMA.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                          AND TABLE_NAME = 'lt_auto_listing_schedules'
+                        """
+                    )
+                ).scalars()
+            )
+            if "ix_lt_auto_listing_owner_type" not in auto_listing_indexes:
+                connection.execute(
+                    text(
+                        "CREATE INDEX ix_lt_auto_listing_owner_type "
+                        "ON lt_auto_listing_schedules (owner_username, task_type)"
+                    )
+                )
+
         sales_tables = (
             model_module.SalesOrderModel.__table__,
             model_module.SalesOrderItemModel.__table__,

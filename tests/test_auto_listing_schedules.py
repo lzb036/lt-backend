@@ -271,3 +271,63 @@ def test_run_schedule_now_is_owner_scoped(database) -> None:
 
     with pytest.raises(RuntimeError, match="不存在"):
         crawler_service.run_auto_listing_schedule_now("bob", 1)
+
+
+def test_manual_tasks_allow_repeated_store_and_automatic_tasks_sort_first(
+    database,
+) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    automatic = crawler_service.create_auto_listing_schedule(
+        "alice",
+        SimpleNamespace(
+            storeId=store_id,
+            scheduleType="daily",
+            scheduleTime="09:00",
+            weekday=None,
+            monthDay=None,
+            quantity=10,
+        ),
+    )
+    first_manual = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=10),
+    )
+    second_manual = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=20),
+    )
+
+    assert automatic["taskType"] == "automatic"
+    assert first_manual["taskType"] == "manual"
+    assert first_manual["status"] == "completed"
+    assert second_manual["taskType"] == "manual"
+    assert first_manual["id"] != second_manual["id"]
+
+    all_tasks = crawler_service.list_auto_listing_schedules("alice")
+    manual_tasks = crawler_service.list_auto_listing_schedules(
+        "alice",
+        store_id=store_id,
+        task_type="manual",
+    )
+
+    assert [task["taskType"] for task in all_tasks] == [
+        "automatic",
+        "manual",
+        "manual",
+    ]
+    assert {task["id"] for task in manual_tasks} == {
+        first_manual["id"],
+        second_manual["id"],
+    }
+
+
+def test_auto_listing_model_uses_nullable_automatic_store_unique_key() -> None:
+    constraint_names = {
+        constraint.name
+        for constraint in AutoListingScheduleModel.__table__.constraints
+    }
+    assert "uq_lt_auto_listing_owner_auto_store" in constraint_names
+    assert "uq_lt_auto_listing_owner_store" not in constraint_names
+    assert AutoListingScheduleModel.__table__.columns["automatic_store_id"].nullable
