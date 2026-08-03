@@ -1798,7 +1798,7 @@ def run_schedule(schedule_id: int, user: dict = Depends(require_crawler_permissi
 @router.get("/auto-listing-schedules")
 def list_auto_listing_schedules(
     storeId: int | None = Query(default=None),
-    taskType: Literal["automatic", "manual"] | None = Query(default=None),
+    taskType: str | None = Query(default=None, pattern="^(|automatic|manual)$"),
     user: dict = Depends(require_products_permission),
 ) -> dict:
     return {
@@ -1891,7 +1891,7 @@ def delete_auto_listing_schedule(
 @router.get("/auto-deletion-tasks")
 def list_auto_deletion_tasks(
     storeId: int | None = Query(default=None),
-    taskType: Literal["automatic", "manual"] | None = Query(default=None),
+    taskType: str | None = Query(default=None, pattern="^(|automatic|manual)$"),
     user: dict = Depends(require_products_permission),
 ) -> dict:
     return {"tasks": crawler_service.list_auto_deletion_tasks(user["username"], store_id=storeId, task_type=taskType)}
