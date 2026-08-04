@@ -73,6 +73,8 @@ class Settings(BaseModel):
     crawler_timeout_seconds: int = 20
     rakuten_write_timeout_seconds: int = 60
     max_running_crawl_tasks_per_user: int = 2
+    max_running_manual_crawl_tasks_per_user: int = 2
+    max_running_scheduled_crawl_tasks_per_user: int = 1
     max_running_sync_tasks_per_user: int = 2
     max_running_listing_tasks_global: int = 5
     max_running_listing_tasks_per_user: int = 2
@@ -109,6 +111,8 @@ class Settings(BaseModel):
     redis_url: str = "redis://127.0.0.1:6379/0"
     task_queue_name: str = "lt-tasks"
     task_queue_crawl_name: str = "lt-tasks-crawl"
+    task_queue_manual_crawl_name: str = "lt-tasks-manual-crawl"
+    task_queue_scheduled_crawl_name: str = "lt-tasks-scheduled-crawl"
     task_queue_sync_name: str = "lt-tasks-sync"
     task_queue_title_optimization_name: str = "lt-tasks-title-optimization"
     task_queue_image_cleanup_name: str = "lt-tasks-image-cleanup"
@@ -194,6 +198,14 @@ def build_settings() -> Settings:
         crawler_timeout_seconds=_env_int("LT_CRAWLER_TIMEOUT_SECONDS", 20),
         rakuten_write_timeout_seconds=_env_int("LT_RAKUTEN_WRITE_TIMEOUT_SECONDS", 60),
         max_running_crawl_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_CRAWL_TASKS_PER_USER", 2)),
+        max_running_manual_crawl_tasks_per_user=max(
+            1,
+            _env_int("LT_MAX_RUNNING_MANUAL_CRAWL_TASKS_PER_USER", 2),
+        ),
+        max_running_scheduled_crawl_tasks_per_user=max(
+            1,
+            _env_int("LT_MAX_RUNNING_SCHEDULED_CRAWL_TASKS_PER_USER", 1),
+        ),
         max_running_sync_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_SYNC_TASKS_PER_USER", 2)),
         max_running_listing_tasks_global=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_GLOBAL", 5)),
         max_running_listing_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_USER", 2)),
@@ -233,6 +245,14 @@ def build_settings() -> Settings:
         redis_url=_env_text("LT_REDIS_URL", "redis://127.0.0.1:6379/0"),
         task_queue_name=(base_task_queue_name := _env_text("LT_TASK_QUEUE_NAME", "lt-tasks")),
         task_queue_crawl_name=_env_text("LT_TASK_QUEUE_CRAWL_NAME", f"{base_task_queue_name}-crawl"),
+        task_queue_manual_crawl_name=_env_text(
+            "LT_TASK_QUEUE_MANUAL_CRAWL_NAME",
+            f"{base_task_queue_name}-manual-crawl",
+        ),
+        task_queue_scheduled_crawl_name=_env_text(
+            "LT_TASK_QUEUE_SCHEDULED_CRAWL_NAME",
+            f"{base_task_queue_name}-scheduled-crawl",
+        ),
         task_queue_sync_name=_env_text("LT_TASK_QUEUE_SYNC_NAME", f"{base_task_queue_name}-sync"),
         task_queue_title_optimization_name=_env_text(
             "LT_TASK_QUEUE_TITLE_OPTIMIZATION_NAME",

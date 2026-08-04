@@ -587,15 +587,45 @@ def start_background_task(target: Callable[..., Any], *args: Any, delay_seconds:
     worker.start()
 
 
+def normalize_crawl_task_mode(value: Any) -> str:
+    return "scheduled" if normalize_text(value).lower() == "scheduled" else "manual"
+
+
+def crawl_task_mode_filter(mode: str) -> Any:
+    if normalize_crawl_task_mode(mode) == "scheduled":
+        return CrawlTaskModel.mode == "scheduled"
+    return or_(CrawlTaskModel.mode.is_(None), CrawlTaskModel.mode != "scheduled")
+
+
+def crawl_task_queue_kind(mode: str | None) -> str:
+    return "scheduled-crawl" if normalize_crawl_task_mode(mode) == "scheduled" else "manual-crawl"
+
+
+def crawl_task_concurrency_limit(mode: str | None) -> int:
+    if normalize_crawl_task_mode(mode) == "scheduled":
+        return max(1, int(settings.max_running_scheduled_crawl_tasks_per_user))
+    return max(1, int(settings.max_running_manual_crawl_tasks_per_user))
+
+
+def crawl_task_queue_kind_for_id(task_id: str) -> str:
+    with session_scope() as session:
+        mode = session.scalar(
+            select(CrawlTaskModel.mode).where(CrawlTaskModel.id == task_id)
+        )
+    return crawl_task_queue_kind(mode)
+
+
 def dispatch_crawl_task(
     task_id: str,
     *,
     delay_seconds: float = 0.0,
     job_id: str | None = None,
+    queue_kind: str | None = None,
     mark_failed_on_error: bool = True,
 ) -> None:
     if should_use_redis_task_queue():
         try:
+            resolved_queue_kind = queue_kind or crawl_task_queue_kind_for_id(task_id)
             enqueue = enqueue_task_in if delay_seconds > 0 else enqueue_task
             enqueue_args = (
                 (delay_seconds, run_task, task_id, job_id)
@@ -606,7 +636,7 @@ def dispatch_crawl_task(
                 *enqueue_args,
                 job_id=job_id,
                 description=f"采集任务 {task_id}",
-                queue_name=task_queue_name_for_kind("crawl"),
+                queue_name=task_queue_name_for_kind(resolved_queue_kind),
             )
         except Exception as exc:
             if mark_failed_on_error:
@@ -632,59 +662,76 @@ def crawl_dispatch_available_slots(
 def reserve_queued_crawl_tasks(
     session: Any,
     owner_username: str | None = None,
-) -> list[tuple[str, str]]:
-    owner_query = (
-        select(
-            CrawlTaskModel.owner_username,
-            func.min(CrawlTaskModel.created_at).label("oldest_created_at"),
-        )
-        .where(CrawlTaskModel.status == "queued")
-        .group_by(CrawlTaskModel.owner_username)
-        .order_by(func.min(CrawlTaskModel.created_at).asc(), CrawlTaskModel.owner_username.asc())
-    )
-    if owner_username:
-        owner_query = owner_query.where(CrawlTaskModel.owner_username == owner_username)
-    owners = [str(row.owner_username) for row in session.execute(owner_query)]
-    reservations: list[tuple[str, str]] = []
-    for task_owner in owners:
-        running_count = int(
-            session.scalar(
-                select(func.count()).where(
-                    CrawlTaskModel.owner_username == task_owner,
-                    CrawlTaskModel.status == "running",
-                )
+) -> list[tuple[str, str, str]]:
+    reservations: list[tuple[str, str, str]] = []
+    for task_mode in ("manual", "scheduled"):
+        mode_filter = crawl_task_mode_filter(task_mode)
+        owner_query = (
+            select(
+                CrawlTaskModel.owner_username,
+                func.min(CrawlTaskModel.created_at).label("oldest_created_at"),
             )
-            or 0
+            .where(
+                CrawlTaskModel.status == "queued",
+                mode_filter,
+            )
+            .group_by(CrawlTaskModel.owner_username)
+            .order_by(func.min(CrawlTaskModel.created_at).asc(), CrawlTaskModel.owner_username.asc())
         )
-        reserved_count = int(
-            session.scalar(
-                select(func.count()).where(
+        if owner_username:
+            owner_query = owner_query.where(CrawlTaskModel.owner_username == owner_username)
+        owners = [str(row.owner_username) for row in session.execute(owner_query)]
+        for task_owner in owners:
+            running_count = int(
+                session.scalar(
+                    select(func.count()).where(
+                        CrawlTaskModel.owner_username == task_owner,
+                        CrawlTaskModel.status == "running",
+                        mode_filter,
+                    )
+                )
+                or 0
+            )
+            reserved_count = int(
+                session.scalar(
+                    select(func.count()).where(
+                        CrawlTaskModel.owner_username == task_owner,
+                        CrawlTaskModel.status == "queued",
+                        CrawlTaskModel.queue_job_id.is_not(None),
+                        mode_filter,
+                    )
+                )
+                or 0
+            )
+            available_slots = crawl_dispatch_available_slots(
+                running_count,
+                reserved_count,
+                crawl_task_concurrency_limit(task_mode),
+            )
+            if available_slots <= 0:
+                continue
+            rows = session.scalars(
+                select(CrawlTaskModel)
+                .where(
                     CrawlTaskModel.owner_username == task_owner,
                     CrawlTaskModel.status == "queued",
-                    CrawlTaskModel.queue_job_id.is_not(None),
+                    CrawlTaskModel.queue_job_id.is_(None),
+                    mode_filter,
                 )
-            )
-            or 0
-        )
-        available_slots = crawl_dispatch_available_slots(running_count, reserved_count)
-        if available_slots <= 0:
-            continue
-        rows = session.scalars(
-            select(CrawlTaskModel)
-            .where(
-                CrawlTaskModel.owner_username == task_owner,
-                CrawlTaskModel.status == "queued",
-                CrawlTaskModel.queue_job_id.is_(None),
-            )
-            .order_by(CrawlTaskModel.created_at.asc(), CrawlTaskModel.id.asc())
-            .limit(available_slots)
-            .with_for_update()
-        ).all()
-        for task in rows:
-            job_id = crawl_dispatch_job_id(str(task.id))
-            task.queue_job_id = job_id
-            task.message = "已进入采集队列，等待 Worker"
-            reservations.append((str(task.id), job_id))
+                .order_by(CrawlTaskModel.created_at.asc(), CrawlTaskModel.id.asc())
+                .limit(available_slots)
+                .with_for_update()
+            ).all()
+            queue_kind = crawl_task_queue_kind(task_mode)
+            for task in rows:
+                job_id = crawl_dispatch_job_id(str(task.id))
+                task.queue_job_id = job_id
+                task.message = (
+                    "已进入定时采集队列，等待 Worker"
+                    if task_mode == "scheduled"
+                    else "已进入手动采集队列，等待 Worker"
+                )
+                reservations.append((str(task.id), job_id, queue_kind))
     return reservations
 
 
@@ -706,11 +753,12 @@ def dispatch_queued_crawl_tasks(owner_username: str | None = None) -> int:
         with session_scope() as session:
             reservations = reserve_queued_crawl_tasks(session, owner_username)
         dispatched_count = 0
-        for task_id, job_id in reservations:
+        for task_id, job_id, queue_kind in reservations:
             try:
                 dispatch_crawl_task(
                     task_id,
                     job_id=job_id,
+                    queue_kind=queue_kind,
                     mark_failed_on_error=False,
                 )
                 dispatched_count += 1
@@ -3582,7 +3630,18 @@ def reconcile_interrupted_running_tasks(
     if not rows:
         return 0
     try:
-        if model is SyncTaskModel:
+        if model is CrawlTaskModel:
+            task_ids = {str(row.id) for row in rows}
+            task_states: dict[str, dict[str, Any]] = {}
+            for row_queue_kind in ("manual-crawl", "scheduled-crawl", "crawl"):
+                task_states.update(
+                    redis_task_states(
+                        task_ids,
+                        row_queue_kind,
+                        job_id_prefixes=task_model_job_id_prefixes(model),
+                    )
+                )
+        elif model is SyncTaskModel:
             task_states: dict[str, dict[str, Any]] = {}
             rows_by_queue: dict[str, set[str]] = {}
             for row in rows:
@@ -3907,7 +3966,9 @@ def reserved_crawl_job_state(connection: Any, job_id: str) -> dict[str, Any] | N
 
 def task_queue_health_kind_by_name() -> dict[str, str]:
     return {
-        task_queue_name_for_kind("crawl"): "采集",
+        task_queue_name_for_kind("manual-crawl"): "手动采集",
+        task_queue_name_for_kind("scheduled-crawl"): "定时采集执行",
+        task_queue_name_for_kind("crawl"): "采集兼容队列",
         task_queue_name_for_kind("sync"): "同步",
         task_queue_name_for_kind("title-optimization"): "标题优化",
         task_queue_name_for_kind("image-cleanup"): "图片清理",
@@ -3953,7 +4014,10 @@ def task_queue_health() -> dict[str, Any]:
                     worker_count_by_queue[queue_name] = worker_count_by_queue.get(queue_name, 0) + 1
 
         queue_kind_by_name = task_queue_health_kind_by_name()
-        expected_queue_names = set(queue_kind_by_name) - {settings.task_queue_name}
+        expected_queue_names = set(queue_kind_by_name) - {
+            settings.task_queue_name,
+            settings.task_queue_crawl_name,
+        }
         queues: list[dict[str, Any]] = []
         issues: list[str] = []
         for queue_name in all_task_queue_names():
@@ -4464,6 +4528,35 @@ def task_start_wait_reason(
     )
     if store_running_count > 0:
         return "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
+    return ""
+
+
+def crawl_task_start_wait_reason(
+    session: Any,
+    task: CrawlTaskModel,
+) -> str:
+    task_id = str(task.id)
+    task_mode = normalize_crawl_task_mode(task.mode)
+    action_label = "定时采集" if task_mode == "scheduled" else "手动采集"
+    finalize_stale_cancel_requested_tasks(
+        session,
+        CrawlTaskModel,
+        action_label=action_label,
+        owner_username=task.owner_username,
+    )
+    running_count = int(
+        session.scalar(
+            select(func.count()).where(
+                CrawlTaskModel.owner_username == task.owner_username,
+                CrawlTaskModel.status == "running",
+                CrawlTaskModel.id != task_id,
+                crawl_task_mode_filter(task_mode),
+            )
+        )
+        or 0
+    )
+    if running_count >= crawl_task_concurrency_limit(task_mode):
+        return f"排队中，等待当前{action_label}任务完成"
     return ""
 
 
@@ -7182,35 +7275,37 @@ def remove_crawl_queue_jobs_for_task_ids(task_ids: set[str]) -> int:
         return 0
     try:
         connection = redis_connection()
-        queue_name = task_queue_name_for_kind("crawl")
-        queue = Queue(queue_name, connection=connection)
         removed = 0
 
-        for job_id in list(queue.job_ids):
-            job = fetch_rq_job(connection, job_id)
-            if job is None or not task_id_from_rq_job(job, task_ids):
-                continue
-            try:
-                job.cancel()
-                job.delete(remove_from_queue=True)
-                removed += 1
-            except Exception:
-                continue
+        for queue_kind in ("manual-crawl", "scheduled-crawl", "crawl"):
+            queue_name = task_queue_name_for_kind(queue_kind)
+            queue = Queue(queue_name, connection=connection)
 
-        for registry in (
-            DeferredJobRegistry(queue_name, connection=connection),
-            ScheduledJobRegistry(queue_name, connection=connection),
-            FailedJobRegistry(queue_name, connection=connection),
-        ):
-            for job_id in list(registry.get_job_ids()):
+            for job_id in list(queue.job_ids):
                 job = fetch_rq_job(connection, job_id)
                 if job is None or not task_id_from_rq_job(job, task_ids):
                     continue
                 try:
-                    registry.remove(job_id, delete_job=True)
+                    job.cancel()
+                    job.delete(remove_from_queue=True)
                     removed += 1
                 except Exception:
                     continue
+
+            for registry in (
+                DeferredJobRegistry(queue_name, connection=connection),
+                ScheduledJobRegistry(queue_name, connection=connection),
+                FailedJobRegistry(queue_name, connection=connection),
+            ):
+                for job_id in list(registry.get_job_ids()):
+                    job = fetch_rq_job(connection, job_id)
+                    if job is None or not task_id_from_rq_job(job, task_ids):
+                        continue
+                    try:
+                        registry.remove(job_id, delete_job=True)
+                        removed += 1
+                    except Exception:
+                        continue
         return removed
     except Exception:
         return 0
@@ -19361,14 +19456,7 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
                 task.warning_detail = cancelled_task_warning_detail(existing_warning_detail=task.warning_detail)
                 task.finished_at = datetime.now()
             else:
-                wait_reason = task_start_wait_reason(
-                    session,
-                    CrawlTaskModel,
-                    task.owner_username,
-                    task_id,
-                    limit=settings.max_running_crawl_tasks_per_user,
-                    label="采集",
-                )
+                wait_reason = crawl_task_start_wait_reason(session, task)
                 if wait_reason:
                     task.message = wait_reason
                     should_retry_thread_task = not should_refill

@@ -123,7 +123,12 @@ class CrawlDispatcherTests(CrawlDispatchDatabaseTestCase):
             patch.object(crawler_service.settings, "task_queue_mode", "redis"),
             patch.object(
                 crawler_service.settings,
-                "max_running_crawl_tasks_per_user",
+                "max_running_manual_crawl_tasks_per_user",
+                3,
+            ),
+            patch.object(
+                crawler_service.settings,
+                "max_running_scheduled_crawl_tasks_per_user",
                 3,
             ),
         ):
@@ -156,6 +161,10 @@ class CrawlDispatcherTests(CrawlDispatchDatabaseTestCase):
             enqueue.call_args.args[2],
             "crawl-oldest-unreserved-12345678",
         )
+        self.assertEqual(
+            enqueue.call_args.kwargs["queue_name"],
+            crawler_service.settings.task_queue_scheduled_crawl_name,
+        )
         reserved = self.get_task("oldest-unreserved")
         newer = self.get_task("newer-unreserved")
         self.assertEqual(
@@ -164,6 +173,59 @@ class CrawlDispatcherTests(CrawlDispatchDatabaseTestCase):
         )
         self.assertIsNone(newer.queue_job_id)
         self.assertEqual(lock.release_calls, 1)
+
+    def test_dispatch_routes_manual_and_scheduled_tasks_to_dedicated_queues(self):
+        self.add_task("manual", mode="manual")
+        self.add_task("scheduled", mode="scheduled")
+        enqueue = Mock(return_value="job")
+        lock = FakeRedisLock()
+
+        with self.dispatcher_context(enqueue, lock):
+            dispatched = crawler_service.dispatch_queued_crawl_tasks("owner")
+
+        self.assertEqual(dispatched, 2)
+        queue_names = {
+            call.kwargs["queue_name"]
+            for call in enqueue.call_args_list
+        }
+        self.assertEqual(
+            queue_names,
+            {
+                crawler_service.settings.task_queue_manual_crawl_name,
+                crawler_service.settings.task_queue_scheduled_crawl_name,
+            },
+        )
+
+    def test_manual_capacity_does_not_block_scheduled_dispatch(self):
+        self.add_task("manual-running", status="running", mode="manual")
+        self.add_task("manual-waiting", mode="manual")
+        self.add_task("scheduled-waiting", mode="scheduled")
+        enqueue = Mock(return_value="job")
+        lock = FakeRedisLock()
+
+        with (
+            self.dispatcher_context(enqueue, lock),
+            patch.object(
+                crawler_service.settings,
+                "max_running_manual_crawl_tasks_per_user",
+                1,
+            ),
+            patch.object(
+                crawler_service.settings,
+                "max_running_scheduled_crawl_tasks_per_user",
+                1,
+            ),
+        ):
+            dispatched = crawler_service.dispatch_queued_crawl_tasks("owner")
+
+        self.assertEqual(dispatched, 1)
+        self.assertEqual(enqueue.call_args.args[1], "scheduled-waiting")
+        self.assertEqual(
+            enqueue.call_args.kwargs["queue_name"],
+            crawler_service.settings.task_queue_scheduled_crawl_name,
+        )
+        self.assertIsNone(self.get_task("manual-waiting").queue_job_id)
+        self.assertIsNotNone(self.get_task("scheduled-waiting").queue_job_id)
 
     def test_dispatch_does_not_exceed_capacity(self):
         now = datetime.now()
@@ -280,7 +342,7 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
             patch.object(crawler_service.settings, "task_queue_mode", "redis"),
             patch.object(
                 crawler_service.settings,
-                "max_running_crawl_tasks_per_user",
+                "max_running_scheduled_crawl_tasks_per_user",
                 1,
             ),
             patch.object(
@@ -309,6 +371,50 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
         self.assertIsNone(task.queue_job_id)
         self.assertIn("排队中", task.message)
 
+    def test_running_manual_task_does_not_block_scheduled_worker_start(self):
+        self.add_task(
+            "manual-running",
+            status="running",
+            mode="manual",
+        )
+        self.add_task(
+            "scheduled-ready",
+            queue_job_id="crawl-scheduled-ready",
+            mode="scheduled",
+        )
+        refill = Mock(return_value=0)
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(
+                crawler_service.settings,
+                "max_running_manual_crawl_tasks_per_user",
+                1,
+            ),
+            patch.object(
+                crawler_service.settings,
+                "max_running_scheduled_crawl_tasks_per_user",
+                1,
+            ),
+            patch.object(
+                crawler_service,
+                "collect_item_plan",
+                return_value=crawler_service.CollectedItemPlan(0, ()),
+            ),
+            patch.object(crawler_service, "log_event"),
+            patch.object(
+                crawler_service,
+                "dispatch_queued_crawl_tasks_safely",
+                refill,
+            ),
+        ):
+            crawler_service.run_task("scheduled-ready", "crawl-scheduled-ready")
+
+        self.assertEqual(self.get_task("scheduled-ready").status, "success")
+        self.assertEqual(self.get_task("manual-running").status, "running")
+        refill.assert_called_once_with("owner")
+
     def test_thread_mode_concurrency_rejection_keeps_delayed_retry(self):
         now = datetime.now()
         self.add_task(
@@ -327,7 +433,7 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
             patch.object(crawler_service.settings, "task_queue_mode", "thread"),
             patch.object(
                 crawler_service.settings,
-                "max_running_crawl_tasks_per_user",
+                "max_running_scheduled_crawl_tasks_per_user",
                 1,
             ),
             patch.object(
@@ -407,7 +513,7 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
             patch.object(crawler_service.settings, "task_queue_mode", "redis"),
             patch.object(
                 crawler_service.settings,
-                "max_running_crawl_tasks_per_user",
+                "max_running_scheduled_crawl_tasks_per_user",
                 3,
             ),
             patch.object(
@@ -437,6 +543,37 @@ class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
 
 
 class CrawlRecoveryTests(CrawlDispatchDatabaseTestCase):
+    def test_running_crawl_recovery_checks_dedicated_and_legacy_queues(self):
+        self.add_task(
+            "manual-running",
+            status="running",
+            mode="manual",
+        )
+        states = Mock(
+            side_effect=lambda task_ids, queue_kind, **_: (
+                {"manual-running": {"status": "started"}}
+                if queue_kind == "manual-crawl"
+                else {}
+            )
+        )
+
+        with (
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(crawler_service, "redis_task_states", states),
+        ):
+            with self.session_scope() as session:
+                finalized = crawler_service.reconcile_interrupted_running_tasks(
+                    session,
+                    CrawlTaskModel,
+                )
+
+        self.assertEqual(finalized, 0)
+        self.assertEqual(
+            [call.args[1] for call in states.call_args_list],
+            ["manual-crawl", "scheduled-crawl", "crawl"],
+        )
+        self.assertEqual(self.get_task("manual-running").status, "running")
+
     def test_missing_job_recovery_ignores_unreserved_backlog(self):
         self.add_task(
             "waiting",
