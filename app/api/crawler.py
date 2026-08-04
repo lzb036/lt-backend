@@ -107,6 +107,10 @@ class ScheduleStatusBatchPayload(BaseModel):
     enabled: bool
 
 
+class ScheduleStatusAllPayload(BaseModel):
+    enabled: bool
+
+
 class ScheduleRunAllPayload(BaseModel):
     keyword: str | None = None
     enabledStatus: str | None = None
@@ -1731,6 +1735,20 @@ def update_schedule_statuses(
         return crawler_service.update_scheduled_crawl_statuses(
             user["username"],
             payload.scheduleIds,
+            payload.enabled,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/schedules/status/all")
+def update_all_schedule_statuses(
+    payload: ScheduleStatusAllPayload,
+    user: dict = Depends(require_crawler_permission),
+) -> dict:
+    try:
+        return crawler_service.update_all_scheduled_crawl_statuses(
+            user["username"],
             payload.enabled,
         )
     except RuntimeError as exc:

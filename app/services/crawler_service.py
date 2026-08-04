@@ -11980,6 +11980,33 @@ def update_scheduled_crawl_statuses(
         }
 
 
+def update_all_scheduled_crawl_statuses(
+    owner_username: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    target_enabled = bool(enabled)
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ScheduledCrawlModel).where(
+                ScheduledCrawlModel.owner_username == owner_username,
+                ScheduledCrawlModel.source_type == "shop",
+            )
+        ).all()
+        updated_count = 0
+        for row in rows:
+            if bool(row.enabled) == target_enabled:
+                continue
+            row.enabled = target_enabled
+            row.status = "idle" if target_enabled else "disabled"
+            row.next_run_at = next_daily_run_at(row.schedule_time) if target_enabled else None
+            updated_count += 1
+        return {
+            "matchedCount": len(rows),
+            "updatedCount": updated_count,
+            "enabled": target_enabled,
+        }
+
+
 def delete_scheduled_crawls(
     owner_username: str,
     schedule_ids: list[int],
