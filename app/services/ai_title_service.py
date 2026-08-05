@@ -477,17 +477,34 @@ def _image_data_url(product: ProductModel, raw_payload: dict[str, Any]) -> str:
         product_shop_code,
     )
 
-    images = product_editable_image_urls(raw_payload, shop_code=product_shop_code(product, raw_payload))
-    image_url = images[0] if images else product.image_url
-    if not image_url:
-        return ""
-    image = load_product_image_bytes(
-        image_url,
-        max_bytes=4 * 1024 * 1024,
-        size_error_message="商品主图不能超过 4MB。",
-    )
-    encoded = base64.b64encode(image["content"]).decode("ascii")
-    return f"data:{image['contentType']};base64,{encoded}"
+    image_candidates = [
+        *product_editable_image_urls(
+            raw_payload,
+            shop_code=product_shop_code(product, raw_payload),
+        ),
+        product.image_url,
+    ]
+    checked_urls: set[str] = set()
+    for image_url in image_candidates:
+        normalized_url = str(image_url or "").strip()
+        if not normalized_url or normalized_url in checked_urls:
+            continue
+        checked_urls.add(normalized_url)
+        try:
+            image = load_product_image_bytes(
+                normalized_url,
+                max_bytes=4 * 1024 * 1024,
+                size_error_message="商品主图不能超过 4MB。",
+            )
+            content = image.get("content")
+            content_type = str(image.get("contentType") or "").strip()
+            if not isinstance(content, bytes) or not content or not content_type:
+                continue
+            encoded = base64.b64encode(content).decode("ascii")
+        except Exception:
+            continue
+        return f"data:{content_type};base64,{encoded}"
+    return ""
 
 
 def stream_generate_version(owner_username: str, product_id: int, created_by: str) -> Iterator[dict[str, Any]]:
@@ -511,6 +528,11 @@ def stream_generate_version(owner_username: str, product_id: int, created_by: st
         raw_payload = product_raw_payload(product)
         snapshot = _compact_product_context(product, raw_payload)
         image_data_url = _image_data_url(product, raw_payload)
+        input_description = (
+            "请结合以下商品文本信息和商品主图生成标题与副标题：\n"
+            if image_data_url
+            else "请根据以下商品文本信息生成标题与副标题：\n"
+        )
         messages = [
                 {
                     "role": "system",
@@ -528,8 +550,7 @@ def stream_generate_version(owner_username: str, product_id: int, created_by: st
                     "content": [
                         {
                             "type": "text",
-                            "text": "请结合以下商品文本信息和商品主图生成标题与副标题：\n"
-                            + json.dumps(snapshot, ensure_ascii=False),
+                            "text": input_description + json.dumps(snapshot, ensure_ascii=False),
                         },
                         *(
                             [{"type": "image_url", "image_url": {"url": image_data_url}}]

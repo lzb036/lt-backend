@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from app.services import ai_title_service
 from app.services.user_service import normalize_permissions
@@ -40,6 +40,63 @@ class AiTitleServiceTests(unittest.TestCase):
         self.assertLessEqual(len(result["subtitle"].encode("utf-8")), 174)
         self.assertTrue(result["title"])
         self.assertTrue(result["subtitle"])
+
+    def test_image_data_url_uses_next_available_image(self) -> None:
+        product = MagicMock(image_url="missing-cover")
+        raw_payload = {"images": ["missing-main", "available-main"]}
+
+        with (
+            patch(
+                "app.services.crawler_service.product_editable_image_urls",
+                return_value=["missing-main", "available-main"],
+            ),
+            patch(
+                "app.services.crawler_service.product_shop_code",
+                return_value="shop",
+            ),
+            patch(
+                "app.services.crawler_service.load_product_image_bytes",
+                side_effect=[
+                    RuntimeError("图片不存在或已失效（HTTP 404）。"),
+                    {"content": b"image-content", "contentType": "image/jpeg"},
+                ],
+            ) as load_image,
+        ):
+            result = ai_title_service._image_data_url(product, raw_payload)
+
+        self.assertEqual(
+            result,
+            "data:image/jpeg;base64,aW1hZ2UtY29udGVudA==",
+        )
+        self.assertEqual(
+            [call.args[0] for call in load_image.call_args_list],
+            ["missing-main", "available-main"],
+        )
+
+    def test_image_data_url_returns_empty_when_all_images_are_unavailable(self) -> None:
+        product = MagicMock(image_url="missing-cover")
+
+        with (
+            patch(
+                "app.services.crawler_service.product_editable_image_urls",
+                return_value=["missing-main"],
+            ),
+            patch(
+                "app.services.crawler_service.product_shop_code",
+                return_value="shop",
+            ),
+            patch(
+                "app.services.crawler_service.load_product_image_bytes",
+                side_effect=RuntimeError("商品图片文件不存在。"),
+            ) as load_image,
+        ):
+            result = ai_title_service._image_data_url(product, {})
+
+        self.assertEqual(result, "")
+        self.assertEqual(
+            [call.args[0] for call in load_image.call_args_list],
+            ["missing-main", "missing-cover"],
+        )
 
     def test_save_version_updates_product_only_after_explicit_save(self) -> None:
         session = MagicMock()
