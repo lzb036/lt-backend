@@ -2476,6 +2476,26 @@ def parse_public_datetime(value: Any) -> datetime | None:
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
+def manual_task_execution_settings(
+    payload: Any,
+    *,
+    task_name: str,
+) -> tuple[str, datetime | None]:
+    execution_mode = normalize_text(
+        getattr(payload, "executionMode", None)
+    ).lower() or "immediate"
+    if execution_mode not in {"immediate", "scheduled"}:
+        raise RuntimeError(f"{task_name}执行方式不正确。")
+    if execution_mode == "immediate":
+        return execution_mode, None
+    execute_at = parse_public_datetime(getattr(payload, "executeAt", None))
+    if execute_at is None:
+        raise RuntimeError(f"请选择{task_name}的到期执行时间。")
+    if execute_at <= datetime.now():
+        raise RuntimeError(f"{task_name}的到期执行时间必须晚于当前时间。")
+    return execution_mode, execute_at
+
+
 def normalize_cleanup_weekday(value: Any) -> int:
     try:
         weekday = int(value)
@@ -2735,6 +2755,11 @@ def auto_listing_schedule_to_public(
         "storeName": store.store_name if store is not None else "",
         "storeAliasName": store.alias_name if store is not None else "",
         "taskType": row.task_type or "automatic",
+        "executionMode": (
+            "scheduled"
+            if row.task_type == "manual" and row.schedule_type == "once"
+            else ("immediate" if row.task_type == "manual" else None)
+        ),
         "scheduleType": row.schedule_type,
         "scheduleTime": row.schedule_time,
         "weekday": row.weekday,
@@ -2838,6 +2863,10 @@ def create_auto_listing_schedule(owner_username: str, payload: Any) -> dict[str,
 def create_manual_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
     quantity = int(getattr(payload, "quantity", 0) or 0)
     store_id = int(getattr(payload, "storeId", 0) or 0)
+    execution_mode, execute_at = manual_task_execution_settings(
+        payload,
+        task_name="手动上架任务",
+    )
     if quantity < 1 or quantity > 10000:
         raise RuntimeError("上架数量只能设置为 1 到 10000。")
     with session_scope() as session:
@@ -2856,16 +2885,23 @@ def create_manual_listing_task(owner_username: str, payload: Any) -> dict[str, A
             store_id=store_id,
             automatic_store_id=None,
             task_type="manual",
-            schedule_type="",
-            schedule_time="",
+            schedule_type="once" if execution_mode == "scheduled" else "",
+            schedule_time=execute_at.strftime("%H:%M") if execute_at else "",
             quantity=quantity,
-            enabled=False,
+            enabled=execution_mode == "scheduled",
             status="idle",
-            next_run_at=None,
+            next_run_at=execute_at,
+            last_message=(
+                f"任务将在 {datetime_to_public(execute_at)} 到期执行。"
+                if execute_at
+                else ""
+            ),
         )
         session.add(row)
         session.flush()
         schedule_id = int(row.id)
+        if execution_mode == "scheduled":
+            return auto_listing_schedule_to_public(row, store)
     return execute_auto_listing_schedule(
         schedule_id,
         owner_username=owner_username,
@@ -2889,6 +2925,8 @@ def update_auto_listing_schedule_status(
             raise RuntimeError("自动上架任务不存在。")
         if row.task_type != "automatic":
             raise RuntimeError("手动上架任务不支持启用或停用。")
+        if row.status == "running":
+            raise RuntimeError("自动上架任务正在执行，暂时不能启用或关闭。")
         store = session.get(StoreModel, row.store_id)
         row.enabled = bool(enabled)
         row.status = "idle" if enabled else "disabled"
@@ -2902,6 +2940,50 @@ def update_auto_listing_schedule_status(
             if enabled
             else None
         )
+        row.last_error = None
+        session.flush()
+        return auto_listing_schedule_to_public(row, store)
+
+
+def update_auto_listing_schedule(
+    owner_username: str,
+    schedule_id: int,
+    payload: Any,
+) -> dict[str, Any]:
+    schedule_type = normalize_text(getattr(payload, "scheduleType", None))
+    schedule_time = normalize_schedule_time(getattr(payload, "scheduleTime", None))
+    weekday = getattr(payload, "weekday", None)
+    month_day = getattr(payload, "monthDay", None)
+    quantity = int(getattr(payload, "quantity", 0) or 0)
+    if quantity < 1 or quantity > 10000:
+        raise RuntimeError("自动上架数量只能设置为 1 到 10000。")
+    next_run_at = next_auto_listing_run_at(
+        schedule_type,
+        schedule_time,
+        weekday=weekday,
+        month_day=month_day,
+    )
+    with session_scope() as session:
+        row = session.scalar(
+            select(AutoListingScheduleModel).where(
+                AutoListingScheduleModel.id == schedule_id,
+                AutoListingScheduleModel.owner_username == owner_username,
+            )
+        )
+        if row is None:
+            raise RuntimeError("自动上架任务不存在。")
+        if row.task_type != "automatic":
+            raise RuntimeError("手动上架任务不支持编辑。")
+        if row.status == "running":
+            raise RuntimeError("自动上架任务正在执行，暂时不能编辑。")
+        store = session.get(StoreModel, row.store_id)
+        row.schedule_type = schedule_type
+        row.schedule_time = schedule_time
+        row.weekday = int(weekday) if schedule_type == "weekly" else None
+        row.month_day = int(month_day) if schedule_type == "monthly" else None
+        row.quantity = quantity
+        row.status = "idle" if row.enabled else "disabled"
+        row.next_run_at = next_run_at if row.enabled else None
         row.last_error = None
         session.flush()
         return auto_listing_schedule_to_public(row, store)
@@ -2932,11 +3014,17 @@ def auto_deletion_task_to_public(row: AutoDeletionTaskModel, store: StoreModel |
         "storeName": store.store_name if store else "",
         "storeAliasName": store.alias_name if store else "",
         "taskType": row.task_type,
+        "executionMode": (
+            "scheduled"
+            if row.task_type == "manual" and row.schedule_type == "once"
+            else ("immediate" if row.task_type == "manual" else None)
+        ),
         "scheduleType": row.schedule_type,
         "scheduleTime": row.schedule_time,
         "weekday": row.weekday,
         "monthDay": row.month_day,
         "quantity": row.quantity,
+        "enabled": bool(row.enabled),
         "status": row.status,
         "lastRunAt": datetime_to_public(row.last_run_at),
         "nextRunAt": datetime_to_public(row.next_run_at),
@@ -2991,6 +3079,86 @@ def create_auto_deletion_task(owner_username: str, payload: Any) -> dict[str, An
             session.flush()
         except IntegrityError as exc:
             raise RuntimeError("该店铺已经创建过自动删除任务，不能重复创建。") from exc
+        return auto_deletion_task_to_public(row, store)
+
+
+def update_auto_deletion_task(
+    owner_username: str,
+    task_id: int,
+    payload: Any,
+) -> dict[str, Any]:
+    schedule_type = normalize_text(getattr(payload, "scheduleType", None))
+    schedule_time = normalize_schedule_time(getattr(payload, "scheduleTime", None))
+    weekday = getattr(payload, "weekday", None)
+    month_day = getattr(payload, "monthDay", None)
+    quantity = int(getattr(payload, "quantity", 0) or 0)
+    if quantity < 1 or quantity > 10000:
+        raise RuntimeError("删除数量只能设置为 1 到 10000。")
+    next_run_at = next_auto_listing_run_at(
+        schedule_type,
+        schedule_time,
+        weekday=weekday,
+        month_day=month_day,
+    )
+    with session_scope() as session:
+        row = session.scalar(
+            select(AutoDeletionTaskModel).where(
+                AutoDeletionTaskModel.id == task_id,
+                AutoDeletionTaskModel.owner_username == owner_username,
+            )
+        )
+        if row is None:
+            raise RuntimeError("自动删除任务不存在。")
+        if row.task_type != "automatic":
+            raise RuntimeError("手动删除任务不支持编辑。")
+        if row.status == "running":
+            raise RuntimeError("自动删除任务正在执行，暂时不能编辑。")
+        store = session.get(StoreModel, row.store_id)
+        row.schedule_type = schedule_type
+        row.schedule_time = schedule_time
+        row.weekday = int(weekday) if schedule_type == "weekly" else None
+        row.month_day = int(month_day) if schedule_type == "monthly" else None
+        row.quantity = quantity
+        row.status = "idle" if row.enabled else "disabled"
+        row.next_run_at = next_run_at if row.enabled else None
+        row.last_error = None
+        session.flush()
+        return auto_deletion_task_to_public(row, store)
+
+
+def update_auto_deletion_task_status(
+    owner_username: str,
+    task_id: int,
+    enabled: bool,
+) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.scalar(
+            select(AutoDeletionTaskModel).where(
+                AutoDeletionTaskModel.id == task_id,
+                AutoDeletionTaskModel.owner_username == owner_username,
+            )
+        )
+        if row is None:
+            raise RuntimeError("自动删除任务不存在。")
+        if row.task_type != "automatic":
+            raise RuntimeError("手动删除任务不支持启用或关闭。")
+        if row.status == "running":
+            raise RuntimeError("自动删除任务正在执行，暂时不能启用或关闭。")
+        store = session.get(StoreModel, row.store_id)
+        row.enabled = bool(enabled)
+        row.status = "idle" if enabled else "disabled"
+        row.next_run_at = (
+            next_auto_listing_run_at(
+                row.schedule_type,
+                row.schedule_time,
+                weekday=row.weekday,
+                month_day=row.month_day,
+            )
+            if enabled
+            else None
+        )
+        row.last_error = None
+        session.flush()
         return auto_deletion_task_to_public(row, store)
 
 
@@ -13003,13 +13171,16 @@ def execute_auto_listing_schedule(
         row.last_run_at = now
         row.last_error = None
         if advance_next_run and row.enabled:
-            row.next_run_at = next_auto_listing_run_at(
-                row.schedule_type,
-                row.schedule_time,
-                weekday=row.weekday,
-                month_day=row.month_day,
-                now=now,
-            )
+            if row.task_type == "manual" and row.schedule_type == "once":
+                row.enabled = False
+            else:
+                row.next_run_at = next_auto_listing_run_at(
+                    row.schedule_type,
+                    row.schedule_time,
+                    weekday=row.weekday,
+                    month_day=row.month_day,
+                    now=now,
+                )
 
     try:
         product_ids = auto_listing_candidate_product_ids(
@@ -13104,11 +13275,20 @@ def run_due_auto_listing_schedules_once() -> int:
         with session_scope() as session:
             schedule_ids = session.scalars(
                 select(AutoListingScheduleModel.id).where(
-                    AutoListingScheduleModel.task_type == "automatic",
                     AutoListingScheduleModel.enabled.is_(True),
                     AutoListingScheduleModel.next_run_at.is_not(None),
                     AutoListingScheduleModel.next_run_at <= now,
-                    AutoListingScheduleModel.status != "running",
+                    or_(
+                        and_(
+                            AutoListingScheduleModel.task_type == "automatic",
+                            AutoListingScheduleModel.status != "running",
+                        ),
+                        and_(
+                            AutoListingScheduleModel.task_type == "manual",
+                            AutoListingScheduleModel.schedule_type == "once",
+                            AutoListingScheduleModel.status == "idle",
+                        ),
+                    ),
                 )
                 .order_by(
                     AutoListingScheduleModel.next_run_at.asc(),
@@ -13194,7 +13374,10 @@ def execute_auto_deletion_task(task_id: int, *, owner_username: str | None = Non
         row.last_run_at = now
         row.last_error = None
         if advance_next_run and row.enabled:
-            row.next_run_at = next_auto_listing_run_at(row.schedule_type, row.schedule_time, weekday=row.weekday, month_day=row.month_day, now=now)
+            if row.task_type == "manual" and row.schedule_type == "once":
+                row.enabled = False
+            else:
+                row.next_run_at = next_auto_listing_run_at(row.schedule_type, row.schedule_time, weekday=row.weekday, month_day=row.month_day, now=now)
     try:
         product_ids = auto_deletion_candidate_product_ids(resolved_owner, store_id, quantity)
         task_ids: list[str] = []
@@ -13229,14 +13412,36 @@ def execute_auto_deletion_task(task_id: int, *, owner_username: str | None = Non
 def create_manual_deletion_task(owner_username: str, payload: Any) -> dict[str, Any]:
     store_id = int(getattr(payload, "storeId", 0) or 0)
     quantity = int(getattr(payload, "quantity", 0) or 0)
+    execution_mode, execute_at = manual_task_execution_settings(
+        payload,
+        task_name="手动删除任务",
+    )
     if quantity < 1 or quantity > 10000:
         raise RuntimeError("删除数量只能设置为 1 到 10000。")
     with session_scope() as session:
-        _validate_deletion_store(session, owner_username, store_id)
-        row = AutoDeletionTaskModel(owner_username=owner_username, store_id=store_id, automatic_store_id=None, task_type="manual", quantity=quantity, enabled=False, status="idle")
+        store = _validate_deletion_store(session, owner_username, store_id)
+        row = AutoDeletionTaskModel(
+            owner_username=owner_username,
+            store_id=store_id,
+            automatic_store_id=None,
+            task_type="manual",
+            schedule_type="once" if execution_mode == "scheduled" else "",
+            schedule_time=execute_at.strftime("%H:%M") if execute_at else "",
+            quantity=quantity,
+            enabled=execution_mode == "scheduled",
+            status="idle",
+            next_run_at=execute_at,
+            last_message=(
+                f"任务将在 {datetime_to_public(execute_at)} 到期执行。"
+                if execute_at
+                else ""
+            ),
+        )
         session.add(row)
         session.flush()
         task_id = int(row.id)
+        if execution_mode == "scheduled":
+            return auto_deletion_task_to_public(row, store)
     return execute_auto_deletion_task(task_id, owner_username=owner_username)
 
 
@@ -13245,11 +13450,20 @@ def run_due_auto_deletion_tasks_once() -> int:
     with session_scope() as session:
         task_ids = session.scalars(
             select(AutoDeletionTaskModel.id).where(
-                AutoDeletionTaskModel.task_type == "automatic",
                 AutoDeletionTaskModel.enabled.is_(True),
                 AutoDeletionTaskModel.next_run_at.is_not(None),
                 AutoDeletionTaskModel.next_run_at <= now,
-                AutoDeletionTaskModel.status != "running",
+                or_(
+                    and_(
+                        AutoDeletionTaskModel.task_type == "automatic",
+                        AutoDeletionTaskModel.status != "running",
+                    ),
+                    and_(
+                        AutoDeletionTaskModel.task_type == "manual",
+                        AutoDeletionTaskModel.schedule_type == "once",
+                        AutoDeletionTaskModel.status == "idle",
+                    ),
+                ),
             ).order_by(AutoDeletionTaskModel.next_run_at.asc(), AutoDeletionTaskModel.id.asc()).limit(max(1, int(settings.scheduled_crawl_dispatch_batch_size)))
         ).all()
     for task_id in task_ids:

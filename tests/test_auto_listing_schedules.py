@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
 from app.db.models import (
+    AutoDeletionTaskModel,
     AutoListingScheduleModel,
     ProductModel,
     StoreModel,
@@ -331,3 +332,255 @@ def test_auto_listing_model_uses_nullable_automatic_store_unique_key() -> None:
     assert "uq_lt_auto_listing_owner_auto_store" in constraint_names
     assert "uq_lt_auto_listing_owner_store" not in constraint_names
     assert AutoListingScheduleModel.__table__.columns["automatic_store_id"].nullable
+
+
+def test_scheduled_manual_listing_task_runs_once_when_due(
+    database,
+    monkeypatch,
+) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    created = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(
+            storeId=store_id,
+            quantity=25,
+            executionMode="scheduled",
+            executeAt=datetime.now() + timedelta(hours=1),
+        ),
+    )
+
+    assert created["taskType"] == "manual"
+    assert created["executionMode"] == "scheduled"
+    assert created["status"] == "idle"
+    assert created["enabled"] is True
+
+    with database() as session:
+        row = session.get(AutoListingScheduleModel, created["id"])
+        row.next_run_at = datetime.now() - timedelta(minutes=1)
+        scheduled_at = row.next_run_at
+
+    monkeypatch.setattr(
+        crawler_service,
+        "auto_listing_candidate_product_ids",
+        lambda owner_username, store_id, quantity: [],
+    )
+
+    assert crawler_service.run_due_auto_listing_schedules_once() == 1
+    assert crawler_service.run_due_auto_listing_schedules_once() == 0
+
+    with database() as session:
+        row = session.get(AutoListingScheduleModel, created["id"])
+        assert row.task_type == "manual"
+        assert row.schedule_type == "once"
+        assert row.status == "completed"
+        assert row.enabled is False
+        assert row.next_run_at == scheduled_at
+
+
+def test_scheduled_manual_deletion_task_runs_once_when_due(
+    database,
+    monkeypatch,
+) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    created = crawler_service.create_manual_deletion_task(
+        "alice",
+        SimpleNamespace(
+            storeId=store_id,
+            quantity=30,
+            executionMode="scheduled",
+            executeAt=datetime.now() + timedelta(hours=1),
+        ),
+    )
+
+    assert created["taskType"] == "manual"
+    assert created["executionMode"] == "scheduled"
+    assert created["status"] == "idle"
+
+    with database() as session:
+        row = session.get(AutoDeletionTaskModel, created["id"])
+        row.next_run_at = datetime.now() - timedelta(minutes=1)
+        scheduled_at = row.next_run_at
+
+    monkeypatch.setattr(
+        crawler_service,
+        "auto_deletion_candidate_product_ids",
+        lambda owner_username, store_id, quantity: [],
+    )
+
+    assert crawler_service.run_due_auto_deletion_tasks_once() == 1
+    assert crawler_service.run_due_auto_deletion_tasks_once() == 0
+
+    with database() as session:
+        row = session.get(AutoDeletionTaskModel, created["id"])
+        assert row.task_type == "manual"
+        assert row.schedule_type == "once"
+        assert row.status == "completed"
+        assert row.enabled is False
+        assert row.next_run_at == scheduled_at
+
+
+def test_scheduled_manual_task_requires_future_execute_at(database) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    with pytest.raises(RuntimeError, match="必须晚于当前时间"):
+        crawler_service.create_manual_listing_task(
+            "alice",
+            SimpleNamespace(
+                storeId=store_id,
+                quantity=10,
+                executionMode="scheduled",
+                executeAt=datetime.now() - timedelta(minutes=1),
+            ),
+        )
+
+
+def test_automatic_listing_task_can_be_edited_and_toggled(database) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    created = crawler_service.create_auto_listing_schedule(
+        "alice",
+        SimpleNamespace(
+            storeId=store_id,
+            scheduleType="daily",
+            scheduleTime="09:00",
+            weekday=None,
+            monthDay=None,
+            quantity=10,
+        ),
+    )
+    updated = crawler_service.update_auto_listing_schedule(
+        "alice",
+        created["id"],
+        SimpleNamespace(
+            scheduleType="weekly",
+            scheduleTime="16:30",
+            weekday=5,
+            monthDay=None,
+            quantity=88,
+        ),
+    )
+    assert updated["scheduleType"] == "weekly"
+    assert updated["scheduleTime"] == "16:30"
+    assert updated["weekday"] == 5
+    assert updated["quantity"] == 88
+    assert updated["nextRunAt"]
+
+    disabled = crawler_service.update_auto_listing_schedule_status(
+        "alice",
+        created["id"],
+        False,
+    )
+    assert disabled["enabled"] is False
+    assert disabled["status"] == "disabled"
+    assert disabled["nextRunAt"] is None
+
+    enabled = crawler_service.update_auto_listing_schedule_status(
+        "alice",
+        created["id"],
+        True,
+    )
+    assert enabled["enabled"] is True
+    assert enabled["status"] == "idle"
+    assert enabled["nextRunAt"]
+
+
+def test_automatic_deletion_task_can_be_edited_and_toggled(database) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    created = crawler_service.create_auto_deletion_task(
+        "alice",
+        SimpleNamespace(
+            storeId=store_id,
+            scheduleType="daily",
+            scheduleTime="09:00",
+            weekday=None,
+            monthDay=None,
+            quantity=10,
+        ),
+    )
+    updated = crawler_service.update_auto_deletion_task(
+        "alice",
+        created["id"],
+        SimpleNamespace(
+            scheduleType="monthly",
+            scheduleTime="18:45",
+            weekday=None,
+            monthDay=20,
+            quantity=66,
+        ),
+    )
+    assert updated["scheduleType"] == "monthly"
+    assert updated["scheduleTime"] == "18:45"
+    assert updated["monthDay"] == 20
+    assert updated["quantity"] == 66
+
+    disabled = crawler_service.update_auto_deletion_task_status(
+        "alice",
+        created["id"],
+        False,
+    )
+    assert disabled["enabled"] is False
+    assert disabled["status"] == "disabled"
+    assert disabled["nextRunAt"] is None
+
+    enabled = crawler_service.update_auto_deletion_task_status(
+        "alice",
+        created["id"],
+        True,
+    )
+    assert enabled["enabled"] is True
+    assert enabled["status"] == "idle"
+    assert enabled["nextRunAt"]
+
+
+def test_manual_tasks_reject_automatic_edit_and_toggle(database) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    listing = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=10),
+    )
+    deletion = crawler_service.create_manual_deletion_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=10),
+    )
+    update_payload = SimpleNamespace(
+        scheduleType="daily",
+        scheduleTime="09:00",
+        weekday=None,
+        monthDay=None,
+        quantity=20,
+    )
+
+    with pytest.raises(RuntimeError, match="不支持编辑"):
+        crawler_service.update_auto_listing_schedule(
+            "alice",
+            listing["id"],
+            update_payload,
+        )
+    with pytest.raises(RuntimeError, match="不支持启用或停用"):
+        crawler_service.update_auto_listing_schedule_status(
+            "alice",
+            listing["id"],
+            True,
+        )
+    with pytest.raises(RuntimeError, match="不支持编辑"):
+        crawler_service.update_auto_deletion_task(
+            "alice",
+            deletion["id"],
+            update_payload,
+        )
+    with pytest.raises(RuntimeError, match="不支持启用或关闭"):
+        crawler_service.update_auto_deletion_task_status(
+            "alice",
+            deletion["id"],
+            True,
+        )

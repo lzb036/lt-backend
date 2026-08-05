@@ -293,9 +293,19 @@ class AutoListingScheduleStatusPayload(BaseModel):
     enabled: bool
 
 
+class AutomaticTaskScheduleUpdatePayload(BaseModel):
+    scheduleType: Literal["daily", "weekly", "monthly"]
+    scheduleTime: str = Field(pattern=r"^\d{2}:\d{2}$")
+    weekday: int | None = Field(default=None, ge=1, le=7)
+    monthDay: int | None = Field(default=None, ge=1, le=31)
+    quantity: int = Field(ge=1, le=10000)
+
+
 class ManualListingTaskPayload(BaseModel):
     storeId: int
     quantity: int = Field(ge=1, le=10000)
+    executionMode: Literal["immediate", "scheduled"] = "immediate"
+    executeAt: datetime | None = None
 
 
 class AutoDeletionTaskPayload(BaseModel):
@@ -310,6 +320,8 @@ class AutoDeletionTaskPayload(BaseModel):
 class ManualDeletionTaskPayload(BaseModel):
     storeId: int
     quantity: int = Field(ge=1, le=10000)
+    executionMode: Literal["immediate", "scheduled"] = "immediate"
+    executeAt: datetime | None = None
 
 
 class RolePayload(BaseModel):
@@ -1878,6 +1890,24 @@ def update_auto_listing_schedule_status(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.put("/auto-listing-schedules/{schedule_id}")
+def update_auto_listing_schedule(
+    schedule_id: int,
+    payload: AutomaticTaskScheduleUpdatePayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return {
+            "schedule": crawler_service.update_auto_listing_schedule(
+                user["username"],
+                schedule_id,
+                payload,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/auto-listing-schedules/{schedule_id}/run")
 def run_auto_listing_schedule(
     schedule_id: int,
@@ -1927,6 +1957,42 @@ def create_auto_deletion_task(payload: AutoDeletionTaskPayload, user: dict = Dep
 def create_manual_deletion_task(payload: ManualDeletionTaskPayload, user: dict = Depends(require_products_permission)) -> dict:
     try:
         return {"task": crawler_service.create_manual_deletion_task(user["username"], payload)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/auto-deletion-tasks/{task_id}")
+def update_auto_deletion_task(
+    task_id: int,
+    payload: AutomaticTaskScheduleUpdatePayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return {
+            "task": crawler_service.update_auto_deletion_task(
+                user["username"],
+                task_id,
+                payload,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/auto-deletion-tasks/{task_id}/status")
+def update_auto_deletion_task_status(
+    task_id: int,
+    payload: AutoListingScheduleStatusPayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return {
+            "task": crawler_service.update_auto_deletion_task_status(
+                user["username"],
+                task_id,
+                payload.enabled,
+            )
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
