@@ -2647,8 +2647,6 @@ def safe_shop_ranking_target(value: Any) -> str:
         target = normalize_rakuten_shop_target(normalized)
     except RuntimeError:
         return normalized if not normalized.startswith(("http://", "https://")) else ""
-    if re.fullmatch(r"[0-9]+", target):
-        return fetch_rakuten_shop_display_name_by_sid(target) or target
     return target
 
 
@@ -4891,11 +4889,14 @@ def normalize_rakuten_shop_target(target: str) -> str:
         raise RuntimeError(RAKUTEN_SHOP_TARGET_ERROR) from exc
     if parsed.netloc.lower() == "search.rakuten.co.jp" and parsed.path.rstrip("/").endswith("/search/mall"):
         params = parse_qs(parsed.query)
-        return (
-            normalize_text((params.get("sn") or [""])[0])
-            or normalize_text((params.get("su") or [""])[0])
-            or normalize_text((params.get("sid") or [""])[0])
-        )
+        shop_code = normalize_text((params.get("su") or [""])[0])
+        sid = normalize_text((params.get("sid") or [""])[0])
+        shop_name = normalize_text((params.get("sn") or [""])[0])
+        if looks_like_rakuten_shop_code(shop_code):
+            return shop_code
+        if re.fullmatch(r"[0-9]+", sid):
+            return sid
+        return shop_name or shop_code or sid
     if parsed.netloc.lower() in {"www.rakuten.co.jp", "item.rakuten.co.jp"}:
         parts = [unquote(part.strip()) for part in parsed.path.split("/") if part.strip()]
         if parts:
