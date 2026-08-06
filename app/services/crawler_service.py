@@ -8879,14 +8879,6 @@ def list_products(
                     )
                 )
             }
-            sales_summary = store_product_sales_summary(
-                session,
-                owner_username,
-                store_id,
-                sales_period_range,
-                synced_store_ids=synced_store_ids,
-                sales_counts=sales_counts,
-            )
             identity_query = query.with_only_columns(
                 ProductModel.id,
                 ProductModel.store_id,
@@ -9046,7 +9038,6 @@ def list_products(
                     "total": total,
                     "page": normalized_page,
                     "pageSize": normalized_page_size,
-                    "salesSummary": sales_summary,
                 }
             return public_rows
         if normalized_page_size:
@@ -9299,6 +9290,61 @@ def store_product_sales_summary(
         "currentProductCount": len(current_product_keys),
         "outsideCurrentProductCount": len(outside_current_product_keys),
     }
+
+
+def get_store_product_sales_summary(owner_username: str, store_id: int) -> dict[str, Any]:
+    sales_period_range = normalize_store_product_sales_range(365, None, None)
+    if sales_period_range is None:
+        raise RuntimeError("销量周期不正确。")
+    with session_scope() as session:
+        store = session.get(StoreModel, store_id)
+        if store is None:
+            raise RuntimeError("店铺不存在。")
+        if store.owner_username != owner_username:
+            raise RuntimeError("不能查看其他用户的店铺销量。")
+        sync_completed = bool(
+            session.scalar(
+                select(SalesSyncStateModel.store_id).where(
+                    SalesSyncStateModel.owner_username == owner_username,
+                    SalesSyncStateModel.store_id == store_id,
+                    SalesSyncStateModel.initial_sync_completed.is_(True),
+                )
+            )
+        )
+        synced_store_ids = {int(store_id)} if sync_completed else set()
+        period_from, period_to = sales_period_range
+        sales_counts = {
+            (int(result.store_id), str(result.manage_number)): int(
+                result.effective_units or 0
+            )
+            for result in session.execute(
+                select(
+                    ProductSalesDailyModel.store_id,
+                    ProductSalesDailyModel.manage_number,
+                    func.sum(
+                        ProductSalesDailyModel.effective_units
+                    ).label("effective_units"),
+                )
+                .where(
+                    ProductSalesDailyModel.owner_username == owner_username,
+                    ProductSalesDailyModel.store_id == store_id,
+                    ProductSalesDailyModel.sales_date >= period_from,
+                    ProductSalesDailyModel.sales_date <= period_to,
+                )
+                .group_by(
+                    ProductSalesDailyModel.store_id,
+                    ProductSalesDailyModel.manage_number,
+                )
+            )
+        }
+        return store_product_sales_summary(
+            session,
+            owner_username,
+            store_id,
+            sales_period_range,
+            synced_store_ids=synced_store_ids,
+            sales_counts=sales_counts,
+        ) or {}
 
 
 def active_title_optimization_task_ids(

@@ -1553,6 +1553,24 @@ def sync_store(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/stores/{store_id}/sales-summary")
+def get_store_product_sales_summary(
+    store_id: int,
+    ownerUsername: str | None = Query(default=None),
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        target_username = resolve_target_username(user, ownerUsername)
+        return {
+            "salesSummary": crawler_service.get_store_product_sales_summary(
+                target_username,
+                store_id,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/stores/{store_id}/cabinet/empty-folders")
 def list_store_empty_cabinet_folders(
     store_id: int,
