@@ -64,6 +64,44 @@ class ShopCollectionScopeTests(unittest.TestCase):
 
         self.assertEqual(normalized, "403302")
 
+    def test_fallback_search_url_extracts_shop_code_from_nested_shop_url(self) -> None:
+        normalized = crawler_service.normalize_rakuten_shop_target(
+            "https://search.rakuten.co.jp/search/mall/"
+            "?su=https%3A%2F%2Fwww.rakuten.co.jp%2Fgdphoenix%2F"
+            "&sn=430634&sid=430634"
+        )
+
+        self.assertEqual(normalized, "gdphoenix")
+
+    def test_sid_identity_prefers_unique_store_link_over_product_links(self) -> None:
+        html = """
+        <html>
+          <h1>YLX TRADE楽天市場店</h1>
+          <a href="https://www.rakuten.co.jp/gdphoenix/">store</a>
+          <a href="https://item.rakuten.co.jp/gdphoenix/item-1/">item</a>
+          <a href="https://item.rakuten.co.jp/advertiser/ad-1/">ad</a>
+        </html>
+        """
+
+        self.assertEqual(
+            crawler_service.parse_rakuten_search_shop_identity(html),
+            ("gdphoenix", "YLX TRADE楽天市場店"),
+        )
+
+    def test_sid_identity_rejects_ambiguous_product_shop_codes(self) -> None:
+        html = """
+        <html>
+          <h1>YLX TRADE楽天市場店</h1>
+          <a href="https://item.rakuten.co.jp/gdphoenix/item-1/">item</a>
+          <a href="https://item.rakuten.co.jp/advertiser/ad-1/">ad</a>
+        </html>
+        """
+
+        self.assertEqual(
+            crawler_service.parse_rakuten_search_shop_identity(html),
+            ("", "YLX TRADE楽天市場店"),
+        )
+
     def test_display_name_only_shop_target_is_rejected(self) -> None:
         with (
             patch.object(crawler_service, "crawl_price_rule_for_task", return_value={}),
@@ -124,13 +162,28 @@ class ShopCollectionScopeTests(unittest.TestCase):
             ["https://item.rakuten.co.jp/mondeselection/item-1/"],
         )
 
-    def test_numeric_sid_uses_sid_scoped_search(self) -> None:
+    def test_numeric_sid_uses_ranking_and_filters_to_resolved_shop(self) -> None:
+        listing_items = [
+            {
+                "title": "correct",
+                "source_url": "https://item.rakuten.co.jp/gdphoenix/item-1/",
+            },
+            {
+                "title": "wrong",
+                "source_url": "https://item.rakuten.co.jp/other-shop/item-2/",
+            },
+        ]
         with (
             patch.object(crawler_service, "crawl_price_rule_for_task", return_value={}),
             patch.object(
                 crawler_service,
+                "fetch_rakuten_shop_identity_by_sid",
+                return_value=("gdphoenix", "YLX TRADE楽天市場店"),
+            ),
+            patch.object(
+                crawler_service,
                 "collect_listing_items",
-                return_value=[],
+                return_value=listing_items,
             ) as collect_listing,
             patch.object(
                 crawler_service,
@@ -140,7 +193,7 @@ class ShopCollectionScopeTests(unittest.TestCase):
             patch.object(
                 crawler_service,
                 "iter_enriched_collected_items_with_detail",
-                return_value=iter(()),
+                side_effect=lambda items, **_: iter(items),
             ),
         ):
             result = crawler_service.collect_items_for_target(
@@ -148,12 +201,72 @@ class ShopCollectionScopeTests(unittest.TestCase):
                 "店铺:123456 日榜 前 30",
             )
 
-        self.assertEqual(result, [])
+        self.assertEqual(
+            [item["source_url"] for item in result],
+            ["https://item.rakuten.co.jp/gdphoenix/item-1/"],
+        )
         collect_listing.assert_called_once_with(
-            "https://search.rakuten.co.jp/search/mall/?sid=123456",
-            30,
+            crawler_service.build_ranking_source_url("YLX TRADE楽天市場店", "daily"),
+            None,
             task_id=None,
         )
+
+    def test_numeric_sid_returns_zero_when_shop_identity_cannot_be_confirmed(self) -> None:
+        with (
+            patch.object(crawler_service, "crawl_price_rule_for_task", return_value={}),
+            patch.object(
+                crawler_service,
+                "fetch_rakuten_shop_identity_by_sid",
+                return_value=("", "YLX TRADE楽天市場店"),
+            ),
+            patch.object(crawler_service, "collect_listing_items") as collect_listing,
+        ):
+            plan = crawler_service.collect_item_plan_for_target(
+                "shop",
+                "店铺:430634 日榜 全部",
+            )
+
+        self.assertEqual(plan.total_count, 0)
+        self.assertEqual(list(plan.items), [])
+        collect_listing.assert_not_called()
+
+    def test_numeric_sid_returns_zero_when_shop_has_no_ranking_items(self) -> None:
+        listing_items = [
+            {
+                "title": "other shop",
+                "source_url": "https://item.rakuten.co.jp/other-shop/item-2/",
+            },
+        ]
+        with (
+            patch.object(crawler_service, "crawl_price_rule_for_task", return_value={}),
+            patch.object(
+                crawler_service,
+                "fetch_rakuten_shop_identity_by_sid",
+                return_value=("gdphoenix", "YLX TRADE楽天市場店"),
+            ),
+            patch.object(
+                crawler_service,
+                "collect_listing_items",
+                return_value=listing_items,
+            ),
+            patch.object(
+                crawler_service,
+                "existing_collected_source_hashes_for_task",
+                return_value=set(),
+            ),
+            patch.object(
+                crawler_service,
+                "iter_enriched_collected_items_with_detail",
+                side_effect=lambda items, **_: iter(items),
+            ),
+        ):
+            plan = crawler_service.collect_item_plan_for_target(
+                "shop",
+                "店铺:430634 日榜 全部",
+            )
+
+        self.assertEqual(plan.total_count, 0)
+        self.assertEqual(list(plan.items), [])
 
 
 if __name__ == "__main__":

@@ -4894,6 +4894,13 @@ def normalize_rakuten_shop_target(target: str) -> str:
         shop_name = normalize_text((params.get("sn") or [""])[0])
         if looks_like_rakuten_shop_code(shop_code):
             return shop_code
+        if shop_code.startswith(("http://", "https://")):
+            try:
+                nested_target = normalize_rakuten_shop_target(shop_code)
+            except RuntimeError:
+                nested_target = ""
+            if looks_like_rakuten_shop_code(nested_target):
+                return nested_target
         if re.fullmatch(r"[0-9]+", sid):
             return sid
         return shop_name or shop_code or sid
@@ -4933,14 +4940,51 @@ def fetch_rakuten_shop_display_name_by_code(shop_code: str) -> str:
 
 
 def fetch_rakuten_shop_display_name_by_sid(sid: str) -> str:
+    _, display_name = fetch_rakuten_shop_identity_by_sid(sid)
+    return display_name
+
+
+def fetch_rakuten_shop_identity_by_sid(sid: str) -> tuple[str, str]:
     normalized_sid = normalize_text(sid)
-    if not normalized_sid:
-        return ""
+    if not re.fullmatch(r"[0-9]+", normalized_sid):
+        return "", ""
     try:
         html = fetch_html(f"{RAKUTEN_SEARCH_BASE}?sid={quote(normalized_sid)}")
     except requests.RequestException:
-        return ""
-    return parse_rakuten_search_shop_name(html) or parse_rakuten_shop_display_name(html)
+        return "", ""
+    return parse_rakuten_search_shop_identity(html)
+
+
+def parse_rakuten_search_shop_identity(html: str) -> tuple[str, str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    store_link_codes: set[str] = set()
+    for link in soup.select("a[href*='www.rakuten.co.jp']"):
+        try:
+            parsed_link = urlsplit(urljoin(RAKUTEN_SEARCH_BASE, str(link.get("href") or "")))
+        except Exception:
+            continue
+        if parsed_link.netloc.lower() != "www.rakuten.co.jp":
+            continue
+        path_parts = [unquote(part.strip()) for part in parsed_link.path.split("/") if part.strip()]
+        if len(path_parts) == 1 and looks_like_rakuten_shop_code(path_parts[0]):
+            store_link_codes.add(normalize_shop_code(path_parts[0]))
+
+    product_link_codes: set[str] = set()
+    for link in soup.select("a[href*='item.rakuten.co.jp']"):
+        parsed_product = parse_rakuten_product_target(urljoin(RAKUTEN_SEARCH_BASE, str(link.get("href") or "")))
+        if parsed_product:
+            product_link_codes.add(normalize_shop_code(parsed_product[0]))
+    shared_codes = store_link_codes & product_link_codes
+    if len(shared_codes) == 1:
+        shop_code = next(iter(shared_codes))
+    elif len(store_link_codes) == 1 and not product_link_codes:
+        shop_code = next(iter(store_link_codes))
+    elif not store_link_codes and len(product_link_codes) == 1:
+        shop_code = next(iter(product_link_codes))
+    else:
+        shop_code = ""
+    display_name = parse_rakuten_search_shop_name(html) or parse_rakuten_shop_display_name(html)
+    return shop_code, display_name
 
 
 def parse_rakuten_shop_display_name(html: str) -> str:
@@ -20078,7 +20122,17 @@ def collect_item_plan_for_target(
         target, limit, period = parse_ranking_target(strip_shop_ranking_prefix(target))
         normalized_shop_target = normalize_rakuten_shop_target(target)
         if re.fullmatch(r"[0-9]+", normalized_shop_target):
-            target = normalized_shop_target
+            shop_code_filter, display_name = fetch_rakuten_shop_identity_by_sid(normalized_shop_target)
+            if not shop_code_filter:
+                if task_id:
+                    update_task_progress(
+                        CrawlTaskModel,
+                        task_id,
+                        total_count=0,
+                        message="未能确认该店铺的店铺代码，本次榜单采集数量为 0",
+                    )
+                return CollectedItemPlan(total_count=0, items=iter(()))
+            target = display_name or shop_code_filter
         elif looks_like_rakuten_shop_code(normalized_shop_target):
             shop_code_filter = normalize_shop_code(normalized_shop_target)
             target = resolve_rakuten_shop_search_keyword(normalized_shop_target)
@@ -20088,9 +20142,7 @@ def collect_item_plan_for_target(
         target, limit, period = parse_ranking_target(target)
     else:
         period = "daily"
-    if source_type == "shop" and re.fullmatch(r"[0-9]+", normalize_text(target)):
-        url = build_source_url(source_type, target)
-    elif source_type == "ranking":
+    if source_type == "ranking":
         url = build_ranking_source_url(target, period)
     elif source_type == "shop" and period == "realtime":
         url = build_ranking_source_url(target, period)
