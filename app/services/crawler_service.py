@@ -8879,6 +8879,14 @@ def list_products(
                     )
                 )
             }
+            sales_summary = store_product_sales_summary(
+                session,
+                owner_username,
+                store_id,
+                sales_period_range,
+                synced_store_ids=synced_store_ids,
+                sales_counts=sales_counts,
+            )
             identity_query = query.with_only_columns(
                 ProductModel.id,
                 ProductModel.store_id,
@@ -9038,6 +9046,7 @@ def list_products(
                     "total": total,
                     "page": normalized_page,
                     "pageSize": normalized_page_size,
+                    "salesSummary": sales_summary,
                 }
             return public_rows
         if normalized_page_size:
@@ -9216,6 +9225,80 @@ def _products_to_public_with_period_sales(
         )
         for row in rows
     ]
+
+
+def store_product_sales_summary(
+    session: Any,
+    owner_username: str,
+    store_id: int | None,
+    sales_period_range: tuple[date, date],
+    *,
+    synced_store_ids: set[int],
+    sales_counts: dict[tuple[int, str], int],
+) -> dict[str, Any] | None:
+    if store_id is None:
+        return None
+    normalized_store_id = int(store_id)
+    period_from, period_to = sales_period_range
+    if normalized_store_id not in synced_store_ids:
+        return {
+            "storeId": normalized_store_id,
+            "periodFrom": period_from.isoformat(),
+            "periodTo": period_to.isoformat(),
+            "syncCompleted": False,
+            "totalEffectiveUnits": None,
+            "currentProductEffectiveUnits": None,
+            "outsideCurrentProductEffectiveUnits": None,
+            "currentProductCount": 0,
+            "outsideCurrentProductCount": 0,
+        }
+
+    current_product_keys = {
+        canonical_sales_order_item_product_key(
+            manage_number=row.rakuten_manage_number,
+            item_number=row.item_number,
+        )
+        for row in session.execute(
+            select(
+                ProductModel.rakuten_manage_number,
+                ProductModel.item_number,
+            ).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.store_id == normalized_store_id,
+                ProductModel.review_status == "listed",
+                ProductModel.store_product_status != "removed",
+            )
+        )
+    }
+    store_sales_counts = {
+        product_key: max(0, int(effective_units or 0))
+        for (sales_store_id, product_key), effective_units in sales_counts.items()
+        if int(sales_store_id) == normalized_store_id
+    }
+    total_effective_units = sum(store_sales_counts.values())
+    current_product_effective_units = sum(
+        store_sales_counts.get(product_key, 0)
+        for product_key in current_product_keys
+    )
+    outside_current_product_keys = {
+        product_key
+        for product_key, effective_units in store_sales_counts.items()
+        if effective_units > 0 and product_key not in current_product_keys
+    }
+    return {
+        "storeId": normalized_store_id,
+        "periodFrom": period_from.isoformat(),
+        "periodTo": period_to.isoformat(),
+        "syncCompleted": True,
+        "totalEffectiveUnits": total_effective_units,
+        "currentProductEffectiveUnits": current_product_effective_units,
+        "outsideCurrentProductEffectiveUnits": max(
+            0,
+            total_effective_units - current_product_effective_units,
+        ),
+        "currentProductCount": len(current_product_keys),
+        "outsideCurrentProductCount": len(outside_current_product_keys),
+    }
 
 
 def active_title_optimization_task_ids(

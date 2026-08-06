@@ -125,6 +125,14 @@ def test_list_store_products_aggregates_effective_sales_for_selected_period(
                 sku_key="",
                 effective_units=1,
             ),
+            ProductSalesDailyModel(
+                owner_username="alice",
+                store_id=store.id,
+                sales_date=date(2026, 7, 18),
+                manage_number="missing-current-product",
+                sku_key="",
+                effective_units=4,
+            ),
         ])
         store_id = store.id
         session.commit()
@@ -173,6 +181,17 @@ def test_list_store_products_aggregates_effective_sales_for_selected_period(
     assert filtered["total"] == 1
     assert filtered["products"][0]["rakutenManageNumber"] == "manage-1"
     assert filtered["products"][0]["periodSalesCount"] == 3
+    assert filtered["salesSummary"] == {
+        "storeId": store_id,
+        "periodFrom": "2026-07-12",
+        "periodTo": "2026-07-18",
+        "syncCompleted": True,
+        "totalEffectiveUnits": 8,
+        "currentProductEffectiveUnits": 4,
+        "outsideCurrentProductEffectiveUnits": 4,
+        "currentProductCount": 2,
+        "outsideCurrentProductCount": 1,
+    }
 
 
 def test_list_store_products_applies_sales_filter_before_page_serialization(
@@ -350,6 +369,8 @@ def test_zero_sales_filter_excludes_store_without_completed_initial_sync(
 
     assert unfiltered["total"] == 1
     assert unfiltered["products"][0]["periodSalesCount"] is None
+    assert unfiltered["salesSummary"]["syncCompleted"] is False
+    assert unfiltered["salesSummary"]["totalEffectiveUnits"] is None
     assert zero_sales["total"] == 0
     assert zero_sales["products"] == []
 
