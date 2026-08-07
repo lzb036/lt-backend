@@ -1076,6 +1076,57 @@ def dispatch_auto_listing_schedule(
     )
 
 
+def run_auto_deletion_task_job(
+    task_id: int,
+    owner_username: str | None = None,
+    advance_next_run: bool = False,
+) -> None:
+    execute_auto_deletion_task(
+        task_id,
+        owner_username=owner_username,
+        advance_next_run=advance_next_run,
+    )
+
+
+def mark_auto_deletion_task_dispatch_failed(task_id: int, exc: Exception) -> None:
+    with session_scope() as session:
+        row = session.get(AutoDeletionTaskModel, task_id)
+        if row is None:
+            return
+        row.status = "failed"
+        row.last_message = "删除任务投递失败。"
+        row.last_error = f"Redis 队列投递失败：{exc}"
+
+
+def dispatch_auto_deletion_task(
+    task_id: int,
+    *,
+    owner_username: str | None = None,
+    advance_next_run: bool = False,
+) -> None:
+    if should_use_redis_task_queue():
+        try:
+            enqueue_task(
+                run_auto_deletion_task_job,
+                task_id,
+                owner_username,
+                advance_next_run,
+                job_id=f"auto-deletion-task-{task_id}",
+                description=f"创建删除任务 {task_id}",
+                queue_name=task_queue_name_for_kind("schedule"),
+            )
+        except Exception as exc:
+            mark_auto_deletion_task_dispatch_failed(task_id, exc)
+            raise
+        return
+    start_background_task(
+        run_auto_deletion_task_job,
+        task_id,
+        owner_username,
+        advance_next_run,
+    )
+
+
 def dispatch_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
     if should_use_redis_task_queue():
         try:
@@ -3129,8 +3180,17 @@ def list_auto_deletion_tasks(owner_username: str, *, store_id: int | None = None
         return [auto_deletion_task_to_public(row, store) for row, store in rows]
 
 
-def _validate_deletion_store(session: Any, owner_username: str, store_id: int) -> StoreModel:
-    store = session.get(StoreModel, store_id)
+def _validate_deletion_store(
+    session: Any,
+    owner_username: str,
+    store_id: int,
+    *,
+    for_update: bool = False,
+) -> StoreModel:
+    query = select(StoreModel).where(StoreModel.id == store_id)
+    if for_update:
+        query = query.with_for_update()
+    store = session.scalar(query)
     if store is None or store.owner_username != owner_username:
         raise RuntimeError("删除店铺不存在或不属于当前用户。")
     if not store.enabled:
@@ -3246,6 +3306,12 @@ def delete_auto_deletion_task(owner_username: str, task_id: int) -> None:
         row = session.scalar(select(AutoDeletionTaskModel).where(AutoDeletionTaskModel.id == task_id, AutoDeletionTaskModel.owner_username == owner_username))
         if row is None:
             raise RuntimeError("自动删除任务不存在。")
+        if row.status == "running" or (
+            row.task_type == "manual"
+            and row.schedule_type == ""
+            and row.status == "idle"
+        ):
+            raise RuntimeError("该删除任务正在等待或执行，暂时不能删除。")
         session.delete(row)
 
 
@@ -13674,7 +13740,27 @@ def create_manual_deletion_task(owner_username: str, payload: Any) -> dict[str, 
     if quantity < 1 or quantity > 10000:
         raise RuntimeError("删除数量只能设置为 1 到 10000。")
     with session_scope() as session:
-        store = _validate_deletion_store(session, owner_username, store_id)
+        store = _validate_deletion_store(
+            session,
+            owner_username,
+            store_id,
+            for_update=True,
+        )
+        if execution_mode == "immediate":
+            active_manual_task_id = session.scalar(
+                select(AutoDeletionTaskModel.id)
+                .where(
+                    AutoDeletionTaskModel.owner_username == owner_username,
+                    AutoDeletionTaskModel.store_id == store_id,
+                    AutoDeletionTaskModel.task_type == "manual",
+                    AutoDeletionTaskModel.schedule_type == "",
+                    AutoDeletionTaskModel.status.in_(("idle", "running")),
+                )
+                .order_by(AutoDeletionTaskModel.id.asc())
+                .limit(1)
+            )
+            if active_manual_task_id is not None:
+                raise RuntimeError("该店铺已有正在创建或执行的手动删除任务，请勿重复提交。")
         row = AutoDeletionTaskModel(
             owner_username=owner_username,
             store_id=store_id,
@@ -13689,7 +13775,7 @@ def create_manual_deletion_task(owner_username: str, payload: Any) -> dict[str, 
             last_message=(
                 f"任务将在 {datetime_to_public(execute_at)} 到期执行。"
                 if execute_at
-                else ""
+                else "任务已受理，后台正在创建删除任务。"
             ),
         )
         session.add(row)
@@ -13697,7 +13783,16 @@ def create_manual_deletion_task(owner_username: str, payload: Any) -> dict[str, 
         task_id = int(row.id)
         if execution_mode == "scheduled":
             return auto_deletion_task_to_public(row, store)
-    return execute_auto_deletion_task(task_id, owner_username=owner_username)
+        created = auto_deletion_task_to_public(row, store)
+    try:
+        dispatch_auto_deletion_task(
+            task_id,
+            owner_username=owner_username,
+            advance_next_run=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"删除任务投递失败：{exc}") from exc
+    return created
 
 
 def run_due_auto_deletion_tasks_once() -> int:

@@ -45,6 +45,11 @@ def database(monkeypatch):
         "dispatch_auto_listing_schedule",
         lambda schedule_id, **kwargs: None,
     )
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_auto_deletion_task",
+        lambda task_id, **kwargs: None,
+    )
     with local_session_scope() as session:
         session.add(
             UserAccountModel(
@@ -490,6 +495,62 @@ def test_scheduled_manual_deletion_task_runs_once_when_due(
         assert row.status == "completed"
         assert row.enabled is False
         assert row.next_run_at == scheduled_at
+
+
+def test_immediate_manual_deletion_task_dispatches_and_rejects_duplicate(
+    database,
+    monkeypatch,
+) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    calls: list[tuple[int, str | None, bool]] = []
+
+    def fake_dispatch(
+        task_id: int,
+        *,
+        owner_username: str | None = None,
+        advance_next_run: bool = False,
+    ) -> None:
+        calls.append((task_id, owner_username, advance_next_run))
+
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_auto_deletion_task",
+        fake_dispatch,
+    )
+
+    created = crawler_service.create_manual_deletion_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=30),
+    )
+
+    assert created["status"] == "idle"
+    assert created["lastMessage"] == "任务已受理，后台正在创建删除任务。"
+    assert calls == [(created["id"], "alice", False)]
+
+    with pytest.raises(RuntimeError, match="请勿重复提交"):
+        crawler_service.create_manual_deletion_task(
+            "alice",
+            SimpleNamespace(storeId=store_id, quantity=20),
+        )
+
+    with pytest.raises(RuntimeError, match="暂时不能删除"):
+        crawler_service.delete_auto_deletion_task("alice", created["id"])
+
+    with database() as session:
+        row = session.get(AutoDeletionTaskModel, created["id"])
+        row.status = "completed"
+
+    second = crawler_service.create_manual_deletion_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=20),
+    )
+    assert second["id"] != created["id"]
+
+    crawler_service.delete_auto_deletion_task("alice", created["id"])
+    with database() as session:
+        assert session.get(AutoDeletionTaskModel, created["id"]) is None
 
 
 def test_scheduled_manual_task_requires_future_execute_at(database) -> None:
