@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import create_engine
@@ -128,6 +129,29 @@ def test_listing_image_upload_uses_dedicated_queue() -> None:
         crawler_service.settings.task_queue_listing_image_upload_name
     )
     assert crawler_service.settings.task_queue_listing_image_upload_name in task_queue.all_task_queue_names()
+
+
+def test_cabinet_system_error_107_is_retried(monkeypatch) -> None:
+    transient = Mock(
+        status_code=200,
+        text="<result><systemStatus>NG</systemStatus><message>SystemError(107)</message></result>",
+    )
+    success = Mock(
+        status_code=200,
+        text="<result><systemStatus>OK</systemStatus></result>",
+    )
+    transient.close.return_value = None
+    monkeypatch.setattr(crawler_service, "throttle_rakuten_cabinet_request", lambda *_args: None)
+    monkeypatch.setattr(crawler_service, "mark_rakuten_cabinet_qps_limited", lambda *_args: None)
+    monkeypatch.setattr(crawler_service.time, "sleep", lambda _seconds: None)
+    request = Mock(side_effect=[transient, success])
+    monkeypatch.setattr(crawler_service.requests, "request", request)
+
+    result = crawler_service.rakuten_cabinet_request("GET", "https://example.com")
+
+    assert result is success
+    assert request.call_count == 2
+    transient.close.assert_called_once()
 
 
 def test_create_listing_image_upload_task_is_persisted_and_dispatched(

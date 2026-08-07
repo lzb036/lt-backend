@@ -5296,10 +5296,15 @@ def rakuten_cabinet_request(method: str, url: str, **kwargs: Any) -> requests.Re
                 raise
             time.sleep(rakuten_cabinet_backoff_seconds(attempt))
             continue
-        if is_rakuten_cabinet_qps_limited_response(response):
+        transient_error = rakuten_cabinet_transient_error(response)
+        if transient_error:
             mark_rakuten_cabinet_qps_limited(account_key)
             if attempt >= attempts:
-                raise RuntimeError(f"R-Cabinet 请求触发 QPSLimit，已重试 {attempts} 次：{normalize_text(response.text)[:500]}")
+                detail = normalize_text(response.text)[:500]
+                response.close()
+                if transient_error == "QPSLimit":
+                    raise RuntimeError(f"R-Cabinet 请求触发 QPSLimit，已重试 {attempts} 次：{detail}")
+                raise RuntimeError(f"R-Cabinet 请求持续返回 {transient_error}，已重试 {attempts} 次：{detail}")
             response.close()
             time.sleep(rakuten_cabinet_backoff_seconds(attempt))
             continue
@@ -5316,8 +5321,16 @@ def rakuten_cabinet_backoff_seconds(attempt: int) -> float:
 
 
 def is_rakuten_cabinet_qps_limited_response(response: requests.Response) -> bool:
+    return rakuten_cabinet_transient_error(response) == "QPSLimit"
+
+
+def rakuten_cabinet_transient_error(response: requests.Response) -> str:
     text = normalize_text(getattr(response, "text", ""))
-    return response.status_code == 429 or "QPSLimit" in text
+    if response.status_code == 429 or "QPSLimit" in text:
+        return "QPSLimit"
+    if "SystemError(107)" in text:
+        return "SystemError(107)"
+    return ""
 
 
 def cabinet_xml_error_message(xml_text: str) -> str:
@@ -17521,6 +17534,7 @@ def download_remote_product_image(
     max_bytes: int,
     size_error_message: str,
 ) -> dict[str, Any]:
+    request_url = corrected_remote_product_image_url(image_url)
     proxy_config = crawler_request_proxies()
     attempts: list[dict[str, str] | None] = [None]
     if proxy_config:
@@ -17530,7 +17544,7 @@ def download_remote_product_image(
         response: requests.Response | None = None
         try:
             response = requests.get(
-                image_url,
+                request_url,
                 timeout=settings.crawler_timeout_seconds,
                 headers={"User-Agent": settings.crawler_user_agent},
                 proxies=proxies,
@@ -17557,7 +17571,7 @@ def download_remote_product_image(
                     raise RuntimeError(size_error_message)
                 chunks.append(chunk)
             content = b"".join(chunks)
-            suffix = Path(urlsplit(image_url).path).suffix.lower()
+            suffix = Path(urlsplit(request_url).path).suffix.lower()
             content_type = normalize_text(response.headers.get("Content-Type")).split(";", 1)[0].lower()
             if not suffix:
                 suffix = product_image_suffix_from_content_type(content_type)
@@ -17577,6 +17591,13 @@ def download_remote_product_image(
             if response is not None:
                 response.close()
     raise RuntimeError("读取商品图片失败。") from last_error
+
+
+def corrected_remote_product_image_url(image_url: str) -> str:
+    parsed = urlsplit(image_url)
+    if parsed.path.lower().endswith(".pg"):
+        return parsed._replace(path=f"{parsed.path[:-3]}.jpg").geturl()
+    return image_url
 
 
 def prepare_rakuten_cabinet_image(image_data: dict[str, Any]) -> dict[str, Any]:

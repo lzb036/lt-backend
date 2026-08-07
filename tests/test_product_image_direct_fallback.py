@@ -73,6 +73,21 @@ class ProductImageDirectFallbackTests(unittest.TestCase):
 
         request.assert_called_once()
 
+    def test_malformed_pg_suffix_is_corrected_before_download(self) -> None:
+        direct = image_response()
+        with patch.object(crawler_service.requests, "get", return_value=direct) as request:
+            result = crawler_service.download_remote_product_image(
+                "https://image.rakuten.co.jp/example/cabinet/image.pg",
+                max_bytes=1024,
+                size_error_message="too large",
+            )
+
+        self.assertEqual(result["suffix"], ".jpg")
+        self.assertEqual(
+            request.call_args.args[0],
+            "https://image.rakuten.co.jp/example/cabinet/image.jpg",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
