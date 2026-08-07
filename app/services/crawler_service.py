@@ -1025,6 +1025,57 @@ def dispatch_next_listing_task_safely() -> None:
         return
 
 
+def run_auto_listing_schedule_job(
+    schedule_id: int,
+    owner_username: str | None = None,
+    advance_next_run: bool = False,
+) -> None:
+    execute_auto_listing_schedule(
+        schedule_id,
+        owner_username=owner_username,
+        advance_next_run=advance_next_run,
+    )
+
+
+def mark_auto_listing_schedule_dispatch_failed(schedule_id: int, exc: Exception) -> None:
+    with session_scope() as session:
+        row = session.get(AutoListingScheduleModel, schedule_id)
+        if row is None:
+            return
+        row.status = "failed"
+        row.last_message = "上架任务投递失败。"
+        row.last_error = f"Redis 队列投递失败：{exc}"
+
+
+def dispatch_auto_listing_schedule(
+    schedule_id: int,
+    *,
+    owner_username: str | None = None,
+    advance_next_run: bool = False,
+) -> None:
+    if should_use_redis_task_queue():
+        try:
+            enqueue_task(
+                run_auto_listing_schedule_job,
+                schedule_id,
+                owner_username,
+                advance_next_run,
+                job_id=f"auto-listing-schedule-{schedule_id}",
+                description=f"创建上架任务 {schedule_id}",
+                queue_name=task_queue_name_for_kind("schedule"),
+            )
+        except Exception as exc:
+            mark_auto_listing_schedule_dispatch_failed(schedule_id, exc)
+            raise
+        return
+    start_background_task(
+        run_auto_listing_schedule_job,
+        schedule_id,
+        owner_username,
+        advance_next_run,
+    )
+
+
 def dispatch_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
     if should_use_redis_task_queue():
         try:
@@ -2868,7 +2919,11 @@ def create_manual_listing_task(owner_username: str, payload: Any) -> dict[str, A
     if quantity < 1 or quantity > 10000:
         raise RuntimeError("上架数量只能设置为 1 到 10000。")
     with session_scope() as session:
-        store = session.get(StoreModel, store_id)
+        store = session.scalar(
+            select(StoreModel)
+            .where(StoreModel.id == store_id)
+            .with_for_update()
+        )
         if store is None or store.owner_username != owner_username:
             raise RuntimeError("上架店铺不存在或不属于当前用户。")
         if not store.enabled:
@@ -2878,6 +2933,21 @@ def create_manual_listing_task(owner_username: str, payload: Any) -> dict[str, A
             or not decrypt_text(store.rakuten_license_key_encrypted)
         ):
             raise RuntimeError(f"上架店铺「{store.alias_name or store.store_name}」缺少乐天 Secret 或乐天 Key。")
+        if execution_mode == "immediate":
+            active_manual_task_id = session.scalar(
+                select(AutoListingScheduleModel.id)
+                .where(
+                    AutoListingScheduleModel.owner_username == owner_username,
+                    AutoListingScheduleModel.store_id == store_id,
+                    AutoListingScheduleModel.task_type == "manual",
+                    AutoListingScheduleModel.schedule_type == "",
+                    AutoListingScheduleModel.status.in_(("idle", "running")),
+                )
+                .order_by(AutoListingScheduleModel.id.asc())
+                .limit(1)
+            )
+            if active_manual_task_id is not None:
+                raise RuntimeError("该店铺已有正在创建或执行的手动上架任务，请勿重复提交。")
         row = AutoListingScheduleModel(
             owner_username=owner_username,
             store_id=store_id,
@@ -2892,7 +2962,7 @@ def create_manual_listing_task(owner_username: str, payload: Any) -> dict[str, A
             last_message=(
                 f"任务将在 {datetime_to_public(execute_at)} 到期执行。"
                 if execute_at
-                else ""
+                else "任务已受理，后台正在创建上架任务。"
             ),
         )
         session.add(row)
@@ -2900,11 +2970,16 @@ def create_manual_listing_task(owner_username: str, payload: Any) -> dict[str, A
         schedule_id = int(row.id)
         if execution_mode == "scheduled":
             return auto_listing_schedule_to_public(row, store)
-    return execute_auto_listing_schedule(
-        schedule_id,
-        owner_username=owner_username,
-        advance_next_run=False,
-    )
+        created = auto_listing_schedule_to_public(row, store)
+    try:
+        dispatch_auto_listing_schedule(
+            schedule_id,
+            owner_username=owner_username,
+            advance_next_run=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"上架任务投递失败：{exc}") from exc
+    return created
 
 
 def update_auto_listing_schedule_status(
@@ -2997,6 +3072,12 @@ def delete_auto_listing_schedule(owner_username: str, schedule_id: int) -> None:
         )
         if row is None:
             raise RuntimeError("自动上架任务不存在。")
+        if row.status == "running" or (
+            row.task_type == "manual"
+            and row.schedule_type == ""
+            and row.status == "idle"
+        ):
+            raise RuntimeError("该上架任务正在等待或执行，暂时不能删除。")
         session.delete(row)
 
 
@@ -19010,10 +19091,12 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
             if not decrypt_text(store.rakuten_service_secret_encrypted) or not decrypt_text(store.rakuten_license_key_encrypted):
                 raise RuntimeError(f"上架店铺「{store.alias_name or store.store_name}」缺少乐天 Secret 或乐天 Key。")
         products = session.scalars(
-            select(ProductModel).where(
+            select(ProductModel)
+            .where(
                 ProductModel.owner_username == owner_username,
                 ProductModel.id.in_(product_ids),
             )
+            .with_for_update()
         ).all()
         if not products:
             raise RuntimeError("没有找到可上架的商品。")

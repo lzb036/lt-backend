@@ -40,6 +40,11 @@ def database(monkeypatch):
 
     monkeypatch.setattr(crawler_service, "session_scope", local_session_scope)
     monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value or "")
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_auto_listing_schedule",
+        lambda schedule_id, **kwargs: None,
+    )
     with local_session_scope() as session:
         session.add(
             UserAccountModel(
@@ -274,7 +279,7 @@ def test_run_schedule_now_is_owner_scoped(database) -> None:
         crawler_service.run_auto_listing_schedule_now("bob", 1)
 
 
-def test_manual_tasks_allow_repeated_store_and_automatic_tasks_sort_first(
+def test_manual_tasks_reject_repeated_active_store_and_allow_after_completion(
     database,
 ) -> None:
     with database() as session:
@@ -295,6 +300,16 @@ def test_manual_tasks_allow_repeated_store_and_automatic_tasks_sort_first(
         "alice",
         SimpleNamespace(storeId=store_id, quantity=10),
     )
+    with pytest.raises(RuntimeError, match="请勿重复提交"):
+        crawler_service.create_manual_listing_task(
+            "alice",
+            SimpleNamespace(storeId=store_id, quantity=20),
+        )
+
+    with database() as session:
+        row = session.get(AutoListingScheduleModel, first_manual["id"])
+        row.status = "completed"
+
     second_manual = crawler_service.create_manual_listing_task(
         "alice",
         SimpleNamespace(storeId=store_id, quantity=20),
@@ -302,7 +317,8 @@ def test_manual_tasks_allow_repeated_store_and_automatic_tasks_sort_first(
 
     assert automatic["taskType"] == "automatic"
     assert first_manual["taskType"] == "manual"
-    assert first_manual["status"] == "completed"
+    assert first_manual["status"] == "idle"
+    assert first_manual["lastMessage"] == "任务已受理，后台正在创建上架任务。"
     assert second_manual["taskType"] == "manual"
     assert first_manual["id"] != second_manual["id"]
 
@@ -322,6 +338,59 @@ def test_manual_tasks_allow_repeated_store_and_automatic_tasks_sort_first(
         first_manual["id"],
         second_manual["id"],
     }
+
+
+def test_immediate_manual_listing_task_dispatches_after_commit(
+    database,
+    monkeypatch,
+) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    calls: list[tuple[int, str | None, bool]] = []
+
+    def fake_dispatch(
+        schedule_id: int,
+        *,
+        owner_username: str | None = None,
+        advance_next_run: bool = False,
+    ) -> None:
+        calls.append((schedule_id, owner_username, advance_next_run))
+
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_auto_listing_schedule",
+        fake_dispatch,
+    )
+
+    created = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=30),
+    )
+
+    assert created["status"] == "idle"
+    assert calls == [(created["id"], "alice", False)]
+
+
+def test_pending_immediate_manual_listing_task_cannot_be_deleted(database) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    created = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=10),
+    )
+
+    with pytest.raises(RuntimeError, match="暂时不能删除"):
+        crawler_service.delete_auto_listing_schedule("alice", created["id"])
+
+    with database() as session:
+        row = session.get(AutoListingScheduleModel, created["id"])
+        row.status = "completed"
+
+    crawler_service.delete_auto_listing_schedule("alice", created["id"])
+    with database() as session:
+        assert session.get(AutoListingScheduleModel, created["id"]) is None
 
 
 def test_auto_listing_model_uses_nullable_automatic_store_unique_key() -> None:
