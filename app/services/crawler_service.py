@@ -228,8 +228,6 @@ RAKUTEN_SP_DESCRIPTION_DROP_TAGS = {
 RAKUTEN_CABINET_FOLDER_PAGE_SIZE = 100
 RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT = 500
 RAKUTEN_CABINET_FOLDER_CREATE_ATTEMPTS = 10
-RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS = 0.35
-RAKUTEN_CABINET_QPS_COOLDOWN_INTERVAL_SECONDS = 0.6
 RAKUTEN_CABINET_QPS_COOLDOWN_SECONDS = 5 * 60
 RAKUTEN_CABINET_REQUEST_MAX_RETRIES = 6
 RAKUTEN_CABINET_QPS_BACKOFF_SECONDS = (1.5, 3.0, 5.0, 8.0, 13.0)
@@ -3423,6 +3421,15 @@ def listing_task_retry_product_ids(task: ListingTaskModel) -> list[int]:
     return product_ids_payload["productIds"]
 
 
+def listing_task_product_worker_count(product_count: int, *, retry: bool) -> int:
+    configured_workers = (
+        settings.listing_retry_product_workers
+        if retry
+        else settings.listing_product_workers
+    )
+    return min(max(0, int(product_count)), max(1, int(configured_workers)))
+
+
 def listing_task_store_snapshot(row: StoreModel | None) -> dict[str, str]:
     if row is None:
         return {"storeCode": "", "storeName": "", "aliasName": ""}
@@ -5230,12 +5237,18 @@ def wait_for_distributed_request_slot(bucket: str, min_interval: float) -> bool:
 
 
 def rakuten_cabinet_request_interval(account_key: str) -> float:
-    normal_interval = max(0.0, RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS)
+    normal_interval = max(
+        0.0,
+        float(settings.rakuten_cabinet_request_min_interval_seconds),
+    )
     if not should_use_redis_task_queue():
         return normal_interval
     try:
         if redis_connection().exists(f"lt:request-rate:cabinet:{account_key}:cooldown"):
-            return max(normal_interval, RAKUTEN_CABINET_QPS_COOLDOWN_INTERVAL_SECONDS)
+            return max(
+                normal_interval,
+                float(settings.rakuten_cabinet_qps_cooldown_interval_seconds),
+            )
     except Exception:
         pass
     return normal_interval
@@ -19499,9 +19512,9 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     next_error_detail = summarize_task_errors(errors, limit=50)
                     task.error_detail = with_task_cancel_marker(next_error_detail) if task_cancel_requested(task) else next_error_detail
 
-        worker_count = min(
+        worker_count = listing_task_product_worker_count(
             len(ordered_product_ids),
-            max(1, int(settings.listing_product_workers)),
+            retry=bool(retry_product_ids),
         )
         image_completion_product_ids: list[int] = []
         cancellation_error: TaskCancelled | None = None

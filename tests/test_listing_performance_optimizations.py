@@ -266,6 +266,38 @@ def test_listing_task_limit_remains_fifty():
     assert [len(chunk) for chunk in crawler_service.chunk_product_ids(list(range(1, 102)))] == [50, 50, 1]
 
 
+def test_listing_retry_uses_lower_product_concurrency(monkeypatch):
+    monkeypatch.setattr(crawler_service.settings, "listing_product_workers", 6)
+    monkeypatch.setattr(crawler_service.settings, "listing_retry_product_workers", 2)
+
+    assert crawler_service.listing_task_product_worker_count(50, retry=False) == 6
+    assert crawler_service.listing_task_product_worker_count(50, retry=True) == 2
+    assert crawler_service.listing_task_product_worker_count(1, retry=True) == 1
+
+
+def test_rakuten_cabinet_request_interval_uses_configured_cooldown(monkeypatch):
+    monkeypatch.setattr(
+        crawler_service.settings,
+        "rakuten_cabinet_request_min_interval_seconds",
+        0.8,
+    )
+    monkeypatch.setattr(
+        crawler_service.settings,
+        "rakuten_cabinet_qps_cooldown_interval_seconds",
+        1.5,
+    )
+    monkeypatch.setattr(crawler_service, "should_use_redis_task_queue", lambda: True)
+
+    class FakeRedis:
+        @staticmethod
+        def exists(_key):
+            return 1
+
+    monkeypatch.setattr(crawler_service, "redis_connection", lambda: FakeRedis())
+
+    assert crawler_service.rakuten_cabinet_request_interval("shop") == 1.5
+
+
 def test_listing_dispatch_uses_global_user_and_store_capacity(
     monkeypatch,
     session_factory,

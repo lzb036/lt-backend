@@ -80,8 +80,11 @@ class Settings(BaseModel):
     max_running_listing_tasks_per_user: int = 2
     max_running_listing_tasks_per_store: int = 1
     listing_product_workers: int = 6
+    listing_retry_product_workers: int = 2
     listing_image_prepare_workers: int = 4
     listing_creation_image_limit: int = 1
+    rakuten_cabinet_request_min_interval_seconds: float = 0.8
+    rakuten_cabinet_qps_cooldown_interval_seconds: float = 1.5
     crawler_browser_fallback_enabled: bool = False
     crawler_browser_timeout_seconds: int = 35
     crawler_max_ranking_pages: int = 200
@@ -211,8 +214,17 @@ def build_settings() -> Settings:
         max_running_listing_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_USER", 2)),
         max_running_listing_tasks_per_store=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_STORE", 1)),
         listing_product_workers=max(1, _env_int("LT_LISTING_PRODUCT_WORKERS", 6)),
+        listing_retry_product_workers=max(1, _env_int("LT_LISTING_RETRY_PRODUCT_WORKERS", 2)),
         listing_image_prepare_workers=max(1, _env_int("LT_LISTING_IMAGE_PREPARE_WORKERS", 4)),
         listing_creation_image_limit=min(20, max(1, _env_int("LT_LISTING_CREATION_IMAGE_LIMIT", 1))),
+        rakuten_cabinet_request_min_interval_seconds=max(
+            0.0,
+            float(_env_text("LT_RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS", "0.8") or "0"),
+        ),
+        rakuten_cabinet_qps_cooldown_interval_seconds=max(
+            0.0,
+            float(_env_text("LT_RAKUTEN_CABINET_QPS_COOLDOWN_INTERVAL_SECONDS", "1.5") or "0"),
+        ),
         crawler_browser_fallback_enabled=_env_bool("LT_CRAWLER_BROWSER_FALLBACK_ENABLED", False),
         crawler_browser_timeout_seconds=_env_int("LT_CRAWLER_BROWSER_TIMEOUT_SECONDS", 35),
         crawler_max_ranking_pages=max(1, _env_int("LT_CRAWLER_MAX_RANKING_PAGES", 200)),
