@@ -91,6 +91,7 @@ class WholeShopPreviewPayload(BaseModel):
     sourceType: str = Field(default="whole_shop", pattern="^whole_shop$")
     target: str = Field(min_length=1)
     wholeShopFilter: str = Field(default="all", pattern="^(all|reviewed)$")
+    crawlPriceRule: dict[str, Any] | None = None
 
 
 class TaskDeletePayload(BaseModel):
@@ -739,6 +740,7 @@ def preview_task(payload: WholeShopPreviewPayload, user: dict = Depends(require_
                 user["username"],
                 payload.target,
                 payload.wholeShopFilter,
+                payload.crawlPriceRule,
             )
         }
     except RuntimeError as exc:

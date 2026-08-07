@@ -79,6 +79,20 @@ def test_whole_shop_target_and_standard_search_urls() -> None:
     assert crawler_service.build_whole_shop_search_url("415734", "reviewed") == (
         "https://search.rakuten.co.jp/search/mall/?sid=415734&review=1"
     )
+    assert crawler_service.build_whole_shop_search_url(
+        "415734",
+        "reviewed",
+        price_min=2500,
+        price_max=5000,
+    ) == "https://search.rakuten.co.jp/search/mall/?sid=415734&review=1&min=2500&max=5000"
+    assert crawler_service.whole_shop_price_bounds({"operator": "gte", "value": 2500}) == (
+        2500,
+        None,
+    )
+    assert crawler_service.whole_shop_price_bounds({"operator": "lt", "value": 2500}) == (
+        None,
+        2499,
+    )
 
 
 def test_preview_reads_exact_all_and_reviewed_counts_without_writes() -> None:
@@ -112,6 +126,31 @@ def test_preview_reads_exact_all_and_reviewed_counts_without_writes() -> None:
     }
 
 
+def test_preview_applies_price_rule_to_collectable_count() -> None:
+    all_html = search_page_html(total=6287)
+    filtered_html = search_page_html(total=4210)
+
+    def fetch(url: str) -> str:
+        return filtered_html if "min=2500" in url else all_html
+
+    with (
+        patch.object(crawler_service, "fetch_listing_html", side_effect=fetch),
+        patch.object(crawler_service, "session_scope") as session_scope,
+    ):
+        preview = crawler_service.preview_whole_shop_crawl(
+            "alice",
+            "415734",
+            "all",
+            {"operator": "gte", "value": 2500},
+        )
+
+    session_scope.assert_not_called()
+    assert preview["totalFound"] == 6287
+    assert preview["collectableCount"] == 4210
+    assert preview["pageCount"] == 4210
+    assert preview["message"] == "本次预计采集 4210 个商品"
+
+
 def test_whole_shop_execution_uses_review_filter_and_shared_listing_collector() -> None:
     listing_items = [
         {
@@ -121,8 +160,16 @@ def test_whole_shop_execution_uses_review_filter_and_shared_listing_collector() 
         }
     ]
     with (
-        patch.object(crawler_service, "crawl_price_rule_for_task", return_value={"operator": "all"}),
-        patch.object(crawler_service, "collect_listing_items", return_value=listing_items) as collect_listing,
+        patch.object(
+            crawler_service,
+            "crawl_price_rule_for_task",
+            return_value={"operator": "gte", "value": 2500},
+        ),
+        patch.object(
+            crawler_service,
+            "collect_whole_shop_listing_items",
+            return_value=listing_items,
+        ) as collect_listing,
         patch.object(crawler_service, "existing_collected_source_hashes_for_task", return_value=set()),
         patch.object(
             crawler_service,
@@ -140,12 +187,86 @@ def test_whole_shop_execution_uses_review_filter_and_shared_listing_collector() 
 
     assert items == listing_items
     collect_listing.assert_called_once_with(
-        "https://search.rakuten.co.jp/search/mall/?sid=415734&review=1",
+        "415734",
+        "reviewed",
+        {"operator": "gte", "value": 2500},
         120,
         task_id="task-id",
-        progress_label="整店商品",
     )
     enrich.assert_called_once()
+
+
+def test_large_whole_shop_collection_uses_price_partitions_and_deduplicates() -> None:
+    partitions = [
+        (2500, 3749, 4592),
+        (3750, 4999, 3845),
+        (5000, 9999, 5000),
+        (10000, None, 1538),
+    ]
+
+    def collect(url: str, _limit: int | None, **_kwargs):
+        suffix = url.split("min=", 1)[-1]
+        return [
+            {
+                "title": suffix,
+                "source_url": f"https://item.rakuten.co.jp/shop/{suffix}/",
+            },
+            {
+                "title": "duplicate",
+                "source_url": "https://item.rakuten.co.jp/shop/shared/",
+            },
+        ]
+
+    with (
+        patch.object(crawler_service, "whole_shop_search_count", return_value=(12886, 287)),
+        patch.object(crawler_service, "whole_shop_price_partitions", return_value=partitions),
+        patch.object(crawler_service, "collect_listing_items", side_effect=collect) as collect_items,
+        patch.object(crawler_service, "update_task_progress") as update_progress,
+    ):
+        items = crawler_service.collect_whole_shop_listing_items(
+            "415734",
+            "all",
+            {"operator": "gte", "value": 2500},
+            None,
+            task_id="task-id",
+        )
+
+    assert len(items) == 5
+    assert collect_items.call_count == 4
+    assert "min=2500&max=3749" in collect_items.call_args_list[0].args[0]
+    assert "min=10000" in collect_items.call_args_list[-1].args[0]
+    assert "max=" not in collect_items.call_args_list[-1].args[0]
+    assert update_progress.call_count == 4
+    assert update_progress.call_args.kwargs["total_count"] == 12886
+
+
+def test_unbounded_price_rule_is_recursively_partitioned() -> None:
+    totals = {
+        "https://search.rakuten.co.jp/search/mall/?sid=415734&min=2500": 12886,
+        "https://search.rakuten.co.jp/search/mall/?sid=415734&min=2500&max=4999": 7000,
+        "https://search.rakuten.co.jp/search/mall/?sid=415734&min=2500&max=3749": 4000,
+        "https://search.rakuten.co.jp/search/mall/?sid=415734&min=3750&max=4999": 3000,
+        "https://search.rakuten.co.jp/search/mall/?sid=415734&min=5000": 5886,
+        "https://search.rakuten.co.jp/search/mall/?sid=415734&min=5000&max=9999": 5000,
+        "https://search.rakuten.co.jp/search/mall/?sid=415734&min=10000": 886,
+    }
+
+    def search_count(url: str) -> tuple[int, int]:
+        return totals[url], 1
+
+    with patch.object(crawler_service, "whole_shop_search_count", side_effect=search_count):
+        partitions = crawler_service.whole_shop_price_partitions(
+            "415734",
+            "all",
+            {"operator": "gte", "value": 2500},
+        )
+
+    assert partitions == [
+        (2500, 3749, 4000),
+        (3750, 4999, 3000),
+        (5000, 9999, 5000),
+        (10000, None, 886),
+    ]
 
 
 def test_create_whole_shop_task_persists_normalized_target() -> None:

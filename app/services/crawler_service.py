@@ -98,6 +98,8 @@ PRODUCT_IMAGE_VISUAL_SIZE = (32, 32)
 PRODUCT_IMAGE_VISUAL_MAX_MEAN_DIFFERENCE = 2.0
 PRODUCT_IMAGE_VISUAL_MAX_ASPECT_RATIO_DIFFERENCE = 0.03
 CRAWL_SAVE_LOCK_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
+WHOLE_SHOP_PARTITION_TARGET_ITEMS = 5000
+WHOLE_SHOP_PARTITION_MAX_STEPS = 32
 
 
 @dataclass(frozen=True)
@@ -3606,7 +3608,7 @@ def update_task_progress(
             return
         except OperationalError as exc:
             last_error = exc
-            if not is_mysql_lock_wait_timeout(exc) or attempt >= 2:
+            if not is_mysql_retryable_lock_error(exc) or attempt >= 2:
                 raise
             time.sleep(0.25 * (attempt + 1))
     if last_error is not None:
@@ -4597,10 +4599,15 @@ def raise_if_task_cancelled(model: Any, task_id: str | None) -> None:
         raise TaskCancelled(TASK_CANCELLED_MESSAGE)
 
 
-def is_mysql_lock_wait_timeout(exc: OperationalError) -> bool:
+def is_mysql_retryable_lock_error(exc: OperationalError) -> bool:
     original = getattr(exc, "orig", None)
     code = getattr(original, "args", [None])[0] if original is not None else None
-    return code == 1205 or "Lock wait timeout exceeded" in str(exc)
+    normalized = str(exc).lower()
+    return (
+        code in {1205, 1213}
+        or "lock wait timeout exceeded" in normalized
+        or "deadlock found" in normalized
+    )
 
 
 def running_user_task_count(
@@ -20236,19 +20243,19 @@ def save_collected_item_with_lock_retry(
                 scheduled_crawl_id=scheduled_crawl_id,
             )
         except OperationalError as exc:
-            if not is_mysql_lock_wait_timeout(exc):
+            if not is_mysql_retryable_lock_error(exc):
                 raise
             if attempt >= attempts - 1:
                 display_name = normalize_text(item.get("title") or item.get("source_url") or "商品")
                 return {
                     "saved": False,
                     "skipped": False,
-                    "error": f"{display_name}: 商品入库等待数据库锁超时，重试 {attempts} 次后仍未成功。",
+                    "error": f"{display_name}: 商品入库遇到数据库锁冲突，重试 {attempts} 次后仍未成功。",
                 }
             raise_if_task_cancelled(CrawlTaskModel, task_id)
             delay_seconds = CRAWL_SAVE_LOCK_RETRY_DELAYS_SECONDS[attempt]
             logger.warning(
-                "crawl item save lock timeout; retrying task_id=%s attempt=%s/%s delay=%ss",
+                "crawl item save lock conflict; retrying task_id=%s attempt=%s/%s delay=%ss",
                 task_id,
                 attempt + 1,
                 attempts,
@@ -20431,12 +20438,12 @@ def collect_item_plan_for_target(
     price_rule = crawl_price_rule_for_task(task_id)
     if source_type == "whole_shop":
         sid, whole_shop_filter, limit = parse_whole_shop_task_options(target)
-        url = build_whole_shop_search_url(sid, whole_shop_filter)
-        items = collect_listing_items(
-            url,
+        items = collect_whole_shop_listing_items(
+            sid,
+            whole_shop_filter,
+            price_rule,
             limit,
             task_id=task_id,
-            progress_label="整店商品",
         )
         for item in items:
             mark_collected_item_price_filter(item, price_rule)
@@ -20717,13 +20724,45 @@ def parse_whole_shop_task_options(target: str) -> tuple[str, str, int | None]:
     return match.group(1), normalize_whole_shop_filter(match.group(2)), limit
 
 
-def build_whole_shop_search_url(sid: str, whole_shop_filter: str) -> str:
+def whole_shop_price_bounds(price_rule: dict[str, Any] | None) -> tuple[int | None, int | None]:
+    normalized_rule = normalize_crawl_price_rule(price_rule or {"operator": "all"})
+    operator = normalize_text(normalized_rule.get("operator")).lower()
+    if operator == "all":
+        return None, None
+    if operator == "range":
+        return (
+            int(normalized_rule.get("minPrice") or 0),
+            int(normalized_rule.get("maxPrice") or 0),
+        )
+    value = int(normalized_rule.get("value") or 0)
+    if operator == "gt":
+        return value + 1, None
+    if operator == "gte":
+        return value, None
+    if operator == "lt":
+        return None, max(0, value - 1)
+    if operator == "lte":
+        return None, value
+    return None, None
+
+
+def build_whole_shop_search_url(
+    sid: str,
+    whole_shop_filter: str,
+    *,
+    price_min: int | None = None,
+    price_max: int | None = None,
+) -> str:
     normalized_sid = normalize_text(sid)
     if not re.fullmatch(r"[0-9]+", normalized_sid):
         raise RuntimeError(WHOLE_SHOP_TARGET_ERROR)
     query: dict[str, str] = {"sid": normalized_sid}
     if normalize_whole_shop_filter(whole_shop_filter) == "reviewed":
         query["review"] = "1"
+    if price_min is not None and int(price_min) > 0:
+        query["min"] = str(int(price_min))
+    if price_max is not None and int(price_max) >= 0:
+        query["max"] = str(int(price_max))
     return f"{RAKUTEN_SEARCH_BASE}?{urlencode(query)}"
 
 
@@ -20740,20 +20779,189 @@ def whole_shop_preview_page(url: str) -> tuple[str, int, int]:
     return html, total_count, math.ceil(total_count / page_size)
 
 
-def preview_whole_shop_crawl(owner_username: str, target: str, whole_shop_filter: str) -> dict[str, Any]:
+def whole_shop_search_count(url: str) -> tuple[int, int]:
+    _, total_count, page_count = whole_shop_preview_page(url)
+    return total_count, page_count
+
+
+def split_bounded_whole_shop_price_range(
+    sid: str,
+    whole_shop_filter: str,
+    price_min: int,
+    price_max: int,
+) -> list[tuple[int, int | None, int]]:
+    url = build_whole_shop_search_url(
+        sid,
+        whole_shop_filter,
+        price_min=price_min,
+        price_max=price_max,
+    )
+    total_count, _ = whole_shop_search_count(url)
+    if total_count <= WHOLE_SHOP_PARTITION_TARGET_ITEMS:
+        return [(price_min, price_max, total_count)]
+    if price_min >= price_max:
+        raise RuntimeError(
+            f"价格 {price_min} 日元的商品超过 {WHOLE_SHOP_PARTITION_TARGET_ITEMS} 件，"
+            "乐天搜索无法完整分页，请缩小采集范围。"
+        )
+    midpoint = (price_min + price_max) // 2
+    return [
+        *split_bounded_whole_shop_price_range(
+            sid,
+            whole_shop_filter,
+            price_min,
+            midpoint,
+        ),
+        *split_bounded_whole_shop_price_range(
+            sid,
+            whole_shop_filter,
+            midpoint + 1,
+            price_max,
+        ),
+    ]
+
+
+def whole_shop_price_partitions(
+    sid: str,
+    whole_shop_filter: str,
+    price_rule: dict[str, Any] | None,
+) -> list[tuple[int | None, int | None, int]]:
+    price_min, price_max = whole_shop_price_bounds(price_rule)
+    normalized_min = max(0, int(price_min or 0))
+    if price_max is not None:
+        return split_bounded_whole_shop_price_range(
+            sid,
+            whole_shop_filter,
+            normalized_min,
+            int(price_max),
+        )
+
+    partitions: list[tuple[int | None, int | None, int]] = []
+    current_min = normalized_min
+    width = max(1000, current_min or 1000)
+    for _ in range(WHOLE_SHOP_PARTITION_MAX_STEPS):
+        tail_url = build_whole_shop_search_url(
+            sid,
+            whole_shop_filter,
+            price_min=current_min,
+        )
+        tail_total, _ = whole_shop_search_count(tail_url)
+        if tail_total <= WHOLE_SHOP_PARTITION_TARGET_ITEMS:
+            partitions.append((current_min or None, None, tail_total))
+            return partitions
+        current_max = current_min + width - 1
+        partitions.extend(
+            split_bounded_whole_shop_price_range(
+                sid,
+                whole_shop_filter,
+                current_min,
+                current_max,
+            )
+        )
+        current_min = current_max + 1
+        width *= 2
+    raise RuntimeError("整店商品价格范围过大，无法完成自动分段，请缩小采集价格范围。")
+
+
+def collect_whole_shop_listing_items(
+    sid: str,
+    whole_shop_filter: str,
+    price_rule: dict[str, Any] | None,
+    requested_limit: int | None,
+    *,
+    task_id: str | None = None,
+) -> list[dict[str, Any]]:
+    price_min, price_max = whole_shop_price_bounds(price_rule)
+    direct_url = build_whole_shop_search_url(
+        sid,
+        whole_shop_filter,
+        price_min=price_min,
+        price_max=price_max,
+    )
+    if requested_limit is not None and requested_limit <= WHOLE_SHOP_PARTITION_TARGET_ITEMS:
+        return collect_listing_items(
+            direct_url,
+            requested_limit,
+            task_id=task_id,
+            progress_label="整店商品",
+        )
+
+    total_count, _ = whole_shop_search_count(direct_url)
+    if total_count <= WHOLE_SHOP_PARTITION_TARGET_ITEMS:
+        return collect_listing_items(
+            direct_url,
+            requested_limit,
+            task_id=task_id,
+            progress_label="整店商品",
+        )
+
+    partitions = whole_shop_price_partitions(sid, whole_shop_filter, price_rule)
+    expected_total = total_count
+    if requested_limit is not None:
+        expected_total = min(expected_total, requested_limit)
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for partition_min, partition_max, _ in partitions:
+        remaining = None if requested_limit is None else max(0, requested_limit - len(items))
+        if remaining == 0:
+            break
+        partition_url = build_whole_shop_search_url(
+            sid,
+            whole_shop_filter,
+            price_min=partition_min,
+            price_max=partition_max,
+        )
+        partition_items = collect_listing_items(
+            partition_url,
+            remaining,
+            task_id=task_id,
+        )
+        for item in partition_items:
+            source_url = normalize_text(item.get("source_url"))
+            if not source_url or source_url in seen:
+                continue
+            seen.add(source_url)
+            items.append(item)
+            if requested_limit is not None and len(items) >= requested_limit:
+                break
+        if task_id:
+            update_task_progress(
+                CrawlTaskModel,
+                task_id,
+                total_count=expected_total,
+                message=f"正在发现整店商品：{len(items)} / {expected_total}",
+            )
+    return items
+
+
+def preview_whole_shop_crawl(
+    owner_username: str,
+    target: str,
+    whole_shop_filter: str,
+    crawl_price_rule: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     del owner_username
     normalized_filter = normalize_whole_shop_filter(whole_shop_filter)
+    normalized_price_rule = normalize_crawl_price_rule(crawl_price_rule or {"operator": "all"})
+    price_min, price_max = whole_shop_price_bounds(normalized_price_rule)
     sid, resolved_shop_name = resolve_whole_shop_identity(target)
     all_url = build_whole_shop_search_url(sid, "all")
     all_html, total_found, all_page_count = whole_shop_preview_page(all_url)
     shop_name = resolved_shop_name or parse_rakuten_search_shop_name(all_html) or sid
-    collectable_count = total_found
-    page_count = all_page_count
+    selected_url = build_whole_shop_search_url(
+        sid,
+        normalized_filter,
+        price_min=price_min,
+        price_max=price_max,
+    )
+    if selected_url == all_url:
+        collectable_count = total_found
+        page_count = all_page_count
+    else:
+        _, collectable_count, page_count = whole_shop_preview_page(selected_url)
     reviewed_count = 0
     if normalized_filter == "reviewed":
-        reviewed_url = build_whole_shop_search_url(sid, "reviewed")
-        _, reviewed_count, page_count = whole_shop_preview_page(reviewed_url)
-        collectable_count = reviewed_count
+        reviewed_count = collectable_count
     return {
         "valid": True,
         "shopName": shop_name,

@@ -23,6 +23,14 @@ def mysql_lock_wait_error() -> OperationalError:
     )
 
 
+def mysql_deadlock_error() -> OperationalError:
+    return OperationalError(
+        "INSERT INTO lt_products ...",
+        {},
+        RuntimeError(1213, "Deadlock found when trying to get lock; try restarting transaction"),
+    )
+
+
 def test_save_collected_item_retries_mysql_lock_wait_with_new_attempts() -> None:
     item = {
         "title": "商品 1",
@@ -77,6 +85,35 @@ def test_save_collected_item_marks_only_item_failed_after_lock_retries_exhausted
     assert result["skipped"] is False
     assert "重试 4 次" in result["error"]
     assert save_item.call_count == 4
+
+
+def test_save_collected_item_retries_mysql_deadlock() -> None:
+    item = {
+        "title": "商品 1",
+        "source_url": "https://item.rakuten.co.jp/shop/item-1/",
+    }
+    with (
+        patch.object(
+            crawler_service,
+            "save_collected_item",
+            side_effect=[
+                mysql_deadlock_error(),
+                {"saved": True, "skipped": False, "error": ""},
+            ],
+        ) as save_item,
+        patch.object(crawler_service, "raise_if_task_cancelled") as cancel_check,
+        patch.object(crawler_service.time, "sleep") as sleep,
+    ):
+        result = crawler_service.save_collected_item_with_lock_retry(
+            "alice",
+            "task-id",
+            item,
+        )
+
+    assert result["saved"] is True
+    assert save_item.call_count == 2
+    cancel_check.assert_called_once()
+    sleep.assert_called_once_with(0.5)
 
 
 def test_save_collected_item_does_not_retry_other_database_errors() -> None:
@@ -174,7 +211,7 @@ def test_requested_limit_uses_actual_discovered_item_count() -> None:
         patch.object(crawler_service, "crawl_price_rule_for_task", return_value={}),
         patch.object(
             crawler_service,
-            "collect_listing_items",
+            "collect_whole_shop_listing_items",
             return_value=listing_items,
         ) as collect_listing,
         patch.object(
@@ -196,10 +233,11 @@ def test_requested_limit_uses_actual_discovered_item_count() -> None:
     assert plan.total_count == 2000
     assert len(list(plan.items)) == 2000
     collect_listing.assert_called_once_with(
-        "https://search.rakuten.co.jp/search/mall/?sid=415734",
+        "415734",
+        "all",
+        {},
         3000,
         task_id=None,
-        progress_label="整店商品",
     )
 
 
