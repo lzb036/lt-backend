@@ -21,6 +21,8 @@ QUEUE_KIND_NAMES = {
     "schedule": "task_queue_schedule_name",
 }
 
+CRAWL_QUEUE_KINDS = ("crawl", "manual-crawl", "scheduled-crawl")
+
 
 def redis_connection() -> Any:
     from redis import Redis
@@ -76,13 +78,25 @@ def resolve_worker_queue_names(queue_names: Iterable[str] | None = None) -> list
     return unique_queue_names(resolved) or all_task_queue_names()
 
 
+def task_queue_job_timeout_for_name(queue_name: str | None = None) -> int:
+    normalized_name = str(queue_name or settings.task_queue_name).strip()
+    crawl_queue_names = {
+        task_queue_name_for_kind(kind)
+        for kind in CRAWL_QUEUE_KINDS
+    }
+    if normalized_name in crawl_queue_names:
+        return int(settings.task_queue_crawl_job_timeout_seconds)
+    return int(settings.task_queue_job_timeout_seconds)
+
+
 def task_queue(queue_name: str | None = None) -> Any:
     from rq import Queue
 
+    resolved_name = queue_name or settings.task_queue_name
     return Queue(
-        queue_name or settings.task_queue_name,
+        resolved_name,
         connection=redis_connection(),
-        default_timeout=settings.task_queue_job_timeout_seconds,
+        default_timeout=task_queue_job_timeout_for_name(resolved_name),
     )
 
 
@@ -93,11 +107,12 @@ def enqueue_task(
     description: str = "",
     queue_name: str | None = None,
 ) -> str:
+    job_timeout = task_queue_job_timeout_for_name(queue_name)
     job = task_queue(queue_name).enqueue(
         func,
         args=args,
         job_id=job_id,
-        job_timeout=settings.task_queue_job_timeout_seconds,
+        job_timeout=job_timeout,
         result_ttl=settings.task_queue_result_ttl_seconds,
         failure_ttl=settings.task_queue_failure_ttl_seconds,
         description=description or None,
@@ -113,12 +128,13 @@ def enqueue_task_in(
     description: str = "",
     queue_name: str | None = None,
 ) -> str:
+    job_timeout = task_queue_job_timeout_for_name(queue_name)
     job = task_queue(queue_name).enqueue_in(
         timedelta(seconds=max(0.0, float(delay_seconds or 0))),
         func,
         args=args,
         job_id=job_id,
-        job_timeout=settings.task_queue_job_timeout_seconds,
+        job_timeout=job_timeout,
         result_ttl=settings.task_queue_result_ttl_seconds,
         failure_ttl=settings.task_queue_failure_ttl_seconds,
         description=description or None,
@@ -134,7 +150,7 @@ def run_worker(queue_names: Iterable[str] | None = None) -> None:
         Queue(
             queue_name,
             connection=connection,
-            default_timeout=settings.task_queue_job_timeout_seconds,
+            default_timeout=task_queue_job_timeout_for_name(queue_name),
         )
         for queue_name in resolve_worker_queue_names(queue_names)
     ]

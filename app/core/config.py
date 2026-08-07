@@ -9,6 +9,7 @@ from pydantic import BaseModel
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_DIR = BACKEND_DIR.parent
 TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS = 3 * 60 * 60
+TASK_QUEUE_CRAWL_JOB_TIMEOUT_DEFAULT_SECONDS = 24 * 60 * 60
 
 
 def _load_dotenv(path: Path) -> None:
@@ -123,6 +124,7 @@ class Settings(BaseModel):
     task_queue_listing_name: str = "lt-tasks-listing"
     task_queue_schedule_name: str = "lt-tasks-schedule"
     task_queue_job_timeout_seconds: int = TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS
+    task_queue_crawl_job_timeout_seconds: int = TASK_QUEUE_CRAWL_JOB_TIMEOUT_DEFAULT_SECONDS
     task_queue_result_ttl_seconds: int = 60 * 60
     task_queue_failure_ttl_seconds: int = 24 * 60 * 60
     task_queue_queued_requeue_limit: int = 25
@@ -181,6 +183,20 @@ def build_settings() -> Settings:
             raise RuntimeError(f"OSS 图片存储缺少配置：{', '.join(missing)}。")
         if not oss_endpoint.lower().startswith("https://"):
             raise RuntimeError("LT_OSS_ENDPOINT 在 OSS 模式下必须使用 HTTPS。")
+    task_queue_job_timeout_seconds = max(
+        TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS,
+        _env_int(
+            "LT_TASK_QUEUE_JOB_TIMEOUT_SECONDS",
+            TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS,
+        ),
+    )
+    task_queue_crawl_job_timeout_seconds = max(
+        task_queue_job_timeout_seconds,
+        _env_int(
+            "LT_TASK_QUEUE_CRAWL_JOB_TIMEOUT_SECONDS",
+            TASK_QUEUE_CRAWL_JOB_TIMEOUT_DEFAULT_SECONDS,
+        ),
+    )
     return Settings(
         database_url=database_url,
         api_docs_enabled=_env_bool("LT_API_DOCS_ENABLED", False),
@@ -280,10 +296,8 @@ def build_settings() -> Settings:
         ),
         task_queue_listing_name=_env_text("LT_TASK_QUEUE_LISTING_NAME", f"{base_task_queue_name}-listing"),
         task_queue_schedule_name=_env_text("LT_TASK_QUEUE_SCHEDULE_NAME", f"{base_task_queue_name}-schedule"),
-        task_queue_job_timeout_seconds=max(
-            TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS,
-            _env_int("LT_TASK_QUEUE_JOB_TIMEOUT_SECONDS", TASK_QUEUE_JOB_TIMEOUT_DEFAULT_SECONDS),
-        ),
+        task_queue_job_timeout_seconds=task_queue_job_timeout_seconds,
+        task_queue_crawl_job_timeout_seconds=task_queue_crawl_job_timeout_seconds,
         task_queue_result_ttl_seconds=max(0, _env_int("LT_TASK_QUEUE_RESULT_TTL_SECONDS", 60 * 60)),
         task_queue_failure_ttl_seconds=max(60, _env_int("LT_TASK_QUEUE_FAILURE_TTL_SECONDS", 24 * 60 * 60)),
         task_queue_queued_requeue_limit=max(1, _env_int("LT_TASK_QUEUE_QUEUED_REQUEUE_LIMIT", 25)),
