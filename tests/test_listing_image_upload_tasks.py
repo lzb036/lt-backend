@@ -154,6 +154,50 @@ def test_cabinet_system_error_107_is_retried(monkeypatch) -> None:
     transient.close.assert_called_once()
 
 
+def test_cabinet_upstream_connection_error_is_retried(monkeypatch) -> None:
+    transient = Mock(
+        status_code=503,
+        text=(
+            "upstream connect error or disconnect/reset before headers. "
+            "reset reason: connection termination"
+        ),
+    )
+    success = Mock(
+        status_code=200,
+        text="<result><systemStatus>OK</systemStatus></result>",
+    )
+    transient.close.return_value = None
+    monkeypatch.setattr(crawler_service, "throttle_rakuten_cabinet_request", lambda *_args: None)
+    qps_limited = Mock()
+    monkeypatch.setattr(crawler_service, "mark_rakuten_cabinet_qps_limited", qps_limited)
+    monkeypatch.setattr(crawler_service.time, "sleep", lambda _seconds: None)
+    request = Mock(side_effect=[transient, success])
+    monkeypatch.setattr(crawler_service.requests, "request", request)
+
+    result = crawler_service.rakuten_cabinet_request("GET", "https://example.com")
+
+    assert result is success
+    assert request.call_count == 2
+    transient.close.assert_called_once()
+    qps_limited.assert_not_called()
+
+
+def test_cabinet_http_502_is_retried(monkeypatch) -> None:
+    transient = Mock(status_code=502, text="Bad Gateway")
+    success = Mock(status_code=200, text="<result><systemStatus>OK</systemStatus></result>")
+    transient.close.return_value = None
+    monkeypatch.setattr(crawler_service, "throttle_rakuten_cabinet_request", lambda *_args: None)
+    monkeypatch.setattr(crawler_service.time, "sleep", lambda _seconds: None)
+    request = Mock(side_effect=[transient, success])
+    monkeypatch.setattr(crawler_service.requests, "request", request)
+
+    result = crawler_service.rakuten_cabinet_request("GET", "https://example.com")
+
+    assert result is success
+    assert request.call_count == 2
+    transient.close.assert_called_once()
+
+
 def test_create_listing_image_upload_task_is_persisted_and_dispatched(
     monkeypatch,
     session_factory,

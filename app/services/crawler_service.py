@@ -17,6 +17,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 import time
 import threading
+from contextlib import contextmanager
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -230,9 +231,17 @@ RAKUTEN_SP_DESCRIPTION_DROP_TAGS = {
 RAKUTEN_CABINET_FOLDER_PAGE_SIZE = 100
 RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT = 500
 RAKUTEN_CABINET_FOLDER_CREATE_ATTEMPTS = 10
+RAKUTEN_CABINET_FOLDER_LOCK_TIMEOUT_SECONDS = 120
+RAKUTEN_CABINET_FOLDER_VISIBILITY_DELAYS_SECONDS = (1.0, 2.0, 3.0)
 RAKUTEN_CABINET_QPS_COOLDOWN_SECONDS = 5 * 60
 RAKUTEN_CABINET_REQUEST_MAX_RETRIES = 6
 RAKUTEN_CABINET_QPS_BACKOFF_SECONDS = (1.5, 3.0, 5.0, 8.0, 13.0)
+RAKUTEN_CABINET_RETRY_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+RAKUTEN_CABINET_UPSTREAM_ERROR_MARKERS = (
+    "upstream connect error",
+    "disconnect/reset before headers",
+    "connection termination",
+)
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
@@ -492,6 +501,7 @@ STORE_UNLISTED_PRODUCT_CLEANUP_LOCK = threading.Lock()
 DELETED_PRODUCT_IMAGE_CLEANUP_LOCK = threading.Lock()
 CRAWLER_REQUEST_LOCK = threading.Lock()
 RAKUTEN_CABINET_REQUEST_LOCK = threading.Lock()
+RAKUTEN_CABINET_FOLDER_CREATE_LOCK = threading.Lock()
 RAKUTEN_WRITE_REQUEST_LOCK = threading.Lock()
 RAKUTEN_ITEM_DELETE_REQUEST_LOCK = threading.Lock()
 CRAWLER_SESSION_LOCAL = threading.local()
@@ -5305,7 +5315,8 @@ def rakuten_cabinet_request(method: str, url: str, **kwargs: Any) -> requests.Re
             continue
         transient_error = rakuten_cabinet_transient_error(response)
         if transient_error:
-            mark_rakuten_cabinet_qps_limited(account_key)
+            if transient_error in {"QPSLimit", "SystemError(107)"}:
+                mark_rakuten_cabinet_qps_limited(account_key)
             if attempt >= attempts:
                 detail = normalize_text(response.text)[:500]
                 response.close()
@@ -5337,6 +5348,11 @@ def rakuten_cabinet_transient_error(response: requests.Response) -> str:
         return "QPSLimit"
     if "SystemError(107)" in text:
         return "SystemError(107)"
+    normalized_text = text.lower()
+    if any(marker in normalized_text for marker in RAKUTEN_CABINET_UPSTREAM_ERROR_MARKERS):
+        return "UpstreamConnectionError"
+    if int(getattr(response, "status_code", 0) or 0) in RAKUTEN_CABINET_RETRY_STATUS_CODES:
+        return f"HTTP {response.status_code}"
     return ""
 
 
@@ -5649,7 +5665,87 @@ def is_cabinet_same_folder_path_result(result: dict[str, Any]) -> bool:
     return result_code == "3015" or "same folder path" in message
 
 
+@contextmanager
+def rakuten_cabinet_folder_creation_lock(
+    service_secret: str,
+    license_key: str,
+) -> Iterator[None]:
+    local_acquired = RAKUTEN_CABINET_FOLDER_CREATE_LOCK.acquire(
+        timeout=RAKUTEN_CABINET_FOLDER_LOCK_TIMEOUT_SECONDS,
+    )
+    if not local_acquired:
+        raise RuntimeError("等待 R-Cabinet 文件夹创建锁超时，请稍后重试。")
+    distributed_lock = None
+    distributed_acquired = False
+    try:
+        if should_use_redis_task_queue():
+            account_key = rakuten_request_account_key(
+                {
+                    "Authorization": build_rakuten_authorization_header(
+                        service_secret,
+                        license_key,
+                    )
+                }
+            )
+            try:
+                distributed_lock = redis_connection().lock(
+                    f"lt:lock:cabinet-folder:{account_key}",
+                    timeout=RAKUTEN_CABINET_FOLDER_LOCK_TIMEOUT_SECONDS,
+                    blocking_timeout=RAKUTEN_CABINET_FOLDER_LOCK_TIMEOUT_SECONDS,
+                )
+                distributed_acquired = bool(distributed_lock.acquire(blocking=True))
+                if not distributed_acquired:
+                    raise RuntimeError("等待 R-Cabinet 店铺文件夹创建锁超时，请稍后重试。")
+            except RuntimeError:
+                raise
+            except Exception:
+                logger.warning("获取 R-Cabinet 文件夹分布式锁失败，使用本进程锁继续", exc_info=True)
+                distributed_lock = None
+        yield
+    finally:
+        if distributed_lock is not None and distributed_acquired:
+            try:
+                distributed_lock.release()
+            except Exception:
+                logger.warning("释放 R-Cabinet 文件夹分布式锁失败", exc_info=True)
+        RAKUTEN_CABINET_FOLDER_CREATE_LOCK.release()
+
+
+def wait_for_visible_listing_cabinet_folder(
+    service_secret: str,
+    license_key: str,
+    directory_name: str,
+    required_slots: int,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    folders: list[dict[str, Any]] = []
+    for delay_seconds in RAKUTEN_CABINET_FOLDER_VISIBILITY_DELAYS_SECONDS:
+        time.sleep(delay_seconds)
+        folders = fetch_rakuten_cabinet_folders(service_secret, license_key)
+        existing = find_listing_cabinet_folder_by_directory(folders, directory_name)
+        if existing and cabinet_folder_remaining_slots(existing) >= required_slots:
+            return prepare_listing_cabinet_folder(existing), folders
+    return None, folders
+
+
 def ensure_listing_cabinet_folder(
+    service_secret: str,
+    license_key: str,
+    store: StoreModel,
+    required_slots: int,
+    *,
+    usage: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    with rakuten_cabinet_folder_creation_lock(service_secret, license_key):
+        return ensure_listing_cabinet_folder_locked(
+            service_secret,
+            license_key,
+            store,
+            required_slots,
+            usage=usage,
+        )
+
+
+def ensure_listing_cabinet_folder_locked(
     service_secret: str,
     license_key: str,
     store: StoreModel,
@@ -5692,10 +5788,14 @@ def ensure_listing_cabinet_folder(
             return folder
         except CabinetFolderAlreadyExistsError as exc:
             last_error = exc
-            folders = fetch_rakuten_cabinet_folders(service_secret, license_key)
-            existing = find_listing_cabinet_folder_by_directory(folders, directory_name)
-            if existing and cabinet_folder_remaining_slots(existing) >= required_slots:
-                return prepare_listing_cabinet_folder(existing)
+            existing, folders = wait_for_visible_listing_cabinet_folder(
+                service_secret,
+                license_key,
+                directory_name,
+                required_slots,
+            )
+            if existing:
+                return existing
             continue
         except Exception as exc:
             last_error = exc

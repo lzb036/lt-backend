@@ -127,6 +127,7 @@ def test_concurrently_created_folder_is_reused(monkeypatch):
     freeze_now(monkeypatch, datetime(2026, 7, 30, 12, 0, 0))
     fetch_results = [
         [],
+        [],
         [
             {
                 "folderId": 88,
@@ -148,6 +149,7 @@ def test_concurrently_created_folder_is_reused(monkeypatch):
             crawler_service.CabinetFolderAlreadyExistsError("yx20260730-1")
         ),
     )
+    monkeypatch.setattr(crawler_service.time, "sleep", lambda _seconds: None)
 
     folder = crawler_service.ensure_listing_cabinet_folder(
         "secret",
@@ -159,6 +161,50 @@ def test_concurrently_created_folder_is_reused(monkeypatch):
 
     assert folder["folderId"] == 88
     assert folder["directoryName"] == "yx20260730-1"
+
+
+def test_folder_creation_uses_store_scoped_distributed_lock(monkeypatch):
+    events = []
+
+    class FakeLock:
+        def acquire(self, blocking=True):
+            events.append(("acquire", blocking))
+            return True
+
+        def release(self):
+            events.append(("release",))
+
+    class FakeRedis:
+        def lock(self, name, **kwargs):
+            events.append(("lock", name, kwargs))
+            return FakeLock()
+
+    monkeypatch.setattr(crawler_service, "should_use_redis_task_queue", lambda: True)
+    monkeypatch.setattr(crawler_service, "redis_connection", lambda: FakeRedis())
+    monkeypatch.setattr(
+        crawler_service,
+        "fetch_rakuten_cabinet_folders",
+        lambda *_: [
+            {
+                "folderId": 1,
+                "folderName": "YX20260730-1",
+                "directoryName": "yx20260730-1",
+                "fileCount": 1,
+            }
+        ],
+    )
+
+    folder = crawler_service.ensure_listing_cabinet_folder(
+        "secret",
+        "key",
+        SimpleNamespace(id=2, store_code="japaneden"),
+        1,
+    )
+
+    assert folder["folderId"] == 1
+    assert events[0][0] == "lock"
+    assert events[0][1].startswith("lt:lock:cabinet-folder:")
+    assert events[1:] == [("acquire", True), ("release",)]
 
 
 def test_product_images_fill_current_folder_before_switching(monkeypatch):
