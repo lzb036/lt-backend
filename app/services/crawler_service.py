@@ -21270,7 +21270,10 @@ def enrich_collected_item_with_detail(
         return fallback
     raw = detail.get("raw") if isinstance(detail.get("raw"), dict) else {}
     list_raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-    detail["raw"] = {**raw, "listPage": list_raw.get("pageUrl"), "detailCollected": True}
+    merged_raw = {**raw, "listPage": list_raw.get("pageUrl"), "detailCollected": True}
+    if "reviewCount" in list_raw:
+        merged_raw["reviewCount"] = list_raw.get("reviewCount")
+    detail["raw"] = merged_raw
     if not detail.get("price"):
         detail["price"] = item.get("price")
     if not detail.get("image_url"):

@@ -196,6 +196,33 @@ def test_whole_shop_execution_uses_review_filter_and_shared_listing_collector() 
     enrich.assert_called_once()
 
 
+def test_detail_enrichment_preserves_listing_review_count() -> None:
+    listing_item = {
+        "title": "商品一",
+        "source_url": "https://item.rakuten.co.jp/bellissima-km/item-1/",
+        "raw": {
+            "pageUrl": "https://search.rakuten.co.jp/search/mall/?sid=415734",
+            "reviewCount": 37,
+        },
+    }
+    detail_item = {
+        "title": "商品一详情",
+        "source_url": listing_item["source_url"],
+        "raw": {"sourceType": "rakuten_market_public"},
+    }
+
+    with (
+        patch.object(crawler_service, "collect_product_detail", return_value=detail_item),
+        patch.object(crawler_service, "raise_if_task_cancelled"),
+    ):
+        enriched = crawler_service.enrich_collected_item_with_detail(listing_item)
+
+    assert enriched["raw"]["sourceType"] == "rakuten_market_public"
+    assert enriched["raw"]["listPage"] == listing_item["raw"]["pageUrl"]
+    assert enriched["raw"]["reviewCount"] == 37
+    assert enriched["raw"]["detailCollected"] is True
+
+
 def test_large_whole_shop_collection_uses_price_partitions_and_deduplicates() -> None:
     partitions = [
         (2500, 3749, 4592),
