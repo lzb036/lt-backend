@@ -1371,6 +1371,7 @@ def product_to_public(
         "priceMax": price_max,
         "currency": row.currency,
         "salesCount": product_sales_count(raw_payload),
+        "reviewCount": getattr(row, "review_count", None),
         "periodSalesCount": period_sales_count,
         "titleOptimizationCount": title_optimization_count,
         "titleOptimizationTaskId": title_optimization_task_id,
@@ -1501,6 +1502,16 @@ def product_sales_count(raw_payload: dict[str, Any]) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def product_review_count(raw_payload: dict[str, Any]) -> int | None:
+    if "reviewCount" not in raw_payload:
+        return None
+    value = raw_payload.get("reviewCount")
+    try:
+        return max(0, int(float(str(value).replace(",", ""))))
+    except (TypeError, ValueError):
+        return None
 
 
 def product_detail_to_public(row: ProductModel) -> dict[str, Any]:
@@ -8944,6 +8955,8 @@ def list_products(
     collected_at_to: str | None = None,
     genre_status: str | None = None,
     genre_path: str | None = None,
+    review_filter: str | None = None,
+    sort: str | None = None,
     sales_period_days: int | None = None,
     sales_period_from: str | None = None,
     sales_period_to: str | None = None,
@@ -8969,11 +8982,31 @@ def list_products(
             raise ValueError("品类状态筛选条件无效")
         if (normalized_genre_status or normalized_genre_path) and product_status != "pending":
             raise ValueError("品类筛选仅支持待审核商品")
+        normalized_review_filter = normalize_text(review_filter).lower()
+        if normalized_review_filter not in {"", "has", "none", "unknown"}:
+            raise ValueError("评论状态筛选条件无效")
+        normalized_sort = normalize_text(sort).lower()
+        if normalized_sort not in {
+            "",
+            "default",
+            "price_asc",
+            "price_desc",
+            "review_count_desc",
+        }:
+            raise ValueError("商品排序条件无效")
         normalized_collection_source = normalize_text(collection_source).lower()
         if normalized_collection_source not in {"", "manual", "scheduled"}:
             raise ValueError("采集来源筛选条件无效")
         if normalized_collection_source and product_status not in {"pending", "approved"}:
             raise ValueError("采集来源筛选仅支持待审核或已审核商品")
+        if (
+            normalized_review_filter
+            or normalized_sort in {"price_asc", "price_desc", "review_count_desc"}
+        ) and not (
+            product_status == "pending"
+            and normalized_collection_source == "manual"
+        ):
+            raise ValueError("评论筛选和商品排序仅支持手动采集待审核商品")
         sales_period_range = (
             normalize_store_product_sales_range(
                 sales_period_days,
@@ -9046,6 +9079,12 @@ def list_products(
             query = query.where(ProductModel.price >= price_min)
         if price_max is not None:
             query = query.where(ProductModel.price <= price_max)
+        if normalized_review_filter == "has":
+            query = query.where(ProductModel.review_count > 0)
+        elif normalized_review_filter == "none":
+            query = query.where(ProductModel.review_count == 0)
+        elif normalized_review_filter == "unknown":
+            query = query.where(ProductModel.review_count.is_(None))
         if collected_at_from_value is not None:
             query = query.where(ProductModel.created_at >= collected_at_from_value)
         if collected_at_to_value is not None:
@@ -9116,7 +9155,7 @@ def list_products(
                         == listed_store_filter
                     )
                 )
-        order_by = product_list_order_by(product_status)
+        order_by = product_list_order_by(product_status, normalized_sort)
         if (
             product_status == "listed"
             and sales_period_range is not None
@@ -9670,7 +9709,28 @@ def product_matches_listed_store_filter(row: ProductModel, listed_store_filter: 
     return any(int(item.get("storeId") or 0) == listed_store_filter for item in listed_stores)
 
 
-def product_list_order_by(status: str | None) -> tuple[Any, ...]:
+def product_list_order_by(status: str | None, sort: str = "") -> tuple[Any, ...]:
+    if sort == "price_asc":
+        return (
+            ProductModel.price.is_(None).asc(),
+            ProductModel.price.asc(),
+            ProductModel.created_at.desc(),
+            ProductModel.id.desc(),
+        )
+    if sort == "price_desc":
+        return (
+            ProductModel.price.is_(None).asc(),
+            ProductModel.price.desc(),
+            ProductModel.created_at.desc(),
+            ProductModel.id.desc(),
+        )
+    if sort == "review_count_desc":
+        return (
+            ProductModel.review_count.is_(None).asc(),
+            ProductModel.review_count.desc(),
+            ProductModel.created_at.desc(),
+            ProductModel.id.desc(),
+        )
     if status == "listed":
         return (
             ProductModel.listed_at.is_(None).asc(),
@@ -23044,6 +23104,8 @@ def upsert_product(
         row.store_product_status = "active"
         row.store_last_seen_at = datetime.now()
     raw_payload = prepared.item.get("raw") or prepared.item
+    if isinstance(raw_payload, dict) and "reviewCount" in raw_payload:
+        row.review_count = product_review_count(raw_payload)
     row.listed_at = parse_rakuten_datetime_value(raw_payload.get("created") if isinstance(raw_payload, dict) else None) or row.listed_at
     row.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
     row.last_error = None

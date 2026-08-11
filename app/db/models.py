@@ -294,6 +294,20 @@ class ProductModel(TimestampMixin, Base):
         Index("ix_lt_product_owner_created", "owner_username", "created_at"),
         Index("ix_lt_product_owner_updated", "owner_username", "updated_at"),
         Index("ix_lt_product_owner_title", "owner_username", "title"),
+        Index(
+            "ix_lt_product_owner_status_source_price",
+            "owner_username",
+            "review_status",
+            "collection_source",
+            "price",
+        ),
+        Index(
+            "ix_lt_product_owner_status_source_review_count",
+            "owner_username",
+            "review_status",
+            "collection_source",
+            "review_count",
+        ),
         Index("ix_lt_product_store_status", "store_id", "store_product_status"),
         Index("ix_lt_product_store_listing_listed", "store_id", "review_status", "rakuten_listing_status", "listed_at"),
         Index("ix_lt_product_parent_status", "parent_product_id", "review_status"),
@@ -328,6 +342,7 @@ class ProductModel(TimestampMixin, Base):
     shop_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     image_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
     price: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    review_count: Mapped[int | None] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(16), nullable=False, default="JPY")
     genre_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     review_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")

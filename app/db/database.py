@@ -1108,6 +1108,23 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN listed_at DATETIME NULL"))
         if "store_last_seen_at" not in product_columns:
             connection.execute(text("ALTER TABLE lt_products ADD COLUMN store_last_seen_at DATETIME NULL"))
+        if "review_count" not in product_columns:
+            connection.execute(text("ALTER TABLE lt_products ADD COLUMN review_count INT NULL"))
+            connection.execute(
+                text(
+                    """
+                    UPDATE lt_products
+                    SET review_count = CAST(
+                        JSON_UNQUOTE(JSON_EXTRACT(raw_payload_json, '$.reviewCount'))
+                        AS UNSIGNED
+                    )
+                    WHERE JSON_VALID(raw_payload_json)
+                      AND JSON_CONTAINS_PATH(raw_payload_json, 'one', '$.reviewCount')
+                      AND JSON_UNQUOTE(JSON_EXTRACT(raw_payload_json, '$.reviewCount'))
+                          REGEXP '^[0-9]+$'
+                    """
+                )
+            )
 
         connection.execute(
             text(
@@ -1189,6 +1206,24 @@ def ensure_schema_compatibility() -> None:
             connection.execute(text("CREATE INDEX ix_lt_product_owner_created ON lt_products (owner_username, created_at)"))
         if "ix_lt_product_owner_updated" not in product_indexes:
             connection.execute(text("CREATE INDEX ix_lt_product_owner_updated ON lt_products (owner_username, updated_at)"))
+        if "ix_lt_product_owner_status_source_price" not in product_indexes:
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX ix_lt_product_owner_status_source_price
+                    ON lt_products (owner_username, review_status, collection_source, price)
+                    """
+                )
+            )
+        if "ix_lt_product_owner_status_source_review_count" not in product_indexes:
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX ix_lt_product_owner_status_source_review_count
+                    ON lt_products (owner_username, review_status, collection_source, review_count)
+                    """
+                )
+            )
         if "ix_lt_product_store_status" not in product_indexes:
             connection.execute(text("CREATE INDEX ix_lt_product_store_status ON lt_products (store_id, store_product_status)"))
         if "ix_lt_product_store_listing_listed" not in product_indexes:
