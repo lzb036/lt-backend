@@ -18,7 +18,6 @@ from app.db.models import (
     SystemSettingModel,
 )
 from app.services.sales_time import sales_now_naive
-from app.services.task_status_ordering import task_status_order_by
 
 
 GLOBAL_SETTINGS_KEY = "sales_order_sync_settings"
@@ -501,7 +500,10 @@ def list_runs(
         rows = session.scalars(
             select(SalesOrderSyncRunModel)
             .where(*filters)
-            .order_by(*task_status_order_by(SalesOrderSyncRunModel))
+            .order_by(
+                SalesOrderSyncRunModel.created_at.desc(),
+                SalesOrderSyncRunModel.id.desc(),
+            )
             .offset((page - 1) * page_size)
             .limit(page_size)
         ).all()

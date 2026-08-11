@@ -239,7 +239,7 @@ def test_list_runs_is_owner_scoped_and_server_paginated(
     assert result["total"] == 2
     assert result["page"] == 1
     assert result["pageSize"] == 1
-    assert [row["id"] for row in result["rows"]] == ["run-a-old"]
+    assert [row["id"] for row in result["rows"]] == ["run-a-new"]
     assert result["rows"][0]["storeAliasName"] == "Owner A Alias"
     assert result["rows"][0]["totalOrderCount"] == 2
 
