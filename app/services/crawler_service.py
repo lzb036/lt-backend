@@ -84,6 +84,7 @@ from app.services.sales_time import (
     iso_sales_datetime,
     sales_now_naive,
 )
+from app.services.task_status_ordering import task_status_order_by
 from app.services.user_service import account_crawl_price_rule, normalize_crawl_price_rule
 
 logger = logging.getLogger(__name__)
@@ -2919,12 +2920,13 @@ def list_auto_listing_schedules(
             query = query.where(AutoListingScheduleModel.task_type == normalized_task_type)
         rows = session.execute(
             query.order_by(
-                case(
-                    (AutoListingScheduleModel.task_type == "automatic", 0),
-                    else_=1,
-                ).asc(),
-                AutoListingScheduleModel.created_at.desc(),
-                AutoListingScheduleModel.id.desc(),
+                *task_status_order_by(
+                    AutoListingScheduleModel,
+                    disabled_condition=and_(
+                        AutoListingScheduleModel.task_type == "automatic",
+                        AutoListingScheduleModel.enabled.is_(False),
+                    ),
+                ),
             )
         ).all()
         return [
@@ -3197,7 +3199,17 @@ def list_auto_deletion_tasks(owner_username: str, *, store_id: int | None = None
             query = query.where(AutoDeletionTaskModel.store_id == store_id)
         if normalized_type:
             query = query.where(AutoDeletionTaskModel.task_type == normalized_type)
-        rows = session.execute(query.order_by(case((AutoDeletionTaskModel.task_type == "automatic", 0), else_=1), AutoDeletionTaskModel.created_at.desc(), AutoDeletionTaskModel.id.desc())).all()
+        rows = session.execute(
+            query.order_by(
+                *task_status_order_by(
+                    AutoDeletionTaskModel,
+                    disabled_condition=and_(
+                        AutoDeletionTaskModel.task_type == "automatic",
+                        AutoDeletionTaskModel.enabled.is_(False),
+                    ),
+                )
+            )
+        ).all()
         return [auto_deletion_task_to_public(row, store) for row, store in rows]
 
 
@@ -7170,7 +7182,10 @@ def list_tasks(
         return paginate_query(
             session,
             query,
-            order_by=CrawlTaskModel.created_at.desc(),
+            order_by=task_status_order_by(
+                CrawlTaskModel,
+                failure_condition=CrawlTaskModel.failed_count > 0,
+            ),
             page=page,
             page_size=page_size,
             response_key="tasks",
@@ -8133,7 +8148,7 @@ def list_deleted_product_image_cleanups(
         return paginate_query(
             session,
             query,
-            order_by=(DeletedProductImageCleanupModel.deleted_at.desc(), DeletedProductImageCleanupModel.id.desc()),
+            order_by=task_status_order_by(DeletedProductImageCleanupModel),
             page=page,
             page_size=page_size,
             response_key="records",
@@ -10343,7 +10358,7 @@ def list_sync_tasks(
         return paginate_query(
             session,
             query,
-            order_by=SyncTaskModel.created_at.desc(),
+            order_by=task_status_order_by(SyncTaskModel),
             page=page,
             page_size=page_size,
             response_key="syncTasks",
@@ -12656,7 +12671,10 @@ def list_scheduled_crawls(
         return paginate_query(
             session,
             query,
-            order_by=ScheduledCrawlModel.created_at.desc(),
+            order_by=task_status_order_by(
+                ScheduledCrawlModel,
+                disabled_condition=ScheduledCrawlModel.enabled.is_(False),
+            ),
             page=page,
             page_size=page_size,
             response_key="schedules",
@@ -19317,9 +19335,9 @@ def list_listing_tasks(
                 ListingTaskModel.id.in_(normalized_task_ids)
             )
         normalized_page, normalized_page_size = normalize_page_params(page, page_size)
-        order_by = ListingTaskModel.created_at.desc()
+        order_by = task_status_order_by(ListingTaskModel)
         if not normalized_page_size:
-            rows = session.scalars(query.order_by(order_by)).all()
+            rows = session.scalars(query.order_by(*order_by)).all()
             store_snapshots = listing_task_store_snapshots(session, rows)
             return [
                 listing_task_to_public(row, store_snapshots.get(row.store_id, listing_task_store_snapshot(None)))
@@ -19331,7 +19349,7 @@ def list_listing_tasks(
             max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
             normalized_page = min(normalized_page, max_page)
         rows = session.scalars(
-            query.order_by(order_by)
+            query.order_by(*order_by)
             .offset((normalized_page - 1) * normalized_page_size)
             .limit(normalized_page_size)
         ).all()

@@ -335,8 +335,8 @@ def test_manual_tasks_reject_repeated_active_store_and_allow_after_completion(
     )
 
     assert [task["taskType"] for task in all_tasks] == [
-        "automatic",
         "manual",
+        "automatic",
         "manual",
     ]
     assert {task["id"] for task in manual_tasks} == {
