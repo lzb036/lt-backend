@@ -816,7 +816,7 @@ def list_products(
     collectedAtTo: str | None = Query(default=None),
     genreStatus: str | None = Query(default=None, pattern="^(|missing|present)$"),
     genrePath: str | None = Query(default=None),
-    reviewFilter: str | None = Query(default=None, pattern="^(|has|none|unknown)$"),
+    reviewFilter: str | None = Query(default=None, pattern="^(|has|none)$"),
     sort: str | None = Query(
         default=None,
         pattern="^(|default|price_asc|price_desc|review_count_desc)$",

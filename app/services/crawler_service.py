@@ -1371,7 +1371,7 @@ def product_to_public(
         "priceMax": price_max,
         "currency": row.currency,
         "salesCount": product_sales_count(raw_payload),
-        "reviewCount": getattr(row, "review_count", None),
+        "reviewCount": int(getattr(row, "review_count", None) or 0),
         "periodSalesCount": period_sales_count,
         "titleOptimizationCount": title_optimization_count,
         "titleOptimizationTaskId": title_optimization_task_id,
@@ -8983,7 +8983,7 @@ def list_products(
         if (normalized_genre_status or normalized_genre_path) and product_status != "pending":
             raise ValueError("品类筛选仅支持待审核商品")
         normalized_review_filter = normalize_text(review_filter).lower()
-        if normalized_review_filter not in {"", "has", "none", "unknown"}:
+        if normalized_review_filter not in {"", "has", "none"}:
             raise ValueError("评论状态筛选条件无效")
         normalized_sort = normalize_text(sort).lower()
         if normalized_sort not in {
@@ -9082,9 +9082,12 @@ def list_products(
         if normalized_review_filter == "has":
             query = query.where(ProductModel.review_count > 0)
         elif normalized_review_filter == "none":
-            query = query.where(ProductModel.review_count == 0)
-        elif normalized_review_filter == "unknown":
-            query = query.where(ProductModel.review_count.is_(None))
+            query = query.where(
+                or_(
+                    ProductModel.review_count == 0,
+                    ProductModel.review_count.is_(None),
+                )
+            )
         if collected_at_from_value is not None:
             query = query.where(ProductModel.created_at >= collected_at_from_value)
         if collected_at_to_value is not None:
@@ -9726,8 +9729,7 @@ def product_list_order_by(status: str | None, sort: str = "") -> tuple[Any, ...]
         )
     if sort == "review_count_desc":
         return (
-            ProductModel.review_count.is_(None).asc(),
-            ProductModel.review_count.desc(),
+            func.coalesce(ProductModel.review_count, 0).desc(),
             ProductModel.created_at.desc(),
             ProductModel.id.desc(),
         )

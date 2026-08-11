@@ -96,12 +96,6 @@ def test_manual_pending_products_support_review_filters_and_sorting(monkeypatch)
         collection_source="manual",
         review_filter="none",
     )
-    unknown_reviews = crawler_service.list_products(
-        "alice",
-        status="pending",
-        collection_source="manual",
-        review_filter="unknown",
-    )
     price_ascending = crawler_service.list_products(
         "alice",
         status="pending",
@@ -122,9 +116,8 @@ def test_manual_pending_products_support_review_filters_and_sorting(monkeypatch)
     )
 
     assert {item["title"] for item in has_reviews} == {"Some reviews", "Many reviews"}
-    assert [item["title"] for item in no_reviews] == ["No reviews"]
-    assert [item["title"] for item in unknown_reviews] == ["Unknown reviews"]
-    assert [item["reviewCount"] for item in reviews_descending] == [20, 3, 0, None]
+    assert {item["title"] for item in no_reviews} == {"No reviews", "Unknown reviews"}
+    assert [item["reviewCount"] for item in reviews_descending] == [20, 3, 0, 0]
     assert [item["title"] for item in price_ascending] == [
         "Unknown reviews",
         "Some reviews",
@@ -160,6 +153,16 @@ def test_review_filters_and_sorting_are_scoped_to_manual_pending_products(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         crawler_service.list_products("alice", **kwargs)
+
+
+def test_unknown_review_filter_is_rejected() -> None:
+    with pytest.raises(ValueError, match="评论状态筛选条件无效"):
+        crawler_service.list_products(
+            "alice",
+            status="pending",
+            collection_source="manual",
+            review_filter="unknown",
+        )
 
 
 @pytest.mark.parametrize(
