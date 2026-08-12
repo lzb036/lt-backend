@@ -16,7 +16,7 @@ QUEUE_KIND_NAMES = {
     "sync": "task_queue_sync_name",
     "title-optimization": "task_queue_title_optimization_name",
     "image-cleanup": "task_queue_image_cleanup_name",
-    "listing-image-upload": "task_queue_listing_image_upload_name",
+    "listing-image-upload": "task_queue_listing_name",
     "listing": "task_queue_listing_name",
     "schedule": "task_queue_schedule_name",
 }
@@ -57,7 +57,6 @@ def all_task_queue_names() -> list[str]:
             settings.task_queue_listing_name,
             settings.task_queue_title_optimization_name,
             settings.task_queue_image_cleanup_name,
-            settings.task_queue_listing_image_upload_name,
             settings.task_queue_sync_name,
             settings.task_queue_manual_crawl_name,
             settings.task_queue_scheduled_crawl_name,
@@ -80,6 +79,8 @@ def resolve_worker_queue_names(queue_names: Iterable[str] | None = None) -> list
 
 def task_queue_job_timeout_for_name(queue_name: str | None = None) -> int:
     normalized_name = str(queue_name or settings.task_queue_name).strip()
+    if normalized_name == settings.task_queue_listing_name:
+        return -1
     crawl_queue_names = {
         task_queue_name_for_kind(kind)
         for kind in CRAWL_QUEUE_KINDS

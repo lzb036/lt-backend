@@ -818,7 +818,7 @@ def sync_task_queue_kind(task_type: str | None) -> str:
     if normalized_type in IMAGE_CLEANUP_TASK_TYPES:
         return "image-cleanup"
     if normalized_type in LISTING_IMAGE_UPLOAD_TASK_TYPES:
-        return "listing-image-upload"
+        return "listing"
     return "sync"
 
 

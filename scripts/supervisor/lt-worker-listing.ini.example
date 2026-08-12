@@ -1,0 +1,14 @@
+[program:lt-worker-listing]
+command=/www/wwwroot/lt/lt-backend/.venv/bin/python /www/wwwroot/lt/lt-backend/worker.py listing
+directory=/www/wwwroot/lt/lt-backend
+autorestart=true
+startsecs=3
+startretries=3
+stdout_logfile=/www/server/panel/plugin/supervisor/log/lt-worker-listing.out.log
+stderr_logfile=/www/server/panel/plugin/supervisor/log/lt-worker-listing.err.log
+stdout_logfile_maxbytes=2MB
+stderr_logfile_maxbytes=2MB
+user=www
+priority=999
+numprocs=5
+process_name=%(program_name)s_%(process_num)02d

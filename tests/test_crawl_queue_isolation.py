@@ -36,7 +36,7 @@ def test_crawl_queues_use_independent_long_job_timeout(monkeypatch) -> None:
         ) == 86400
     assert task_queue.task_queue_job_timeout_for_name(
         task_queue.task_queue_name_for_kind("listing")
-    ) == 10800
+    ) == -1
     assert task_queue.task_queue_job_timeout_for_name(
         task_queue.task_queue_name_for_kind("sync")
     ) == 10800
@@ -83,6 +83,28 @@ def test_enqueue_uses_crawl_specific_job_timeout(monkeypatch) -> None:
     assert captured["delayed"]["job_timeout"] == 86400
 
 
+def test_listing_queue_uses_infinite_job_timeout(monkeypatch) -> None:
+    captured = {}
+
+    class FakeJob:
+        id = "listing-job"
+
+    class FakeQueue:
+        def enqueue(self, *_args, **kwargs):
+            captured.update(kwargs)
+            return FakeJob()
+
+    monkeypatch.setattr(task_queue, "task_queue", lambda _queue_name=None: FakeQueue())
+
+    job_id = task_queue.enqueue_task(
+        lambda: None,
+        queue_name=task_queue.task_queue_name_for_kind("listing"),
+    )
+
+    assert job_id == "listing-job"
+    assert captured["job_timeout"] == -1
+
+
 def test_queue_health_distinguishes_manual_scheduled_and_legacy_crawl() -> None:
     labels = crawler_service.task_queue_health_kind_by_name()
     assert labels[crawler_service.settings.task_queue_manual_crawl_name] == "手动采集"
@@ -102,6 +124,16 @@ def test_supervisor_templates_keep_total_crawl_worker_count_at_three() -> None:
     assert "numprocs=2" in manual_template
     assert "worker.py scheduled-crawl" in scheduled_template
     assert "numprocs=1" in scheduled_template
+
+
+def test_supervisor_template_uses_five_unified_listing_workers() -> None:
+    listing_template = (
+        ROOT / "scripts/supervisor/lt-worker-listing.ini.example"
+    ).read_text(encoding="utf-8")
+
+    assert "worker.py listing" in listing_template
+    assert "numprocs=5" in listing_template
+    assert "listing-image-upload" not in listing_template
 
 
 def test_environment_example_documents_independent_limits_and_queues() -> None:

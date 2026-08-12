@@ -123,12 +123,13 @@ def seed_listing_products(session_factory):
         return int(store.id), int(source.id), int(listed.id)
 
 
-def test_listing_image_upload_uses_dedicated_queue() -> None:
-    assert crawler_service.sync_task_queue_kind("listing_image_upload") == "listing-image-upload"
-    assert task_queue.task_queue_name_for_kind("listing-image-upload") == (
-        crawler_service.settings.task_queue_listing_image_upload_name
-    )
-    assert crawler_service.settings.task_queue_listing_image_upload_name in task_queue.all_task_queue_names()
+def test_legacy_listing_image_upload_uses_unified_listing_queue() -> None:
+    listing_queue_name = crawler_service.settings.task_queue_listing_name
+
+    assert crawler_service.sync_task_queue_kind("listing_image_upload") == "listing"
+    assert task_queue.task_queue_name_for_kind("listing-image-upload") == listing_queue_name
+    assert task_queue.all_task_queue_names().count(listing_queue_name) == 1
+    assert "lt-tasks-listing-image-upload" not in task_queue.all_task_queue_names()
 
 
 def test_cabinet_system_error_107_is_retried(monkeypatch) -> None:
