@@ -7215,8 +7215,34 @@ def list_tasks(
 
 def crawl_task_status_filter(status: str) -> Any:
     normalized = normalize_text(status)
+    cancel_requested = func.coalesce(
+        CrawlTaskModel.error_detail,
+        "",
+    ).like(f"{TASK_CANCEL_REQUESTED_MARKER}%")
     if normalized in {"queued", "running"}:
-        return CrawlTaskModel.status == normalized
+        return and_(
+            CrawlTaskModel.status == normalized,
+            ~cancel_requested,
+        )
+    if normalized == "cancelling":
+        return and_(
+            CrawlTaskModel.status.in_(("queued", "running")),
+            cancel_requested,
+        )
+    if normalized == "skipped":
+        return and_(
+            CrawlTaskModel.status.notin_(("queued", "running", "cancelled")),
+            CrawlTaskModel.saved_count == 0,
+            CrawlTaskModel.skipped_count > 0,
+            CrawlTaskModel.failed_count == 0,
+        )
+    if normalized == "partial_saved":
+        return and_(
+            CrawlTaskModel.status.notin_(("queued", "running", "cancelled")),
+            CrawlTaskModel.saved_count > 0,
+            CrawlTaskModel.skipped_count > 0,
+            CrawlTaskModel.failed_count == 0,
+        )
     if normalized == "failed":
         return and_(
             CrawlTaskModel.status.notin_(("queued", "running", "cancelled")),
@@ -7232,8 +7258,12 @@ def crawl_task_status_filter(status: str) -> Any:
     if normalized == "success":
         return and_(
             CrawlTaskModel.status.notin_(("queued", "running", "cancelled")),
-            CrawlTaskModel.success_count > 0,
+            or_(
+                CrawlTaskModel.status == "success",
+                CrawlTaskModel.success_count > 0,
+            ),
             CrawlTaskModel.failed_count == 0,
+            CrawlTaskModel.skipped_count == 0,
         )
     return CrawlTaskModel.status == normalized
 

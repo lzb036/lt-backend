@@ -947,5 +947,128 @@ class CrawlTaskPendingProductDeletionTests(CrawlDispatchDatabaseTestCase):
                 )
 
 
+class CrawlTaskStatusFilterTests(CrawlDispatchDatabaseTestCase):
+    def test_display_status_filters_match_saved_and_skipped_counts(self):
+        with self.session_scope() as session:
+            session.add_all([
+                CrawlTaskModel(
+                    id="success",
+                    owner_username="owner",
+                    source_type="shop",
+                    target="success",
+                    mode="manual",
+                    status="success",
+                    total_count=2,
+                    success_count=2,
+                    failed_count=0,
+                    saved_count=2,
+                    skipped_count=0,
+                ),
+                CrawlTaskModel(
+                    id="empty-success",
+                    owner_username="owner",
+                    source_type="shop",
+                    target="empty-success",
+                    mode="manual",
+                    status="success",
+                    total_count=0,
+                    success_count=0,
+                    failed_count=0,
+                    saved_count=0,
+                    skipped_count=0,
+                ),
+                CrawlTaskModel(
+                    id="skipped",
+                    owner_username="owner",
+                    source_type="shop",
+                    target="skipped",
+                    mode="manual",
+                    status="success",
+                    total_count=2,
+                    success_count=2,
+                    failed_count=0,
+                    saved_count=0,
+                    skipped_count=2,
+                ),
+                CrawlTaskModel(
+                    id="partial-saved",
+                    owner_username="owner",
+                    source_type="shop",
+                    target="partial-saved",
+                    mode="scheduled",
+                    status="success",
+                    total_count=2,
+                    success_count=2,
+                    failed_count=0,
+                    saved_count=1,
+                    skipped_count=1,
+                ),
+                CrawlTaskModel(
+                    id="partial",
+                    owner_username="owner",
+                    source_type="shop",
+                    target="partial",
+                    mode="scheduled",
+                    status="partial",
+                    total_count=2,
+                    success_count=1,
+                    failed_count=1,
+                    saved_count=1,
+                    skipped_count=0,
+                ),
+                CrawlTaskModel(
+                    id="queued",
+                    owner_username="owner",
+                    source_type="shop",
+                    target="queued",
+                    mode="manual",
+                    status="queued",
+                ),
+                CrawlTaskModel(
+                    id="cancelling",
+                    owner_username="owner",
+                    source_type="shop",
+                    target="cancelling",
+                    mode="manual",
+                    status="queued",
+                    error_detail=crawler_service.TASK_CANCEL_REQUESTED_MARKER,
+                ),
+            ])
+
+        with patch.object(crawler_service, "session_scope", self.session_scope):
+            results = {
+                status: crawler_service.list_tasks(
+                    "owner",
+                    status=status,
+                    page=1,
+                    page_size=30,
+                )
+                for status in (
+                    "queued",
+                    "cancelling",
+                    "success",
+                    "skipped",
+                    "partial_saved",
+                    "partial",
+                )
+            }
+
+        self.assertEqual([row["id"] for row in results["queued"]["tasks"]], ["queued"])
+        self.assertEqual(
+            [row["id"] for row in results["cancelling"]["tasks"]],
+            ["cancelling"],
+        )
+        self.assertEqual(
+            {row["id"] for row in results["success"]["tasks"]},
+            {"success", "empty-success"},
+        )
+        self.assertEqual([row["id"] for row in results["skipped"]["tasks"]], ["skipped"])
+        self.assertEqual(
+            [row["id"] for row in results["partial_saved"]["tasks"]],
+            ["partial-saved"],
+        )
+        self.assertEqual([row["id"] for row in results["partial"]["tasks"]], ["partial"])
+
+
 if __name__ == "__main__":
     unittest.main()
