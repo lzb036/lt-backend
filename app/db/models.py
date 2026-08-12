@@ -82,6 +82,22 @@ class UserAccountModel(TimestampMixin, Base):
     password_iterations: Mapped[int] = mapped_column(Integer, nullable=False, default=240000, server_default="240000")
 
 
+class SystemMaintenanceSettingModel(TimestampMixin, Base):
+    __tablename__ = "lt_system_maintenance_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="系统维护中")
+    message: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="系统正在进行维护升级，请稍后再试。",
+    )
+    starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    estimated_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+
 class UserSecretProfileModel(TimestampMixin, Base):
     __tablename__ = "lt_user_secret_profiles"
 

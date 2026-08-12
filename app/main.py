@@ -10,14 +10,17 @@ from sqlalchemy import text
 
 from app.api.auth import router as auth_router
 from app.api.crawler import router as crawler_router
+from app.api.maintenance import router as maintenance_router
 from app.api.profile import router as profile_router
 from app.api.users import router as users_router
 from app.core.config import settings
-from app.core.auth import require_superadmin
+from app.core.auth import read_session_token, require_superadmin
 from app.db.database import SessionLocal, init_database
 from app.services import crawler_service
 from app.services.crawler_service import LOCAL_PRODUCT_IMAGE_DIR, LOCAL_PRODUCT_IMAGE_DRAFT_DIR, start_schedule_runner
+from app.services.maintenance_service import get_maintenance_status
 from app.services.product_image_storage import product_image_storage
+from app.services.user_service import require_existing_account
 
 DESIGNKIT_IMAGE_CORS_ORIGINS = {
     "https://designkit.cn",
@@ -58,6 +61,36 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(profile_router, prefix="/api")
 app.include_router(crawler_router, prefix="/api")
+app.include_router(maintenance_router, prefix="/api")
+
+
+MAINTENANCE_ALLOWED_API_PREFIXES = (
+    "/api/auth/",
+    "/api/health",
+    "/api/maintenance/status",
+)
+
+
+@app.middleware("http")
+async def enforce_system_maintenance(request: Request, call_next):
+    path = request.url.path
+    if (
+        request.method.upper() == "OPTIONS"
+        or not path.startswith("/api/")
+        or path.startswith(MAINTENANCE_ALLOWED_API_PREFIXES)
+    ):
+        return await call_next(request)
+    maintenance = get_maintenance_status()
+    if not maintenance["active"] or request_is_superadmin(request):
+        return await call_next(request)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "系统维护中，请稍后再试。",
+            "maintenance": maintenance,
+        },
+        headers={"Retry-After": "60"},
+    )
 
 
 @app.middleware("http")
@@ -100,6 +133,18 @@ def is_same_origin_browser_request(request: Request) -> bool:
             return False
         return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == expected_host
     return True
+
+
+def request_is_superadmin(request: Request) -> bool:
+    token = request.cookies.get(settings.session_cookie_name)
+    if not token:
+        return False
+    try:
+        payload = read_session_token(token)
+        user = require_existing_account(str(payload.get("sub") or ""))
+    except Exception:
+        return False
+    return user.get("role") == "superadmin"
 
 
 @app.api_route(
