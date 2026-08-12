@@ -133,8 +133,6 @@ class ListingProductAttemptResult:
     product_id: int
     success: bool
     error: str = ""
-    listed_product_id: int | None = None
-    image_completion_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -16404,27 +16402,16 @@ def create_store_product_on_rakuten(
     cabinet_context: dict[str, Any] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    original_raw_payload = product_raw_payload(product)
-    raw_payload = base_listing_raw_payload(original_raw_payload, store.store_code)
+    raw_payload = product_raw_payload(product)
     product._listing_store_id = store.id
     manage_number = generate_listing_manage_number(product, raw_payload)
     uploaded_product_images: list[dict[str, str]] = []
-    all_product_images = [
+    uploaded_description_images: list[dict[str, str]] = []
+    product_images = [
         image
         for image in recover_missing_local_product_images(product, product_images_for_edit(product))
         if not is_gif_image_url(image)
     ][:RAKUTEN_LISTING_IMAGE_LIMIT]
-    fast_image_limit = min(
-        RAKUTEN_LISTING_IMAGE_LIMIT,
-        max(1, int(settings.listing_creation_image_limit)),
-    )
-    fast_product_images = all_product_images[:fast_image_limit]
-    remaining_product_images = all_product_images[fast_image_limit:]
-    description_transfer_urls = listing_description_transfer_urls(
-        original_raw_payload,
-        store.store_code,
-    )
-    image_completion_required = bool(remaining_product_images or description_transfer_urls)
     item_write_started = False
     payload: dict[str, Any] = {}
     try:
@@ -16437,9 +16424,23 @@ def create_store_product_on_rakuten(
             product,
             manage_number,
             cabinet_context=cabinet_context,
-            source_images=fast_product_images,
+            source_images=product_images,
             cancel_check=cancel_check,
         )
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+        description_result = upload_product_description_images_to_rakuten(
+            service_secret,
+            license_key,
+            store,
+            product,
+            manage_number,
+            raw_payload,
+            cabinet_context=cabinet_context,
+            cancel_check=cancel_check,
+        )
+        raw_payload = description_result["rawPayload"]
+        uploaded_description_images = description_result["uploadedImages"]
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
         payload = build_rakuten_item_upsert_payload(
@@ -16447,7 +16448,7 @@ def create_store_product_on_rakuten(
             raw_payload,
             uploaded_product_images,
             manage_number=manage_number,
-            hide_item=False,
+            hide_item=True,
         )
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
@@ -16462,6 +16463,12 @@ def create_store_product_on_rakuten(
         bulk_upsert_rakuten_inventories(service_secret, license_key, inventory_payloads)
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+        patch_rakuten_item_visibility(
+            service_secret,
+            license_key,
+            manage_number,
+            hide_item=False,
+        )
         payload["hideItem"] = False
     except TaskCancelled:
         if item_write_started:
@@ -16469,7 +16476,11 @@ def create_store_product_on_rakuten(
                 delete_rakuten_item(service_secret, license_key, manage_number)
             except Exception:
                 pass
-        rollback_uploaded_listing_images(service_secret, license_key, uploaded_product_images)
+        rollback_uploaded_listing_images(
+            service_secret,
+            license_key,
+            [*uploaded_product_images, *uploaded_description_images],
+        )
         raise
     except Exception as exc:
         if item_write_started:
@@ -16477,7 +16488,11 @@ def create_store_product_on_rakuten(
                 delete_rakuten_item(service_secret, license_key, manage_number)
             except Exception:
                 pass
-        rollback_message = rollback_uploaded_listing_images(service_secret, license_key, uploaded_product_images)
+        rollback_message = rollback_uploaded_listing_images(
+            service_secret,
+            license_key,
+            [*uploaded_product_images, *uploaded_description_images],
+        )
         if rollback_message:
             raise RuntimeError(f"{exc}；已回滚本次上传图片：{rollback_message}") from exc
         raise
@@ -16487,7 +16502,7 @@ def create_store_product_on_rakuten(
     updated_payload["manageNumber"] = manage_number
     updated_payload["itemNumber"] = payload.get("itemNumber") or manage_number
     updated_payload["images"] = uploaded_product_images
-    updated_payload["descriptionImages"] = []
+    updated_payload["descriptionImages"] = uploaded_description_images
     updated_payload["ltEditedImages"] = [
         build_rakuten_cabinet_image_url(store.store_code, image["location"])
         for image in uploaded_product_images
@@ -16500,11 +16515,11 @@ def create_store_product_on_rakuten(
         "aliasName": store.alias_name,
     }
     updated_payload["listingImageCompletion"] = {
-        "status": "queued" if image_completion_required else "not_required",
-        "fastImageCount": len(uploaded_product_images),
-        "totalMainImageCount": len(all_product_images),
-        "remainingMainImageCount": len(remaining_product_images),
-        "descriptionImageCount": len(description_transfer_urls),
+        "status": "success",
+        "completedAt": now.isoformat(timespec="seconds"),
+        "totalMainImageCount": len(uploaded_product_images),
+        "remainingMainImageCount": 0,
+        "descriptionImageCount": len(uploaded_description_images),
     }
     updated_payload["created"] = updated_payload.get("created") or now.isoformat(timespec="seconds")
     updated_payload["updated"] = now.isoformat(timespec="seconds")
@@ -16514,7 +16529,6 @@ def create_store_product_on_rakuten(
         "payload": updated_payload,
         "price": price_from_rakuten_item(updated_payload),
         "imageUrl": build_rakuten_cabinet_image_url(store.store_code, uploaded_product_images[0]["location"]) if uploaded_product_images else product.image_url,
-        "imageCompletionRequired": image_completion_required,
     }
 
 
@@ -17259,22 +17273,6 @@ def upload_product_description_images_to_rakuten(
         return {"rawPayload": raw_payload, "uploadedImages": []}
     updated_payload = replace_product_description_image_urls(raw_payload, replacement_map)
     return {"rawPayload": updated_payload, "uploadedImages": uploaded_images}
-
-
-def listing_description_transfer_urls(raw_payload: dict[str, Any], store_code: str) -> list[str]:
-    return unique_texts([
-        url
-        for description in product_descriptions(raw_payload)
-        for url in description_image_urls(description.get("value"))
-        if should_transfer_description_image(url, store_code) and not is_gif_image_url(url)
-    ])
-
-
-def base_listing_raw_payload(raw_payload: dict[str, Any], store_code: str) -> dict[str, Any]:
-    description_urls = listing_description_transfer_urls(raw_payload, store_code)
-    if not description_urls:
-        return dict(raw_payload)
-    return remove_product_description_image_urls(dict(raw_payload), description_urls)
 
 
 def description_image_urls(html: Any) -> list[str]:
@@ -19614,12 +19612,7 @@ def run_listing_product_attempt(
             )
             session.flush()
             record_product_listed_store(product, listed_product, store, listing_result)
-            return ListingProductAttemptResult(
-                product_id=product_id,
-                success=True,
-                listed_product_id=int(listed_product.id),
-                image_completion_required=bool(listing_result.get("imageCompletionRequired")),
-            )
+            return ListingProductAttemptResult(product_id=product_id, success=True)
         except TaskCancelled:
             raise
         except Exception as exc:
@@ -19767,7 +19760,6 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             len(ordered_product_ids),
             retry=bool(retry_product_ids),
         )
-        image_completion_product_ids: list[int] = []
         cancellation_error: TaskCancelled | None = None
         with ThreadPoolExecutor(
             max_workers=worker_count,
@@ -19806,8 +19798,6 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     success_attempt_count += 1
                     success_product_ids.add(attempt.product_id)
                     failed_product_ids.discard(attempt.product_id)
-                    if attempt.image_completion_required and attempt.listed_product_id:
-                        image_completion_product_ids.append(int(attempt.listed_product_id))
                 else:
                     failed_attempt_count += 1
                     failed_product_ids.add(attempt.product_id)
@@ -19853,20 +19843,6 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     for pending_future in futures:
                         pending_future.cancel()
                     break
-        if image_completion_product_ids:
-            try:
-                create_listing_image_upload_task(
-                    owner_username,
-                    task_store_id,
-                    task_id,
-                    image_completion_product_ids,
-                )
-            except Exception:
-                logger.exception(
-                    "图片上传任务创建或派发失败 listing_task_id=%s store_id=%s",
-                    task_id,
-                    task_store_id,
-                )
         if cancellation_error is not None:
             raise cancellation_error
     raise_if_task_cancelled(ListingTaskModel, task_id)

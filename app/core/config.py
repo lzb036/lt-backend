@@ -83,7 +83,6 @@ class Settings(BaseModel):
     listing_product_workers: int = 6
     listing_retry_product_workers: int = 2
     listing_image_prepare_workers: int = 4
-    listing_creation_image_limit: int = 1
     rakuten_cabinet_request_min_interval_seconds: float = 0.8
     rakuten_cabinet_qps_cooldown_interval_seconds: float = 1.5
     crawler_browser_fallback_enabled: bool = False
@@ -232,7 +231,6 @@ def build_settings() -> Settings:
         listing_product_workers=max(1, _env_int("LT_LISTING_PRODUCT_WORKERS", 6)),
         listing_retry_product_workers=max(1, _env_int("LT_LISTING_RETRY_PRODUCT_WORKERS", 2)),
         listing_image_prepare_workers=max(1, _env_int("LT_LISTING_IMAGE_PREPARE_WORKERS", 4)),
-        listing_creation_image_limit=min(20, max(1, _env_int("LT_LISTING_CREATION_IMAGE_LIMIT", 1))),
         rakuten_cabinet_request_min_interval_seconds=max(
             0.0,
             float(_env_text("LT_RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS", "0.8") or "0"),
