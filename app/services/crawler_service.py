@@ -7747,7 +7747,11 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
         )
 
 
-def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:
+def cleanup_completed_scheduled_crawl_tasks(
+    *,
+    force: bool = False,
+    include_recent_terminal: bool = False,
+) -> int:
     if not SCHEDULED_CRAWL_TASK_CLEANUP_LOCK.acquire(blocking=False):
         return 0
     try:
@@ -7771,12 +7775,14 @@ def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:
                 ),
             )
             cleanup_cutoff = now - timedelta(days=retention_days)
-            rows = session.scalars(
-                select(CrawlTaskModel).where(
-                    CrawlTaskModel.mode == "scheduled",
-                    CrawlTaskModel.status.in_(
-                        ("success", "partial", "failed", "cancelled")
-                    ),
+            task_query = select(CrawlTaskModel).where(
+                CrawlTaskModel.mode == "scheduled",
+                CrawlTaskModel.status.in_(
+                    ("success", "partial", "failed", "cancelled")
+                ),
+            )
+            if not include_recent_terminal:
+                task_query = task_query.where(
                     func.coalesce(
                         CrawlTaskModel.finished_at,
                         CrawlTaskModel.updated_at,
@@ -7784,7 +7790,7 @@ def cleanup_completed_scheduled_crawl_tasks(*, force: bool = False) -> int:
                     )
                     <= cleanup_cutoff,
                 )
-            ).all()
+            rows = session.scalars(task_query).all()
             task_ids = [task.id for task in rows]
             if task_ids:
                 remove_crawl_queue_jobs_for_task_ids(set(task_ids))
@@ -7855,7 +7861,10 @@ def cleanup_completed_scheduled_crawl_tasks_if_due() -> int:
 
 
 def run_completed_scheduled_crawl_tasks_cleanup_now(*, include_queue_health: bool = True) -> dict[str, Any]:
-    cleanup_completed_scheduled_crawl_tasks(force=True)
+    cleanup_completed_scheduled_crawl_tasks(
+        force=True,
+        include_recent_terminal=True,
+    )
     return get_time_settings(include_queue_health=include_queue_health)
 
 

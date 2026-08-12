@@ -801,6 +801,61 @@ class ScheduledCrawlCleanupTests(CrawlDispatchDatabaseTestCase):
         self.assertIsNone(self.get_task("failed-old"))
         self.assertIsNotNone(self.get_task("manual-old"))
 
+    def test_manual_cleanup_deletes_all_terminal_scheduled_tasks(self):
+        now = datetime.now()
+        old = now - timedelta(days=8)
+        recent = now - timedelta(minutes=5)
+        for task_id, status, finished_at in (
+            ("queued-old", "queued", None),
+            ("running-old", "running", None),
+            ("success-recent", "success", recent),
+            ("partial-recent", "partial", recent),
+            ("failed-old", "failed", old),
+            ("cancelled-recent", "cancelled", recent),
+        ):
+            self.add_task(
+                task_id,
+                status=status,
+                created_at=old,
+                finished_at=finished_at,
+            )
+        self.add_task(
+            "manual-success",
+            status="success",
+            created_at=old,
+            finished_at=recent,
+            mode="manual",
+        )
+        remove_jobs = Mock(return_value=4)
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(
+                crawler_service,
+                "remove_crawl_queue_jobs_for_task_ids",
+                remove_jobs,
+            ),
+        ):
+            deleted = crawler_service.cleanup_completed_scheduled_crawl_tasks(
+                force=True,
+                include_recent_terminal=True,
+            )
+
+        self.assertEqual(deleted, 4)
+        remove_jobs.assert_called_once_with({
+            "success-recent",
+            "partial-recent",
+            "failed-old",
+            "cancelled-recent",
+        })
+        self.assertIsNotNone(self.get_task("queued-old"))
+        self.assertIsNotNone(self.get_task("running-old"))
+        self.assertIsNotNone(self.get_task("manual-success"))
+        self.assertIsNone(self.get_task("success-recent"))
+        self.assertIsNone(self.get_task("partial-recent"))
+        self.assertIsNone(self.get_task("failed-old"))
+        self.assertIsNone(self.get_task("cancelled-recent"))
+
 
 if __name__ == "__main__":
     unittest.main()
