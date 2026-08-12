@@ -7,7 +7,7 @@ from unittest.mock import patch
 from fastapi.routing import APIRoute
 
 from app.api import crawler as crawler_api
-from app.core.auth import require_authenticated_account, require_superadmin
+from app.core.auth import require_authenticated_account, require_permission, require_superadmin
 from app.services import crawler_service
 
 
@@ -47,6 +47,23 @@ class ResourceVisibilityTests(unittest.TestCase):
                 dependency_calls,
                 f"{method} {path} should allow authenticated users",
             )
+
+    def test_task_pending_product_delete_requires_products_permission(self) -> None:
+        route = next(
+            route
+            for route in crawler_api.router.routes
+            if isinstance(route, APIRoute)
+            and route.path == "/crawler/tasks/{task_id}/pending-products"
+            and "DELETE" in route.methods
+        )
+        products_dependency = require_permission("products.manage")
+        dependency_calls = [dependency.call for dependency in route.dependant.dependencies]
+
+        self.assertEqual(len(dependency_calls), 1)
+        self.assertEqual(
+            dependency_calls[0].__closure__[0].cell_contents,
+            products_dependency.__closure__[0].cell_contents,
+        )
 
     def test_superadmin_time_settings_include_queue_health(self) -> None:
         with patch.object(

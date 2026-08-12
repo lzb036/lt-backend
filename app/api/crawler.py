@@ -799,6 +799,20 @@ def delete_tasks(payload: TaskDeletePayload, user: dict = Depends(require_crawle
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.delete("/tasks/{task_id}/pending-products")
+def delete_task_pending_products(
+    task_id: str,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return crawler_service.delete_pending_products_for_crawl_task(
+            user["username"],
+            task_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/products")
 def list_products(
     status: str | None = Query(default=None),

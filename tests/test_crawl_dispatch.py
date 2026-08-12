@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.database import Base
-from app.db.models import CrawlTaskModel
+from app.db.models import CrawlTaskModel, ProductModel
 from app.services import crawler_service
 
 
@@ -855,6 +855,96 @@ class ScheduledCrawlCleanupTests(CrawlDispatchDatabaseTestCase):
         self.assertIsNone(self.get_task("partial-recent"))
         self.assertIsNone(self.get_task("failed-old"))
         self.assertIsNone(self.get_task("cancelled-recent"))
+
+
+class CrawlTaskPendingProductDeletionTests(CrawlDispatchDatabaseTestCase):
+    def test_deletes_only_pending_products_saved_by_selected_task(self):
+        self.add_task("selected-task", status="success", mode="manual")
+        self.add_task("other-task", status="success", mode="scheduled")
+        with self.session_scope() as session:
+            session.add_all([
+                ProductModel(
+                    owner_username="owner",
+                    task_id="selected-task",
+                    title="Pending selected",
+                    source_url="https://example.com/pending-selected",
+                    source_url_hash="pending-selected",
+                    item_number="pending-selected",
+                    review_status="pending",
+                ),
+                ProductModel(
+                    owner_username="owner",
+                    task_id="selected-task",
+                    title="Approved selected",
+                    source_url="https://example.com/approved-selected",
+                    source_url_hash="approved-selected",
+                    item_number="approved-selected",
+                    review_status="approved",
+                ),
+                ProductModel(
+                    owner_username="owner",
+                    task_id="other-task",
+                    title="Pending other",
+                    source_url="https://example.com/pending-other",
+                    source_url_hash="pending-other",
+                    item_number="pending-other",
+                    review_status="pending",
+                ),
+                ProductModel(
+                    owner_username="other-owner",
+                    task_id="selected-task",
+                    title="Pending other owner",
+                    source_url="https://example.com/pending-other-owner",
+                    source_url_hash="pending-other-owner",
+                    item_number="pending-other-owner",
+                    review_status="pending",
+                ),
+            ])
+
+        with patch.object(crawler_service, "session_scope", self.session_scope), patch.object(
+            crawler_service,
+            "cleanup_product_image_ids",
+        ) as cleanup_images:
+            result = crawler_service.delete_pending_products_for_crawl_task(
+                "owner",
+                "selected-task",
+            )
+
+        self.assertEqual(result["deletedCount"], 1)
+        cleanup_images.assert_called_once_with(result["deletedProductIds"])
+        with Session(self.engine, future=True) as session:
+            remaining = {
+                row.title
+                for row in session.scalars(select(ProductModel)).all()
+            }
+        self.assertEqual(
+            remaining,
+            {"Approved selected", "Pending other", "Pending other owner"},
+        )
+        self.assertIsNotNone(self.get_task("selected-task"))
+
+    def test_rejects_active_task(self):
+        self.add_task("running-task", status="running", mode="scheduled")
+
+        with patch.object(crawler_service, "session_scope", self.session_scope):
+            with self.assertRaisesRegex(RuntimeError, "不能删除商品"):
+                crawler_service.delete_pending_products_for_crawl_task(
+                    "owner",
+                    "running-task",
+                )
+
+    def test_rejects_product_replacement_task(self):
+        self.add_task("replacement-task", status="success", mode="manual")
+        with self.session_scope() as session:
+            task = session.get(CrawlTaskModel, "replacement-task")
+            task.source_type = "product_replace"
+
+        with patch.object(crawler_service, "session_scope", self.session_scope):
+            with self.assertRaisesRegex(RuntimeError, "商品替换任务"):
+                crawler_service.delete_pending_products_for_crawl_task(
+                    "owner",
+                    "replacement-task",
+                )
 
 
 if __name__ == "__main__":

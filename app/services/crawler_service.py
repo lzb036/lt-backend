@@ -7280,6 +7280,48 @@ def delete_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
         }
 
 
+def delete_pending_products_for_crawl_task(
+    owner_username: str,
+    task_id: str,
+) -> dict[str, Any]:
+    normalized_task_id = normalize_text(task_id)
+    if not normalized_task_id:
+        raise RuntimeError("采集任务不存在。")
+    deleted_ids: list[int] = []
+    with session_scope() as session:
+        task = session.scalar(
+            select(CrawlTaskModel).where(
+                CrawlTaskModel.id == normalized_task_id,
+                CrawlTaskModel.owner_username == owner_username,
+            )
+        )
+        if task is None:
+            raise RuntimeError("采集任务不存在或无权操作。")
+        if task.status in {"queued", "running"}:
+            raise RuntimeError("待执行或执行中的采集任务不能删除商品。")
+        if task.source_type == "product_replace":
+            raise RuntimeError("商品替换任务不能通过采集记录删除商品。")
+
+        rows = session.scalars(
+            select(ProductModel).where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.task_id == normalized_task_id,
+                ProductModel.review_status == "pending",
+            )
+        ).all()
+        deleted_ids = [int(row.id) for row in rows]
+        for row in rows:
+            session.delete(row)
+        session.flush()
+
+    cleanup_product_image_ids(deleted_ids)
+    return {
+        "taskId": normalized_task_id,
+        "deletedCount": len(deleted_ids),
+        "deletedProductIds": deleted_ids,
+    }
+
+
 def parse_subscription_userinfo(value: Any) -> dict[str, int]:
     parsed: dict[str, int] = {}
     key_map = {
