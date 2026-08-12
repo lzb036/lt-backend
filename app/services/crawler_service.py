@@ -16426,6 +16426,7 @@ def create_store_product_on_rakuten(
             cabinet_context=cabinet_context,
             source_images=product_images,
             cancel_check=cancel_check,
+            require_complete=True,
         )
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
@@ -16438,6 +16439,7 @@ def create_store_product_on_rakuten(
             raw_payload,
             cabinet_context=cabinet_context,
             cancel_check=cancel_check,
+            require_complete=True,
         )
         raw_payload = description_result["rawPayload"]
         uploaded_description_images = description_result["uploadedImages"]
@@ -17085,6 +17087,7 @@ def upload_product_images_to_rakuten(
     cancel_check: Callable[[], bool] | None = None,
     start_index: int = 1,
     before_upload: Callable[[], None] | None = None,
+    require_complete: bool = False,
 ) -> list[dict[str, str]]:
     images = [
         image for image in recover_missing_local_product_images(product, source_images or product_images_for_edit(product))
@@ -17097,6 +17100,11 @@ def upload_product_images_to_rakuten(
     image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
         prepared_images = prepare_rakuten_listing_images(images, cancel_check=cancel_check)
+        if require_complete and len(prepared_images) != len(images):
+            missing_count = len(images) - len(prepared_images)
+            raise RuntimeError(
+                f"商品主图未能完整读取（缺少 {missing_count} 张），已停止上架。"
+            )
         for index, image_data in enumerate(prepared_images, start=max(1, int(start_index or 1))):
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
@@ -17170,6 +17178,7 @@ def upload_product_description_images_to_rakuten(
     cabinet_context: dict[str, Any] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     before_upload: Callable[[], None] | None = None,
+    require_complete: bool = False,
 ) -> dict[str, Any]:
     description_items = product_descriptions(raw_payload)
     all_description_image_urls = unique_texts([
@@ -17196,6 +17205,11 @@ def upload_product_description_images_to_rakuten(
     image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
         prepared_images = prepare_rakuten_listing_images(image_urls, cancel_check=cancel_check)
+        if require_complete and len(prepared_images) != len(image_urls):
+            missing_count = len(image_urls) - len(prepared_images)
+            raise RuntimeError(
+                f"商品说明图未能完整读取（缺少 {missing_count} 张），已停止上架。"
+            )
         prepared_source_urls = {
             normalize_text(image_data.get("sourceUrl"))
             for image_data in prepared_images

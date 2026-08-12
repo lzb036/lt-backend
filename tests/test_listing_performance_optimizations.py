@@ -75,16 +75,22 @@ def install_direct_listing_mocks(
     monkeypatch.setattr(crawler_service, "generate_listing_manage_number", lambda *_args: "manage-1")
     def upload_main(*_args, **kwargs):
         calls.append(("main_images", list(kwargs.get("source_images") or [])))
+        calls.append(("main_require_complete", kwargs.get("require_complete")))
         return uploaded_main
 
     monkeypatch.setattr(crawler_service, "upload_product_images_to_rakuten", upload_main)
+    def upload_description(*_args, **kwargs):
+        calls.append(("description_images", None))
+        calls.append(("description_require_complete", kwargs.get("require_complete")))
+        return {
+            "rawPayload": {"variants": {}},
+            "uploadedImages": uploaded_description,
+        }
+
     monkeypatch.setattr(
         crawler_service,
         "upload_product_description_images_to_rakuten",
-        lambda *_args, **_kwargs: calls.append(("description_images", None)) or {
-            "rawPayload": {"variants": {}},
-            "uploadedImages": uploaded_description,
-        },
+        upload_description,
     )
 
     def build_payload(_product, _raw, images, *, manage_number, hide_item):
@@ -156,7 +162,9 @@ def test_listing_creates_hidden_complete_item_then_publishes(monkeypatch):
     assert [name for name, _payload in calls].count("inventory") == 1
     assert ("build", {"manageNumber": "manage-1", "hideItem": True}) in calls
     assert ("main_images", ["https://example.com/source.jpg"]) in calls
+    assert ("main_require_complete", True) in calls
     assert ("description_images", None) in calls
+    assert ("description_require_complete", True) in calls
     assert ("visibility", False) in calls
     assert result["payload"]["hideItem"] is False
     assert result["payload"]["listingImageCompletion"]["status"] == "success"
@@ -260,7 +268,7 @@ def test_listing_image_preparation_preserves_order_and_skips_unavailable(monkeyp
     assert [row["sourceUrl"] for row in prepared] == ["first", "second"]
 
 
-def test_listing_image_preparation_skips_read_failures_without_failing_product(monkeypatch):
+def test_listing_image_preparation_reports_read_failures_as_missing(monkeypatch):
     monkeypatch.setattr(
         crawler_service,
         "load_product_image_bytes",
@@ -285,6 +293,95 @@ def test_listing_image_preparation_skips_read_failures_without_failing_product(m
     )
 
     assert [row["sourceUrl"] for row in prepared] == ["first", "second"]
+
+
+def test_listing_main_image_upload_rejects_incomplete_preparation(monkeypatch):
+    product, store = listing_product_and_store()
+    monkeypatch.setattr(
+        crawler_service,
+        "recover_missing_local_product_images",
+        lambda _product, images: images,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "prepare_rakuten_listing_images",
+        lambda _images, **_kwargs: [
+            {
+                "sourceUrl": "https://example.com/first.jpg",
+                "content": b"image",
+                "suffix": ".jpg",
+                "contentType": "image/jpeg",
+            }
+        ],
+    )
+    rollback_calls = []
+    monkeypatch.setattr(
+        crawler_service,
+        "rollback_uploaded_listing_images",
+        lambda _secret, _key, images: rollback_calls.append(images) or "",
+    )
+
+    with pytest.raises(RuntimeError, match=r"商品主图未能完整读取（缺少 1 张）"):
+        crawler_service.upload_product_images_to_rakuten(
+            "secret",
+            "key",
+            store,
+            product,
+            "manage-1",
+            source_images=[
+                "https://example.com/first.jpg",
+                "https://example.com/missing.jpg",
+            ],
+            require_complete=True,
+        )
+
+    assert rollback_calls == [[]]
+
+
+def test_listing_description_image_upload_rejects_incomplete_preparation(monkeypatch):
+    product, store = listing_product_and_store()
+    raw_payload = {
+        "descriptions": [
+            {
+                "label": "PC用 商品説明文",
+                "value": (
+                    '<img src="https://example.com/first.jpg">'
+                    '<img src="https://example.com/missing.jpg">'
+                ),
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        crawler_service,
+        "prepare_rakuten_listing_images",
+        lambda _images, **_kwargs: [
+            {
+                "sourceUrl": "https://example.com/first.jpg",
+                "content": b"image",
+                "suffix": ".jpg",
+                "contentType": "image/jpeg",
+            }
+        ],
+    )
+    rollback_calls = []
+    monkeypatch.setattr(
+        crawler_service,
+        "rollback_uploaded_listing_images",
+        lambda _secret, _key, images: rollback_calls.append(images) or "",
+    )
+
+    with pytest.raises(RuntimeError, match=r"商品说明图未能完整读取（缺少 1 张）"):
+        crawler_service.upload_product_description_images_to_rakuten(
+            "secret",
+            "key",
+            store,
+            product,
+            "manage-1",
+            raw_payload,
+            require_complete=True,
+        )
+
+    assert rollback_calls == [[]]
 
 
 def test_listing_task_limit_remains_fifty():
