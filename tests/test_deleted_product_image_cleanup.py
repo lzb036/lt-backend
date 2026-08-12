@@ -126,6 +126,43 @@ def test_deleted_image_cleanup_tasks_chunk_and_remove_successful_records(monkeyp
         assert session.get(DeletedProductImageCleanupModel, cleanup_ids[0]) is None
 
 
+def test_deleted_image_cleanup_requeues_cancelled_records(monkeypatch, session_factory):
+    install_session_scope(monkeypatch, session_factory)
+    store_id = seed_owner_store(session_factory)
+    with session_factory() as session:
+        session.add(
+            DeletedProductImageCleanupModel(
+                owner_username="alice",
+                store_id=store_id,
+                store_name="Shop",
+                original_product_id=1999,
+                product_code="cancelled-product",
+                status="cancelled",
+                last_error="管理员已停止全部任务。",
+            )
+        )
+        session.commit()
+
+    with session_factory() as session:
+        task_refs, product_count = crawler_service.create_deleted_product_image_cleanup_tasks(
+            session,
+            datetime(2026, 8, 12, 21, 0, 0),
+            owner_username="alice",
+        )
+        session.commit()
+        record = session.scalar(
+            select(DeletedProductImageCleanupModel).where(
+                DeletedProductImageCleanupModel.owner_username == "alice"
+            )
+        )
+
+    assert product_count == 1
+    assert len(task_refs) == 1
+    assert record.status == "queued"
+    assert record.sync_task_id == task_refs[0][1]
+    assert record.last_error is None
+
+
 def test_time_settings_include_deleted_image_cleanup_pending_count(monkeypatch, session_factory):
     install_session_scope(monkeypatch, session_factory)
     store_id = seed_owner_store(session_factory)

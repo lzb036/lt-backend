@@ -8213,7 +8213,7 @@ def create_deleted_product_image_cleanup_tasks(
             row.sync_task_id = None
             row.last_error = "上次图片清理任务未完成，已重新进入待清理队列。"
     pending_query = select(DeletedProductImageCleanupModel).where(
-        DeletedProductImageCleanupModel.status.in_(("pending", "failed"))
+        DeletedProductImageCleanupModel.status.in_(("pending", "failed", "cancelled"))
     )
     if owner_username is not None:
         pending_query = pending_query.where(
