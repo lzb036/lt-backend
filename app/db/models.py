@@ -98,6 +98,29 @@ class SystemMaintenanceSettingModel(TimestampMixin, Base):
     updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
 
+class SystemTaskControlModel(TimestampMixin, Base):
+    __tablename__ = "lt_system_task_control"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    phase: Mapped[str] = mapped_column(String(32), nullable=False, default="running", server_default="running")
+    operation_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    stopped_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    resumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    resumed_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    snapshot_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="{}",
+    )
+    last_result_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="{}",
+    )
+
+
 class UserSecretProfileModel(TimestampMixin, Base):
     __tablename__ = "lt_user_secret_profiles"
 

@@ -87,3 +87,21 @@ def normalized_local_datetime(value: datetime | None) -> datetime | None:
     if value is None or value.tzinfo is None:
         return value
     return value.astimezone().replace(tzinfo=None)
+
+
+def get_task_control_status() -> dict[str, Any]:
+    from app.services.task_control_service import get_task_control_status as get_status
+
+    return get_status()
+
+
+def stop_all_tasks(*, operated_by: str) -> dict[str, Any]:
+    from app.services.task_control_service import stop_all_tasks as stop_tasks
+
+    return stop_tasks(operated_by=operated_by)
+
+
+def resume_all_tasks(*, operated_by: str) -> dict[str, Any]:
+    from app.services.task_control_service import resume_all_tasks as resume_tasks
+
+    return resume_tasks(operated_by=operated_by)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -15,7 +16,7 @@ from app.core.auth import require_superadmin
 from app.db.database import Base
 from app.db.models import SystemMaintenanceSettingModel
 from app.main import enforce_system_maintenance
-from app.services import maintenance_service
+from app.services import maintenance_service, task_control_service
 
 
 def test_maintenance_routes_and_permissions() -> None:
@@ -28,8 +29,17 @@ def test_maintenance_routes_and_permissions() -> None:
     assert ("GET", "/maintenance/status") in routes
     assert ("GET", "/maintenance/settings") in routes
     assert ("PUT", "/maintenance/settings") in routes
+    assert ("GET", "/maintenance/task-control") in routes
+    assert ("POST", "/maintenance/task-control/stop-all") in routes
+    assert ("POST", "/maintenance/task-control/resume-all") in routes
     assert not routes[("GET", "/maintenance/status")].dependant.dependencies
-    for key in [("GET", "/maintenance/settings"), ("PUT", "/maintenance/settings")]:
+    for key in [
+        ("GET", "/maintenance/settings"),
+        ("PUT", "/maintenance/settings"),
+        ("GET", "/maintenance/task-control"),
+        ("POST", "/maintenance/task-control/stop-all"),
+        ("POST", "/maintenance/task-control/resume-all"),
+    ]:
         dependency_calls = [dependency.call for dependency in routes[key].dependant.dependencies]
         assert require_superadmin in dependency_calls
 
@@ -158,6 +168,167 @@ def test_maintenance_status_endpoint_is_always_available() -> None:
 
     assert response.status_code == 200
     get_status.assert_not_called()
+
+
+def test_task_control_status_defaults_to_running() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+    with patch.object(task_control_service, "SessionLocal", test_session):
+        status = task_control_service.get_task_control_status()
+
+    assert status["paused"] is False
+    assert status["activeTotal"] == 0
+    assert status["resumableCount"] == 0
+
+
+def test_stop_all_tasks_snapshots_and_cancels_active_rows() -> None:
+    from app.db.models import CrawlTaskModel, ListingTaskModel, SyncTaskModel
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with test_session() as session:
+        session.add_all(
+            [
+                CrawlTaskModel(
+                    id="crawl-active",
+                    owner_username="alice",
+                    source_type="keyword",
+                    target="test",
+                    mode="manual",
+                    status="queued",
+                    message="等待执行",
+                ),
+                ListingTaskModel(
+                    id="listing-active",
+                    owner_username="alice",
+                    status="running",
+                    product_ids_json="[]",
+                    message="执行中",
+                ),
+                SyncTaskModel(
+                    id="sync-active",
+                    owner_username="alice",
+                    task_type="store_sync",
+                    payload_json="{}",
+                    status="queued",
+                    message="等待执行",
+                ),
+                SyncTaskModel(
+                    id="sync-old-cancelled",
+                    owner_username="alice",
+                    task_type="store_sync",
+                    payload_json="{}",
+                    status="cancelled",
+                    message="历史取消",
+                ),
+            ]
+        )
+        session.commit()
+
+    with (
+        patch.object(task_control_service, "SessionLocal", test_session),
+        patch.object(task_control_service, "_stop_snapshot_rq_jobs", return_value={"queued": 3, "deferred": 0, "scheduled": 0, "started": 0}),
+        patch("app.services.crawler_service.release_listing_task_locks"),
+    ):
+        status = task_control_service.stop_all_tasks(operated_by="superadmin")
+
+    with test_session() as session:
+        crawl = session.get(CrawlTaskModel, "crawl-active")
+        listing = session.get(ListingTaskModel, "listing-active")
+        sync = session.get(SyncTaskModel, "sync-active")
+        historical = session.get(SyncTaskModel, "sync-old-cancelled")
+
+    assert status["paused"] is True
+    assert status["phase"] == "paused"
+    assert status["activeTotal"] == 0
+    assert status["resumableCount"] == 3
+    assert crawl is not None and crawl.status == "cancelled"
+    assert listing is not None and listing.status == "cancelled"
+    assert sync is not None and sync.status == "cancelled"
+    assert historical is not None and historical.message == "历史取消"
+
+
+def test_resume_all_only_uses_current_stop_snapshot() -> None:
+    from app.db.models import CrawlTaskModel, SystemTaskControlModel
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    snapshot = {
+        "tasks": {
+            "crawl": [
+                {
+                    "id": "crawl-paused",
+                    "ownerUsername": "alice",
+                    "status": "queued",
+                }
+            ],
+            "listing": [],
+            "sync": [],
+            "salesOrderSync": [],
+            "imageCleanupRecords": [],
+        },
+        "schedules": {
+            "scheduledCrawls": [],
+            "autoListing": [],
+            "autoDeletion": [],
+        },
+    }
+    with test_session() as session:
+        session.add(
+            CrawlTaskModel(
+                id="crawl-paused",
+                owner_username="alice",
+                source_type="keyword",
+                target="test",
+                mode="manual",
+                status="cancelled",
+                message=task_control_service.TASK_CONTROL_STOP_MESSAGE,
+            )
+        )
+        session.add(
+            CrawlTaskModel(
+                id="crawl-historical",
+                owner_username="alice",
+                source_type="keyword",
+                target="old",
+                mode="manual",
+                status="cancelled",
+                message="历史取消",
+            )
+        )
+        session.add(
+            SystemTaskControlModel(
+                id=task_control_service.TASK_CONTROL_ROW_ID,
+                paused=True,
+                phase="paused",
+                operation_id="operation",
+                snapshot_json=json.dumps(snapshot),
+                last_result_json="{}",
+            )
+        )
+        session.commit()
+
+    with (
+        patch.object(task_control_service, "SessionLocal", test_session),
+        patch("app.services.crawler_service.dispatch_queued_crawl_tasks_safely"),
+        patch("app.services.crawler_service.dispatch_next_listing_task_safely"),
+        patch("app.services.crawler_service.dispatch_next_sync_task_safely"),
+    ):
+        status = task_control_service.resume_all_tasks(operated_by="superadmin")
+
+    with test_session() as session:
+        resumed = session.get(CrawlTaskModel, "crawl-paused")
+        historical = session.get(CrawlTaskModel, "crawl-historical")
+
+    assert status["paused"] is False
+    assert status["phase"] == "running"
+    assert status["resumableCount"] == 0
+    assert resumed is not None and resumed.status == "queued"
+    assert historical is not None and historical.status == "cancelled"
 
 
 def build_request(path: str) -> Request:

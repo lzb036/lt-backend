@@ -56,3 +56,26 @@ def update_maintenance_settings(
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"maintenance": maintenance}
+
+
+@router.get("/task-control")
+def get_task_control(_: dict = Depends(require_superadmin)) -> dict:
+    return {"taskControl": maintenance_service.get_task_control_status()}
+
+
+@router.post("/task-control/stop-all")
+def stop_all_tasks(user: dict = Depends(require_superadmin)) -> dict:
+    return {
+        "taskControl": maintenance_service.stop_all_tasks(
+            operated_by=user["username"],
+        )
+    }
+
+
+@router.post("/task-control/resume-all")
+def resume_all_tasks(user: dict = Depends(require_superadmin)) -> dict:
+    return {
+        "taskControl": maintenance_service.resume_all_tasks(
+            operated_by=user["username"],
+        )
+    }
