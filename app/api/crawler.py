@@ -1509,7 +1509,7 @@ def list_stores(
         target_username,
         page=page,
         page_size=pageSize,
-        reveal=user.get("role") == "superadmin",
+        reveal=True,
     )
     if isinstance(result, dict):
         return result
@@ -1580,7 +1580,7 @@ def verify_store(
             "store": crawler_service.verify_store(
                 target_username,
                 store_id,
-                reveal=user.get("role") == "superadmin",
+                reveal=True,
             )
         }
     except RuntimeError as exc:

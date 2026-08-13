@@ -36,7 +36,7 @@ def test_superadmin_store_list_reveals_credentials() -> None:
     )
 
 
-def test_operator_store_list_keeps_credentials_hidden() -> None:
+def test_operator_store_list_reveals_own_credentials() -> None:
     with patch.object(
         crawler_api.crawler_service,
         "list_stores",
@@ -56,7 +56,7 @@ def test_operator_store_list_keeps_credentials_hidden() -> None:
         "operator",
         page=1,
         page_size=30,
-        reveal=False,
+        reveal=True,
     )
 
 
@@ -90,7 +90,7 @@ def test_superadmin_single_store_verify_reveals_credentials() -> None:
     )
 
 
-def test_operator_single_store_verify_keeps_credentials_hidden() -> None:
+def test_operator_single_store_verify_reveals_own_credentials() -> None:
     with patch.object(
         crawler_api.crawler_service,
         "verify_store",
@@ -109,5 +109,5 @@ def test_operator_single_store_verify_keeps_credentials_hidden() -> None:
     verify_store.assert_called_once_with(
         "operator",
         7,
-        reveal=False,
+        reveal=True,
     )
