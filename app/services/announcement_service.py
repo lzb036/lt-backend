@@ -46,7 +46,9 @@ DEFAULT_MANUAL_ANNOUNCEMENT_CONTENT = (
     "商品采集系统使用手册已发布，可通过下方链接查看完整操作说明。"
 )
 DEFAULT_MANUAL_ANNOUNCEMENT_LINK_LABEL = "查看使用手册"
-DEFAULT_MANUAL_ANNOUNCEMENT_LINK_URL = "/help/operator-manual"
+DEFAULT_MANUAL_ANNOUNCEMENT_LINK_URL = (
+    "/docs/product-collection-system-manual.pdf?v=20260720-2220"
+)
 
 
 def list_announcements(
@@ -443,13 +445,32 @@ def normalize_payload(
 
 def ensure_default_manual_announcement(session: Any) -> bool:
     existing = session.execute(
-        select(SystemAnnouncementModel.id).where(
+        select(SystemAnnouncementModel).where(
             SystemAnnouncementModel.created_by
             == DEFAULT_MANUAL_ANNOUNCEMENT_CREATED_BY
         )
     ).scalar_one_or_none()
     if existing is not None:
-        return False
+        changed = False
+        expected_values = {
+            "title": DEFAULT_MANUAL_ANNOUNCEMENT_TITLE,
+            "content": DEFAULT_MANUAL_ANNOUNCEMENT_CONTENT,
+            "link_label": DEFAULT_MANUAL_ANNOUNCEMENT_LINK_LABEL,
+            "link_url": DEFAULT_MANUAL_ANNOUNCEMENT_LINK_URL,
+            "published": True,
+            "updated_by": DEFAULT_MANUAL_ANNOUNCEMENT_CREATED_BY,
+        }
+        for field, value in expected_values.items():
+            if getattr(existing, field) != value:
+                setattr(existing, field, value)
+                changed = True
+        if changed:
+            session.execute(
+                delete(SystemAnnouncementReadModel).where(
+                    SystemAnnouncementReadModel.announcement_id == existing.id
+                )
+            )
+        return changed
     session.add(
         SystemAnnouncementModel(
             title=DEFAULT_MANUAL_ANNOUNCEMENT_TITLE,

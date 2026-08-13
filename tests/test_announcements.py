@@ -7,11 +7,11 @@ from unittest.mock import patch
 import pytest
 from PIL import Image
 from fastapi import UploadFile
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import UserAccountModel
+from app.db.models import SystemAnnouncementModel, UserAccountModel
 from app.services import announcement_service
 
 
@@ -210,4 +210,30 @@ def test_default_manual_announcement_is_seeded_once(
     assert len(announcements) == 1
     assert announcements[0]["title"] == "商品采集系统使用手册"
     assert announcements[0]["linkLabel"] == "查看使用手册"
-    assert announcements[0]["linkUrl"] == "/help/operator-manual"
+    assert announcements[0]["linkUrl"].startswith(
+        "/docs/product-collection-system-manual.pdf"
+    )
+
+
+def test_default_manual_announcement_updates_existing_system_record(
+    announcement_database,
+) -> None:
+    factory, _image_dir = announcement_database
+    with factory() as session:
+        announcement_service.ensure_default_manual_announcement(session)
+        session.commit()
+        row = session.scalar(
+            select(SystemAnnouncementModel).where(
+                SystemAnnouncementModel.created_by
+                == announcement_service.DEFAULT_MANUAL_ANNOUNCEMENT_CREATED_BY
+            )
+        )
+        assert row is not None
+        row.link_url = "/help/operator-manual"
+        session.commit()
+
+        assert announcement_service.ensure_default_manual_announcement(session)
+        session.commit()
+        assert row.link_url.startswith(
+            "/docs/product-collection-system-manual.pdf"
+        )
