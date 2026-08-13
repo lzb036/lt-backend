@@ -46,6 +46,10 @@ class AnnouncementReadPayload(BaseModel):
     announcementIds: list[int] = Field(default_factory=list, max_length=100)
 
 
+class TaskControlStopPayload(BaseModel):
+    usernames: list[str] = Field(min_length=1, max_length=500)
+
+
 @router.get("/status")
 def get_maintenance_status() -> dict:
     return {"maintenance": maintenance_service.get_maintenance_status()}
@@ -207,10 +211,14 @@ def get_task_control(_: dict = Depends(require_superadmin)) -> dict:
 
 
 @router.post("/task-control/stop-all")
-def stop_all_tasks(user: dict = Depends(require_superadmin)) -> dict:
+def stop_all_tasks(
+    payload: TaskControlStopPayload,
+    user: dict = Depends(require_superadmin),
+) -> dict:
     return {
         "taskControl": maintenance_service.stop_all_tasks(
             operated_by=user["username"],
+            usernames=payload.usernames,
         )
     }
 

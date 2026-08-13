@@ -107,7 +107,14 @@ def enqueue_task(
     job_id: str | None = None,
     description: str = "",
     queue_name: str | None = None,
+    owner_username: str | None = None,
 ) -> str:
+    from app.services.task_control_service import ensure_task_dispatch_allowed
+
+    if owner_username:
+        ensure_task_dispatch_allowed(owner_username)
+    else:
+        ensure_task_dispatch_allowed()
     job_timeout = task_queue_job_timeout_for_name(queue_name)
     job = task_queue(queue_name).enqueue(
         func,
@@ -117,6 +124,7 @@ def enqueue_task(
         result_ttl=settings.task_queue_result_ttl_seconds,
         failure_ttl=settings.task_queue_failure_ttl_seconds,
         description=description or None,
+        meta={"ownerUsername": owner_username} if owner_username else None,
     )
     return job.id
 
@@ -128,7 +136,14 @@ def enqueue_task_in(
     job_id: str | None = None,
     description: str = "",
     queue_name: str | None = None,
+    owner_username: str | None = None,
 ) -> str:
+    from app.services.task_control_service import ensure_task_dispatch_allowed
+
+    if owner_username:
+        ensure_task_dispatch_allowed(owner_username)
+    else:
+        ensure_task_dispatch_allowed()
     job_timeout = task_queue_job_timeout_for_name(queue_name)
     job = task_queue(queue_name).enqueue_in(
         timedelta(seconds=max(0.0, float(delay_seconds or 0))),
@@ -139,6 +154,7 @@ def enqueue_task_in(
         result_ttl=settings.task_queue_result_ttl_seconds,
         failure_ttl=settings.task_queue_failure_ttl_seconds,
         description=description or None,
+        meta={"ownerUsername": owner_username} if owner_username else None,
     )
     return job.id
 

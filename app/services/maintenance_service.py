@@ -95,10 +95,14 @@ def get_task_control_status() -> dict[str, Any]:
     return get_status()
 
 
-def stop_all_tasks(*, operated_by: str) -> dict[str, Any]:
+def stop_all_tasks(
+    *,
+    operated_by: str,
+    usernames: list[str],
+) -> dict[str, Any]:
     from app.services.task_control_service import stop_all_tasks as stop_tasks
 
-    return stop_tasks(operated_by=operated_by)
+    return stop_tasks(operated_by=operated_by, usernames=usernames)
 
 
 def resume_all_tasks(*, operated_by: str) -> dict[str, Any]:

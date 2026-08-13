@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.core import task_queue
 from app.services import crawler_service
 
@@ -64,6 +66,10 @@ def test_enqueue_uses_crawl_specific_job_timeout(monkeypatch) -> None:
         86400,
     )
     monkeypatch.setattr(task_queue, "task_queue", lambda _queue_name=None: FakeQueue())
+    monkeypatch.setattr(
+        "app.services.task_control_service.ensure_task_dispatch_allowed",
+        lambda: None,
+    )
 
     job_id = task_queue.enqueue_task(
         lambda: None,
@@ -95,6 +101,10 @@ def test_listing_queue_uses_infinite_job_timeout(monkeypatch) -> None:
             return FakeJob()
 
     monkeypatch.setattr(task_queue, "task_queue", lambda _queue_name=None: FakeQueue())
+    monkeypatch.setattr(
+        "app.services.task_control_service.ensure_task_dispatch_allowed",
+        lambda: None,
+    )
 
     job_id = task_queue.enqueue_task(
         lambda: None,
@@ -103,6 +113,27 @@ def test_listing_queue_uses_infinite_job_timeout(monkeypatch) -> None:
 
     assert job_id == "listing-job"
     assert captured["job_timeout"] == -1
+
+
+def test_enqueue_is_rejected_by_global_task_control(monkeypatch) -> None:
+    called = False
+
+    class FakeQueue:
+        def enqueue(self, *_args, **_kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("paused task must not reach Redis")
+
+    monkeypatch.setattr(task_queue, "task_queue", lambda _queue_name=None: FakeQueue())
+    monkeypatch.setattr(
+        "app.services.task_control_service.ensure_task_dispatch_allowed",
+        lambda: (_ for _ in ()).throw(RuntimeError("任务调度已暂停")),
+    )
+
+    with pytest.raises(RuntimeError, match="任务调度已暂停"):
+        task_queue.enqueue_task(lambda: None)
+
+    assert called is False
 
 
 def test_queue_health_distinguishes_manual_scheduled_and_legacy_crawl() -> None:

@@ -16,9 +16,21 @@ from app.api import maintenance as maintenance_api
 from app.core.auth import require_authenticated_account, require_superadmin
 from app.core.config import settings
 from app.db.database import Base
-from app.db.models import SystemMaintenanceSettingModel
+from app.db.models import SystemMaintenanceSettingModel, UserAccountModel
 from app.main import enforce_system_maintenance, request_is_maintenance_bypass_user
 from app.services import maintenance_service, task_control_service
+
+
+def task_control_user(username: str) -> UserAccountModel:
+    return UserAccountModel(
+        username=username,
+        display_name=username,
+        role="operator",
+        enabled=True,
+        password_salt_b64="salt",
+        password_hash_b64="hash",
+        password_iterations=1,
+    )
 
 
 def test_maintenance_routes_and_permissions() -> None:
@@ -232,6 +244,7 @@ def test_stop_all_tasks_snapshots_and_cancels_active_rows() -> None:
     Base.metadata.create_all(engine)
     test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
     with test_session() as session:
+        session.add(task_control_user("alice"))
         session.add_all(
             [
                 CrawlTaskModel(
@@ -272,10 +285,52 @@ def test_stop_all_tasks_snapshots_and_cancels_active_rows() -> None:
 
     with (
         patch.object(task_control_service, "SessionLocal", test_session),
-        patch.object(task_control_service, "_stop_snapshot_rq_jobs", return_value={"queued": 3, "deferred": 0, "scheduled": 0, "started": 0}),
+        patch.object(
+            task_control_service,
+            "_stop_all_managed_rq_jobs",
+            side_effect=[
+                {
+                    "counts": {
+                        "queued": 3,
+                        "deferred": 0,
+                        "scheduled": 0,
+                        "started": 0,
+                    },
+                    "errors": [],
+                },
+                {
+                    "counts": {
+                        "queued": 0,
+                        "deferred": 0,
+                        "scheduled": 0,
+                        "started": 0,
+                    },
+                    "errors": [],
+                },
+            ],
+        ),
+        patch.object(
+            task_control_service,
+            "_deployment_quiescence",
+            return_value={
+                "quiet": True,
+                "databaseActive": 0,
+                "queue": {
+                    "queued": 0,
+                    "deferred": 0,
+                    "scheduled": 0,
+                    "started": 0,
+                },
+                "errors": [],
+            },
+        ),
+        patch.object(task_control_service.time, "sleep"),
         patch("app.services.crawler_service.release_listing_task_locks"),
     ):
-        status = task_control_service.stop_all_tasks(operated_by="superadmin")
+        status = task_control_service.stop_all_tasks(
+            operated_by="superadmin",
+            usernames=["alice"],
+        )
 
     with test_session() as session:
         crawl = session.get(CrawlTaskModel, "crawl-active")
@@ -285,6 +340,7 @@ def test_stop_all_tasks_snapshots_and_cancels_active_rows() -> None:
 
     assert status["paused"] is True
     assert status["phase"] == "paused"
+    assert status["deploySafe"] is True
     assert status["activeTotal"] == 0
     assert status["resumableCount"] == 3
     assert crawl is not None and crawl.status == "cancelled"
@@ -349,7 +405,12 @@ def test_resume_all_only_uses_current_stop_snapshot() -> None:
                 phase="paused",
                 operation_id="operation",
                 snapshot_json=json.dumps(snapshot),
-                last_result_json="{}",
+                last_result_json=json.dumps(
+                    {
+                        "action": "stop",
+                        "deploySafe": True,
+                    }
+                ),
             )
         )
         session.commit()
@@ -371,6 +432,354 @@ def test_resume_all_only_uses_current_stop_snapshot() -> None:
     assert status["resumableCount"] == 0
     assert resumed is not None and resumed.status == "queued"
     assert historical is not None and historical.status == "cancelled"
+
+
+def test_stop_all_tasks_is_not_deploy_safe_when_jobs_remain() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with test_session() as session:
+        session.add(task_control_user("alice"))
+        session.commit()
+
+    with (
+        patch.object(task_control_service, "SessionLocal", test_session),
+        patch.object(
+            task_control_service,
+            "_stop_all_managed_rq_jobs",
+            return_value={
+                "counts": {
+                    "queued": 0,
+                    "deferred": 0,
+                    "scheduled": 0,
+                    "started": 1,
+                },
+                "errors": [],
+            },
+        ),
+        patch.object(
+            task_control_service,
+            "_deployment_quiescence",
+            return_value={
+                "quiet": False,
+                "databaseActive": 0,
+                "queue": {
+                    "queued": 0,
+                    "deferred": 0,
+                    "scheduled": 0,
+                    "started": 1,
+                },
+                "errors": [],
+            },
+        ),
+        patch.object(
+            task_control_service.time,
+            "monotonic",
+            side_effect=[0.0, 121.0],
+        ),
+        patch.object(task_control_service.time, "sleep"),
+        patch("app.services.crawler_service.release_listing_task_locks"),
+    ):
+        status = task_control_service.stop_all_tasks(
+            operated_by="superadmin",
+            usernames=["alice"],
+        )
+
+    assert status["paused"] is True
+    assert status["phase"] == "stop_failed"
+    assert status["deploySafe"] is False
+    assert status["lastResult"]["quiescence"]["queue"]["started"] == 1
+    assert status["lastResult"]["errors"]
+
+
+def test_resume_all_rejects_unconfirmed_stop() -> None:
+    from app.db.models import SystemTaskControlModel
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with test_session() as session:
+        session.add(task_control_user("alice"))
+        session.add(
+            SystemTaskControlModel(
+                id=task_control_service.TASK_CONTROL_ROW_ID,
+                paused=True,
+                phase="stop_failed",
+                operation_id="operation",
+                snapshot_json=json.dumps(
+                    {
+                        "selectedUsernames": ["alice"],
+                        "tasks": {},
+                        "schedules": {},
+                    }
+                ),
+                last_result_json=json.dumps(
+                    {
+                        "action": "stop",
+                        "deploySafe": False,
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    with patch.object(task_control_service, "SessionLocal", test_session):
+        with pytest.raises(RuntimeError, match="尚未确认完全停止"):
+            task_control_service.resume_all_tasks(
+                operated_by="superadmin"
+            )
+
+
+def test_duplicate_stop_request_does_not_start_second_stop_loop() -> None:
+    from app.db.models import SystemTaskControlModel
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with test_session() as session:
+        session.add(task_control_user("alice"))
+        session.add(
+            SystemTaskControlModel(
+                id=task_control_service.TASK_CONTROL_ROW_ID,
+                paused=True,
+                phase="stopping",
+                operation_id="operation",
+                snapshot_json=json.dumps(
+                    {
+                        "selectedUsernames": ["alice"],
+                        "tasks": {},
+                        "schedules": {},
+                    }
+                ),
+                last_result_json="{}",
+            )
+        )
+        session.commit()
+
+    with (
+        patch.object(task_control_service, "SessionLocal", test_session),
+        patch.object(task_control_service, "_stop_all_managed_rq_jobs") as stop_jobs,
+    ):
+        status = task_control_service.stop_all_tasks(
+            operated_by="superadmin",
+            usernames=["alice"],
+        )
+
+    assert status["phase"] == "stopping"
+    stop_jobs.assert_not_called()
+
+
+def test_stop_and_resume_covers_tasks_from_multiple_users() -> None:
+    from app.db.models import CrawlTaskModel
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with test_session() as session:
+        session.add_all(
+            [task_control_user("alice"), task_control_user("bob")]
+        )
+        session.add_all(
+            [
+                CrawlTaskModel(
+                    id="alice-task",
+                    owner_username="alice",
+                    source_type="keyword",
+                    target="alice",
+                    mode="manual",
+                    status="queued",
+                    message="等待执行",
+                ),
+                CrawlTaskModel(
+                    id="bob-task",
+                    owner_username="bob",
+                    source_type="keyword",
+                    target="bob",
+                    mode="manual",
+                    status="running",
+                    message="执行中",
+                ),
+            ]
+        )
+        session.commit()
+
+    quiet = {
+        "quiet": True,
+        "databaseActive": 0,
+        "queue": {
+            "queued": 0,
+            "deferred": 0,
+            "scheduled": 0,
+            "started": 0,
+        },
+        "errors": [],
+    }
+    with (
+        patch.object(task_control_service, "SessionLocal", test_session),
+        patch.object(
+            task_control_service,
+            "_stop_all_managed_rq_jobs",
+            return_value={
+                "counts": {
+                    "queued": 0,
+                    "deferred": 0,
+                    "scheduled": 0,
+                    "started": 0,
+                },
+                "errors": [],
+            },
+        ),
+        patch.object(
+            task_control_service,
+            "_deployment_quiescence",
+            return_value=quiet,
+        ),
+        patch.object(task_control_service.time, "sleep"),
+        patch("app.services.crawler_service.release_listing_task_locks"),
+        patch("app.services.crawler_service.dispatch_queued_crawl_tasks"),
+        patch("app.services.crawler_service.dispatch_next_listing_task"),
+        patch("app.services.crawler_service.dispatch_next_sync_task"),
+    ):
+        stopped = task_control_service.stop_all_tasks(
+            operated_by="superadmin",
+            usernames=["alice", "bob"],
+        )
+        resumed = task_control_service.resume_all_tasks(
+            operated_by="superadmin"
+        )
+
+    with test_session() as session:
+        alice = session.get(CrawlTaskModel, "alice-task")
+        bob = session.get(CrawlTaskModel, "bob-task")
+
+    assert stopped["resumableCount"] == 2
+    assert stopped["deploySafe"] is True
+    assert resumed["paused"] is False
+    assert resumed["lastResult"]["counts"]["crawl"] == 2
+    assert alice is not None and alice.status == "queued"
+    assert bob is not None and bob.status == "queued"
+
+
+def test_stop_selected_user_leaves_other_user_running() -> None:
+    from app.db.models import CrawlTaskModel
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with test_session() as session:
+        session.add_all(
+            [task_control_user("alice"), task_control_user("bob")]
+        )
+        session.add_all(
+            [
+                CrawlTaskModel(
+                    id="alice-selected",
+                    owner_username="alice",
+                    source_type="keyword",
+                    target="alice",
+                    mode="manual",
+                    status="running",
+                    message="执行中",
+                ),
+                CrawlTaskModel(
+                    id="bob-unselected",
+                    owner_username="bob",
+                    source_type="keyword",
+                    target="bob",
+                    mode="manual",
+                    status="running",
+                    message="执行中",
+                ),
+            ]
+        )
+        session.commit()
+
+    quiet = {
+        "quiet": True,
+        "databaseActive": 0,
+        "queue": {
+            "queued": 0,
+            "deferred": 0,
+            "scheduled": 0,
+            "started": 0,
+        },
+        "errors": [],
+    }
+    with (
+        patch.object(task_control_service, "SessionLocal", test_session),
+        patch.object(
+            task_control_service,
+            "_stop_all_managed_rq_jobs",
+            return_value={
+                "counts": {
+                    "queued": 0,
+                    "deferred": 0,
+                    "scheduled": 0,
+                    "started": 0,
+                },
+                "errors": [],
+            },
+        ),
+        patch.object(
+            task_control_service,
+            "_deployment_quiescence",
+            return_value=quiet,
+        ),
+        patch.object(task_control_service.time, "sleep"),
+        patch("app.services.crawler_service.release_listing_task_locks"),
+    ):
+        status = task_control_service.stop_all_tasks(
+            operated_by="superadmin",
+            usernames=["alice"],
+        )
+
+    with test_session() as session:
+        alice = session.get(CrawlTaskModel, "alice-selected")
+        bob = session.get(CrawlTaskModel, "bob-unselected")
+
+    assert status["selectedUsernames"] == ["alice"]
+    assert status["selectionLocked"] is True
+    assert status["resumableCount"] == 1
+    assert alice is not None and alice.status == "cancelled"
+    assert bob is not None and bob.status == "running"
+
+
+def test_active_operation_rejects_different_user_selection() -> None:
+    from app.db.models import SystemTaskControlModel
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with test_session() as session:
+        session.add_all(
+            [task_control_user("alice"), task_control_user("bob")]
+        )
+        session.add(
+            SystemTaskControlModel(
+                id=task_control_service.TASK_CONTROL_ROW_ID,
+                paused=True,
+                phase="paused",
+                operation_id="operation",
+                snapshot_json=json.dumps(
+                    {
+                        "selectedUsernames": ["alice"],
+                        "tasks": {},
+                        "schedules": {},
+                    }
+                ),
+                last_result_json=json.dumps(
+                    {"action": "stop", "deploySafe": True}
+                ),
+            )
+        )
+        session.commit()
+
+    with patch.object(task_control_service, "SessionLocal", test_session):
+        with pytest.raises(RuntimeError, match="请先恢复本次停止"):
+            task_control_service.stop_all_tasks(
+                operated_by="superadmin",
+                usernames=["bob"],
+            )
 
 
 def build_request(path: str) -> Request:

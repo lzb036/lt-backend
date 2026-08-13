@@ -104,17 +104,33 @@ WHOLE_SHOP_PARTITION_TARGET_ITEMS = 5000
 WHOLE_SHOP_PARTITION_MAX_STEPS = 32
 
 
-def system_task_dispatch_paused() -> bool:
+def system_task_dispatch_paused(
+    owner_username: str | None = None,
+) -> bool:
+    return (
+        str(owner_username or "").strip()
+        in system_task_paused_usernames()
+    )
+
+
+def system_task_paused_usernames() -> set[str]:
     from app.db.models import SystemTaskControlModel
     from app.services.task_control_service import TASK_CONTROL_ROW_ID
 
     with session_scope() as session:
         row = session.get(SystemTaskControlModel, TASK_CONTROL_ROW_ID)
-        return bool(row.paused) if row is not None else False
+        if row is None or not row.paused:
+            return set()
+        snapshot = parse_json_object(row.snapshot_json)
+    return {
+        str(username or "").strip()
+        for username in snapshot.get("selectedUsernames", [])
+        if str(username or "").strip()
+    }
 
 
-def ensure_system_task_dispatch_allowed() -> None:
-    if system_task_dispatch_paused():
+def ensure_system_task_dispatch_allowed(owner_username: str) -> None:
+    if system_task_dispatch_paused(owner_username):
         raise RuntimeError("系统维护期间任务调度已暂停，请等待超级管理员恢复。")
 
 
@@ -530,6 +546,7 @@ SCHEDULE_RUNNER_HEALTH: dict[str, Any] = {
     "lastError": "",
     "consecutiveFailures": 0,
 }
+SCHEDULE_RUNNER_ACTIVE = False
 SCHEDULE_RUNNER_REDIS_LOCK_NAME = "lt:schedule-runner:tick"
 DRAFT_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
 ORPHAN_IMAGE_CLEANUP_LAST_RUN_AT = 0.0
@@ -639,6 +656,18 @@ def crawl_task_queue_kind_for_id(task_id: str) -> str:
     return crawl_task_queue_kind(mode)
 
 
+def crawl_task_owner_for_id(task_id: str) -> str:
+    with session_scope() as session:
+        return str(
+            session.scalar(
+                select(CrawlTaskModel.owner_username).where(
+                    CrawlTaskModel.id == task_id
+                )
+            )
+            or ""
+        )
+
+
 def dispatch_crawl_task(
     task_id: str,
     *,
@@ -647,6 +676,7 @@ def dispatch_crawl_task(
     queue_kind: str | None = None,
     mark_failed_on_error: bool = True,
 ) -> None:
+    owner_username = crawl_task_owner_for_id(task_id)
     if should_use_redis_task_queue():
         try:
             resolved_queue_kind = queue_kind or crawl_task_queue_kind_for_id(task_id)
@@ -661,6 +691,7 @@ def dispatch_crawl_task(
                 job_id=job_id,
                 description=f"采集任务 {task_id}",
                 queue_name=task_queue_name_for_kind(resolved_queue_kind),
+                owner_username=owner_username,
             )
         except Exception as exc:
             if mark_failed_on_error:
@@ -687,6 +718,7 @@ def reserve_queued_crawl_tasks(
     session: Any,
     owner_username: str | None = None,
 ) -> list[tuple[str, str, str]]:
+    paused_owners = system_task_paused_usernames()
     reservations: list[tuple[str, str, str]] = []
     for task_mode in ("manual", "scheduled"):
         mode_filter = crawl_task_mode_filter(task_mode)
@@ -706,6 +738,8 @@ def reserve_queued_crawl_tasks(
             owner_query = owner_query.where(CrawlTaskModel.owner_username == owner_username)
         owners = [str(row.owner_username) for row in session.execute(owner_query)]
         for task_owner in owners:
+            if task_owner in paused_owners:
+                continue
             running_count = int(
                 session.scalar(
                     select(func.count()).where(
@@ -760,7 +794,7 @@ def reserve_queued_crawl_tasks(
 
 
 def dispatch_queued_crawl_tasks(owner_username: str | None = None) -> int:
-    if system_task_dispatch_paused():
+    if owner_username and system_task_dispatch_paused(owner_username):
         return 0
     if not should_use_redis_task_queue():
         return 0
@@ -857,6 +891,7 @@ def dispatch_sync_task(
                 *enqueue_args,
                 description=f"{sync_task_type_label(resolved_task_type)} {task_id}",
                 queue_name=task_queue_name_for_kind(queue_kind),
+                owner_username=owner_username,
             )
         except Exception as exc:
             mark_background_task_dispatch_failed(SyncTaskModel, task_id, exc)
@@ -883,8 +918,6 @@ def sync_task_has_active_background_job(task_id: str, task_type: str | None = No
 
 
 def dispatch_next_sync_task() -> None:
-    if system_task_dispatch_paused():
-        return
     next_task: tuple[str, str, str] | None = None
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步")
@@ -900,6 +933,8 @@ def dispatch_next_sync_task() -> None:
             .order_by(SyncTaskModel.created_at.asc(), SyncTaskModel.id.asc())
         ).all()
         for task in rows:
+            if system_task_dispatch_paused(task.owner_username):
+                continue
             if task_cancel_requested(task):
                 task.status = "cancelled"
                 task.message = TASK_CANCELLED_MESSAGE
@@ -933,6 +968,7 @@ def dispatch_listing_task(owner_username: str, task_id: str, *, delay_seconds: f
                 *enqueue_args,
                 description=f"上架任务 {task_id}",
                 queue_name=task_queue_name_for_kind("listing"),
+                owner_username=owner_username,
             )
         except Exception as exc:
             mark_background_task_dispatch_failed(ListingTaskModel, task_id, exc)
@@ -960,8 +996,6 @@ def listing_task_store_ids(task: ListingTaskModel) -> list[int]:
 
 
 def dispatch_next_listing_task() -> None:
-    if system_task_dispatch_paused():
-        return
     next_tasks: list[tuple[str, str]] = []
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架")
@@ -1014,6 +1048,8 @@ def dispatch_next_listing_task() -> None:
         for task in queued_rows:
             if available_slots <= 0:
                 break
+            if system_task_dispatch_paused(task.owner_username):
+                continue
             if task_cancel_requested(task):
                 release_listing_task_locks(session, task.owner_username, task)
                 task.status = "cancelled"
@@ -1093,6 +1129,7 @@ def dispatch_auto_listing_schedule(
                 job_id=f"auto-listing-schedule-{schedule_id}",
                 description=f"创建上架任务 {schedule_id}",
                 queue_name=task_queue_name_for_kind("schedule"),
+                owner_username=owner_username,
             )
         except Exception as exc:
             mark_auto_listing_schedule_dispatch_failed(schedule_id, exc)
@@ -1144,6 +1181,7 @@ def dispatch_auto_deletion_task(
                 job_id=f"auto-deletion-task-{task_id}",
                 description=f"创建删除任务 {task_id}",
                 queue_name=task_queue_name_for_kind("schedule"),
+                owner_username=owner_username,
             )
         except Exception as exc:
             mark_auto_deletion_task_dispatch_failed(task_id, exc)
@@ -1167,6 +1205,7 @@ def dispatch_scheduled_crawl(owner_username: str, schedule_id: int) -> None:
                 job_id=f"schedule-{schedule_id}-{uuid.uuid4().hex[:8]}",
                 description=f"定时采集 {schedule_id}",
                 queue_name=task_queue_name_for_kind("schedule"),
+                owner_username=owner_username,
             )
         except Exception as exc:
             mark_scheduled_crawl_dispatch_failed(schedule_id, exc)
@@ -3003,7 +3042,7 @@ def create_auto_listing_schedule(owner_username: str, payload: Any) -> dict[str,
 
 
 def create_manual_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
-    ensure_system_task_dispatch_allowed()
+    ensure_system_task_dispatch_allowed(owner_username)
     quantity = int(getattr(payload, "quantity", 0) or 0)
     store_id = int(getattr(payload, "storeId", 0) or 0)
     execution_mode, execute_at = manual_task_execution_settings(
@@ -3254,7 +3293,7 @@ def _validate_deletion_store(
 
 
 def create_auto_deletion_task(owner_username: str, payload: Any) -> dict[str, Any]:
-    ensure_system_task_dispatch_allowed()
+    ensure_system_task_dispatch_allowed(owner_username)
     store_id = int(getattr(payload, "storeId", 0) or 0)
     quantity = int(getattr(payload, "quantity", 0) or 0)
     schedule_type = normalize_text(getattr(payload, "scheduleType", None))
@@ -8903,7 +8942,7 @@ def cleanup_deleted_product_images(
     force: bool = False,
     owner_username: str | None = None,
 ) -> dict[str, int]:
-    if system_task_dispatch_paused():
+    if owner_username and system_task_dispatch_paused(owner_username):
         return {"taskCount": 0, "productCount": 0}
     if not DELETED_PRODUCT_IMAGE_CLEANUP_LOCK.acquire(blocking=False):
         return {"taskCount": 0, "productCount": 0}
@@ -8918,6 +8957,7 @@ def cleanup_deleted_product_images(
             summaries.append(summary)
             task_refs.extend(scoped_refs)
         else:
+            paused_owners = system_task_paused_usernames()
             with session_scope() as session:
                 setting_keys = session.scalars(
                     select(SystemSettingModel.key).where(
@@ -8936,11 +8976,13 @@ def cleanup_deleted_product_images(
             summary, scoped_refs = cleanup_deleted_product_images_scope(
                 force=False,
                 owner_username=None,
-                excluded_owner_usernames=personal_owners,
+                excluded_owner_usernames=personal_owners | paused_owners,
             )
             summaries.append(summary)
             task_refs.extend(scoped_refs)
             for personal_owner in sorted(personal_owners):
+                if personal_owner in paused_owners:
+                    continue
                 summary, scoped_refs = cleanup_deleted_product_images_scope(
                     force=False,
                     owner_username=personal_owner,
@@ -11322,7 +11364,7 @@ def create_sync_task_record(
     task_group_index: int | None = None,
     task_group_size: int | None = None,
 ) -> str:
-    ensure_system_task_dispatch_allowed()
+    ensure_system_task_dispatch_allowed(owner_username)
     with session_scope() as session:
         store = session.get(StoreModel, store_id)
         if store is None:
@@ -12583,7 +12625,7 @@ def retry_sync_task(
     *,
     allow_all_owners: bool = False,
 ) -> dict[str, Any]:
-    ensure_system_task_dispatch_allowed()
+    ensure_system_task_dispatch_allowed(owner_username)
     with session_scope() as session:
         task = session.get(SyncTaskModel, task_id)
         if task is None:
@@ -13910,6 +13952,7 @@ def dispatch_sales_order_sync_task(
             job_id=f"{task_id}-{uuid.uuid4().hex[:12]}",
             description=f"销量同步 {store_id}",
             queue_name=task_queue_name_for_kind("sync"),
+            owner_username=owner_username,
         )
         return
     if not SALES_ORDER_SYNC_LOCAL_SLOTS.acquire(blocking=False):
@@ -13941,8 +13984,8 @@ def queue_sales_order_sync(
     trigger_type: str = "manual",
     parent_run_id: str | None = None,
 ) -> dict[str, Any]:
-    ensure_system_task_dispatch_allowed()
     normalized_owner = str(owner_username or "").strip()
+    ensure_system_task_dispatch_allowed(normalized_owner)
     normalized_store_id = int(store_id)
     with session_scope() as session:
         store = _owned_sales_order_sync_store(
@@ -14162,8 +14205,6 @@ def sales_order_sync_due_candidates(
 
 
 def run_due_sales_order_syncs_once() -> int:
-    if system_task_dispatch_paused():
-        return 0
     if not SALES_ORDER_SYNC_RUN_LOCK.acquire(blocking=False):
         return 0
     try:
@@ -14179,6 +14220,8 @@ def run_due_sales_order_syncs_once() -> int:
         queued_count = 0
         for owner_username in owners:
             owner = str(owner_username)
+            if system_task_dispatch_paused(owner):
+                continue
             try:
                 sales_order_sync_history_service.cleanup_successful_runs_if_due(
                     owner_username=owner,
@@ -14222,8 +14265,6 @@ def run_due_sales_order_syncs_once() -> int:
 
 
 def run_due_store_product_syncs_once() -> int:
-    if system_task_dispatch_paused():
-        return 0
     if not STORE_PRODUCT_SYNC_SCHEDULE_LOCK.acquire(blocking=False):
         return 0
     try:
@@ -14237,6 +14278,8 @@ def run_due_store_product_syncs_once() -> int:
         queued_count = 0
         for owner_username in owners:
             owner = str(owner_username)
+            if system_task_dispatch_paused(owner):
+                continue
             with session_scope() as session:
                 row = session.get(
                     SystemSettingModel,
@@ -14315,8 +14358,6 @@ def run_due_store_product_syncs_once() -> int:
 
 
 def run_due_scheduled_crawls_once() -> int:
-    if system_task_dispatch_paused():
-        return 0
     if not SCHEDULE_RUN_LOCK.acquire(blocking=False):
         return 0
     try:
@@ -14334,8 +14375,13 @@ def run_due_scheduled_crawls_once() -> int:
                 .order_by(ScheduledCrawlModel.next_run_at.asc(), ScheduledCrawlModel.created_at.asc(), ScheduledCrawlModel.id.asc())
                 .limit(max(1, int(settings.scheduled_crawl_dispatch_batch_size)))
             ).all()
-            due_items = [(row.owner_username, row.id) for row in rows]
-            for row in rows:
+            due_rows = [
+                row
+                for row in rows
+                if not system_task_dispatch_paused(row.owner_username)
+            ]
+            due_items = [(row.owner_username, row.id) for row in due_rows]
+            for row in due_rows:
                 row.status = "running"
                 row.last_run_at = now
                 row.next_run_at = next_daily_run_at(row.schedule_time, now=now)
@@ -14516,15 +14562,13 @@ def run_auto_listing_schedule_now(
 
 
 def run_due_auto_listing_schedules_once() -> int:
-    if system_task_dispatch_paused():
-        return 0
     if not AUTO_LISTING_SCHEDULE_LOCK.acquire(blocking=False):
         return 0
     try:
         now = datetime.now()
         with session_scope() as session:
-            schedule_ids = session.scalars(
-                select(AutoListingScheduleModel.id).where(
+            schedule_rows = session.scalars(
+                select(AutoListingScheduleModel).where(
                     AutoListingScheduleModel.enabled.is_(True),
                     AutoListingScheduleModel.next_run_at.is_not(None),
                     AutoListingScheduleModel.next_run_at <= now,
@@ -14548,15 +14592,20 @@ def run_due_auto_listing_schedules_once() -> int:
                 .limit(max(1, int(settings.scheduled_crawl_dispatch_batch_size)))
             ).all()
 
-        for schedule_id in schedule_ids:
+        runnable_rows = [
+            row
+            for row in schedule_rows
+            if not system_task_dispatch_paused(row.owner_username)
+        ]
+        for schedule_row in runnable_rows:
             try:
                 execute_auto_listing_schedule(
-                    int(schedule_id),
+                    int(schedule_row.id),
                     advance_next_run=True,
                 )
             except RuntimeError:
                 continue
-        return len(schedule_ids)
+        return len(runnable_rows)
     finally:
         AUTO_LISTING_SCHEDULE_LOCK.release()
 
@@ -14660,7 +14709,7 @@ def execute_auto_deletion_task(task_id: int, *, owner_username: str | None = Non
 
 
 def create_manual_deletion_task(owner_username: str, payload: Any) -> dict[str, Any]:
-    ensure_system_task_dispatch_allowed()
+    ensure_system_task_dispatch_allowed(owner_username)
     store_id = int(getattr(payload, "storeId", 0) or 0)
     quantity = int(getattr(payload, "quantity", 0) or 0)
     execution_mode, execute_at = manual_task_execution_settings(
@@ -14726,12 +14775,10 @@ def create_manual_deletion_task(owner_username: str, payload: Any) -> dict[str, 
 
 
 def run_due_auto_deletion_tasks_once() -> int:
-    if system_task_dispatch_paused():
-        return 0
     now = datetime.now()
     with session_scope() as session:
-        task_ids = session.scalars(
-            select(AutoDeletionTaskModel.id).where(
+        task_rows = session.scalars(
+            select(AutoDeletionTaskModel).where(
                 AutoDeletionTaskModel.enabled.is_(True),
                 AutoDeletionTaskModel.next_run_at.is_not(None),
                 AutoDeletionTaskModel.next_run_at <= now,
@@ -14748,12 +14795,20 @@ def run_due_auto_deletion_tasks_once() -> int:
                 ),
             ).order_by(AutoDeletionTaskModel.next_run_at.asc(), AutoDeletionTaskModel.id.asc()).limit(max(1, int(settings.scheduled_crawl_dispatch_batch_size)))
         ).all()
-    for task_id in task_ids:
+    runnable_rows = [
+        row
+        for row in task_rows
+        if not system_task_dispatch_paused(row.owner_username)
+    ]
+    for task_row in runnable_rows:
         try:
-            execute_auto_deletion_task(int(task_id), advance_next_run=True)
+            execute_auto_deletion_task(
+                int(task_row.id),
+                advance_next_run=True,
+            )
         except RuntimeError:
             continue
-    return len(task_ids)
+    return len(runnable_rows)
 
 
 def run_periodic_maintenance_once() -> None:
@@ -14786,7 +14841,10 @@ def cleanup_orphan_product_image_dirs_if_due() -> int:
 
 def schedule_runner_health() -> dict[str, Any]:
     with SCHEDULE_RUNNER_HEALTH_LOCK:
-        return dict(SCHEDULE_RUNNER_HEALTH)
+        return {
+            **SCHEDULE_RUNNER_HEALTH,
+            "active": SCHEDULE_RUNNER_ACTIVE,
+        }
 
 
 def _record_schedule_runner_tick(*, errors: list[str]) -> None:
@@ -14805,6 +14863,9 @@ def _record_schedule_runner_tick(*, errors: list[str]) -> None:
 
 
 def run_schedule_runner_tick() -> bool:
+    global SCHEDULE_RUNNER_ACTIVE
+    with SCHEDULE_RUNNER_HEALTH_LOCK:
+        SCHEDULE_RUNNER_ACTIVE = True
     tasks = (
         ("scheduled crawls", run_due_scheduled_crawls_once),
         ("auto listing schedules", run_due_auto_listing_schedules_once),
@@ -14814,14 +14875,18 @@ def run_schedule_runner_tick() -> bool:
         ("periodic maintenance", run_periodic_maintenance_once),
     )
     errors: list[str] = []
-    for task_name, task in tasks:
-        try:
-            task()
-        except Exception as exc:
-            errors.append(f"{task_name}: {type(exc).__name__}")
-            logger.exception("Schedule runner task failed: %s", task_name)
-    _record_schedule_runner_tick(errors=errors)
-    return not errors
+    try:
+        for task_name, task in tasks:
+            try:
+                task()
+            except Exception as exc:
+                errors.append(f"{task_name}: {type(exc).__name__}")
+                logger.exception("Schedule runner task failed: %s", task_name)
+        _record_schedule_runner_tick(errors=errors)
+        return not errors
+    finally:
+        with SCHEDULE_RUNNER_HEALTH_LOCK:
+            SCHEDULE_RUNNER_ACTIVE = False
 
 
 def _run_schedule_runner_tick_with_lock(interval_seconds: int) -> bool:
@@ -20169,7 +20234,7 @@ def delete_listing_tasks(owner_username: str, task_ids: list[str]) -> dict[str, 
 
 
 def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
-    ensure_system_task_dispatch_allowed()
+    ensure_system_task_dispatch_allowed(owner_username)
     product_ids = normalize_product_ids([int(value) for value in (getattr(payload, "productIds", None) or [])])
     store_ids = listing_task_payload_store_ids(payload)
     task_name = str(getattr(payload, "taskName", "") or "").strip()
@@ -20689,7 +20754,7 @@ def fail_listing_task_unexpectedly(owner_username: str, task_id: str, exc: Excep
 
 
 def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
-    ensure_system_task_dispatch_allowed()
+    ensure_system_task_dispatch_allowed(owner_username)
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
         if task is None:
@@ -20825,7 +20890,7 @@ def delete_role(role_id: int) -> None:
 
 
 def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
-    ensure_system_task_dispatch_allowed()
+    ensure_system_task_dispatch_allowed(owner_username)
     source_id = getattr(payload, "sourceId", None)
     scheduled_crawl_id = getattr(payload, "scheduledCrawlId", None)
     source_type = str(getattr(payload, "sourceType", "") or "").strip()
@@ -20905,7 +20970,7 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
 
 
 def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
-    ensure_system_task_dispatch_allowed()
+    ensure_system_task_dispatch_allowed(owner_username)
     with session_scope() as session:
         task = session.get(CrawlTaskModel, task_id)
         if task is None:

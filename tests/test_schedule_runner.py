@@ -7,6 +7,7 @@ from app.services import crawler_service
 
 def _reset_health() -> None:
     with crawler_service.SCHEDULE_RUNNER_HEALTH_LOCK:
+        crawler_service.SCHEDULE_RUNNER_ACTIVE = False
         crawler_service.SCHEDULE_RUNNER_HEALTH.update(
             {
                 "lastTickAt": None,
@@ -20,6 +21,11 @@ def _reset_health() -> None:
 def test_schedule_runner_continues_after_task_failure(monkeypatch, caplog) -> None:
     _reset_health()
     calls: list[str] = []
+    monkeypatch.setattr(
+        crawler_service,
+        "system_task_dispatch_paused",
+        lambda: False,
+    )
 
     def fail() -> None:
         calls.append("crawl")
@@ -65,6 +71,11 @@ def test_schedule_runner_continues_after_task_failure(monkeypatch, caplog) -> No
 
 def test_successful_schedule_tick_resets_failure_health(monkeypatch) -> None:
     _reset_health()
+    monkeypatch.setattr(
+        crawler_service,
+        "system_task_dispatch_paused",
+        lambda: False,
+    )
     with crawler_service.SCHEDULE_RUNNER_HEALTH_LOCK:
         crawler_service.SCHEDULE_RUNNER_HEALTH["consecutiveFailures"] = 3
         crawler_service.SCHEDULE_RUNNER_HEALTH["lastError"] = "old error"
@@ -82,3 +93,51 @@ def test_successful_schedule_tick_resets_failure_health(monkeypatch) -> None:
     assert health["consecutiveFailures"] == 0
     assert health["lastError"] == ""
     assert health["lastSuccessfulTickAt"]
+
+
+def test_schedule_runner_continues_while_selected_users_are_paused(
+    monkeypatch,
+) -> None:
+    _reset_health()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        crawler_service,
+        "run_due_scheduled_crawls_once",
+        lambda: calls.append("crawl"),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "run_due_auto_listing_schedules_once",
+        lambda: calls.append("auto-listing"),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "run_due_auto_deletion_tasks_once",
+        lambda: calls.append("auto-deletion"),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "run_due_sales_order_syncs_once",
+        lambda: calls.append("sales"),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "run_due_store_product_syncs_once",
+        lambda: calls.append("products"),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "run_periodic_maintenance_once",
+        lambda: calls.append("maintenance"),
+    )
+
+    assert crawler_service.run_schedule_runner_tick() is True
+    assert calls == [
+        "crawl",
+        "auto-listing",
+        "auto-deletion",
+        "sales",
+        "products",
+        "maintenance",
+    ]
+    assert crawler_service.schedule_runner_health()["active"] is False
