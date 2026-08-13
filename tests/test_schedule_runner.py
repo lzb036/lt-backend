@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.db.database import Base
+from app.db.models import SystemTaskControlModel
 from app.services import crawler_service
 
 
@@ -141,3 +147,47 @@ def test_schedule_runner_continues_while_selected_users_are_paused(
         "maintenance",
     ]
     assert crawler_service.schedule_runner_health()["active"] is False
+
+
+def test_system_task_paused_usernames_reads_selected_snapshot(
+    monkeypatch,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+    def local_session_scope():
+        session = factory()
+
+        class SessionContext:
+            def __enter__(self):
+                return session
+
+            def __exit__(self, exc_type, exc, traceback):
+                session.close()
+
+        return SessionContext()
+
+    with factory() as session:
+        session.add(
+            SystemTaskControlModel(
+                id=1,
+                paused=True,
+                phase="paused",
+                snapshot_json=json.dumps(
+                    {"selectedUsernames": ["alice", "bob"]}
+                ),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        crawler_service,
+        "session_scope",
+        local_session_scope,
+    )
+
+    assert crawler_service.system_task_paused_usernames() == {
+        "alice",
+        "bob",
+    }

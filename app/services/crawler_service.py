@@ -121,7 +121,12 @@ def system_task_paused_usernames() -> set[str]:
         row = session.get(SystemTaskControlModel, TASK_CONTROL_ROW_ID)
         if row is None or not row.paused:
             return set()
-        snapshot = parse_json_object(row.snapshot_json)
+        try:
+            snapshot = json.loads(row.snapshot_json or "{}")
+        except (TypeError, ValueError):
+            snapshot = {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
     return {
         str(username or "").strip()
         for username in snapshot.get("selectedUsernames", [])
