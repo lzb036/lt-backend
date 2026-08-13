@@ -558,6 +558,7 @@ SCHEDULE_FALLBACK_SHOP_URL_KEY = "fallbackShopUrl"
 SCHEDULE_IMPORTED_NOTE_KEY = "importedSchedule"
 SCHEDULE_FALLBACK_TARGET_PREFIX = "__LT_FALLBACK_SHOP_URL__:"
 SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY = "scheduledCrawlTaskCleanup"
+USER_TIME_SETTINGS_PREFIX = "userTimeSettings:"
 DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX = "deletedProductImageCleanup:"
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY = 6
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME = "09:00"
@@ -7956,25 +7957,89 @@ def time_settings_to_public(
     return result
 
 
-def upsert_time_settings_row(session: Any, payload: dict[str, Any]) -> SystemSettingModel:
-    row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+def user_time_settings_key(owner_username: str) -> str:
+    return f"{USER_TIME_SETTINGS_PREFIX}{normalize_text(owner_username)}"
+
+
+def time_settings_row_key(owner_username: str | None) -> str:
+    return (
+        user_time_settings_key(owner_username)
+        if normalize_text(owner_username)
+        else SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY
+    )
+
+
+def initial_user_time_settings_payload(
+    session: Any,
+    owner_username: str,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    legacy_row = session.get(
+        SystemSettingModel,
+        SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
+    )
+    payload = load_time_settings_payload(legacy_row, now=now)
+    deleted_row = session.get(
+        SystemSettingModel,
+        deleted_product_image_cleanup_user_setting_key(owner_username),
+    )
+    if deleted_row is not None:
+        payload.update(
+            load_deleted_product_image_cleanup_user_payload(
+                deleted_row,
+                payload,
+                now=now,
+            )
+        )
+    return payload
+
+
+def upsert_time_settings_row(
+    session: Any,
+    payload: dict[str, Any],
+    owner_username: str | None = None,
+) -> SystemSettingModel:
+    setting_key = time_settings_row_key(owner_username)
+    row = session.get(SystemSettingModel, setting_key)
     if row is None:
-        row = SystemSettingModel(key=SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
+        row = SystemSettingModel(key=setting_key)
         session.add(row)
     row.value_json = json.dumps(payload, ensure_ascii=False)
     return row
 
 
-def get_time_settings(*, include_queue_health: bool = True) -> dict[str, Any]:
+def get_time_settings(
+    owner_username: str | None = None,
+    *,
+    include_queue_health: bool = True,
+) -> dict[str, Any]:
+    now = datetime.now()
     with session_scope() as session:
-        row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
-        payload = load_time_settings_payload(row)
+        row = session.get(
+            SystemSettingModel,
+            time_settings_row_key(owner_username),
+        )
+        payload = (
+            initial_user_time_settings_payload(
+                session,
+                owner_username,
+                now=now,
+            )
+            if owner_username and row is None
+            else load_time_settings_payload(row, now=now)
+        )
         if row is None or (row.value_json or "") != json.dumps(payload, ensure_ascii=False):
-            row = upsert_time_settings_row(session, payload)
+            row = upsert_time_settings_row(session, payload, owner_username)
             session.flush()
-        pending_count = session.scalar(
-            select(func.count()).select_from(DeletedProductImageCleanupModel)
-        ) or 0
+        pending_query = select(func.count()).select_from(
+            DeletedProductImageCleanupModel
+        )
+        if owner_username:
+            pending_query = pending_query.where(
+                DeletedProductImageCleanupModel.owner_username == owner_username
+            )
+        pending_count = session.scalar(pending_query) or 0
         return time_settings_to_public(
             row,
             payload,
@@ -7983,7 +8048,15 @@ def get_time_settings(*, include_queue_health: bool = True) -> dict[str, Any]:
         )
 
 
-def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> dict[str, Any]:
+def save_time_settings(
+    owner_username: str | Any,
+    payload: Any | None = None,
+    *,
+    include_queue_health: bool = True,
+) -> dict[str, Any]:
+    if payload is None:
+        payload = owner_username
+        owner_username = None
     cleanup_weekday = normalize_cleanup_weekday(getattr(payload, "cleanupWeekday", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY))
     cleanup_time = normalize_schedule_time(getattr(payload, "cleanupTime", SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME))
     cleanup_enabled = bool(getattr(payload, "cleanupEnabled", True))
@@ -8004,8 +8077,19 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
     )
     now = datetime.now()
     with session_scope() as session:
-        row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
-        existing = load_time_settings_payload(row, now=now)
+        row = session.get(
+            SystemSettingModel,
+            time_settings_row_key(owner_username),
+        )
+        existing = (
+            initial_user_time_settings_payload(
+                session,
+                str(owner_username),
+                now=now,
+            )
+            if owner_username and row is None
+            else load_time_settings_payload(row, now=now)
+        )
         updated_payload = {
             **existing,
             "cleanupWeekday": cleanup_weekday,
@@ -8027,11 +8111,68 @@ def save_time_settings(payload: Any, *, include_queue_health: bool = True) -> di
                 next_weekly_run_at(deleted_image_cleanup_weekday, deleted_image_cleanup_time, now=now)
             ),
         }
-        row = upsert_time_settings_row(session, updated_payload)
+        row = upsert_time_settings_row(
+            session,
+            updated_payload,
+            str(owner_username) if owner_username else None,
+        )
+        if owner_username:
+            deleted_setting_key = (
+                deleted_product_image_cleanup_user_setting_key(
+                    str(owner_username)
+                )
+            )
+            deleted_row = session.get(
+                SystemSettingModel,
+                deleted_setting_key,
+            )
+            if deleted_row is None:
+                deleted_row = SystemSettingModel(key=deleted_setting_key)
+                session.add(deleted_row)
+            deleted_row.value_json = json.dumps(
+                {
+                    "deletedImageCleanupEnabled": (
+                        updated_payload["deletedImageCleanupEnabled"]
+                    ),
+                    "deletedImageCleanupWeekday": (
+                        updated_payload["deletedImageCleanupWeekday"]
+                    ),
+                    "deletedImageCleanupTime": (
+                        updated_payload["deletedImageCleanupTime"]
+                    ),
+                    "deletedImageCleanupNextAt": (
+                        updated_payload["deletedImageCleanupNextAt"]
+                    ),
+                    "deletedImageCleanupLastAt": (
+                        updated_payload.get(
+                            "deletedImageCleanupLastAt"
+                        )
+                    ),
+                    "deletedImageCleanupLastProductCount": (
+                        updated_payload.get(
+                            "deletedImageCleanupLastProductCount",
+                            0,
+                        )
+                    ),
+                    "deletedImageCleanupLastTaskCount": (
+                        updated_payload.get(
+                            "deletedImageCleanupLastTaskCount",
+                            0,
+                        )
+                    ),
+                },
+                ensure_ascii=False,
+            )
         session.flush()
-        pending_count = session.scalar(
-            select(func.count()).select_from(DeletedProductImageCleanupModel)
-        ) or 0
+        pending_query = select(func.count()).select_from(
+            DeletedProductImageCleanupModel
+        )
+        if owner_username:
+            pending_query = pending_query.where(
+                DeletedProductImageCleanupModel.owner_username
+                == str(owner_username)
+            )
+        pending_count = session.scalar(pending_query) or 0
         return time_settings_to_public(
             row,
             updated_payload,
@@ -8044,15 +8185,31 @@ def cleanup_completed_scheduled_crawl_tasks(
     *,
     force: bool = False,
     include_recent_terminal: bool = False,
+    owner_username: str | None = None,
 ) -> int:
     if not SCHEDULED_CRAWL_TASK_CLEANUP_LOCK.acquire(blocking=False):
         return 0
     try:
         now = datetime.now()
         with session_scope() as session:
-            row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
-            payload = load_time_settings_payload(row, now=now)
-            row = upsert_time_settings_row(session, payload)
+            row = session.get(
+                SystemSettingModel,
+                time_settings_row_key(owner_username),
+            )
+            payload = (
+                initial_user_time_settings_payload(
+                    session,
+                    owner_username,
+                    now=now,
+                )
+                if owner_username and row is None
+                else load_time_settings_payload(row, now=now)
+            )
+            row = upsert_time_settings_row(
+                session,
+                payload,
+                owner_username,
+            )
             next_cleanup_at = parse_public_datetime(payload.get("nextCleanupAt"))
             if not force and (
                 not payload["cleanupEnabled"]
@@ -8074,6 +8231,10 @@ def cleanup_completed_scheduled_crawl_tasks(
                     ("success", "partial", "failed", "cancelled")
                 ),
             )
+            if owner_username:
+                task_query = task_query.where(
+                    CrawlTaskModel.owner_username == owner_username
+                )
             if not include_recent_terminal:
                 task_query = task_query.where(
                     func.coalesce(
@@ -8150,19 +8311,44 @@ def remove_crawl_queue_jobs_for_task_ids(task_ids: set[str]) -> int:
 
 
 def cleanup_completed_scheduled_crawl_tasks_if_due() -> int:
-    return cleanup_completed_scheduled_crawl_tasks(force=False)
+    with session_scope() as session:
+        owners = session.scalars(
+            select(UserAccountModel.username).where(
+                UserAccountModel.enabled.is_(True)
+            )
+        ).all()
+    return sum(
+        cleanup_completed_scheduled_crawl_tasks(
+            force=False,
+            owner_username=str(owner_username),
+        )
+        for owner_username in owners
+    )
 
 
-def run_completed_scheduled_crawl_tasks_cleanup_now(*, include_queue_health: bool = True) -> dict[str, Any]:
+def run_completed_scheduled_crawl_tasks_cleanup_now(
+    owner_username: str | None = None,
+    *,
+    include_queue_health: bool = True,
+) -> dict[str, Any]:
     cleanup_completed_scheduled_crawl_tasks(
         force=True,
         include_recent_terminal=True,
+        owner_username=owner_username,
     )
-    return get_time_settings(include_queue_health=include_queue_health)
+    return get_time_settings(
+        owner_username,
+        include_queue_health=include_queue_health,
+    )
 
 
-def create_store_unlisted_product_delete_tasks(session: Any, now: datetime) -> tuple[list[tuple[str, str]], int]:
-    rows = session.execute(
+def create_store_unlisted_product_delete_tasks(
+    session: Any,
+    now: datetime,
+    *,
+    owner_username: str | None = None,
+) -> tuple[list[tuple[str, str]], int]:
+    rows_query = (
         select(
             ProductModel.owner_username,
             ProductModel.store_id,
@@ -8179,7 +8365,12 @@ def create_store_unlisted_product_delete_tasks(session: Any, now: datetime) -> t
             ProductModel.rakuten_listing_status == "unlisted",
         )
         .order_by(ProductModel.store_id.asc(), ProductModel.id.asc())
-    ).all()
+    )
+    if owner_username:
+        rows_query = rows_query.where(
+            ProductModel.owner_username == owner_username
+        )
+    rows = session.execute(rows_query).all()
     groups: dict[tuple[str, int], dict[str, Any]] = {}
     for owner_username, store_id, product_id, alias_name, store_name in rows:
         if store_id is None:
@@ -8226,7 +8417,11 @@ def create_store_unlisted_product_delete_tasks(session: Any, now: datetime) -> t
     return task_refs, product_count
 
 
-def cleanup_store_unlisted_products(*, force: bool = False) -> dict[str, int]:
+def cleanup_store_unlisted_products(
+    *,
+    force: bool = False,
+    owner_username: str | None = None,
+) -> dict[str, int]:
     if not STORE_UNLISTED_PRODUCT_CLEANUP_LOCK.acquire(blocking=False):
         return {"taskCount": 0, "productCount": 0}
     task_refs: list[tuple[str, str]] = []
@@ -8234,9 +8429,24 @@ def cleanup_store_unlisted_products(*, force: bool = False) -> dict[str, int]:
     try:
         now = datetime.now()
         with session_scope() as session:
-            row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
-            payload = load_time_settings_payload(row, now=now)
-            row = upsert_time_settings_row(session, payload)
+            row = session.get(
+                SystemSettingModel,
+                time_settings_row_key(owner_username),
+            )
+            payload = (
+                initial_user_time_settings_payload(
+                    session,
+                    owner_username,
+                    now=now,
+                )
+                if owner_username and row is None
+                else load_time_settings_payload(row, now=now)
+            )
+            row = upsert_time_settings_row(
+                session,
+                payload,
+                owner_username,
+            )
             next_cleanup_at = parse_public_datetime(payload.get("unlistedNextCleanupAt"))
             if not force and (
                 not payload["unlistedCleanupEnabled"]
@@ -8244,7 +8454,11 @@ def cleanup_store_unlisted_products(*, force: bool = False) -> dict[str, int]:
             ):
                 return {"taskCount": 0, "productCount": 0}
 
-            task_refs, product_count = create_store_unlisted_product_delete_tasks(session, now)
+            task_refs, product_count = create_store_unlisted_product_delete_tasks(
+                session,
+                now,
+                owner_username=owner_username,
+            )
             payload["unlistedLastCleanupAt"] = datetime_to_public(now)
             payload["unlistedLastDeletedCount"] = product_count
             payload["unlistedLastTaskCount"] = len(task_refs)
@@ -8264,13 +8478,39 @@ def cleanup_store_unlisted_products(*, force: bool = False) -> dict[str, int]:
 
 
 def cleanup_store_unlisted_products_if_due() -> dict[str, int]:
-    return cleanup_store_unlisted_products(force=False)
-
-
-def run_store_unlisted_product_cleanup_now(*, include_queue_health: bool = True) -> dict[str, Any]:
-    summary = cleanup_store_unlisted_products(force=True)
+    with session_scope() as session:
+        owners = session.scalars(
+            select(UserAccountModel.username).where(
+                UserAccountModel.enabled.is_(True)
+            )
+        ).all()
+    summaries = [
+        cleanup_store_unlisted_products(
+            force=False,
+            owner_username=str(owner_username),
+        )
+        for owner_username in owners
+    ]
     return {
-        "settings": get_time_settings(include_queue_health=include_queue_health),
+        "taskCount": sum(item["taskCount"] for item in summaries),
+        "productCount": sum(item["productCount"] for item in summaries),
+    }
+
+
+def run_store_unlisted_product_cleanup_now(
+    owner_username: str | None = None,
+    *,
+    include_queue_health: bool = True,
+) -> dict[str, Any]:
+    summary = cleanup_store_unlisted_products(
+        force=True,
+        owner_username=owner_username,
+    )
+    return {
+        "settings": get_time_settings(
+            owner_username,
+            include_queue_health=include_queue_health,
+        ),
         "summary": {
             "taskCount": summary["taskCount"],
             "productCount": summary["productCount"],
@@ -8372,7 +8612,10 @@ def get_deleted_product_image_cleanup_settings(
     owner_username: str,
 ) -> dict[str, Any]:
     now = datetime.now()
-    base_settings = get_time_settings(include_queue_health=False)
+    base_settings = get_time_settings(
+        owner_username,
+        include_queue_health=False,
+    )
     with session_scope() as session:
         global_row = session.get(
             SystemSettingModel,
@@ -8456,6 +8699,25 @@ def save_deleted_product_image_cleanup_settings(
             row = SystemSettingModel(key=setting_key)
             session.add(row)
         row.value_json = json.dumps(personal_payload, ensure_ascii=False)
+        time_row = session.get(
+            SystemSettingModel,
+            time_settings_row_key(owner_username),
+        )
+        time_payload = (
+            initial_user_time_settings_payload(
+                session,
+                owner_username,
+                now=now,
+            )
+            if time_row is None
+            else load_time_settings_payload(time_row, now=now)
+        )
+        time_payload.update(personal_payload)
+        upsert_time_settings_row(
+            session,
+            time_payload,
+            owner_username,
+        )
     return get_deleted_product_image_cleanup_settings(owner_username)
 
 
@@ -10201,6 +10463,24 @@ def save_store(owner_username: str, payload: Any, store_id: int | None = None) -
             raise RuntimeError("店铺编号已存在。")
         session.flush()
         return store_to_public(row)
+
+
+def update_owned_store_settings(
+    owner_username: str,
+    store_id: int,
+    *,
+    alias_name: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.get(StoreModel, store_id)
+        if row is None or row.owner_username != owner_username:
+            raise RuntimeError("店铺不存在或无权操作。")
+        normalized_alias = normalize_text(alias_name)
+        row.alias_name = normalized_alias or row.store_name
+        row.enabled = bool(enabled)
+        session.flush()
+        return store_to_public(row, reveal=True)
 
 
 def delete_store(owner_username: str, store_id: int) -> None:
@@ -13510,10 +13790,17 @@ def _sales_order_sync_error_is_cooling_down(
         now - SALES_ORDER_SYNC_FAILURE_COOLDOWN
     )
 
-def list_order_sync_stores() -> list[dict[str, Any]]:
+def list_order_sync_stores(
+    owner_username: str | None = None,
+) -> list[dict[str, Any]]:
     with session_scope() as session:
+        query = select(StoreModel)
+        if owner_username:
+            query = query.where(
+                StoreModel.owner_username == owner_username
+            )
         rows = session.scalars(
-            select(StoreModel).order_by(
+            query.order_by(
                 StoreModel.owner_username.asc(),
                 StoreModel.id.asc(),
             )
@@ -13779,6 +14066,7 @@ def sales_order_sync_due_candidates(
     now: datetime,
     *,
     interval: timedelta = SALES_ORDER_SYNC_INTERVAL,
+    owner_username: str | None = None,
 ) -> list[tuple[str, int]]:
     cutoff = now - interval
     active_after = (
@@ -13788,9 +14076,7 @@ def sales_order_sync_due_candidates(
         now - SALES_ORDER_SYNC_FAILURE_COOLDOWN
     )
     with session_scope() as session:
-        active_count = int(
-            session.scalar(
-                select(func.count()).where(
+        active_count_query = select(func.count()).where(
                     and_(
                         or_(
                             SalesSyncStateModel.sync_status == "queued",
@@ -13801,16 +14087,18 @@ def sales_order_sync_due_candidates(
                         SalesSyncStateModel.updated_at >= active_after,
                     )
                 )
+        if owner_username:
+            active_count_query = active_count_query.where(
+                SalesSyncStateModel.owner_username == owner_username
             )
-            or 0
-        )
+        active_count = int(session.scalar(active_count_query) or 0)
         available_slots = max(
             0,
             SALES_ORDER_SYNC_BATCH_SIZE - active_count,
         )
         if available_slots <= 0:
             return []
-        rows = session.execute(
+        due_query = (
             select(
                 StoreModel.owner_username,
                 StoreModel.id,
@@ -13861,7 +14149,12 @@ def sales_order_sync_due_candidates(
             )
             .order_by(StoreModel.id.asc())
             .limit(available_slots)
-        ).all()
+        )
+        if owner_username:
+            due_query = due_query.where(
+                StoreModel.owner_username == owner_username
+            )
+        rows = session.execute(due_query).all()
     return [
         (str(row.owner_username), int(row.id))
         for row in rows
@@ -13877,40 +14170,52 @@ def run_due_sales_order_syncs_once() -> int:
         sales_order_sync_history_service.recover_stale_runs(
             stale_after=_sales_order_sync_active_timeout(),
         )
-        try:
-            sales_order_sync_history_service.cleanup_successful_runs_if_due()
-        except Exception:
-            logger.warning(
-                "销量订单同步成功记录清理失败",
-                exc_info=True,
-            )
-        global_settings = (
-            sales_order_sync_history_service.get_global_settings()
-        )
-        if not global_settings["enabled"]:
-            return 0
-        interval = timedelta(
-            minutes=int(global_settings["intervalMinutes"])
-        )
+        with session_scope() as session:
+            owners = session.scalars(
+                select(UserAccountModel.username).where(
+                    UserAccountModel.enabled.is_(True)
+                )
+            ).all()
         queued_count = 0
-        for owner_username, store_id in sales_order_sync_due_candidates(
-            sales_now_naive(),
-            interval=interval,
-        ):
+        for owner_username in owners:
+            owner = str(owner_username)
             try:
-                queue_sales_order_sync(
-                    owner_username,
-                    store_id,
-                    trigger_type="automatic",
+                sales_order_sync_history_service.cleanup_successful_runs_if_due(
+                    owner_username=owner,
                 )
             except Exception:
                 logger.warning(
-                    "店铺 %s 的定时销量同步投递失败",
-                    store_id,
+                    "用户 %s 的订单同步成功记录清理失败",
+                    owner,
                     exc_info=True,
                 )
+            user_settings = (
+                sales_order_sync_history_service.get_user_settings(owner)
+            )
+            if not user_settings["enabled"]:
                 continue
-            queued_count += 1
+            interval = timedelta(
+                minutes=int(user_settings["intervalMinutes"])
+            )
+            for candidate_owner, store_id in sales_order_sync_due_candidates(
+                sales_now_naive(),
+                interval=interval,
+                owner_username=owner,
+            ):
+                try:
+                    queue_sales_order_sync(
+                        candidate_owner,
+                        store_id,
+                        trigger_type="automatic",
+                    )
+                except Exception:
+                    logger.warning(
+                        "店铺 %s 的定时销量同步投递失败",
+                        store_id,
+                        exc_info=True,
+                    )
+                    continue
+                queued_count += 1
         return queued_count
     finally:
         SALES_ORDER_SYNC_RUN_LOCK.release()
@@ -13924,50 +14229,86 @@ def run_due_store_product_syncs_once() -> int:
     try:
         now = datetime.now()
         with session_scope() as session:
-            row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
-            payload = load_time_settings_payload(row, now=now)
-            row = upsert_time_settings_row(session, payload)
-            next_sync_at = parse_public_datetime(payload.get("productSyncNextAt"))
-            if not payload["productSyncEnabled"] or (next_sync_at is not None and next_sync_at > now):
-                return 0
-
-            due_stores = session.execute(
-                select(StoreModel.owner_username, StoreModel.id)
-                .where(
-                    StoreModel.enabled.is_(True),
-                    func.length(func.trim(StoreModel.rakuten_service_secret_encrypted)) > 0,
-                    func.length(func.trim(StoreModel.rakuten_license_key_encrypted)) > 0,
+            owners = session.scalars(
+                select(UserAccountModel.username).where(
+                    UserAccountModel.enabled.is_(True)
                 )
-                .order_by(StoreModel.owner_username.asc(), StoreModel.id.asc())
             ).all()
-            payload["productSyncNextAt"] = datetime_to_public(
-                next_weekly_run_at(
-                    payload["productSyncWeekday"],
-                    payload["productSyncTime"],
-                    now=now,
-                )
-            )
-            row.value_json = json.dumps(payload, ensure_ascii=False)
-
         queued_count = 0
-        for owner_username, store_id in due_stores:
-            try:
-                create_sync_task(str(owner_username), int(store_id))
-            except Exception:
-                logger.warning(
-                    "店铺 %s 的定时商品同步投递失败",
-                    store_id,
-                    exc_info=True,
+        for owner_username in owners:
+            owner = str(owner_username)
+            with session_scope() as session:
+                row = session.get(
+                    SystemSettingModel,
+                    time_settings_row_key(owner),
                 )
-                continue
-            queued_count += 1
-
-        with session_scope() as session:
-            row = session.get(SystemSettingModel, SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY)
-            payload = load_time_settings_payload(row, now=now)
-            payload["productSyncLastAt"] = datetime_to_public(now)
-            payload["productSyncLastTaskCount"] = queued_count
-            upsert_time_settings_row(session, payload)
+                payload = (
+                    initial_user_time_settings_payload(
+                        session,
+                        owner,
+                        now=now,
+                    )
+                    if row is None
+                    else load_time_settings_payload(row, now=now)
+                )
+                row = upsert_time_settings_row(session, payload, owner)
+                next_sync_at = parse_public_datetime(
+                    payload.get("productSyncNextAt")
+                )
+                if not payload["productSyncEnabled"] or (
+                    next_sync_at is not None and next_sync_at > now
+                ):
+                    continue
+                due_store_ids = session.scalars(
+                    select(StoreModel.id)
+                    .where(
+                        StoreModel.owner_username == owner,
+                        StoreModel.enabled.is_(True),
+                        func.length(
+                            func.trim(
+                                StoreModel.rakuten_service_secret_encrypted
+                            )
+                        )
+                        > 0,
+                        func.length(
+                            func.trim(
+                                StoreModel.rakuten_license_key_encrypted
+                            )
+                        )
+                        > 0,
+                    )
+                    .order_by(StoreModel.id.asc())
+                ).all()
+                payload["productSyncNextAt"] = datetime_to_public(
+                    next_weekly_run_at(
+                        payload["productSyncWeekday"],
+                        payload["productSyncTime"],
+                        now=now,
+                    )
+                )
+                row.value_json = json.dumps(payload, ensure_ascii=False)
+            owner_queued_count = 0
+            for store_id in due_store_ids:
+                try:
+                    create_sync_task(owner, int(store_id))
+                except Exception:
+                    logger.warning(
+                        "店铺 %s 的定时商品同步投递失败",
+                        store_id,
+                        exc_info=True,
+                    )
+                    continue
+                owner_queued_count += 1
+            queued_count += owner_queued_count
+            with session_scope() as session:
+                row = session.get(
+                    SystemSettingModel,
+                    time_settings_row_key(owner),
+                )
+                payload = load_time_settings_payload(row, now=now)
+                payload["productSyncLastAt"] = datetime_to_public(now)
+                payload["productSyncLastTaskCount"] = owner_queued_count
+                upsert_time_settings_row(session, payload, owner)
         return queued_count
     finally:
         STORE_PRODUCT_SYNC_SCHEDULE_LOCK.release()

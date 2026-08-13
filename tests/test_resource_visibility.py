@@ -12,7 +12,7 @@ from app.services import crawler_service
 
 
 class ResourceVisibilityTests(unittest.TestCase):
-    def test_global_time_settings_routes_require_superadmin(self) -> None:
+    def test_time_settings_routes_allow_authenticated_users(self) -> None:
         expected_routes = {
             ("GET", "/crawler/settings/time"),
             ("PUT", "/crawler/settings/time"),
@@ -26,7 +26,11 @@ class ResourceVisibilityTests(unittest.TestCase):
                 if isinstance(route, APIRoute) and route.path == path and method in route.methods
             )
             dependency_calls = [dependency.call for dependency in route.dependant.dependencies]
-            self.assertIn(require_superadmin, dependency_calls, f"{method} {path} should require superadmin")
+            self.assertIn(
+                require_authenticated_account,
+                dependency_calls,
+                f"{method} {path} should allow authenticated users",
+            )
 
     def test_deleted_image_cleanup_routes_allow_authenticated_users(self) -> None:
         expected_routes = {
@@ -71,10 +75,15 @@ class ResourceVisibilityTests(unittest.TestCase):
             "get_time_settings",
             return_value={"cleanupWeekday": 6, "cleanupTime": "09:00", "queueHealth": {"status": "ok"}},
         ) as get_settings:
-            result = crawler_api.get_time_settings({"role": "superadmin"})
+            result = crawler_api.get_time_settings(
+                {"role": "superadmin", "username": "superadmin"}
+            )
 
         self.assertEqual(result["settings"]["queueHealth"], {"status": "ok"})
-        get_settings.assert_called_once_with(include_queue_health=True)
+        get_settings.assert_called_once_with(
+            "superadmin",
+            include_queue_health=True,
+        )
 
     def test_time_settings_can_skip_queue_health_probe(self) -> None:
         with patch.object(crawler_service, "task_queue_health") as queue_health:

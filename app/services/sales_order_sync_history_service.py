@@ -21,6 +21,7 @@ from app.services.sales_time import sales_now_naive
 
 
 GLOBAL_SETTINGS_KEY = "sales_order_sync_settings"
+USER_SETTINGS_PREFIX = "sales_order_sync_settings:"
 DEFAULT_GLOBAL_SETTINGS = {
     "enabled": True,
     "intervalMinutes": 30,
@@ -40,7 +41,7 @@ RETRYABLE_RUN_STATUSES = {"failed", "partial", "cancelled"}
 RUN_STALE_AFTER = timedelta(minutes=10)
 SUCCESS_CLEANUP_INTERVAL = timedelta(hours=1)
 SUCCESS_CLEANUP_LOCK = Lock()
-SUCCESS_CLEANUP_LAST_RUN_AT: datetime | None = None
+SUCCESS_CLEANUP_LAST_RUN_AT: dict[str, datetime] = {}
 
 
 def _validated_settings(payload: Any) -> dict[str, Any]:
@@ -103,6 +104,55 @@ def save_global_settings(payload: Any) -> dict[str, Any]:
         row.value_json = json.dumps(settings, ensure_ascii=False)
         session.flush()
     return settings
+
+
+def user_settings_key(owner_username: str) -> str:
+    return f"{USER_SETTINGS_PREFIX}{str(owner_username or '').strip()}"
+
+
+def get_user_settings(owner_username: str) -> dict[str, Any]:
+    normalized_owner = str(owner_username or "").strip()
+    with session_scope() as session:
+        row = session.get(
+            SystemSettingModel,
+            user_settings_key(normalized_owner),
+        )
+        if row is None:
+            row = session.get(SystemSettingModel, GLOBAL_SETTINGS_KEY)
+        settings = _settings_from_row(row)
+        return {
+            **settings,
+            "updatedAt": (
+                row.updated_at.isoformat(sep=" ")
+                if row is not None and row.updated_at is not None
+                else None
+            ),
+        }
+
+
+def save_user_settings(
+    owner_username: str,
+    payload: Any,
+) -> dict[str, Any]:
+    normalized_owner = str(owner_username or "").strip()
+    settings = _validated_settings(payload)
+    with session_scope() as session:
+        setting_key = user_settings_key(normalized_owner)
+        row = session.get(SystemSettingModel, setting_key)
+        if row is None:
+            row = SystemSettingModel(key=setting_key)
+            session.add(row)
+        row.value_json = json.dumps(settings, ensure_ascii=False)
+        session.flush()
+        updated_at = row.updated_at
+    return {
+        **settings,
+        "updatedAt": (
+            updated_at.isoformat(sep=" ")
+            if updated_at is not None
+            else None
+        ),
+    }
 
 
 def create_run(
@@ -387,33 +437,42 @@ def cleanup_successful_runs_if_due(
     *,
     now: datetime | None = None,
     force: bool = False,
+    owner_username: str | None = None,
 ) -> int:
-    global SUCCESS_CLEANUP_LAST_RUN_AT
     current = now or sales_now_naive()
+    cleanup_scope = str(owner_username or "*")
     if not SUCCESS_CLEANUP_LOCK.acquire(blocking=False):
         return 0
     try:
+        last_run_at = SUCCESS_CLEANUP_LAST_RUN_AT.get(cleanup_scope)
         if (
             not force
-            and SUCCESS_CLEANUP_LAST_RUN_AT is not None
-            and current - SUCCESS_CLEANUP_LAST_RUN_AT
+            and last_run_at is not None
+            and current - last_run_at
             < SUCCESS_CLEANUP_INTERVAL
         ):
             return 0
-        settings = get_global_settings()
+        settings = (
+            get_user_settings(owner_username)
+            if owner_username
+            else get_global_settings()
+        )
         cutoff = current - timedelta(
             days=int(settings["successRetentionDays"])
         )
         with session_scope() as session:
-            result = session.execute(
-                delete(SalesOrderSyncRunModel).where(
+            delete_query = delete(SalesOrderSyncRunModel).where(
                     SalesOrderSyncRunModel.status == "success",
                     SalesOrderSyncRunModel.finished_at.is_not(None),
                     SalesOrderSyncRunModel.finished_at < cutoff,
                 )
-            )
+            if owner_username:
+                delete_query = delete_query.where(
+                    SalesOrderSyncRunModel.owner_username == owner_username
+                )
+            result = session.execute(delete_query)
             deleted_count = max(0, int(result.rowcount or 0))
-        SUCCESS_CLEANUP_LAST_RUN_AT = current
+        SUCCESS_CLEANUP_LAST_RUN_AT[cleanup_scope] = current
         return deleted_count
     finally:
         SUCCESS_CLEANUP_LOCK.release()

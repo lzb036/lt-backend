@@ -131,6 +131,11 @@ class StorePayload(BaseModel):
     rakutenLicenseKey: str = ""
 
 
+class StoreOwnerUpdatePayload(BaseModel):
+    aliasName: str = Field(default="", max_length=255)
+    enabled: bool = True
+
+
 class ScheduledCrawlPayload(BaseModel):
     sourceId: int | None = None
     name: str = Field(min_length=1)
@@ -399,24 +404,28 @@ def get_dashboard_summary(user: dict = Depends(require_any_permission("crawler.m
 
 
 @router.get("/settings/time")
-def get_time_settings(user: dict = Depends(require_superadmin)) -> dict:
+def get_time_settings(user: dict = Depends(require_authenticated_account)) -> dict:
     return {
         "settings": visible_time_settings(
             user,
-            crawler_service.get_time_settings(include_queue_health=True),
+            crawler_service.get_time_settings(
+                user["username"],
+                include_queue_health=user.get("role") == "superadmin",
+            ),
         )
     }
 
 
 @router.put("/settings/time")
-def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(require_superadmin)) -> dict:
+def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         return {
             "settings": visible_time_settings(
                 user,
                 crawler_service.save_time_settings(
+                    user["username"],
                     payload,
-                    include_queue_health=True,
+                    include_queue_health=user.get("role") == "superadmin",
                 ),
             )
         }
@@ -425,13 +434,14 @@ def update_time_settings(payload: TimeSettingsPayload, user: dict = Depends(requ
 
 
 @router.post("/settings/time/scheduled-task-cleanup/run")
-def run_scheduled_task_cleanup(user: dict = Depends(require_superadmin)) -> dict:
+def run_scheduled_task_cleanup(user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         return {
             "settings": visible_time_settings(
                 user,
                 crawler_service.run_completed_scheduled_crawl_tasks_cleanup_now(
-                    include_queue_health=True,
+                    user["username"],
+                    include_queue_health=user.get("role") == "superadmin",
                 ),
             )
         }
@@ -440,10 +450,11 @@ def run_scheduled_task_cleanup(user: dict = Depends(require_superadmin)) -> dict
 
 
 @router.post("/settings/time/unlisted-products/run")
-def run_unlisted_product_cleanup(user: dict = Depends(require_superadmin)) -> dict:
+def run_unlisted_product_cleanup(user: dict = Depends(require_authenticated_account)) -> dict:
     try:
         result = crawler_service.run_store_unlisted_product_cleanup_now(
-            include_queue_health=True,
+            user["username"],
+            include_queue_health=user.get("role") == "superadmin",
         )
         return {
             **result,
@@ -460,7 +471,7 @@ def list_deleted_product_image_cleanups(
     user: dict = Depends(require_authenticated_account),
 ) -> dict:
     return crawler_service.list_deleted_product_image_cleanups(
-        owner_username=None if user.get("role") == "superadmin" else user["username"],
+        owner_username=user["username"],
         page=page,
         page_size=pageSize,
     )
@@ -499,7 +510,7 @@ def run_deleted_product_image_cleanup(
 ) -> dict:
     try:
         return crawler_service.run_deleted_product_image_cleanup_now(
-            owner_username=None if user.get("role") == "superadmin" else user["username"],
+            owner_username=user["username"],
             include_queue_health=user.get("role") == "superadmin",
         )
     except RuntimeError as exc:
@@ -1288,22 +1299,25 @@ def _raise_order_sync_http_error(exc: Exception) -> None:
 
 @router.get("/settings/sales-order-sync")
 def get_sales_order_sync_global_settings(
-    _: dict = Depends(require_superadmin),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
     return {
-        "settings": sales_order_sync_history_service.get_global_settings()
+        "settings": sales_order_sync_history_service.get_user_settings(
+            user["username"]
+        )
     }
 
 
 @router.put("/settings/sales-order-sync")
 def update_sales_order_sync_global_settings(
     payload: SalesOrderSyncGlobalSettingsPayload,
-    _: dict = Depends(require_superadmin),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
     try:
         return {
             "settings": (
-                sales_order_sync_history_service.save_global_settings(
+                sales_order_sync_history_service.save_user_settings(
+                    user["username"],
                     payload
                 )
             )
@@ -1331,7 +1345,7 @@ def list_sales_order_sync_runs(
     | None = Query(default=None),
     createdAtFrom: datetime | None = Query(default=None),
     createdAtTo: datetime | None = Query(default=None),
-    user: dict = Depends(require_superadmin),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
     try:
         result = sales_order_sync_history_service.list_runs(
@@ -1359,7 +1373,7 @@ def list_sales_order_sync_runs(
 @router.delete("/order-sync/runs")
 def delete_sales_order_sync_runs(
     payload: SalesOrderSyncRunDeletePayload,
-    user: dict = Depends(require_superadmin),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
     try:
         return sales_order_sync_history_service.delete_runs(
@@ -1373,7 +1387,7 @@ def delete_sales_order_sync_runs(
 @router.post("/order-sync/runs/{run_id}/retry")
 def retry_sales_order_sync_run(
     run_id: str = ApiPath(min_length=1, max_length=64),
-    user: dict = Depends(require_superadmin),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
     try:
         return {
@@ -1388,9 +1402,9 @@ def retry_sales_order_sync_run(
 
 @router.get("/order-sync/stores")
 def list_order_sync_stores(
-    _: dict = Depends(require_superadmin),
+    user: dict = Depends(require_stores_permission),
 ) -> dict:
-    return {"stores": crawler_service.list_order_sync_stores()}
+    return {"stores": crawler_service.list_order_sync_stores(user["username"])}
 
 
 @router.get("/products/{product_id}/images/{image_index}/download")
@@ -1536,6 +1550,25 @@ def update_store(store_id: int, payload: StorePayload, user: dict = Depends(requ
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.patch("/stores/{store_id}/owner-settings")
+def update_owned_store_settings(
+    store_id: int,
+    payload: StoreOwnerUpdatePayload,
+    user: dict = Depends(require_stores_permission),
+) -> dict:
+    try:
+        return {
+            "store": crawler_service.update_owned_store_settings(
+                user["username"],
+                store_id,
+                alias_name=payload.aliasName,
+                enabled=payload.enabled,
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.delete("/stores/{store_id}")
 def delete_store(
     store_id: int,
@@ -1656,15 +1689,13 @@ def list_sync_tasks(
     ),
     user: dict = Depends(require_task_management_permission),
 ) -> dict:
-    if taskGroup == "image_cleanup" and user.get("role") != "superadmin":
-        raise HTTPException(status_code=403, detail="需要超级管理员权限")
     result = crawler_service.list_sync_tasks(
         user["username"],
         page=page,
         page_size=pageSize,
         task_ids=parse_task_ids_filter(taskIds),
         task_group=taskGroup,
-        all_owners=taskGroup == "image_cleanup" and user.get("role") == "superadmin",
+        all_owners=False,
     )
     if isinstance(result, dict):
         return result
@@ -1677,7 +1708,7 @@ def retry_sync_task(task_id: str, user: dict = Depends(require_task_management_p
         task = crawler_service.retry_sync_task(
             user["username"],
             task_id,
-            allow_all_owners=user.get("role") == "superadmin",
+            allow_all_owners=False,
         )
         return {"syncTask": task}
     except RuntimeError as exc:
@@ -1690,7 +1721,7 @@ def cancel_sync_task(task_id: str, user: dict = Depends(require_task_management_
         task = crawler_service.cancel_sync_task(
             user["username"],
             task_id,
-            allow_all_owners=user.get("role") == "superadmin",
+            allow_all_owners=False,
         )
         return {"syncTask": task}
     except RuntimeError as exc:
@@ -1703,7 +1734,7 @@ def delete_sync_tasks(payload: TaskDeletePayload, user: dict = Depends(require_t
         return crawler_service.delete_sync_tasks(
             user["username"],
             payload.taskIds,
-            allow_all_owners=user.get("role") == "superadmin",
+            allow_all_owners=False,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

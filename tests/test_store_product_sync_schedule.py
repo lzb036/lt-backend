@@ -175,7 +175,7 @@ def test_due_product_sync_queues_only_enabled_stores_with_credentials(
     with session_factory() as session:
         row = session.get(
             SystemSettingModel,
-            crawler_service.SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
+            crawler_service.user_time_settings_key("alice"),
         )
         saved = json.loads(row.value_json)
     assert saved["productSyncNextAt"] == "2026-07-19 21:00:00"
