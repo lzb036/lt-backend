@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import pytest
 from fastapi.routing import APIRoute
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -13,9 +14,10 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api import maintenance as maintenance_api
 from app.core.auth import require_superadmin
+from app.core.config import settings
 from app.db.database import Base
 from app.db.models import SystemMaintenanceSettingModel
-from app.main import enforce_system_maintenance
+from app.main import enforce_system_maintenance, request_is_maintenance_bypass_user
 from app.services import maintenance_service, task_control_service
 
 
@@ -134,7 +136,7 @@ def test_active_maintenance_blocks_ordinary_api_requests() -> None:
 
     with (
         patch("app.main.get_maintenance_status", return_value=maintenance),
-        patch("app.main.request_is_superadmin", return_value=False),
+        patch("app.main.request_is_maintenance_bypass_user", return_value=False),
     ):
         response = asyncio.run(enforce_system_maintenance(request, call_next))
 
@@ -150,11 +152,35 @@ def test_active_maintenance_allows_superadmin_api_requests() -> None:
 
     with (
         patch("app.main.get_maintenance_status", return_value={"active": True}),
-        patch("app.main.request_is_superadmin", return_value=True),
+        patch("app.main.request_is_maintenance_bypass_user", return_value=True),
     ):
         response = asyncio.run(enforce_system_maintenance(request, call_next))
 
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("user", "allowed"),
+    [
+        ({"username": "superadmin", "role": "superadmin"}, True),
+        ({"username": "test", "role": "operator"}, True),
+        ({"username": "Test", "role": "operator"}, False),
+        ({"username": "operator", "role": "operator"}, False),
+    ],
+)
+def test_maintenance_bypass_users_are_exact(user, allowed) -> None:
+    request = build_request("/api/crawler/dashboard/summary")
+    request.scope["headers"] = [
+        (
+            b"cookie",
+            f"{settings.session_cookie_name}=session-token".encode(),
+        )
+    ]
+    with (
+        patch("app.main.read_session_token", return_value={"sub": user["username"]}),
+        patch("app.main.require_existing_account", return_value=user),
+    ):
+        assert request_is_maintenance_bypass_user(request) is allowed
 
 
 def test_maintenance_status_endpoint_is_always_available() -> None:
