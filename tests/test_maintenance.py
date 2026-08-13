@@ -98,6 +98,32 @@ def test_maintenance_status_becomes_active_at_start_time() -> None:
     assert active["active"] is True
 
 
+def test_maintenance_bypass_prefers_tab_bearer_over_shared_cookie() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/crawler/tasks",
+            "headers": [
+                (b"authorization", b"Bearer operator-token"),
+                (b"cookie", b"lt_session=superadmin-token"),
+            ],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("127.0.0.1", 12345),
+            "scheme": "https",
+        }
+    )
+    with (
+        patch("app.main.read_session_token", return_value={"sub": "operator"}),
+        patch(
+            "app.main.require_existing_account",
+            return_value={"username": "operator", "role": "operator"},
+        ),
+    ):
+        assert request_is_maintenance_bypass_user(request) is False
+
+
 def test_save_maintenance_settings_persists_singleton() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)

@@ -140,7 +140,13 @@ def is_same_origin_browser_request(request: Request) -> bool:
 
 
 def request_is_maintenance_bypass_user(request: Request) -> bool:
-    token = request.cookies.get(settings.session_cookie_name)
+    authorization = request.headers.get("authorization", "").strip()
+    scheme, _, bearer_value = authorization.partition(" ")
+    token = (
+        bearer_value.strip()
+        if scheme.lower() == "bearer" and bearer_value.strip()
+        else request.cookies.get(settings.session_cookie_name)
+    )
     if not token:
         return False
     try:

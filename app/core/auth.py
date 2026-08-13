@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import Cookie, Depends, HTTPException
+from fastapi import Cookie, Depends, Header, HTTPException
 
 from app.core.config import settings
 from app.services.user_service import require_existing_account, verify_account_login
@@ -60,10 +60,17 @@ def authenticate_login_credentials(username: str, password: str) -> dict[str, An
 
 def require_authenticated_account(
     session_token: str | None = Cookie(default=None, alias=settings.session_cookie_name),
+    authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    if not session_token:
+    bearer_token = ""
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            bearer_token = value.strip()
+    resolved_token = bearer_token or session_token
+    if not resolved_token:
         raise HTTPException(status_code=401, detail="请先登录")
-    payload = read_session_token(session_token)
+    payload = read_session_token(resolved_token)
     username = str(payload.get("sub") or "")
     if not username:
         raise HTTPException(status_code=401, detail="登录状态无效")

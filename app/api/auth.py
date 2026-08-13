@@ -2,23 +2,117 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
+import logging
+import secrets
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from app.core.auth import authenticate_login_credentials, create_session_token, require_authenticated_account
+from app.core.auth import (
+    authenticate_login_credentials,
+    create_session_token,
+    require_authenticated_account,
+    require_superadmin,
+)
 from app.core.config import settings
 from app.core.task_queue import redis_connection
+from app.services.user_service import require_existing_account
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 LOGIN_FAILURES: dict[str, dict[str, int | float]] = {}
 MAX_MEMORY_LOGIN_FAILURE_KEYS = 10_000
+logger = logging.getLogger(__name__)
+IMPERSONATION_CONSUME_SCRIPT = """
+local value = redis.call('GET', KEYS[1])
+if value then
+  redis.call('DEL', KEYS[1])
+end
+return value
+"""
 
 
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
+
+
+class ImpersonationRequest(BaseModel):
+    username: str = Field(min_length=1)
+
+
+class ImpersonationConsumeRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=200)
+
+
+@router.post("/impersonation")
+def create_impersonation_token(
+    payload: ImpersonationRequest,
+    user: dict = Depends(require_superadmin),
+) -> dict[str, str]:
+    try:
+        target = require_existing_account(payload.username.strip())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not target.get("enabled"):
+        raise HTTPException(status_code=400, detail="该用户已停用，不能代登录")
+    token = secrets.token_urlsafe(32)
+    try:
+        redis_connection().setex(
+            impersonation_key(token),
+            settings.impersonation_token_ttl_seconds,
+            json.dumps(
+                {
+                    "username": target["username"],
+                    "issuedBy": user["username"],
+                },
+                ensure_ascii=False,
+            ),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="代登录服务暂不可用，请稍后重试") from exc
+    logger.info(
+        "Superadmin %s issued a one-time impersonation token for %s",
+        user["username"],
+        target["username"],
+    )
+    return {
+        "path": f"/#impersonation={token}",
+        "username": target["username"],
+    }
+
+
+@router.post("/impersonation/consume")
+def consume_impersonation_token(payload: ImpersonationConsumeRequest) -> dict:
+    normalized = payload.token.strip()
+    try:
+        connection = redis_connection()
+        raw = connection.eval(
+            IMPERSONATION_CONSUME_SCRIPT,
+            1,
+            impersonation_key(normalized),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="代登录服务暂不可用，请稍后重试") from exc
+    if not raw:
+        raise HTTPException(status_code=401, detail="代登录凭证无效或已过期")
+    try:
+        data = json.loads(raw)
+        username = str(data.get("username") or "").strip()
+        issued_by = str(data.get("issuedBy") or "").strip()
+        target = require_existing_account(username)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=401, detail="目标用户已不存在或凭证无效") from exc
+    logger.info(
+        "Superadmin %s impersonated user %s in a separate browser tab",
+        issued_by or "unknown",
+        username,
+    )
+    return {
+        "session": target,
+        "sessionToken": create_session_token(username),
+    }
 
 
 @router.get("/session")
@@ -174,3 +268,7 @@ def cleanup_memory_login_failures() -> None:
         LOGIN_FAILURES.pop(key, None)
     while len(LOGIN_FAILURES) >= MAX_MEMORY_LOGIN_FAILURE_KEYS:
         LOGIN_FAILURES.pop(next(iter(LOGIN_FAILURES)))
+
+
+def impersonation_key(token: str) -> str:
+    return f"lt:auth:impersonation:{hashlib.sha256(token.encode('utf-8')).hexdigest()}"

@@ -67,6 +67,7 @@ class Settings(BaseModel):
     session_duration_seconds: int = 60 * 60 * 24 * 7
     login_max_failed_attempts: int = 5
     login_lockout_seconds: int = 15 * 60
+    impersonation_token_ttl_seconds: int = 60
     session_secret: str
     credential_encryption_secret: str
     initial_superadmin_username: str = "superadmin"
@@ -208,6 +209,7 @@ def build_settings() -> Settings:
         session_duration_seconds=_env_int("LT_SESSION_DURATION_SECONDS", 60 * 60 * 24 * 7),
         login_max_failed_attempts=max(1, _env_int("LT_LOGIN_MAX_FAILED_ATTEMPTS", 5)),
         login_lockout_seconds=max(60, _env_int("LT_LOGIN_LOCKOUT_SECONDS", 15 * 60)),
+        impersonation_token_ttl_seconds=max(15, _env_int("LT_IMPERSONATION_TOKEN_TTL_SECONDS", 60)),
         session_secret=_load_secret("LT_SESSION_SECRET", "session_secret.txt"),
         credential_encryption_secret=_load_secret("LT_CREDENTIAL_SECRET", "credential_secret.txt"),
         initial_superadmin_username=_env_text("LT_INITIAL_SUPERADMIN_USERNAME", "superadmin"),
