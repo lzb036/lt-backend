@@ -390,11 +390,11 @@ def test_listing_task_limit_remains_fifty():
 
 
 def test_listing_retry_uses_lower_product_concurrency(monkeypatch):
-    monkeypatch.setattr(crawler_service.settings, "listing_product_workers", 6)
-    monkeypatch.setattr(crawler_service.settings, "listing_retry_product_workers", 2)
+    monkeypatch.setattr(crawler_service.settings, "listing_product_workers", 2)
+    monkeypatch.setattr(crawler_service.settings, "listing_retry_product_workers", 1)
 
-    assert crawler_service.listing_task_product_worker_count(50, retry=False) == 6
-    assert crawler_service.listing_task_product_worker_count(50, retry=True) == 2
+    assert crawler_service.listing_task_product_worker_count(50, retry=False) == 2
+    assert crawler_service.listing_task_product_worker_count(50, retry=True) == 1
     assert crawler_service.listing_task_product_worker_count(1, retry=True) == 1
 
 
@@ -429,8 +429,8 @@ def test_listing_dispatch_uses_global_user_and_store_capacity(
     monkeypatch.setattr(crawler_service, "finalize_stale_cancel_requested_tasks", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(crawler_service, "reconcile_interrupted_running_tasks", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(crawler_service, "should_use_redis_task_queue", lambda: False)
-    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_global", 5)
-    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_user", 2)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_global", 8)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_user", 1)
     monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_store", 1)
     dispatched: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -492,21 +492,108 @@ def test_listing_dispatch_uses_global_user_and_store_capacity(
 
     assert dispatched == [
         ("alice", "a1"),
-        ("alice", "a2"),
         ("bob", "b1"),
     ]
     with session_factory() as session:
-        delayed = session.get(ListingTaskModel, "a3")
-        assert delayed is not None
-        assert "并发额度" in delayed.message
+        for task_id in ("a2", "a3"):
+            delayed = session.get(ListingTaskModel, task_id)
+            assert delayed is not None
+            assert "并发额度" in delayed.message
 
 
-def test_listing_task_processes_six_products_concurrently(
+def test_listing_dispatch_gives_eight_users_one_slot_each(
     monkeypatch,
     session_factory,
 ):
     install_session_scope(monkeypatch, session_factory)
-    monkeypatch.setattr(crawler_service.settings, "listing_product_workers", 6)
+    monkeypatch.setattr(
+        crawler_service,
+        "finalize_stale_cancel_requested_tasks",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "reconcile_interrupted_running_tasks",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "should_use_redis_task_queue",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        crawler_service.settings,
+        "max_running_listing_tasks_global",
+        8,
+    )
+    monkeypatch.setattr(
+        crawler_service.settings,
+        "max_running_listing_tasks_per_user",
+        1,
+    )
+    monkeypatch.setattr(
+        crawler_service.settings,
+        "max_running_listing_tasks_per_store",
+        1,
+    )
+    dispatched: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_listing_task",
+        lambda owner, task_id: dispatched.append((owner, task_id)),
+    )
+
+    with session_factory() as session:
+        for index in range(1, 11):
+            username = f"user-{index}"
+            session.add(
+                UserAccountModel(
+                    username=username,
+                    display_name=username,
+                    password_salt_b64="salt",
+                    password_hash_b64="hash",
+                )
+            )
+            store = StoreModel(
+                owner_username=username,
+                store_code=f"store-{index}",
+                store_name=f"Store {index}",
+            )
+            session.add(store)
+            session.flush()
+            session.add(
+                ListingTaskModel(
+                    id=f"task-{index}",
+                    owner_username=username,
+                    store_id=store.id,
+                    task_name=f"Task {index}",
+                    status="queued",
+                    product_ids_json=json.dumps(
+                        {
+                            "productIds": [index],
+                            "storeIds": [store.id],
+                        }
+                    ),
+                )
+            )
+        session.commit()
+
+    crawler_service.dispatch_next_listing_task()
+
+    assert len(dispatched) == 8
+    assert len({owner for owner, _task_id in dispatched}) == 8
+    assert all(
+        task_id == f"task-{owner.removeprefix('user-')}"
+        for owner, task_id in dispatched
+    )
+
+
+def test_listing_task_processes_two_products_concurrently(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    monkeypatch.setattr(crawler_service.settings, "listing_product_workers", 2)
     monkeypatch.setattr(crawler_service, "listing_task_start_wait_reason", lambda *_args: "")
     monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value)
     monkeypatch.setattr(crawler_service, "fetch_rakuten_cabinet_usage", lambda *_args: {})
@@ -518,7 +605,7 @@ def test_listing_task_processes_six_products_concurrently(
     active = 0
     max_active = 0
     active_lock = threading.Lock()
-    all_workers_started = threading.Barrier(6)
+    all_workers_started = threading.Barrier(2)
 
     def fake_attempt(
         _owner,
@@ -571,7 +658,7 @@ def test_listing_task_processes_six_products_concurrently(
                 review_status="approved",
                 listing_task_id="listing-task",
             )
-            for index in range(6)
+            for index in range(2)
         ]
         session.add_all(products)
         session.flush()
@@ -583,7 +670,7 @@ def test_listing_task_processes_six_products_concurrently(
                 store_id=store.id,
                 task_name="Listing task",
                 status="queued",
-                total_count=6,
+                total_count=2,
                 product_ids_json=json.dumps({
                     "productIds": product_ids,
                     "successIds": [],
@@ -596,10 +683,10 @@ def test_listing_task_processes_six_products_concurrently(
 
     crawler_service._run_listing_task("alice", "listing-task")
 
-    assert max_active == 6
+    assert max_active == 2
     with session_factory() as session:
         task = session.get(ListingTaskModel, "listing-task")
         assert task is not None
         assert task.status == "success"
-        assert task.success_count == 6
+        assert task.success_count == 2
         assert task.failed_count == 0

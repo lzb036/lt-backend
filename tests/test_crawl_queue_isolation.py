@@ -157,19 +157,25 @@ def test_supervisor_templates_keep_total_crawl_worker_count_at_three() -> None:
     assert "numprocs=1" in scheduled_template
 
 
-def test_supervisor_template_uses_five_unified_listing_workers() -> None:
+def test_supervisor_template_uses_eight_unified_listing_workers() -> None:
     listing_template = (
         ROOT / "scripts/supervisor/lt-worker-listing.ini.example"
     ).read_text(encoding="utf-8")
 
     assert "worker.py listing" in listing_template
-    assert "numprocs=5" in listing_template
+    assert "numprocs=8" in listing_template
     assert "listing-image-upload" not in listing_template
 
 
 def test_environment_example_documents_independent_limits_and_queues() -> None:
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
     for setting in (
+        "LT_MAX_RUNNING_LISTING_TASKS_GLOBAL=8",
+        "LT_MAX_RUNNING_LISTING_TASKS_PER_USER=1",
+        "LT_MAX_RUNNING_LISTING_TASKS_PER_STORE=1",
+        "LT_LISTING_PRODUCT_WORKERS=2",
+        "LT_LISTING_RETRY_PRODUCT_WORKERS=1",
+        "LT_LISTING_IMAGE_PREPARE_WORKERS=2",
         "LT_MAX_RUNNING_MANUAL_CRAWL_TASKS_PER_USER=2",
         "LT_MAX_RUNNING_SCHEDULED_CRAWL_TASKS_PER_USER=1",
         "LT_TASK_QUEUE_MANUAL_CRAWL_NAME=lt-tasks-manual-crawl",

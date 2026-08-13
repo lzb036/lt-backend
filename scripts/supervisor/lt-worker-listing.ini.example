@@ -10,5 +10,5 @@ stdout_logfile_maxbytes=2MB
 stderr_logfile_maxbytes=2MB
 user=www
 priority=999
-numprocs=5
+numprocs=8
 process_name=%(program_name)s_%(process_num)02d

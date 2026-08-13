@@ -77,12 +77,12 @@ class Settings(BaseModel):
     max_running_manual_crawl_tasks_per_user: int = 2
     max_running_scheduled_crawl_tasks_per_user: int = 1
     max_running_sync_tasks_per_user: int = 2
-    max_running_listing_tasks_global: int = 5
-    max_running_listing_tasks_per_user: int = 2
+    max_running_listing_tasks_global: int = 8
+    max_running_listing_tasks_per_user: int = 1
     max_running_listing_tasks_per_store: int = 1
-    listing_product_workers: int = 6
-    listing_retry_product_workers: int = 2
-    listing_image_prepare_workers: int = 4
+    listing_product_workers: int = 2
+    listing_retry_product_workers: int = 1
+    listing_image_prepare_workers: int = 2
     rakuten_cabinet_request_min_interval_seconds: float = 0.8
     rakuten_cabinet_qps_cooldown_interval_seconds: float = 1.5
     crawler_browser_fallback_enabled: bool = False
@@ -224,12 +224,12 @@ def build_settings() -> Settings:
             _env_int("LT_MAX_RUNNING_SCHEDULED_CRAWL_TASKS_PER_USER", 1),
         ),
         max_running_sync_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_SYNC_TASKS_PER_USER", 2)),
-        max_running_listing_tasks_global=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_GLOBAL", 5)),
-        max_running_listing_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_USER", 2)),
+        max_running_listing_tasks_global=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_GLOBAL", 8)),
+        max_running_listing_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_USER", 1)),
         max_running_listing_tasks_per_store=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_STORE", 1)),
-        listing_product_workers=max(1, _env_int("LT_LISTING_PRODUCT_WORKERS", 6)),
-        listing_retry_product_workers=max(1, _env_int("LT_LISTING_RETRY_PRODUCT_WORKERS", 2)),
-        listing_image_prepare_workers=max(1, _env_int("LT_LISTING_IMAGE_PREPARE_WORKERS", 4)),
+        listing_product_workers=max(1, _env_int("LT_LISTING_PRODUCT_WORKERS", 2)),
+        listing_retry_product_workers=max(1, _env_int("LT_LISTING_RETRY_PRODUCT_WORKERS", 1)),
+        listing_image_prepare_workers=max(1, _env_int("LT_LISTING_IMAGE_PREPARE_WORKERS", 2)),
         rakuten_cabinet_request_min_interval_seconds=max(
             0.0,
             float(_env_text("LT_RAKUTEN_CABINET_REQUEST_MIN_INTERVAL_SECONDS", "0.8") or "0"),
