@@ -374,10 +374,23 @@ def update_pagination_preference(username: str, list_key: Any, page_size: Any) -
         return preferences
 
 
-def list_users(*, page: int | None = None, page_size: int | None = None) -> list[dict[str, Any]] | dict[str, Any]:
+def list_users(
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    username: str | None = None,
+    display_name: str | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
     ensure_initial_superadmin()
     with session_scope() as session:
-        return paginate_query(session, select(UserAccountModel), page=page, page_size=page_size)
+        query = select(UserAccountModel)
+        normalized_username = normalize_username(username)
+        normalized_display_name = normalize_username(display_name)
+        if normalized_username:
+            query = query.where(UserAccountModel.username.like(f"%{normalized_username}%"))
+        if normalized_display_name:
+            query = query.where(UserAccountModel.display_name.like(f"%{normalized_display_name}%"))
+        return paginate_query(session, query, page=page, page_size=page_size)
 
 
 def create_user(username: str, password: str, display_name: str = "") -> dict[str, Any]:

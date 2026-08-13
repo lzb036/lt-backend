@@ -32,9 +32,16 @@ class DeleteUserRequest(BaseModel):
 def list_user_accounts(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
+    username: str | None = Query(default=None),
+    displayName: str | None = Query(default=None),
     _: dict = Depends(require_superadmin),
 ) -> dict:
-    result = user_service.list_users(page=page, page_size=pageSize)
+    result = user_service.list_users(
+        page=page,
+        page_size=pageSize,
+        username=username,
+        display_name=displayName,
+    )
     if isinstance(result, dict):
         return result
     return {"users": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}
