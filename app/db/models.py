@@ -126,6 +126,29 @@ class SystemAnnouncementModel(TimestampMixin, Base):
     updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
 
+class SystemAnnouncementReadModel(Base):
+    __tablename__ = "lt_system_announcement_reads"
+    __table_args__ = (
+        Index("ix_lt_system_announcement_read_user", "username", "read_at"),
+    )
+
+    announcement_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("lt_system_announcements.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("lt_user_accounts.username", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    read_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class SystemTaskControlModel(TimestampMixin, Base):
     __tablename__ = "lt_system_task_control"
 

@@ -40,6 +40,10 @@ class AnnouncementImageDeletePayload(BaseModel):
     imageUrl: str = Field(min_length=1, max_length=1000)
 
 
+class AnnouncementReadPayload(BaseModel):
+    announcementIds: list[int] = Field(default_factory=list, max_length=100)
+
+
 @router.get("/status")
 def get_maintenance_status() -> dict:
     return {"maintenance": maintenance_service.get_maintenance_status()}
@@ -71,11 +75,36 @@ def update_maintenance_settings(
 
 @router.get("/announcements")
 def list_published_announcements(
-    _: dict = Depends(require_authenticated_account),
+    user: dict = Depends(require_authenticated_account),
 ) -> dict:
     return {
         "announcements": announcement_service.list_announcements(
             include_unpublished=False,
+            username=user["username"],
+        )
+    }
+
+
+@router.get("/announcements/unread")
+def get_unread_announcement_status(
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    return {
+        "hasUnread": announcement_service.has_unread_announcements(
+            user["username"]
+        )
+    }
+
+
+@router.post("/announcements/read")
+def mark_announcements_read(
+    payload: AnnouncementReadPayload,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    return {
+        "readAnnouncementIds": announcement_service.mark_announcements_read(
+            payload.announcementIds,
+            username=user["username"],
         )
     }
 

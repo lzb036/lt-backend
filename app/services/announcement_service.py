@@ -10,11 +10,11 @@ from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
 from PIL import Image
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.core.config import settings
 from app.db.database import SessionLocal
-from app.db.models import SystemAnnouncementModel
+from app.db.models import SystemAnnouncementModel, SystemAnnouncementReadModel
 from app.services.product_image_storage import product_image_storage
 
 
@@ -42,7 +42,11 @@ MAX_ANNOUNCEMENT_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_ANNOUNCEMENT_IMAGES = 12
 
 
-def list_announcements(*, include_unpublished: bool = False) -> list[dict[str, Any]]:
+def list_announcements(
+    *,
+    include_unpublished: bool = False,
+    username: str | None = None,
+) -> list[dict[str, Any]]:
     with SessionLocal() as session:
         query = select(SystemAnnouncementModel)
         if not include_unpublished:
@@ -53,7 +57,80 @@ def list_announcements(*, include_unpublished: bool = False) -> list[dict[str, A
                 SystemAnnouncementModel.id.desc(),
             )
         ).all()
-        return [announcement_to_public(row) for row in rows]
+        read_ids = announcement_read_ids(
+            session,
+            username=username,
+            announcement_ids=[int(row.id) for row in rows],
+        )
+        return [
+            announcement_to_public(row, is_read=int(row.id) in read_ids)
+            for row in rows
+        ]
+
+
+def has_unread_announcements(username: str) -> bool:
+    normalized_username = str(username or "").strip()
+    if not normalized_username:
+        return False
+    with SessionLocal() as session:
+        unread_id = session.execute(
+            select(SystemAnnouncementModel.id)
+            .outerjoin(
+                SystemAnnouncementReadModel,
+                (
+                    SystemAnnouncementReadModel.announcement_id
+                    == SystemAnnouncementModel.id
+                )
+                & (SystemAnnouncementReadModel.username == normalized_username),
+            )
+            .where(
+                SystemAnnouncementModel.published.is_(True),
+                SystemAnnouncementReadModel.announcement_id.is_(None),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        return unread_id is not None
+
+
+def mark_announcements_read(
+    announcement_ids: list[int],
+    *,
+    username: str,
+) -> list[int]:
+    normalized_username = str(username or "").strip()
+    normalized_ids = list(
+        dict.fromkeys(
+            int(announcement_id)
+            for announcement_id in announcement_ids
+            if int(announcement_id) > 0
+        )
+    )
+    if not normalized_username or not normalized_ids:
+        return []
+    with SessionLocal() as session:
+        published_ids = list(
+            session.scalars(
+                select(SystemAnnouncementModel.id).where(
+                    SystemAnnouncementModel.id.in_(normalized_ids),
+                    SystemAnnouncementModel.published.is_(True),
+                )
+            ).all()
+        )
+        existing_ids = announcement_read_ids(
+            session,
+            username=normalized_username,
+            announcement_ids=published_ids,
+        )
+        for announcement_id in published_ids:
+            if int(announcement_id) not in existing_ids:
+                session.add(
+                    SystemAnnouncementReadModel(
+                        announcement_id=int(announcement_id),
+                        username=normalized_username,
+                    )
+                )
+        session.commit()
+        return [int(announcement_id) for announcement_id in published_ids]
 
 
 def create_announcement(
@@ -114,6 +191,11 @@ def update_announcement(
         row.images_json = json.dumps(normalized_images, ensure_ascii=False)
         row.published = bool(published)
         row.updated_by = str(operated_by or "").strip()
+        session.execute(
+            delete(SystemAnnouncementReadModel).where(
+                SystemAnnouncementReadModel.announcement_id == row.id
+            )
+        )
         session.commit()
         session.refresh(row)
         result = announcement_to_public(row)
@@ -236,7 +318,11 @@ def announcement_image_http_info(
     }
 
 
-def announcement_to_public(row: SystemAnnouncementModel) -> dict[str, Any]:
+def announcement_to_public(
+    row: SystemAnnouncementModel,
+    *,
+    is_read: bool | None = None,
+) -> dict[str, Any]:
     return {
         "id": int(row.id),
         "title": row.title,
@@ -247,6 +333,27 @@ def announcement_to_public(row: SystemAnnouncementModel) -> dict[str, Any]:
         "updatedBy": row.updated_by,
         "createdAt": datetime_to_public(row.created_at),
         "updatedAt": datetime_to_public(row.updated_at),
+        "isRead": is_read,
+    }
+
+
+def announcement_read_ids(
+    session: Any,
+    *,
+    username: str | None,
+    announcement_ids: list[int],
+) -> set[int]:
+    normalized_username = str(username or "").strip()
+    if not normalized_username or not announcement_ids:
+        return set()
+    return {
+        int(announcement_id)
+        for announcement_id in session.scalars(
+            select(SystemAnnouncementReadModel.announcement_id).where(
+                SystemAnnouncementReadModel.username == normalized_username,
+                SystemAnnouncementReadModel.announcement_id.in_(announcement_ids),
+            )
+        ).all()
     }
 
 

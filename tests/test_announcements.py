@@ -11,6 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
+from app.db.models import UserAccountModel
 from app.services import announcement_service
 
 
@@ -135,3 +136,53 @@ def test_announcement_payload_requires_content_or_image(
             published=True,
             operated_by="superadmin",
         )
+
+
+def test_announcement_read_state_is_per_user_and_resets_after_update(
+    announcement_database,
+) -> None:
+    factory, _image_dir = announcement_database
+    with factory() as session:
+        for username in ("operator-a", "operator-b"):
+            session.add(
+                UserAccountModel(
+                    username=username,
+                    display_name=username,
+                    password_salt_b64="salt",
+                    password_hash_b64="hash",
+                    password_iterations=1,
+                )
+            )
+        session.commit()
+
+    announcement = announcement_service.create_announcement(
+        title="系统公告",
+        content="第一版内容。",
+        image_urls=[],
+        published=True,
+        operated_by="superadmin",
+    )
+    assert announcement_service.has_unread_announcements("operator-a") is True
+    assert announcement_service.mark_announcements_read(
+        [announcement["id"]],
+        username="operator-a",
+    ) == [announcement["id"]]
+
+    operator_a = announcement_service.list_announcements(username="operator-a")
+    operator_b = announcement_service.list_announcements(username="operator-b")
+    assert operator_a[0]["isRead"] is True
+    assert operator_b[0]["isRead"] is False
+    assert announcement_service.has_unread_announcements("operator-a") is False
+
+    announcement_service.update_announcement(
+        announcement["id"],
+        title="系统公告",
+        content="第二版内容。",
+        image_urls=[],
+        published=True,
+        operated_by="superadmin",
+    )
+    assert announcement_service.has_unread_announcements("operator-a") is True
+    assert announcement_service.list_announcements(
+        username="operator-a"
+    )[0]["isRead"] is False
