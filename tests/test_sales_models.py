@@ -1542,6 +1542,7 @@ def test_init_database_preflights_sales_parent_before_create_all(
     monkeypatch,
 ):
     from app.services import (
+        announcement_service,
         crawler_service,
         sensitive_word_service,
         user_service,
@@ -1590,6 +1591,11 @@ def test_init_database_preflights_sales_parent_before_create_all(
         lambda: None,
     )
     monkeypatch.setattr(
+        announcement_service,
+        "ensure_default_manual_announcement",
+        lambda _session: None,
+    )
+    monkeypatch.setattr(
         sensitive_word_service,
         "seed_default_sensitive_words",
         lambda _session: None,
@@ -1618,6 +1624,7 @@ def test_init_database_real_create_all_sees_existing_store_parent_key(
     monkeypatch,
 ):
     from app.services import (
+        announcement_service,
         crawler_service,
         sensitive_word_service,
         user_service,
@@ -1674,6 +1681,11 @@ def test_init_database_real_create_all_sees_existing_store_parent_key(
             crawler_service,
             "ensure_default_roles",
             lambda: None,
+        )
+        monkeypatch.setattr(
+            announcement_service,
+            "ensure_default_manual_announcement",
+            lambda _session: None,
         )
         monkeypatch.setattr(
             sensitive_word_service,

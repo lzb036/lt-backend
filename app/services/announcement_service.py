@@ -40,6 +40,13 @@ ALLOWED_ANNOUNCEMENT_IMAGE_MIME_TYPES = {
 }
 MAX_ANNOUNCEMENT_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_ANNOUNCEMENT_IMAGES = 12
+DEFAULT_MANUAL_ANNOUNCEMENT_CREATED_BY = "system:operator-manual"
+DEFAULT_MANUAL_ANNOUNCEMENT_TITLE = "商品采集系统使用手册"
+DEFAULT_MANUAL_ANNOUNCEMENT_CONTENT = (
+    "商品采集系统使用手册已发布，可通过下方链接查看完整操作说明。"
+)
+DEFAULT_MANUAL_ANNOUNCEMENT_LINK_LABEL = "查看使用手册"
+DEFAULT_MANUAL_ANNOUNCEMENT_LINK_URL = "/help/operator-manual"
 
 
 def list_announcements(
@@ -138,19 +145,31 @@ def create_announcement(
     title: str,
     content: str,
     image_urls: list[str],
+    link_label: str = "",
+    link_url: str = "",
     published: bool,
     operated_by: str,
 ) -> dict[str, Any]:
-    normalized_title, normalized_content, normalized_images = normalize_payload(
+    (
+        normalized_title,
+        normalized_content,
+        normalized_images,
+        normalized_link_label,
+        normalized_link_url,
+    ) = normalize_payload(
         title,
         content,
         image_urls,
+        link_label,
+        link_url,
     )
     with SessionLocal() as session:
         row = SystemAnnouncementModel(
             title=normalized_title,
             content=normalized_content,
             images_json=json.dumps(normalized_images, ensure_ascii=False),
+            link_label=normalized_link_label,
+            link_url=normalized_link_url,
             published=bool(published),
             created_by=str(operated_by or "").strip(),
             updated_by=str(operated_by or "").strip(),
@@ -167,13 +186,23 @@ def update_announcement(
     title: str,
     content: str,
     image_urls: list[str],
+    link_label: str = "",
+    link_url: str = "",
     published: bool,
     operated_by: str,
 ) -> dict[str, Any]:
-    normalized_title, normalized_content, normalized_images = normalize_payload(
+    (
+        normalized_title,
+        normalized_content,
+        normalized_images,
+        normalized_link_label,
+        normalized_link_url,
+    ) = normalize_payload(
         title,
         content,
         image_urls,
+        link_label,
+        link_url,
     )
     removed_images: list[str] = []
     with SessionLocal() as session:
@@ -189,6 +218,8 @@ def update_announcement(
         row.title = normalized_title
         row.content = normalized_content
         row.images_json = json.dumps(normalized_images, ensure_ascii=False)
+        row.link_label = normalized_link_label
+        row.link_url = normalized_link_url
         row.published = bool(published)
         row.updated_by = str(operated_by or "").strip()
         session.execute(
@@ -328,6 +359,8 @@ def announcement_to_public(
         "title": row.title,
         "content": row.content,
         "imageUrls": announcement_images(row),
+        "linkLabel": row.link_label,
+        "linkUrl": row.link_url,
         "published": bool(row.published),
         "createdBy": row.created_by,
         "updatedBy": row.updated_by,
@@ -361,7 +394,9 @@ def normalize_payload(
     title: str,
     content: str,
     image_urls: list[str],
-) -> tuple[str, str, list[str]]:
+    link_label: str = "",
+    link_url: str = "",
+) -> tuple[str, str, list[str], str, str]:
     normalized_title = str(title or "").strip()
     normalized_content = str(content or "").strip()
     if not normalized_title:
@@ -370,6 +405,22 @@ def normalize_payload(
         raise RuntimeError("公告标题不能超过 255 个字符。")
     if len(normalized_content) > 20_000:
         raise RuntimeError("公告内容不能超过 20000 个字符。")
+    normalized_link_label = str(link_label or "").strip()
+    normalized_link_url = str(link_url or "").strip()
+    if len(normalized_link_label) > 255:
+        raise RuntimeError("公告链接文字不能超过 255 个字符。")
+    if len(normalized_link_url) > 1000:
+        raise RuntimeError("公告链接地址不能超过 1000 个字符。")
+    if normalized_link_label and not normalized_link_url:
+        raise RuntimeError("填写公告链接文字后必须填写链接地址。")
+    if normalized_link_url and not (
+        normalized_link_url.startswith("/")
+        or normalized_link_url.startswith("https://")
+        or normalized_link_url.startswith("http://")
+    ):
+        raise RuntimeError("公告链接仅支持站内路径或 HTTP/HTTPS 地址。")
+    if normalized_link_url and not normalized_link_label:
+        normalized_link_label = "查看详情"
     normalized_images = list(
         dict.fromkeys(
             normalize_announcement_image_url(image_url)
@@ -379,9 +430,39 @@ def normalize_payload(
     )
     if len(normalized_images) > MAX_ANNOUNCEMENT_IMAGES:
         raise RuntimeError(f"每条公告最多上传 {MAX_ANNOUNCEMENT_IMAGES} 张图片。")
-    if not normalized_content and not normalized_images:
-        raise RuntimeError("公告内容和图片不能同时为空。")
-    return normalized_title, normalized_content, normalized_images
+    if not normalized_content and not normalized_images and not normalized_link_url:
+        raise RuntimeError("公告内容、图片和链接不能同时为空。")
+    return (
+        normalized_title,
+        normalized_content,
+        normalized_images,
+        normalized_link_label,
+        normalized_link_url,
+    )
+
+
+def ensure_default_manual_announcement(session: Any) -> bool:
+    existing = session.execute(
+        select(SystemAnnouncementModel.id).where(
+            SystemAnnouncementModel.created_by
+            == DEFAULT_MANUAL_ANNOUNCEMENT_CREATED_BY
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return False
+    session.add(
+        SystemAnnouncementModel(
+            title=DEFAULT_MANUAL_ANNOUNCEMENT_TITLE,
+            content=DEFAULT_MANUAL_ANNOUNCEMENT_CONTENT,
+            images_json="[]",
+            link_label=DEFAULT_MANUAL_ANNOUNCEMENT_LINK_LABEL,
+            link_url=DEFAULT_MANUAL_ANNOUNCEMENT_LINK_URL,
+            published=True,
+            created_by=DEFAULT_MANUAL_ANNOUNCEMENT_CREATED_BY,
+            updated_by=DEFAULT_MANUAL_ANNOUNCEMENT_CREATED_BY,
+        )
+    )
+    return True
 
 
 def announcement_images(row: SystemAnnouncementModel) -> list[str]:

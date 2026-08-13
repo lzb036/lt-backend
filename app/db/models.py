@@ -116,6 +116,18 @@ class SystemAnnouncementModel(TimestampMixin, Base):
         nullable=False,
         default="[]",
     )
+    link_label: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        default="",
+        server_default="",
+    )
+    link_url: Mapped[str] = mapped_column(
+        String(1000),
+        nullable=False,
+        default="",
+        server_default="",
+    )
     published: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

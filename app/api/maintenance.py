@@ -33,6 +33,8 @@ class AnnouncementPayload(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     content: str = Field(default="", max_length=20_000)
     imageUrls: list[str] = Field(default_factory=list, max_length=12)
+    linkLabel: str = Field(default="", max_length=255)
+    linkUrl: str = Field(default="", max_length=1000)
     published: bool = False
 
 
@@ -130,6 +132,8 @@ def create_announcement(
             title=payload.title,
             content=payload.content,
             image_urls=payload.imageUrls,
+            link_label=payload.linkLabel,
+            link_url=payload.linkUrl,
             published=payload.published,
             operated_by=user["username"],
         )
@@ -150,6 +154,8 @@ def update_announcement(
             title=payload.title,
             content=payload.content,
             image_urls=payload.imageUrls,
+            link_label=payload.linkLabel,
+            link_url=payload.linkUrl,
             published=payload.published,
             operated_by=user["username"],
         )

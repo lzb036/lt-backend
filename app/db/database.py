@@ -980,6 +980,33 @@ def ensure_schema_compatibility() -> None:
                 text("ALTER TABLE lt_user_accounts MODIFY COLUMN pagination_preferences_json TEXT NOT NULL")
             )
 
+        announcement_columns = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'lt_system_announcements'
+                    """
+                )
+            ).scalars()
+        )
+        if announcement_columns and "link_label" not in announcement_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE lt_system_announcements "
+                    "ADD COLUMN link_label VARCHAR(255) NOT NULL DEFAULT ''"
+                )
+            )
+        if announcement_columns and "link_url" not in announcement_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE lt_system_announcements "
+                    "ADD COLUMN link_url VARCHAR(1000) NOT NULL DEFAULT ''"
+                )
+            )
+
         store_columns = set(
             connection.execute(
                 text(
@@ -1631,6 +1658,7 @@ def init_database() -> None:
     if settings.database_auto_create:
         ensure_mysql_database_exists()
     from app.db import models  # noqa: F401
+    from app.services.announcement_service import ensure_default_manual_announcement
     from app.services.crawler_service import ensure_default_roles
     from app.services.sensitive_word_service import seed_default_sensitive_words
     from app.services.user_service import ensure_initial_superadmin
@@ -1643,6 +1671,7 @@ def init_database() -> None:
         ensure_default_roles()
         session = SessionLocal()
         try:
+            ensure_default_manual_announcement(session)
             seed_default_sensitive_words(session)
             session.commit()
         except Exception:

@@ -69,6 +69,8 @@ def test_announcements_publish_and_cleanup_images(
         title="维护预告",
         content="今晚进行系统升级。",
         image_urls=[first_image, second_image],
+        link_label="查看详情",
+        link_url="/docs/notice",
         published=False,
         operated_by="superadmin",
     )
@@ -82,10 +84,14 @@ def test_announcements_publish_and_cleanup_images(
         title="维护预告",
         content="今晚进行系统升级。",
         image_urls=[second_image],
+        link_label="查看详情",
+        link_url="/docs/notice",
         published=True,
         operated_by="superadmin",
     )
     assert published["published"] is True
+    assert published["linkLabel"] == "查看详情"
+    assert published["linkUrl"] == "/docs/notice"
     assert [row["id"] for row in announcement_service.list_announcements()] == [
         draft["id"]
     ]
@@ -186,3 +192,22 @@ def test_announcement_read_state_is_per_user_and_resets_after_update(
     assert announcement_service.list_announcements(
         username="operator-a"
     )[0]["isRead"] is False
+
+
+def test_default_manual_announcement_is_seeded_once(
+    announcement_database,
+) -> None:
+    factory, _image_dir = announcement_database
+    with factory() as session:
+        assert announcement_service.ensure_default_manual_announcement(session)
+        session.commit()
+        assert not announcement_service.ensure_default_manual_announcement(session)
+        session.commit()
+
+    announcements = announcement_service.list_announcements(
+        include_unpublished=True
+    )
+    assert len(announcements) == 1
+    assert announcements[0]["title"] == "商品采集系统使用手册"
+    assert announcements[0]["linkLabel"] == "查看使用手册"
+    assert announcements[0]["linkUrl"] == "/help/operator-manual"
