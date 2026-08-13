@@ -9,7 +9,7 @@ from urllib.parse import quote
 import requests
 from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from decimal import Decimal
 
 from app.core.auth import (
@@ -166,6 +166,18 @@ class ProductStatusPayload(BaseModel):
     productIds: list[int] = Field(default_factory=list)
     status: str = Field(pattern="^(pending|approved|error|listed|listed_master|rejected)$")
     message: str = ""
+
+
+class ProductApproveByCountPayload(BaseModel):
+    collectionSource: Literal["manual", "scheduled"]
+    mode: Literal["all", "count"]
+    count: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_count_mode(self):
+        if self.mode == "count" and self.count is None:
+            raise ValueError("指定数量模式必须填写通过数量")
+        return self
 
 
 class ProductGenrePayload(BaseModel):
@@ -905,6 +917,21 @@ def update_product_status(payload: ProductStatusPayload, user: dict = Depends(re
             message=payload.message,
         )
         return {"products": products}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/products/approve-by-count")
+def approve_products_by_count(
+    payload: ProductApproveByCountPayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        return crawler_service.approve_pending_products_by_count(
+            user["username"],
+            collection_source=payload.collectionSource,
+            count=payload.count if payload.mode == "count" else None,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

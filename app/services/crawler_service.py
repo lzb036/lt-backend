@@ -14305,6 +14305,63 @@ def update_product_status(owner_username: str, product_ids: list[int], status: s
         return [product_to_public(row) for row in rows]
 
 
+def approve_pending_products_by_count(
+    owner_username: str,
+    *,
+    collection_source: str,
+    count: int | None,
+) -> dict[str, Any]:
+    normalized_source = normalize_text(collection_source).lower()
+    if normalized_source not in {"manual", "scheduled"}:
+        raise RuntimeError("采集来源不合法。")
+    if count is not None and count < 1:
+        raise RuntimeError("指定通过数量必须大于 0。")
+
+    with session_scope() as session:
+        rows = session.scalars(
+            select(ProductModel)
+            .where(
+                ProductModel.owner_username == owner_username,
+                ProductModel.review_status == "pending",
+                ProductModel.collection_source == normalized_source,
+                ProductModel.listing_task_id.is_(None),
+            )
+            .order_by(*product_list_order_by("pending"))
+        ).all()
+
+        approved_ids: list[int] = []
+        skipped: list[dict[str, Any]] = []
+        for row in rows:
+            if count is not None and len(approved_ids) >= count:
+                break
+            if product_replacement_metadata(product_raw_payload(row)):
+                skipped.append({
+                    "productId": row.id,
+                    "reason": "替换采集商品不能执行普通审核通过",
+                })
+                continue
+            if not rakuten_genre_path(row.genre_id):
+                skipped.append({
+                    "productId": row.id,
+                    "reason": "缺少有效品类",
+                })
+                continue
+
+            row.review_status = "approved"
+            from app.services.ai_title_service import cleanup_title_versions_for_approved_product
+
+            cleanup_title_versions_for_approved_product(session, row)
+            approved_ids.append(row.id)
+
+        session.flush()
+        return {
+            "approvedCount": len(approved_ids),
+            "skippedCount": len(skipped),
+            "approvedProductIds": approved_ids,
+            "skipped": skipped,
+        }
+
+
 def update_pending_product_genre(owner_username: str, product_id: int, genre_id: str) -> dict[str, Any]:
     normalized_genre_id = normalize_text(genre_id)
     if not re.fullmatch(r"\d{6}", normalized_genre_id) or not rakuten_genre_path(normalized_genre_id):
