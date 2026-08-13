@@ -1576,7 +1576,13 @@ def verify_store(
 ) -> dict:
     try:
         target_username = resolve_target_username(user, ownerUsername)
-        return {"store": crawler_service.verify_store(target_username, store_id)}
+        return {
+            "store": crawler_service.verify_store(
+                target_username,
+                store_id,
+                reveal=user.get("role") == "superadmin",
+            )
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

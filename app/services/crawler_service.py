@@ -12159,7 +12159,12 @@ def verify_all_stores(owner_username: str) -> dict[str, Any]:
     }
 
 
-def verify_store(owner_username: str, store_id: int) -> dict[str, Any]:
+def verify_store(
+    owner_username: str,
+    store_id: int,
+    *,
+    reveal: bool = False,
+) -> dict[str, Any]:
     with session_scope() as session:
         row = session.get(StoreModel, store_id)
         if row is None:
@@ -12172,7 +12177,7 @@ def verify_store(owner_username: str, store_id: int) -> dict[str, Any]:
             row.last_checked_at = datetime.now()
             row.last_error = str(exc)
         session.flush()
-        return store_to_public(row)
+        return store_to_public(row, reveal=reveal)
 
 
 def refresh_all_store_product_counts(owner_username: str) -> dict[str, Any]:
