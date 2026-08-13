@@ -16,7 +16,7 @@ from app.api.users import router as users_router
 from app.core.config import settings
 from app.core.auth import read_session_token, require_superadmin
 from app.db.database import SessionLocal, init_database
-from app.services import crawler_service
+from app.services import announcement_service, crawler_service
 from app.services.crawler_service import LOCAL_PRODUCT_IMAGE_DIR, LOCAL_PRODUCT_IMAGE_DRAFT_DIR, start_schedule_runner
 from app.services.maintenance_service import get_maintenance_status
 from app.services.product_image_storage import product_image_storage
@@ -34,6 +34,10 @@ DESIGNKIT_IMAGE_CORS_ORIGINS = {
 async def lifespan(_app: FastAPI):
     LOCAL_PRODUCT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     LOCAL_PRODUCT_IMAGE_DRAFT_DIR.mkdir(parents=True, exist_ok=True)
+    announcement_service.LOCAL_ANNOUNCEMENT_IMAGE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
     init_database()
     start_schedule_runner()
     yield
@@ -184,6 +188,39 @@ def product_image_draft_file(product_id: int, filename: str, request: Request):
         crawler_service.local_product_image_draft_url(product_id, filename),
         method=request.method,
         cache_control="private, max-age=300",
+    )
+
+
+@app.api_route(
+    "/api/static/announcement-images/{filename}",
+    methods=["GET", "HEAD"],
+    include_in_schema=False,
+)
+def announcement_image_file(filename: str, request: Request):
+    try:
+        info = announcement_service.announcement_image_http_info(
+            filename,
+            include_body=request.method.upper() != "HEAD",
+        )
+    except RuntimeError as exc:
+        status_code = 404 if "不存在" in str(exc) else 503
+        return Response(status_code=status_code)
+    headers = {
+        "Cache-Control": "public, max-age=3600",
+        "Content-Length": str(info["size"]),
+    }
+    if request.method.upper() == "HEAD":
+        return Response(media_type=info["mediaType"], headers=headers)
+    if info["type"] == "local":
+        return FileResponse(
+            info["path"],
+            media_type=info["mediaType"],
+            headers=headers,
+        )
+    return StreamingResponse(
+        info["body"],
+        media_type=info["mediaType"],
+        headers=headers,
     )
 
 

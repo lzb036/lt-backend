@@ -13,7 +13,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.api import maintenance as maintenance_api
-from app.core.auth import require_superadmin
+from app.core.auth import require_authenticated_account, require_superadmin
 from app.core.config import settings
 from app.db.database import Base
 from app.db.models import SystemMaintenanceSettingModel
@@ -34,13 +34,29 @@ def test_maintenance_routes_and_permissions() -> None:
     assert ("GET", "/maintenance/task-control") in routes
     assert ("POST", "/maintenance/task-control/stop-all") in routes
     assert ("POST", "/maintenance/task-control/resume-all") in routes
+    assert ("GET", "/maintenance/announcements") in routes
+    assert ("GET", "/maintenance/announcements/manage") in routes
+    assert ("POST", "/maintenance/announcements") in routes
+    assert ("POST", "/maintenance/announcement-images") in routes
+    assert ("DELETE", "/maintenance/announcement-images") in routes
     assert not routes[("GET", "/maintenance/status")].dependant.dependencies
+    announcement_dependencies = [
+        dependency.call
+        for dependency in routes[
+            ("GET", "/maintenance/announcements")
+        ].dependant.dependencies
+    ]
+    assert require_authenticated_account in announcement_dependencies
     for key in [
         ("GET", "/maintenance/settings"),
         ("PUT", "/maintenance/settings"),
         ("GET", "/maintenance/task-control"),
         ("POST", "/maintenance/task-control/stop-all"),
         ("POST", "/maintenance/task-control/resume-all"),
+        ("GET", "/maintenance/announcements/manage"),
+        ("POST", "/maintenance/announcements"),
+        ("POST", "/maintenance/announcement-images"),
+        ("DELETE", "/maintenance/announcement-images"),
     ]:
         dependency_calls = [dependency.call for dependency in routes[key].dependant.dependencies]
         assert require_superadmin in dependency_calls

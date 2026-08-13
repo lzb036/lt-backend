@@ -98,6 +98,34 @@ class SystemMaintenanceSettingModel(TimestampMixin, Base):
     updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
 
+class SystemAnnouncementModel(TimestampMixin, Base):
+    __tablename__ = "lt_system_announcements"
+    __table_args__ = (
+        Index("ix_lt_system_announcement_published", "published", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="",
+    )
+    images_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="[]",
+    )
+    published: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+    )
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    updated_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+
 class SystemTaskControlModel(TimestampMixin, Base):
     __tablename__ = "lt_system_task_control"
 
