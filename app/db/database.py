@@ -1288,6 +1288,12 @@ def ensure_schema_compatibility() -> None:
         if sync_task_columns:
             if "task_type" not in sync_task_columns:
                 connection.execute(text("ALTER TABLE lt_sync_tasks ADD COLUMN task_type VARCHAR(32) NOT NULL DEFAULT 'store_sync'"))
+            if "task_group_id" not in sync_task_columns:
+                connection.execute(text("ALTER TABLE lt_sync_tasks ADD COLUMN task_group_id VARCHAR(64) NULL"))
+            if "task_group_index" not in sync_task_columns:
+                connection.execute(text("ALTER TABLE lt_sync_tasks ADD COLUMN task_group_index INT NULL"))
+            if "task_group_size" not in sync_task_columns:
+                connection.execute(text("ALTER TABLE lt_sync_tasks ADD COLUMN task_group_size INT NULL"))
             if "payload_json" not in sync_task_columns:
                 connection.execute(text("ALTER TABLE lt_sync_tasks ADD COLUMN payload_json TEXT NULL"))
                 connection.execute(text("UPDATE lt_sync_tasks SET payload_json = '{}' WHERE payload_json IS NULL OR payload_json = ''"))
@@ -1320,6 +1326,8 @@ def ensure_schema_compatibility() -> None:
         if sync_task_columns:
             if "ix_lt_sync_task_owner_status" not in sync_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_status ON lt_sync_tasks (owner_username, status)"))
+            if "ix_lt_sync_task_owner_group" not in sync_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_group ON lt_sync_tasks (owner_username, task_group_id)"))
             if "ix_lt_sync_task_owner_created" not in sync_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_sync_task_owner_created ON lt_sync_tasks (owner_username, created_at)"))
             if "ix_lt_sync_task_owner_started" not in sync_task_indexes:
@@ -1354,8 +1362,16 @@ def ensure_schema_compatibility() -> None:
             ).scalars()
         )
         if listing_task_columns:
+            if "task_group_id" not in listing_task_columns:
+                connection.execute(text("ALTER TABLE lt_listing_tasks ADD COLUMN task_group_id VARCHAR(64) NULL"))
+            if "task_group_index" not in listing_task_columns:
+                connection.execute(text("ALTER TABLE lt_listing_tasks ADD COLUMN task_group_index INT NULL"))
+            if "task_group_size" not in listing_task_columns:
+                connection.execute(text("ALTER TABLE lt_listing_tasks ADD COLUMN task_group_size INT NULL"))
             if "ix_lt_listing_task_owner_status" not in listing_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_listing_task_owner_status ON lt_listing_tasks (owner_username, status)"))
+            if "ix_lt_listing_task_owner_group" not in listing_task_indexes:
+                connection.execute(text("CREATE INDEX ix_lt_listing_task_owner_group ON lt_listing_tasks (owner_username, task_group_id)"))
             if "ix_lt_listing_task_owner_created" not in listing_task_indexes:
                 connection.execute(text("CREATE INDEX ix_lt_listing_task_owner_created ON lt_listing_tasks (owner_username, created_at)"))
             if "ix_lt_listing_task_owner_started" not in listing_task_indexes:

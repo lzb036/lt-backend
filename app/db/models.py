@@ -454,6 +454,7 @@ class ListingTaskModel(TimestampMixin, Base):
     __tablename__ = "lt_listing_tasks"
     __table_args__ = (
         Index("ix_lt_listing_task_owner_status", "owner_username", "status"),
+        Index("ix_lt_listing_task_owner_group", "owner_username", "task_group_id"),
         Index("ix_lt_listing_task_owner_created", "owner_username", "created_at"),
         Index("ix_lt_listing_task_owner_started", "owner_username", "started_at"),
         Index("ix_lt_listing_task_owner_finished", "owner_username", "finished_at"),
@@ -467,6 +468,9 @@ class ListingTaskModel(TimestampMixin, Base):
         nullable=False,
     )
     store_id: Mapped[int | None] = mapped_column(ForeignKey("lt_stores.id", ondelete="SET NULL"))
+    task_group_id: Mapped[str | None] = mapped_column(String(64))
+    task_group_index: Mapped[int | None] = mapped_column(Integer)
+    task_group_size: Mapped[int | None] = mapped_column(Integer)
     task_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", server_default="queued")
     total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -483,6 +487,7 @@ class SyncTaskModel(TimestampMixin, Base):
     __tablename__ = "lt_sync_tasks"
     __table_args__ = (
         Index("ix_lt_sync_task_owner_status", "owner_username", "status"),
+        Index("ix_lt_sync_task_owner_group", "owner_username", "task_group_id"),
         Index("ix_lt_sync_task_owner_created", "owner_username", "created_at"),
         Index("ix_lt_sync_task_owner_started", "owner_username", "started_at"),
         Index("ix_lt_sync_task_owner_finished", "owner_username", "finished_at"),
@@ -496,6 +501,9 @@ class SyncTaskModel(TimestampMixin, Base):
         nullable=False,
     )
     store_id: Mapped[int | None] = mapped_column(ForeignKey("lt_stores.id", ondelete="SET NULL"))
+    task_group_id: Mapped[str | None] = mapped_column(String(64))
+    task_group_index: Mapped[int | None] = mapped_column(Integer)
+    task_group_size: Mapped[int | None] = mapped_column(Integer)
     store_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     task_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     task_type: Mapped[str] = mapped_column(String(32), nullable=False, default="store_sync", server_default="store_sync")

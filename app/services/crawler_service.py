@@ -3555,6 +3555,9 @@ def listing_task_to_public(
         "storeName": store_snapshot.get("storeName", ""),
         "aliasName": store_snapshot.get("aliasName", ""),
         "taskName": row.task_name,
+        "taskGroupId": row.task_group_id,
+        "taskGroupIndex": row.task_group_index,
+        "taskGroupSize": row.task_group_size,
         "status": row.status,
         "totalCount": row.total_count,
         "successCount": row.success_count,
@@ -3597,6 +3600,9 @@ def sync_task_to_public(row: SyncTaskModel) -> dict[str, Any]:
         "storeId": row.store_id,
         "storeName": row.store_name,
         "taskName": row.task_name,
+        "taskGroupId": row.task_group_id,
+        "taskGroupIndex": row.task_group_index,
+        "taskGroupSize": row.task_group_size,
         "taskType": row.task_type,
         "status": row.status,
         "totalCount": total_count,
@@ -3612,6 +3618,221 @@ def sync_task_to_public(row: SyncTaskModel) -> dict[str, Any]:
         "finishedAt": row.finished_at.isoformat(sep=" ") if row.finished_at else None,
         "createdAt": row.created_at.isoformat(sep=" ") if row.created_at else None,
         "updatedAt": row.updated_at.isoformat(sep=" ") if row.updated_at else None,
+    }
+
+
+TASK_GROUP_NAME_PATTERN = re.compile(r"^(?P<prefix>.*?)(?:\s+)(?P<index>\d+)/(?P<size>\d+)(?P<suffix>(?:\s+.*)?)$")
+TASK_GROUP_TERMINAL_STATUSES = {"success", "partial", "failed", "cancelled", "completed"}
+
+
+def task_group_name_parts(task_name: str) -> tuple[str, int, int] | None:
+    match = TASK_GROUP_NAME_PATTERN.fullmatch(normalize_text(task_name))
+    if match is None:
+        return None
+    index = int(match.group("index"))
+    size = int(match.group("size"))
+    if size <= 1 or index < 1 or index > size:
+        return None
+    base_name = f"{match.group('prefix')}{match.group('suffix')}".strip()
+    return base_name, index, size
+
+
+def task_group_status(rows: list[Any]) -> str:
+    statuses = [normalize_text(row.status) for row in rows]
+    if any(status in {"running", "processing"} for status in statuses):
+        return "running"
+    if any(status in {"queued", "idle", "pending", "waiting", "preview_ready"} for status in statuses):
+        return "queued"
+    if statuses and all(status in {"success", "completed"} for status in statuses):
+        return "success"
+    if statuses and all(status == "cancelled" for status in statuses):
+        return "cancelled"
+    if any(status in {"success", "completed", "partial"} for status in statuses):
+        return "partial"
+    return "failed"
+
+
+def task_group_status_priority(status: str) -> int:
+    if status in {"running", "processing"}:
+        return 0
+    if status in {"queued", "idle", "pending", "waiting", "preview_ready"}:
+        return 1
+    if status in {"failed", "partial", "error", "cancelled"}:
+        return 2
+    if status in {"success", "completed"}:
+        return 3
+    return 5
+
+
+def task_group_rows(rows: list[Any]) -> list[list[Any]]:
+    grouped_rows: dict[tuple[Any, ...], list[Any]] = {}
+    standalone_rows: list[list[Any]] = []
+    legacy_candidates: dict[tuple[Any, ...], list[tuple[Any, int, int]]] = {}
+
+    for row in rows:
+        if normalize_text(getattr(row, "task_group_id", None)):
+            key = ("persisted", row.owner_username, row.task_group_id)
+            grouped_rows.setdefault(key, []).append(row)
+            continue
+        name_parts = task_group_name_parts(row.task_name)
+        if name_parts is None:
+            standalone_rows.append([row])
+            continue
+        base_name, group_index, group_size = name_parts
+        key = (
+            "legacy",
+            row.owner_username,
+            getattr(row, "store_id", None),
+            getattr(row, "task_type", None),
+            row.created_at,
+            base_name,
+            group_size,
+        )
+        legacy_candidates.setdefault(key, []).append((row, group_index, group_size))
+
+    for key, candidates in legacy_candidates.items():
+        expected_size = candidates[0][2]
+        indexes = [candidate[1] for candidate in candidates]
+        if len(candidates) == expected_size and sorted(indexes) == list(range(1, expected_size + 1)):
+            grouped_rows[key] = [candidate[0] for candidate in candidates]
+        else:
+            standalone_rows.extend([[candidate[0]] for candidate in candidates])
+
+    result = [*standalone_rows, *grouped_rows.values()]
+    for group in result:
+        group.sort(
+            key=lambda row: (
+                int(getattr(row, "task_group_index", 0) or (task_group_name_parts(row.task_name) or ("", 0, 0))[1]),
+                row.created_at or datetime.min,
+                row.id,
+            )
+        )
+    result.sort(key=lambda group: min(row.id for row in group))
+    result.sort(
+        key=lambda group: max((row.created_at or datetime.min) for row in group),
+        reverse=True,
+    )
+    result.sort(key=lambda group: task_group_status_priority(task_group_status(group)))
+    return result
+
+
+def task_group_to_public(
+    rows: list[Any],
+    *,
+    serializer: Callable[[Any], dict[str, Any]],
+    group_kind: str,
+) -> dict[str, Any]:
+    children = [serializer(row) for row in rows]
+    if len(children) == 1:
+        return children[0]
+
+    for row, child in zip(rows, children):
+        name_parts = task_group_name_parts(row.task_name)
+        child["taskGroupIndex"] = (
+            int(getattr(row, "task_group_index", 0) or 0)
+            or (name_parts[1] if name_parts else None)
+        )
+        child["taskGroupSize"] = (
+            int(getattr(row, "task_group_size", 0) or 0)
+            or (name_parts[2] if name_parts else len(rows))
+        )
+
+    first_row = rows[0]
+    first_child = children[0]
+    name_parts = task_group_name_parts(first_row.task_name)
+    task_name = name_parts[0] if name_parts else first_row.task_name
+    group_id = normalize_text(getattr(first_row, "task_group_id", None)) or hashlib.sha256(
+        "|".join(
+            [
+                str(first_row.owner_username),
+                str(getattr(first_row, "store_id", "") or ""),
+                str(getattr(first_row, "task_type", "") or ""),
+                str(first_row.created_at or ""),
+                task_name,
+            ]
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    status = task_group_status(rows)
+    completed_count = sum(
+        1 for row in rows if normalize_text(row.status) in TASK_GROUP_TERMINAL_STATUSES
+    )
+    failed_task_count = sum(
+        1 for row in rows if normalize_text(row.status) in {"failed", "partial", "error", "cancelled"}
+    )
+    started_values = [row.started_at for row in rows if row.started_at is not None]
+    finished_values = [row.finished_at for row in rows if row.finished_at is not None]
+    all_terminal = all(normalize_text(row.status) in TASK_GROUP_TERMINAL_STATUSES for row in rows)
+    aggregate = {
+        **first_child,
+        "id": f"group:{group_kind}:{group_id}",
+        "taskGroupId": group_id,
+        "taskGroupIndex": None,
+        "taskGroupSize": len(rows),
+        "taskName": task_name,
+        "status": status,
+        "totalCount": sum(max(0, int(child.get("totalCount") or 0)) for child in children),
+        "successCount": sum(max(0, int(child.get("successCount") or 0)) for child in children),
+        "failedCount": sum(max(0, int(child.get("failedCount") or 0)) for child in children),
+        "cancelRequested": any(bool(child.get("cancelRequested")) for child in children),
+        "message": f"共 {len(rows)} 个分任务，已完成 {completed_count} / {len(rows)} 个",
+        "errorDetail": f"{failed_task_count} 个分任务存在失败或终止，请展开查看。" if failed_task_count else None,
+        "startedAt": min(started_values).isoformat(sep=" ") if started_values else None,
+        "finishedAt": max(finished_values).isoformat(sep=" ") if all_terminal and finished_values else None,
+        "createdAt": min(row.created_at for row in rows if row.created_at is not None).isoformat(sep=" "),
+        "updatedAt": max(row.updated_at for row in rows if row.updated_at is not None).isoformat(sep=" "),
+        "isGroup": True,
+        "childTaskIds": [row.id for row in rows],
+        "children": children,
+    }
+    if group_kind == "listing":
+        aggregate["productIds"] = [
+            product_id
+            for child in children
+            for product_id in child.get("productIds") or []
+        ]
+        aggregate["successIds"] = [
+            product_id
+            for child in children
+            for product_id in child.get("successIds") or []
+        ]
+        aggregate["failedIds"] = [
+            product_id
+            for child in children
+            for product_id in child.get("failedIds") or []
+        ]
+    return aggregate
+
+
+def paginate_task_groups(
+    rows: list[Any],
+    *,
+    page: int | None,
+    page_size: int | None,
+    response_key: str,
+    serializer: Callable[[Any], dict[str, Any]],
+    group_kind: str,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    groups = task_group_rows(rows)
+    normalized_page, normalized_page_size = normalize_page_params(page, page_size)
+    if not normalized_page_size:
+        return [
+            task_group_to_public(group, serializer=serializer, group_kind=group_kind)
+            for group in groups
+        ]
+    total = len(groups)
+    if total:
+        max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
+        normalized_page = min(normalized_page, max_page)
+    start = (normalized_page - 1) * normalized_page_size
+    page_groups = groups[start : start + normalized_page_size]
+    return {
+        response_key: [
+            task_group_to_public(group, serializer=serializer, group_kind=group_kind)
+            for group in page_groups
+        ],
+        "total": total,
+        "page": normalized_page,
+        "pageSize": normalized_page_size,
     }
 
 
@@ -7981,6 +8202,7 @@ def create_store_unlisted_product_delete_tasks(session: Any, now: datetime) -> t
             continue
         product_count += len(product_ids)
         chunks = chunk_product_ids(product_ids)
+        task_group_id = uuid.uuid4().hex if len(chunks) > 1 else None
         for index, chunk_ids in enumerate(chunks, start=1):
             task_id = uuid.uuid4().hex
             part_label = "" if len(chunks) == 1 else f" {index}/{len(chunks)}"
@@ -7988,6 +8210,9 @@ def create_store_unlisted_product_delete_tasks(session: Any, now: datetime) -> t
                 id=task_id,
                 owner_username=owner_username,
                 store_id=store_id,
+                task_group_id=task_group_id,
+                task_group_index=index if task_group_id else None,
+                task_group_size=len(chunks) if task_group_id else None,
                 store_name=group["storeName"],
                 task_name=f"月度删除未上架{part_label} {group['storeName']} {now:%Y-%m-%d %H:%M}",
                 task_type="product_delete",
@@ -8323,6 +8548,7 @@ def create_deleted_product_image_cleanup_tasks(
                 row.last_error = "店铺不存在或已停用，无法创建图片清理任务。"
             continue
         chunks = [group_rows[index:index + BATCH_TASK_PRODUCT_LIMIT] for index in range(0, len(group_rows), BATCH_TASK_PRODUCT_LIMIT)]
+        task_group_id = uuid.uuid4().hex if len(chunks) > 1 else None
         for index, chunk_rows in enumerate(chunks, start=1):
             task_id = uuid.uuid4().hex
             cleanup_ids = [int(row.id) for row in chunk_rows]
@@ -8331,6 +8557,9 @@ def create_deleted_product_image_cleanup_tasks(
                 id=task_id,
                 owner_username=owner_username,
                 store_id=store_id,
+                task_group_id=task_group_id,
+                task_group_index=index if task_group_id else None,
+                task_group_size=len(chunks) if task_group_id else None,
                 store_name=store.alias_name or store.store_name,
                 task_name=f"已删除商品图片清理{part_label} {store.alias_name or store.store_name} {now:%Y-%m-%d %H:%M}",
                 task_type="deleted_product_image_cleanup",
@@ -10460,14 +10689,17 @@ def list_sync_tasks(
                     SyncTaskModel.status != "preview_ready",
                 ),
             )
-        return paginate_query(
-            session,
-            query,
-            order_by=task_status_order_by(SyncTaskModel),
+        if normalized_task_ids:
+            rows = session.scalars(query.order_by(*task_status_order_by(SyncTaskModel))).all()
+            return [sync_task_to_public(row) for row in rows]
+        rows = session.scalars(query).all()
+        return paginate_task_groups(
+            rows,
             page=page,
             page_size=page_size,
             response_key="syncTasks",
             serializer=sync_task_to_public,
+            group_kind="sync",
         )
 
 
@@ -10559,6 +10791,7 @@ def create_product_listing_status_sync_task(owner_username: str, product_ids: li
     action_label = "批量上架" if listing_status == "listed" else "批量下架"
     store_id = validate_sync_task_products(owner_username, normalized_ids)
     chunks = chunk_product_ids(normalized_ids)
+    task_group_id = uuid.uuid4().hex if len(chunks) > 1 else None
     task_ids: list[str] = []
     for index, chunk_ids in enumerate(chunks, start=1):
         task_name_prefix = action_label if len(chunks) == 1 else f"{action_label} {index}/{len(chunks)}"
@@ -10570,6 +10803,9 @@ def create_product_listing_status_sync_task(owner_username: str, product_ids: li
             message=f"等待执行{action_label}",
             payload={"listingStatus": listing_status, "productIds": chunk_ids},
             total_count=len(chunk_ids),
+            task_group_id=task_group_id,
+            task_group_index=index if task_group_id else None,
+            task_group_size=len(chunks) if task_group_id else None,
         )
         task_ids.append(task_id)
     dispatch_next_sync_task()
@@ -10582,6 +10818,7 @@ def create_product_delete_sync_task(owner_username: str, product_ids: list[int])
         raise RuntimeError("请先选择商品。")
     store_id = validate_sync_task_products(owner_username, normalized_ids)
     chunks = chunk_product_ids(normalized_ids)
+    task_group_id = uuid.uuid4().hex if len(chunks) > 1 else None
     task_ids: list[str] = []
     for index, chunk_ids in enumerate(chunks, start=1):
         task_name_prefix = "批量删除" if len(chunks) == 1 else f"批量删除 {index}/{len(chunks)}"
@@ -10593,6 +10830,9 @@ def create_product_delete_sync_task(owner_username: str, product_ids: list[int])
             message="等待执行批量删除",
             payload={"productIds": chunk_ids},
             total_count=len(chunk_ids),
+            task_group_id=task_group_id,
+            task_group_index=index if task_group_id else None,
+            task_group_size=len(chunks) if task_group_id else None,
         )
         task_ids.append(task_id)
     dispatch_next_sync_task()
@@ -10607,6 +10847,7 @@ def create_product_title_optimization_task(
     if not normalized_ids:
         raise RuntimeError("请先选择商品。")
     chunks = chunk_product_ids(normalized_ids)
+    task_group_id = uuid.uuid4().hex if len(chunks) > 1 else None
     task_ids: list[str] = []
     with session_scope() as session:
         products = session.scalars(
@@ -10652,6 +10893,9 @@ def create_product_title_optimization_task(
                 id=task_id,
                 owner_username=owner_username,
                 store_id=store.id,
+                task_group_id=task_group_id,
+                task_group_index=index if task_group_id else None,
+                task_group_size=len(chunks) if task_group_id else None,
                 store_name=store.alias_name or store.store_name,
                 task_name=(
                     f"批量优化标题{part_label} "
@@ -10794,6 +11038,9 @@ def create_sync_task_record(
     message: str,
     payload: dict[str, Any] | None = None,
     total_count: int = 0,
+    task_group_id: str | None = None,
+    task_group_index: int | None = None,
+    task_group_size: int | None = None,
 ) -> str:
     ensure_system_task_dispatch_allowed()
     with session_scope() as session:
@@ -10810,6 +11057,9 @@ def create_sync_task_record(
             id=uuid.uuid4().hex,
             owner_username=owner_username,
             store_id=store.id,
+            task_group_id=task_group_id,
+            task_group_index=task_group_index,
+            task_group_size=task_group_size,
             store_name=store.alias_name or store.store_name,
             task_name=f"{task_name_prefix} {store.alias_name or store.store_name} {datetime.now():%Y-%m-%d %H:%M}",
             task_type=task_type,
@@ -19535,33 +19785,26 @@ def list_listing_tasks(
             )
         normalized_page, normalized_page_size = normalize_page_params(page, page_size)
         order_by = task_status_order_by(ListingTaskModel)
-        if not normalized_page_size:
+        if normalized_task_ids:
             rows = session.scalars(query.order_by(*order_by)).all()
             store_snapshots = listing_task_store_snapshots(session, rows)
             return [
                 listing_task_to_public(row, store_snapshots.get(row.store_id, listing_task_store_snapshot(None)))
                 for row in rows
             ]
-
-        total = int(session.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0)
-        if total:
-            max_page = max(1, (total + normalized_page_size - 1) // normalized_page_size)
-            normalized_page = min(normalized_page, max_page)
-        rows = session.scalars(
-            query.order_by(*order_by)
-            .offset((normalized_page - 1) * normalized_page_size)
-            .limit(normalized_page_size)
-        ).all()
+        rows = session.scalars(query).all()
         store_snapshots = listing_task_store_snapshots(session, rows)
-        return {
-            "listingTasks": [
-                listing_task_to_public(row, store_snapshots.get(row.store_id, listing_task_store_snapshot(None)))
-                for row in rows
-            ],
-            "total": total,
-            "page": normalized_page,
-            "pageSize": normalized_page_size,
-        }
+        return paginate_task_groups(
+            rows,
+            page=page,
+            page_size=page_size,
+            response_key="listingTasks",
+            serializer=lambda row: listing_task_to_public(
+                row,
+                store_snapshots.get(row.store_id, listing_task_store_snapshot(None)),
+            ),
+            group_kind="listing",
+        )
 
 
 def delete_listing_tasks(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
@@ -19652,6 +19895,7 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
             ordered_products[index : index + BATCH_TASK_PRODUCT_LIMIT]
             for index in range(0, len(ordered_products), BATCH_TASK_PRODUCT_LIMIT)
         ]
+        task_group_id = uuid.uuid4().hex if len(product_chunks) > 1 else None
         base_task_name = task_name or f"上架任务 {datetime.now():%Y-%m-%d %H:%M}"
         task_ids: list[str] = []
         for index, product_chunk in enumerate(product_chunks, start=1):
@@ -19664,6 +19908,9 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
                 id=task_id,
                 owner_username=owner_username,
                 store_id=ordered_stores[0].id,
+                task_group_id=task_group_id,
+                task_group_index=index if task_group_id else None,
+                task_group_size=len(product_chunks) if task_group_id else None,
                 task_name=base_task_name if len(product_chunks) == 1 else f"{base_task_name} {index}/{len(product_chunks)}",
                 status="queued",
                 total_count=len(product_chunk) * len(ordered_stores),
