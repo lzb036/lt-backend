@@ -24,6 +24,10 @@ class ResetPasswordRequest(BaseModel):
     password: str = Field(min_length=6)
 
 
+class DeleteUserRequest(BaseModel):
+    confirmationText: str = Field(min_length=1)
+
+
 @router.get("")
 def list_user_accounts(
     page: int | None = Query(default=None, ge=1),
@@ -63,5 +67,20 @@ def reset_password(username: str, payload: ResetPasswordRequest, _: dict = Depen
     try:
         user = user_service.reset_password(username, payload.password)
         return {"user": user}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/{username}")
+def delete_user(
+    username: str,
+    payload: DeleteUserRequest,
+    _: dict = Depends(require_superadmin),
+) -> dict:
+    try:
+        return user_service.delete_user(
+            username,
+            confirmation_text=payload.confirmationText,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

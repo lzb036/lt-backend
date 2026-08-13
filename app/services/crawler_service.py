@@ -9876,6 +9876,7 @@ def list_stores(
     *,
     page: int | None = None,
     page_size: int | None = None,
+    reveal: bool = False,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     with session_scope() as session:
         query = select(StoreModel).where(StoreModel.owner_username == owner_username)
@@ -9909,6 +9910,7 @@ def list_stores(
         def serialize_store(row: StoreModel) -> dict[str, Any]:
             return store_to_public(
                 row,
+                reveal=reveal,
                 recent_year_order_count=(
                     recent_year_order_counts.get(int(row.id), 0)
                     if row.id in synced_store_ids

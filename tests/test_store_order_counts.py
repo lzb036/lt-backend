@@ -124,3 +124,54 @@ def test_list_stores_includes_recent_year_order_count_after_initial_sync(
 
     assert isinstance(result, list)
     assert [row["recentYearOrderCount"] for row in result] == [1, 0, None]
+
+
+def test_list_stores_can_reveal_credentials_for_superadmin(
+    monkeypatch,
+    session_factory,
+):
+    @contextmanager
+    def local_session_scope():
+        session = session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="Alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        session.flush()
+        session.add(
+            StoreModel(
+                owner_username="alice",
+                store_code="store",
+                store_name="Store",
+                rakuten_service_secret_encrypted="secret",
+                rakuten_license_key_encrypted="license",
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(crawler_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value)
+
+    hidden = crawler_service.list_stores("alice")
+    revealed = crawler_service.list_stores("alice", reveal=True)
+
+    assert isinstance(hidden, list)
+    assert isinstance(revealed, list)
+    assert hidden[0]["rakutenServiceSecret"] == ""
+    assert hidden[0]["rakutenLicenseKey"] == ""
+    assert revealed[0]["rakutenServiceSecret"] == "secret"
+    assert revealed[0]["rakutenLicenseKey"] == "license"

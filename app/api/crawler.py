@@ -1505,7 +1505,12 @@ def list_stores(
     user: dict = Depends(require_products_or_stores_permission),
 ) -> dict:
     target_username = resolve_target_username(user, ownerUsername)
-    result = crawler_service.list_stores(target_username, page=page, page_size=pageSize)
+    result = crawler_service.list_stores(
+        target_username,
+        page=page,
+        page_size=pageSize,
+        reveal=user.get("role") == "superadmin",
+    )
     if isinstance(result, dict):
         return result
     return {"stores": result, "total": len(result), "page": 1, "pageSize": len(result) or 30}

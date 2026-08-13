@@ -8,11 +8,19 @@ import re
 import secrets
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 
 from app.core.config import settings
 from app.db.database import session_scope
-from app.db.models import UserAccountModel, UserSecretProfileModel
+from app.db.models import (
+    CrawlLogModel,
+    ProductModel,
+    SystemMaintenanceSettingModel,
+    SystemSettingModel,
+    SystemTaskControlModel,
+    UserAccountModel,
+    UserSecretProfileModel,
+)
 
 PASSWORD_ITERATIONS = 240000
 MAX_PAGE_SIZE = 500
@@ -35,6 +43,7 @@ CRAWL_PRICE_OPERATORS = {"all", "gt", "gte", "lt", "lte", "range"}
 CRAWL_PRICE_MAX_VALUE = 10_000_000
 PAGINATION_PREFERENCE_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9:._-]{0,127}$")
 MAX_PAGINATION_PREFERENCES = 100
+DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX = "deletedProductImageCleanup:"
 
 
 def normalize_username(value: Any) -> str:
@@ -432,3 +441,64 @@ def reset_password(username: str, password: str) -> dict[str, Any]:
         row.password_iterations = password_record["iterations"]
         session.flush()
         return account_to_public(row)
+
+
+def delete_user(username: str, *, confirmation_text: str) -> dict[str, Any]:
+    normalized_username = normalize_username(username)
+    expected_confirmation = f"删除用户 {normalized_username}"
+    if confirmation_text.strip() != expected_confirmation:
+        raise RuntimeError(f"请输入“{expected_confirmation}”确认删除。")
+
+    product_ids: list[int] = []
+    with session_scope() as session:
+        row = session.get(UserAccountModel, normalized_username)
+        if row is None:
+            raise RuntimeError("用户不存在。")
+        if row.role == "superadmin":
+            raise RuntimeError("不能删除超级管理员。")
+
+        product_ids = [
+            int(product_id)
+            for product_id in session.scalars(
+                select(ProductModel.id).where(
+                    ProductModel.owner_username == normalized_username,
+                )
+            ).all()
+        ]
+        session.execute(
+            delete(CrawlLogModel).where(
+                CrawlLogModel.owner_username == normalized_username,
+            )
+        )
+        session.execute(
+            delete(SystemSettingModel).where(
+                SystemSettingModel.key
+                == f"{DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX}{normalized_username}",
+            )
+        )
+        session.execute(
+            update(SystemMaintenanceSettingModel)
+            .where(SystemMaintenanceSettingModel.updated_by == normalized_username)
+            .values(updated_by="")
+        )
+        session.execute(
+            update(SystemTaskControlModel)
+            .where(SystemTaskControlModel.stopped_by == normalized_username)
+            .values(stopped_by="")
+        )
+        session.execute(
+            update(SystemTaskControlModel)
+            .where(SystemTaskControlModel.resumed_by == normalized_username)
+            .values(resumed_by="")
+        )
+        session.delete(row)
+
+    if product_ids:
+        from app.services.crawler_service import cleanup_product_image_ids
+
+        cleanup_product_image_ids(product_ids)
+    return {
+        "deleted": True,
+        "username": normalized_username,
+        "deletedProductCount": len(product_ids),
+    }
