@@ -134,6 +134,7 @@ def run() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    logging.getLogger("oss2").setLevel(logging.WARNING)
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     state = load_state(args.state_file)

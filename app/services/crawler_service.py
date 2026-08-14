@@ -18491,13 +18491,12 @@ def store_prepared_rakuten_listing_image(
     digest = hashlib.sha256(content).hexdigest()[:24]
     filename = f"rakuten-prepared-{digest}.jpg"
     image_url = local_product_image_url(product_id, filename)
-    if is_missing_local_product_image_url(image_url):
-        store_product_image_content(
-            image_url,
-            content,
-            "image/jpeg",
-            LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id)) / filename,
-        )
+    store_product_image_content(
+        image_url,
+        content,
+        "image/jpeg",
+        LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id)) / filename,
+    )
     return image_url
 
 
