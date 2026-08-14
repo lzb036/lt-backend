@@ -357,6 +357,32 @@ def test_listing_preparation_cache_invalidates_after_product_change():
     assert crawler_service.listing_preparation_cache(product) == {}
 
 
+def test_listing_preflight_blocks_when_preparation_cache_is_missing(monkeypatch):
+    product, store = listing_product_and_store()
+    monkeypatch.setattr(
+        crawler_service,
+        "_listing_preflight_product_check_uncached",
+        lambda _product, _store: {
+            "productId": product.id,
+            "productCode": "product-123",
+            "productTitle": product.title,
+            "status": "passed",
+            "issueCount": 0,
+            "blockerCount": 0,
+            "warningCount": 0,
+            "issues": [],
+            "preview": {},
+        },
+    )
+    monkeypatch.setattr(crawler_service, "listing_preparation_ready", lambda *_args: False)
+
+    result = crawler_service.listing_preflight_product_check(product, store)
+
+    assert result["status"] == "blocked"
+    assert result["blockerCount"] == 1
+    assert result["issues"][0]["code"] == "listing_preparation_required"
+
+
 def test_collected_product_preparation_persists_preflight_and_image_cache(monkeypatch):
     product = SimpleNamespace(
         id=123,

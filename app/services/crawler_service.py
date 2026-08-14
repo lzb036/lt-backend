@@ -9607,6 +9607,41 @@ def listing_prepared_image_map(
     return result
 
 
+def listing_preparation_expected_image_urls(
+    product: ProductModel,
+    raw_payload: dict[str, Any] | None = None,
+) -> list[str]:
+    payload = raw_payload if isinstance(raw_payload, dict) else product_raw_payload(product)
+    main_images = [
+        image
+        for image in product_images_for_edit(product)
+        if not is_gif_image_url(image)
+    ][:RAKUTEN_LISTING_IMAGE_LIMIT]
+    description_images = [
+        image_url
+        for description in product_descriptions(payload)
+        for image_url in description_image_urls(description.get("value"))
+        if not is_gif_image_url(image_url)
+    ]
+    return unique_texts([*main_images, *description_images])
+
+
+def listing_preparation_ready(
+    product: ProductModel,
+    raw_payload: dict[str, Any] | None = None,
+) -> bool:
+    payload = raw_payload if isinstance(raw_payload, dict) else product_raw_payload(product)
+    cache = listing_preparation_cache(product, payload)
+    if not cache or int(cache.get("missingImageCount") or 0) > 0:
+        return False
+    expected_urls = listing_preparation_expected_image_urls(product, payload)
+    prepared_map = listing_prepared_image_map(product, payload)
+    return len(prepared_map) == len(expected_urls) and all(
+        image_url in prepared_map
+        for image_url in expected_urls
+    )
+
+
 def _listing_preflight_product_check_uncached(product: ProductModel, store: StoreModel | None) -> dict[str, Any]:
     raw_payload = product_raw_payload(product)
     issues: list[dict[str, Any]] = []
@@ -9730,6 +9765,7 @@ def _listing_preflight_product_check_uncached(product: ProductModel, store: Stor
 
 def listing_preflight_product_check(product: ProductModel, store: StoreModel | None) -> dict[str, Any]:
     product._listing_store_id = store.id if store is not None else 0
+    raw_payload = product_raw_payload(product)
     cached = listing_preparation_cache(product)
     cached_preflight = cached.get("preflight")
     if isinstance(cached_preflight, dict):
@@ -9737,8 +9773,19 @@ def listing_preflight_product_check(product: ProductModel, store: StoreModel | N
         result["productId"] = product.id
         result["productCode"] = productCodeForError(product)
         result["productTitle"] = product.title
-        return result
-    return _listing_preflight_product_check_uncached(product, store)
+    else:
+        result = _listing_preflight_product_check_uncached(product, store)
+    if not listing_preparation_ready(product, raw_payload):
+        preparation_issue = listing_preflight_issue(
+            "blocker",
+            "listing_preparation_required",
+            "商品尚未完成上架预处理，请等待预处理任务完成后再上架。",
+        )
+        result["issues"] = [*list(result.get("issues") or []), preparation_issue]
+        result["issueCount"] = int(result.get("issueCount") or 0) + 1
+        result["blockerCount"] = int(result.get("blockerCount") or 0) + 1
+        result["status"] = "blocked"
+    return result
 
 
 def listing_preflight_attribute_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -18454,15 +18501,18 @@ def store_prepared_rakuten_listing_image(
     return image_url
 
 
-def prepare_collected_product_for_listing(owner_username: str, product_id: int) -> dict[str, Any]:
+def prepare_collected_product_for_listing(owner_username: str | None, product_id: int) -> dict[str, Any]:
     with session_scope() as session:
         product = session.get(ProductModel, product_id)
-        if product is None or product.owner_username != owner_username:
+        if product is None or (owner_username and product.owner_username != owner_username):
             return {}
         if product.review_status not in {"pending", "approved", "error", "listed_master"}:
             return {}
         raw_payload = product_raw_payload(product)
         source_fingerprint = listing_preparation_source_fingerprint(product, raw_payload)
+        existing_cache = listing_preparation_cache(product, raw_payload)
+        if existing_cache and listing_preparation_ready(product, raw_payload):
+            return existing_cache
         main_image_urls = [
             image
             for image in product_images_for_edit(product)
