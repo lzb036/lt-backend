@@ -218,6 +218,8 @@ MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024
 RAKUTEN_CABINET_MAX_IMAGE_BYTES = MAX_PRODUCT_IMAGE_BYTES
 RAKUTEN_CABINET_MAX_IMAGE_DIMENSION = 3840
 RAKUTEN_LISTING_IMAGE_LIMIT = 20
+LISTING_PREPARATION_CACHE_KEY = "ltRakutenListingPreparation"
+LISTING_PREPARATION_CACHE_VERSION = 1
 RAKUTEN_SP_DESCRIPTION_IMAGE_LIMIT = 20
 RAKUTEN_SP_DESCRIPTION_ALLOWED_TAGS = {
     "a",
@@ -9547,7 +9549,65 @@ def listing_preflight_product_stub(product_id: int, issue: dict[str, Any]) -> di
     }
 
 
-def listing_preflight_product_check(product: ProductModel, store: StoreModel | None) -> dict[str, Any]:
+def listing_preparation_source_fingerprint(
+    product: ProductModel,
+    raw_payload: dict[str, Any] | None = None,
+) -> str:
+    payload = deepcopy(raw_payload if isinstance(raw_payload, dict) else product_raw_payload(product))
+    payload.pop(LISTING_PREPARATION_CACHE_KEY, None)
+    try:
+        rules_stat = RAKUTEN_ATTRIBUTE_RULES_PATH.stat()
+        attribute_rules_version = f"{rules_stat.st_size}:{rules_stat.st_mtime_ns}"
+    except OSError:
+        attribute_rules_version = "missing"
+    source = {
+        "title": normalize_text(product.title),
+        "genreId": normalize_text(product.genre_id),
+        "price": str(product.price) if product.price is not None else "",
+        "imageUrl": normalize_text(product.image_url),
+        "attributeRulesVersion": attribute_rules_version,
+        "payload": payload,
+    }
+    serialized = json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def listing_preparation_cache(
+    product: ProductModel,
+    raw_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = raw_payload if isinstance(raw_payload, dict) else product_raw_payload(product)
+    cache = payload.get(LISTING_PREPARATION_CACHE_KEY)
+    if not isinstance(cache, dict):
+        return {}
+    if int(cache.get("version") or 0) != LISTING_PREPARATION_CACHE_VERSION:
+        return {}
+    if normalize_text(cache.get("sourceFingerprint")) != listing_preparation_source_fingerprint(product, payload):
+        return {}
+    return cache
+
+
+def listing_prepared_image_map(
+    product: ProductModel,
+    raw_payload: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    cache = listing_preparation_cache(product, raw_payload)
+    rows = cache.get("images")
+    if not isinstance(rows, list):
+        return {}
+    result: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source_url = normalize_text(row.get("sourceUrl"))
+        prepared_url = normalize_text(row.get("preparedUrl"))
+        if not source_url or not prepared_url or is_missing_local_product_image_url(prepared_url):
+            return {}
+        result[source_url] = prepared_url
+    return result
+
+
+def _listing_preflight_product_check_uncached(product: ProductModel, store: StoreModel | None) -> dict[str, Any]:
     raw_payload = product_raw_payload(product)
     issues: list[dict[str, Any]] = []
     title = first_text_from_keys(raw_payload, ("itemName", "title", "name")) or product.title
@@ -9666,6 +9726,19 @@ def listing_preflight_product_check(product: ProductModel, store: StoreModel | N
             "attributeGroup": normalize_text(rakuten_attribute_group_rule_for_payload({"genreId": normalize_text(genre_id)}).get("group")),
         },
     }
+
+
+def listing_preflight_product_check(product: ProductModel, store: StoreModel | None) -> dict[str, Any]:
+    product._listing_store_id = store.id if store is not None else 0
+    cached = listing_preparation_cache(product)
+    cached_preflight = cached.get("preflight")
+    if isinstance(cached_preflight, dict):
+        result = deepcopy(cached_preflight)
+        result["productId"] = product.id
+        result["productCode"] = productCodeForError(product)
+        result["productTitle"] = product.title
+        return result
+    return _listing_preflight_product_check_uncached(product, store)
 
 
 def listing_preflight_attribute_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -17663,6 +17736,7 @@ def create_store_product_on_rakuten(
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     raw_payload = product_raw_payload(product)
+    prepared_image_map = listing_prepared_image_map(product, raw_payload)
     product._listing_store_id = store.id
     manage_number = generate_listing_manage_number(product, raw_payload)
     uploaded_product_images: list[dict[str, str]] = []
@@ -17685,6 +17759,7 @@ def create_store_product_on_rakuten(
             manage_number,
             cabinet_context=cabinet_context,
             source_images=product_images,
+            prepared_image_map=prepared_image_map,
             cancel_check=cancel_check,
             require_complete=True,
         )
@@ -17698,6 +17773,7 @@ def create_store_product_on_rakuten(
             manage_number,
             raw_payload,
             cabinet_context=cabinet_context,
+            prepared_image_map=prepared_image_map,
             cancel_check=cancel_check,
             require_complete=True,
         )
@@ -18278,15 +18354,25 @@ def build_listing_manage_number(product_id: int, *, store_id: int = 0, listed_at
     return f"{LISTING_MANAGE_NUMBER_PREFIX}{store_text}{date_text}{product_text}"[:32]
 
 
-def prepare_rakuten_listing_image(image_url: str) -> dict[str, Any] | None:
+def prepare_rakuten_listing_image(
+    image_url: str,
+    prepared_image_url: str = "",
+) -> dict[str, Any] | None:
     try:
-        image_data = prepare_rakuten_cabinet_image(
-            load_product_image_bytes(
-                image_url,
-                max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
-                size_error_message="图片下载大小不能超过 20MB。",
+        if prepared_image_url:
+            image_data = load_product_image_bytes(
+                prepared_image_url,
+                max_bytes=RAKUTEN_CABINET_MAX_IMAGE_BYTES,
+                size_error_message="缓存图片大小不能超过 2MB。",
             )
-        )
+        else:
+            image_data = prepare_rakuten_cabinet_image(
+                load_product_image_bytes(
+                    image_url,
+                    max_bytes=MAX_PRODUCT_IMAGE_DOWNLOAD_BYTES,
+                    size_error_message="图片下载大小不能超过 20MB。",
+                )
+            )
     except ProductImageUnavailableError:
         return None
     except RuntimeError as exc:
@@ -18310,6 +18396,7 @@ def prepare_rakuten_listing_image(image_url: str) -> dict[str, Any] | None:
 def prepare_rakuten_listing_images(
     image_urls: list[str],
     *,
+    prepared_image_map: dict[str, str] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     if not image_urls:
@@ -18320,12 +18407,20 @@ def prepare_rakuten_listing_images(
         len(image_urls),
         max(1, int(settings.listing_image_prepare_workers)),
     )
+    cached_images = prepared_image_map if isinstance(prepared_image_map, dict) else {}
+
+    def prepare_one(image_url: str) -> dict[str, Any] | None:
+        prepared_url = normalize_text(cached_images.get(image_url))
+        if prepared_url:
+            return prepare_rakuten_listing_image(image_url, prepared_url)
+        return prepare_rakuten_listing_image(image_url)
+
     if worker_count <= 1:
-        prepared = [prepare_rakuten_listing_image(image_url) for image_url in image_urls]
+        prepared = [prepare_one(image_url) for image_url in image_urls]
     else:
         futures = [
             LISTING_IMAGE_PREPARE_EXECUTOR.submit(
-                prepare_rakuten_listing_image,
+                prepare_one,
                 image_url,
             )
             for image_url in image_urls
@@ -18336,6 +18431,98 @@ def prepare_rakuten_listing_images(
     return [image for image in prepared if image is not None]
 
 
+def store_prepared_rakuten_listing_image(
+    product_id: int,
+    image_data: dict[str, Any],
+) -> str:
+    content = image_data.get("content") or b""
+    if not isinstance(content, bytes) or not content:
+        raise RuntimeError("预处理图片内容为空。")
+    suffix = normalize_product_image_suffix(image_data.get("suffix"))
+    if suffix != ".jpg":
+        raise RuntimeError("预处理图片格式不正确。")
+    digest = hashlib.sha256(content).hexdigest()[:24]
+    filename = f"rakuten-prepared-{digest}.jpg"
+    image_url = local_product_image_url(product_id, filename)
+    if is_missing_local_product_image_url(image_url):
+        store_product_image_content(
+            image_url,
+            content,
+            "image/jpeg",
+            LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id)) / filename,
+        )
+    return image_url
+
+
+def prepare_collected_product_for_listing(owner_username: str, product_id: int) -> dict[str, Any]:
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            return {}
+        if product.review_status not in {"pending", "approved", "error", "listed_master"}:
+            return {}
+        raw_payload = product_raw_payload(product)
+        source_fingerprint = listing_preparation_source_fingerprint(product, raw_payload)
+        main_image_urls = [
+            image
+            for image in product_images_for_edit(product)
+            if not is_gif_image_url(image)
+        ][:RAKUTEN_LISTING_IMAGE_LIMIT]
+        description_image_urls_to_prepare = unique_texts(
+            [
+                image_url
+                for description in product_descriptions(raw_payload)
+                for image_url in description_image_urls(description.get("value"))
+                if not is_gif_image_url(image_url)
+            ]
+        )
+        image_urls = unique_texts([*main_image_urls, *description_image_urls_to_prepare])
+        preflight = _listing_preflight_product_check_uncached(product, None)
+
+    prepared_images = prepare_rakuten_listing_images(image_urls)
+    prepared_by_source = {
+        normalize_text(image.get("sourceUrl")): image
+        for image in prepared_images
+        if normalize_text(image.get("sourceUrl"))
+    }
+    cached_images: list[dict[str, str]] = []
+    for image_url in image_urls:
+        prepared = prepared_by_source.get(image_url)
+        if prepared is None:
+            continue
+        cached_images.append(
+            {
+                "sourceUrl": image_url,
+                "preparedUrl": store_prepared_rakuten_listing_image(product_id, prepared),
+            }
+        )
+    missing_images = [image_url for image_url in image_urls if image_url not in prepared_by_source]
+    cache_payload = {
+        "version": LISTING_PREPARATION_CACHE_VERSION,
+        "sourceFingerprint": source_fingerprint,
+        "preparedAt": datetime.now().isoformat(timespec="seconds"),
+        "preflight": preflight,
+        "images": cached_images,
+        "imageCount": len(cached_images),
+        "missingImageCount": len(missing_images),
+    }
+
+    referenced_local_urls: list[str] = []
+    with session_scope() as session:
+        product = session.get(ProductModel, product_id)
+        if product is None or product.owner_username != owner_username:
+            return {}
+        raw_payload = product_raw_payload(product)
+        if listing_preparation_source_fingerprint(product, raw_payload) != source_fingerprint:
+            return {}
+        raw_payload[LISTING_PREPARATION_CACHE_KEY] = cache_payload
+        product.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+        referenced_local_urls = collect_local_product_image_urls(raw_payload)
+        session.flush()
+    remove_unused_local_product_images(product_id, referenced_local_urls)
+    return cache_payload
+
+
 def upload_product_images_to_rakuten(
     service_secret: str,
     license_key: str,
@@ -18344,6 +18531,7 @@ def upload_product_images_to_rakuten(
     manage_number: str,
     cabinet_context: dict[str, Any] | None = None,
     source_images: list[str] | None = None,
+    prepared_image_map: dict[str, str] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     start_index: int = 1,
     before_upload: Callable[[], None] | None = None,
@@ -18359,7 +18547,11 @@ def upload_product_images_to_rakuten(
     upload_cabinet_context = cabinet_context if isinstance(cabinet_context, dict) else {}
     image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
-        prepared_images = prepare_rakuten_listing_images(images, cancel_check=cancel_check)
+        prepared_images = prepare_rakuten_listing_images(
+            images,
+            prepared_image_map=prepared_image_map,
+            cancel_check=cancel_check,
+        )
         if require_complete and len(prepared_images) != len(images):
             missing_count = len(images) - len(prepared_images)
             raise RuntimeError(
@@ -18436,6 +18628,7 @@ def upload_product_description_images_to_rakuten(
     manage_number: str,
     raw_payload: dict[str, Any],
     cabinet_context: dict[str, Any] | None = None,
+    prepared_image_map: dict[str, str] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     before_upload: Callable[[], None] | None = None,
     require_complete: bool = False,
@@ -18464,7 +18657,11 @@ def upload_product_description_images_to_rakuten(
     upload_cabinet_context = cabinet_context if isinstance(cabinet_context, dict) else {}
     image_alt = sanitize_rakuten_image_alt(product.title) or "商品画像"
     try:
-        prepared_images = prepare_rakuten_listing_images(image_urls, cancel_check=cancel_check)
+        prepared_images = prepare_rakuten_listing_images(
+            image_urls,
+            prepared_image_map=prepared_image_map,
+            cancel_check=cancel_check,
+        )
         if require_complete and len(prepared_images) != len(image_urls):
             missing_count = len(image_urls) - len(prepared_images)
             raise RuntimeError(
@@ -21836,6 +22033,15 @@ def save_collected_item(
         except Exception as exc:
             image_error = f"图片本地化失败：{exc}"
             mark_product_local_image_error(owner_username, product_id, image_error)
+        try:
+            prepare_collected_product_for_listing(owner_username, product_id)
+        except Exception:
+            logger.warning(
+                "collected product listing preparation failed owner=%s product_id=%s",
+                owner_username,
+                product_id,
+                exc_info=True,
+            )
     return {"saved": True, "error": image_error}
 
 

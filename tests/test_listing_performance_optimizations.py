@@ -295,6 +295,137 @@ def test_listing_image_preparation_reports_read_failures_as_missing(monkeypatch)
     assert [row["sourceUrl"] for row in prepared] == ["first", "second"]
 
 
+def test_listing_image_preparation_reuses_prepared_cache(monkeypatch):
+    loaded_urls = []
+    monkeypatch.setattr(
+        crawler_service,
+        "load_product_image_bytes",
+        lambda image_url, **_kwargs: loaded_urls.append(image_url) or {
+            "content": b"prepared-image",
+            "suffix": ".jpg",
+            "contentType": "image/jpeg",
+        },
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "prepare_rakuten_cabinet_image",
+        lambda _image_data: (_ for _ in ()).throw(AssertionError("cached image must not be recompressed")),
+    )
+
+    prepared = crawler_service.prepare_rakuten_listing_images(
+        ["source-image"],
+        prepared_image_map={"source-image": "prepared-image"},
+    )
+
+    assert loaded_urls == ["prepared-image"]
+    assert prepared == [
+        {
+            "content": b"prepared-image",
+            "suffix": ".jpg",
+            "contentType": "image/jpeg",
+            "sourceUrl": "source-image",
+        }
+    ]
+
+
+def test_listing_preparation_cache_invalidates_after_product_change():
+    product = SimpleNamespace(
+        id=123,
+        title="Original title",
+        genre_id="123456",
+        price=1000,
+        image_url="source-image",
+        raw_payload_json="{}",
+        source_url="https://example.com/item",
+        item_number="",
+    )
+    fingerprint = crawler_service.listing_preparation_source_fingerprint(product, {})
+    product.raw_payload_json = json.dumps(
+        {
+            crawler_service.LISTING_PREPARATION_CACHE_KEY: {
+                "version": crawler_service.LISTING_PREPARATION_CACHE_VERSION,
+                "sourceFingerprint": fingerprint,
+                "preflight": {"status": "passed"},
+            }
+        }
+    )
+
+    assert crawler_service.listing_preparation_cache(product)["preflight"]["status"] == "passed"
+
+    product.title = "Changed title"
+
+    assert crawler_service.listing_preparation_cache(product) == {}
+
+
+def test_collected_product_preparation_persists_preflight_and_image_cache(monkeypatch):
+    product = SimpleNamespace(
+        id=123,
+        owner_username="owner",
+        review_status="pending",
+        title="Listing product",
+        genre_id="123456",
+        price=1000,
+        image_url="source-image",
+        source_url="https://example.com/item",
+        item_number="",
+        raw_payload_json=json.dumps({"descriptions": []}),
+    )
+
+    @contextmanager
+    def local_session_scope():
+        yield SimpleNamespace(
+            get=lambda _model, _product_id: product,
+            flush=lambda: None,
+        )
+
+    monkeypatch.setattr(crawler_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(crawler_service, "product_images_for_edit", lambda _product: ["source-image"])
+    monkeypatch.setattr(crawler_service, "product_descriptions", lambda _payload: [])
+    monkeypatch.setattr(
+        crawler_service,
+        "_listing_preflight_product_check_uncached",
+        lambda _product, _store: {"status": "passed", "issues": []},
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "prepare_rakuten_listing_images",
+        lambda _images: [
+            {
+                "sourceUrl": "source-image",
+                "content": b"prepared-image",
+                "suffix": ".jpg",
+                "contentType": "image/jpeg",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "store_prepared_rakuten_listing_image",
+        lambda _product_id, _image: "prepared-image",
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "collect_local_product_image_urls",
+        lambda _payload: ["source-image", "prepared-image"],
+    )
+    cleanup_calls = []
+    monkeypatch.setattr(
+        crawler_service,
+        "remove_unused_local_product_images",
+        lambda product_id, urls: cleanup_calls.append((product_id, urls)),
+    )
+
+    result = crawler_service.prepare_collected_product_for_listing("owner", 123)
+    saved_payload = json.loads(product.raw_payload_json)
+    saved_cache = saved_payload[crawler_service.LISTING_PREPARATION_CACHE_KEY]
+
+    assert result["preflight"]["status"] == "passed"
+    assert saved_cache["images"] == [
+        {"sourceUrl": "source-image", "preparedUrl": "prepared-image"}
+    ]
+    assert cleanup_calls == [(123, ["source-image", "prepared-image"])]
+
+
 def test_listing_main_image_upload_rejects_incomplete_preparation(monkeypatch):
     product, store = listing_product_and_store()
     monkeypatch.setattr(
