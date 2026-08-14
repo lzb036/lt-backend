@@ -18527,7 +18527,6 @@ def prepare_collected_product_for_listing(owner_username: str | None, product_id
             ]
         )
         image_urls = unique_texts([*main_image_urls, *description_image_urls_to_prepare])
-        preflight = _listing_preflight_product_check_uncached(product, None)
 
     prepared_images = prepare_rakuten_listing_images(image_urls)
     prepared_by_source = {
@@ -18547,15 +18546,6 @@ def prepare_collected_product_for_listing(owner_username: str | None, product_id
             }
         )
     missing_images = [image_url for image_url in image_urls if image_url not in prepared_by_source]
-    cache_payload = {
-        "version": LISTING_PREPARATION_CACHE_VERSION,
-        "sourceFingerprint": source_fingerprint,
-        "preparedAt": datetime.now().isoformat(timespec="seconds"),
-        "preflight": preflight,
-        "images": cached_images,
-        "imageCount": len(cached_images),
-        "missingImageCount": len(missing_images),
-    }
 
     referenced_local_urls: list[str] = []
     with session_scope() as session:
@@ -18565,6 +18555,46 @@ def prepare_collected_product_for_listing(owner_username: str | None, product_id
         raw_payload = product_raw_payload(product)
         if listing_preparation_source_fingerprint(product, raw_payload) != source_fingerprint:
             return {}
+        if missing_images:
+            valid_main_images = [
+                image_url
+                for image_url in main_image_urls
+                if image_url not in missing_images
+            ]
+            raw_payload = set_product_image_urls_with_description_updates(
+                raw_payload,
+                valid_main_images,
+                remove_urls=missing_images,
+            )
+            raw_payload["ltListingPreparationRemovedImages"] = missing_images[:50]
+            product.image_url = valid_main_images[0] if valid_main_images else ""
+            product.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+        preflight = _listing_preflight_product_check_uncached(product, None)
+        if missing_images:
+            preflight["issues"] = [
+                *list(preflight.get("issues") or []),
+                listing_preflight_issue(
+                    "warning",
+                    "unreadable_images_removed",
+                    f"{len(missing_images)} 张无法读取的图片已在预处理时移除。",
+                    field="images",
+                ),
+            ]
+            preflight["issueCount"] = int(preflight.get("issueCount") or 0) + 1
+            preflight["warningCount"] = int(preflight.get("warningCount") or 0) + 1
+            if preflight.get("status") == "passed":
+                preflight["status"] = "warning"
+        final_fingerprint = listing_preparation_source_fingerprint(product, raw_payload)
+        cache_payload = {
+            "version": LISTING_PREPARATION_CACHE_VERSION,
+            "sourceFingerprint": final_fingerprint,
+            "preparedAt": datetime.now().isoformat(timespec="seconds"),
+            "preflight": preflight,
+            "images": cached_images,
+            "imageCount": len(cached_images),
+            "missingImageCount": 0,
+            "removedImageCount": len(missing_images),
+        }
         raw_payload[LISTING_PREPARATION_CACHE_KEY] = cache_payload
         product.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
         referenced_local_urls = collect_local_product_image_urls(raw_payload)

@@ -452,6 +452,72 @@ def test_collected_product_preparation_persists_preflight_and_image_cache(monkey
     assert cleanup_calls == [(123, ["source-image", "prepared-image"])]
 
 
+def test_collected_product_preparation_removes_unreadable_images(monkeypatch):
+    first_image = "https://example.com/first.jpg"
+    broken_image = "https://example.com/broken.jpg"
+    product = SimpleNamespace(
+        id=123,
+        owner_username="owner",
+        review_status="pending",
+        title="Listing product",
+        genre_id="123456",
+        price=1000,
+        image_url=first_image,
+        source_url="https://example.com/item",
+        item_number="",
+        raw_payload_json=json.dumps({"images": [first_image, broken_image]}),
+    )
+
+    @contextmanager
+    def local_session_scope():
+        yield SimpleNamespace(
+            get=lambda _model, _product_id: product,
+            flush=lambda: None,
+        )
+
+    monkeypatch.setattr(crawler_service, "session_scope", local_session_scope)
+    monkeypatch.setattr(crawler_service, "product_images_for_edit", lambda _product: [first_image, broken_image])
+    monkeypatch.setattr(crawler_service, "product_descriptions", lambda _payload: [])
+    monkeypatch.setattr(
+        crawler_service,
+        "_listing_preflight_product_check_uncached",
+        lambda _product, _store: {
+            "status": "passed",
+            "issueCount": 0,
+            "blockerCount": 0,
+            "warningCount": 0,
+            "issues": [],
+        },
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "prepare_rakuten_listing_images",
+        lambda _images: [
+            {
+                "sourceUrl": first_image,
+                "content": b"prepared-image",
+                "suffix": ".jpg",
+                "contentType": "image/jpeg",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "store_prepared_rakuten_listing_image",
+        lambda _product_id, _image: "prepared-image",
+    )
+    monkeypatch.setattr(crawler_service, "collect_local_product_image_urls", lambda _payload: [])
+    monkeypatch.setattr(crawler_service, "remove_unused_local_product_images", lambda *_args: None)
+
+    result = crawler_service.prepare_collected_product_for_listing(None, 123)
+    saved_payload = json.loads(product.raw_payload_json)
+
+    assert result["removedImageCount"] == 1
+    assert result["missingImageCount"] == 0
+    assert saved_payload["images"] == [first_image]
+    assert saved_payload["ltListingPreparationRemovedImages"] == [broken_image]
+
+
 def test_listing_main_image_upload_rejects_incomplete_preparation(monkeypatch):
     product, store = listing_product_and_store()
     monkeypatch.setattr(
