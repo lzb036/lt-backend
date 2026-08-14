@@ -19019,7 +19019,11 @@ def remove_description_html_image_urls(html: Any, image_urls: set[str]) -> str:
             if srcset_urls and srcset_urls.issubset(image_urls):
                 should_remove = True
         if should_remove:
-            image.decompose()
+            try:
+                image.decompose()
+            except ValueError:
+                # A parent element may already have removed this nested node.
+                continue
     body = soup.body
     return body.decode_contents().strip() if body is not None else str(soup).strip()
 
