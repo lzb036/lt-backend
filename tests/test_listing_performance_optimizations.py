@@ -295,6 +295,18 @@ def test_listing_image_preparation_reports_read_failures_as_missing(monkeypatch)
     assert [row["sourceUrl"] for row in prepared] == ["first", "second"]
 
 
+def test_listing_image_preparation_skips_unsupported_suffix(monkeypatch):
+    monkeypatch.setattr(
+        crawler_service,
+        "load_product_image_bytes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("图片格式只支持 jpg、jpeg、png、gif。")
+        ),
+    )
+
+    assert crawler_service.prepare_rakuten_listing_images(["unsupported-image"]) == []
+
+
 def test_listing_image_preparation_reuses_prepared_cache(monkeypatch):
     loaded_urls = []
     monkeypatch.setattr(

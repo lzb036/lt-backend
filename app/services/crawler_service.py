@@ -19134,6 +19134,7 @@ def should_skip_listing_image_error(exc: Exception) -> bool:
         is_missing_local_product_image_error(exc)
         or "图片文件无法识别" in message
         or "图片文件无法读取" in message
+        or "图片格式只支持 jpg、jpeg、png、gif" in message
         or "R-Cabinet 图片格式只支持" in message
         or "Unsupported format Error" in message
         or "GIF 图片" in message
