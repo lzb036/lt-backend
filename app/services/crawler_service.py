@@ -18560,7 +18560,7 @@ def prepare_collected_product_for_listing(owner_username: str | None, product_id
     referenced_local_urls: list[str] = []
     with session_scope() as session:
         product = session.get(ProductModel, product_id)
-        if product is None or product.owner_username != owner_username:
+        if product is None or (owner_username and product.owner_username != owner_username):
             return {}
         raw_payload = product_raw_payload(product)
         if listing_preparation_source_fingerprint(product, raw_payload) != source_fingerprint:

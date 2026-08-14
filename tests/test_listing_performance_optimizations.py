@@ -441,7 +441,7 @@ def test_collected_product_preparation_persists_preflight_and_image_cache(monkey
         lambda product_id, urls: cleanup_calls.append((product_id, urls)),
     )
 
-    result = crawler_service.prepare_collected_product_for_listing("owner", 123)
+    result = crawler_service.prepare_collected_product_for_listing(None, 123)
     saved_payload = json.loads(product.raw_payload_json)
     saved_cache = saved_payload[crawler_service.LISTING_PREPARATION_CACHE_KEY]
 
