@@ -570,6 +570,15 @@ SPECIALIZED_SYNC_TASK_TYPES = (
     | IMAGE_CLEANUP_TASK_TYPES
     | LISTING_IMAGE_UPLOAD_TASK_TYPES
 )
+PRODUCT_SCOPED_SYNC_TASK_TYPES = frozenset(
+    {
+        "product_delete",
+        "product_listing_status",
+        "product_replace",
+        "title_optimization",
+        "listing_image_upload",
+    }
+)
 CRAWL_DISPATCH_LOCK_NAME = "lt:crawl-dispatch"
 CRAWL_DISPATCH_LOCK_TIMEOUT_SECONDS = 30
 CRAWL_DISPATCH_LOCK_BLOCKING_TIMEOUT_SECONDS = 3
@@ -924,13 +933,17 @@ def sync_task_has_active_background_job(task_id: str, task_type: str | None = No
 
 
 def dispatch_next_sync_task() -> None:
-    next_task: tuple[str, str, str] | None = None
+    next_tasks: list[tuple[str, str, str]] = []
     with session_scope() as session:
         finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步")
         reconcile_interrupted_running_tasks(session, SyncTaskModel)
-        if running_sync_task_count(session) > 0:
-            return
-        rows = session.scalars(
+        running_rows = session.scalars(
+            select(SyncTaskModel).where(
+                SyncTaskModel.status == "running",
+                SyncTaskModel.task_type.notin_(SPECIALIZED_SYNC_TASK_TYPES),
+            )
+        ).all()
+        queued_rows = session.scalars(
             select(SyncTaskModel)
             .where(
                 SyncTaskModel.status == "queued",
@@ -938,7 +951,43 @@ def dispatch_next_sync_task() -> None:
             )
             .order_by(SyncTaskModel.created_at.asc(), SyncTaskModel.id.asc())
         ).all()
-        for task in rows:
+        active_job_ids = {
+            str(task.id)
+            for task in queued_rows
+            if sync_task_has_active_background_job(task.id, task.task_type)
+        }
+        active_rows_by_id = {str(task.id): task for task in running_rows}
+        active_rows_by_id.update(
+            {
+                str(task.id): task
+                for task in queued_rows
+                if str(task.id) in active_job_ids
+            }
+        )
+        active_listing_rows = session.scalars(
+            select(ListingTaskModel).where(
+                ListingTaskModel.status.in_(("queued", "running"))
+            )
+        ).all()
+        active_scopes = [
+            sync_task_resource_scope(session, task)
+            for task in active_rows_by_id.values()
+        ]
+        active_scopes.extend(
+            listing_task_resource_scope(session, task)
+            for task in active_listing_rows
+            if task.status == "running" or listing_task_has_active_background_job(task.id)
+        )
+        owner_counts: dict[str, int] = {}
+        for task in active_rows_by_id.values():
+            owner_counts[task.owner_username] = owner_counts.get(task.owner_username, 0) + 1
+        available_slots = max(
+            0,
+            int(settings.max_running_sync_tasks_global) - len(active_rows_by_id),
+        )
+        for task in queued_rows:
+            if available_slots <= 0:
+                break
             if system_task_dispatch_paused(task.owner_username):
                 continue
             if task_cancel_requested(task):
@@ -947,15 +996,24 @@ def dispatch_next_sync_task() -> None:
                 task.error_detail = cancelled_task_error_detail(existing_error_detail=task.error_detail)
                 task.finished_at = datetime.now()
                 continue
-            if sync_task_has_active_background_job(task.id, task.task_type):
-                return
-            if running_store_task_count(session, task.store_id, exclude_sync_task_id=task.id) > 0:
-                task.message = "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
+            if str(task.id) in active_job_ids:
                 continue
-            next_task = (task.owner_username, task.id, task.task_type or "store_sync")
-            break
-    if next_task:
-        dispatch_sync_task(next_task[0], next_task[1], task_type=next_task[2])
+            if owner_counts.get(task.owner_username, 0) >= int(settings.max_running_sync_tasks_per_user):
+                task.message = "排队中，等待该用户当前同步任务释放并发额度"
+                continue
+            scope = sync_task_resource_scope(session, task)
+            wait_reason = task_scope_conflict_reason(scope, active_scopes)
+            if wait_reason:
+                task.message = wait_reason
+                continue
+            next_tasks.append(
+                (task.owner_username, task.id, task.task_type or "store_sync")
+            )
+            owner_counts[task.owner_username] = owner_counts.get(task.owner_username, 0) + 1
+            active_scopes.append(scope)
+            available_slots -= 1
+    for owner_username, task_id, task_type in next_tasks:
+        dispatch_sync_task(owner_username, task_id, task_type=task_type)
 
 
 def dispatch_next_sync_task_safely() -> None:
@@ -1042,10 +1100,24 @@ def dispatch_next_listing_task() -> None:
         })
         owner_counts: dict[str, int] = {}
         store_counts: dict[int, int] = {}
+        active_scopes: list[TaskResourceScope] = []
         for task in active_rows_by_id.values():
             owner_counts[task.owner_username] = owner_counts.get(task.owner_username, 0) + 1
             for store_id in listing_task_store_ids(task):
                 store_counts[store_id] = store_counts.get(store_id, 0) + 1
+            active_scopes.append(listing_task_resource_scope(session, task))
+        active_sync_rows = session.scalars(
+            select(SyncTaskModel).where(
+                SyncTaskModel.status.in_(("queued", "running")),
+                SyncTaskModel.task_type.notin_(IMAGE_CLEANUP_TASK_TYPES),
+            )
+        ).all()
+        active_scopes.extend(
+            sync_task_resource_scope(session, task)
+            for task in active_sync_rows
+            if task.status == "running"
+            or sync_task_has_active_background_job(task.id, task.task_type)
+        )
 
         available_slots = max(
             0,
@@ -1075,16 +1147,16 @@ def dispatch_next_listing_task() -> None:
             ):
                 task.message = "排队中，等待该店铺当前上架任务释放并发额度"
                 continue
-            if any(
-                running_store_sync_task_count(session, store_id) > 0
-                for store_id in task_store_ids
-            ):
-                task.message = "排队中，等待该店铺当前同步、上下架或删除任务完成"
+            scope = listing_task_resource_scope(session, task)
+            wait_reason = task_scope_conflict_reason(scope, active_scopes)
+            if wait_reason:
+                task.message = wait_reason
                 continue
             next_tasks.append((task.owner_username, task.id))
             owner_counts[task.owner_username] = owner_counts.get(task.owner_username, 0) + 1
             for store_id in task_store_ids:
                 store_counts[store_id] = store_counts.get(store_id, 0) + 1
+            active_scopes.append(scope)
             available_slots -= 1
     for owner_username, task_id in next_tasks:
         dispatch_listing_task(owner_username, task_id)
@@ -4168,6 +4240,176 @@ def sync_task_payload(row: SyncTaskModel) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+@dataclass(frozen=True)
+class TaskResourceScope:
+    owner_username: str
+    store_ids: frozenset[int]
+    product_ids: frozenset[int]
+    store_wide: bool = False
+
+
+def logical_product_ids(
+    session: Any,
+    owner_username: str,
+    product_ids: list[int],
+) -> set[int]:
+    normalized_ids = normalize_product_ids(product_ids)
+    if not normalized_ids:
+        return set()
+    rows = session.execute(
+        select(ProductModel.id, ProductModel.parent_product_id).where(
+            ProductModel.owner_username == owner_username,
+            ProductModel.id.in_(normalized_ids),
+        )
+    ).all()
+    roots_by_id = {
+        int(row.id): int(row.parent_product_id or row.id)
+        for row in rows
+    }
+    return {
+        roots_by_id.get(product_id, product_id)
+        for product_id in normalized_ids
+    }
+
+
+def sync_task_resource_product_ids(task: SyncTaskModel) -> list[int]:
+    payload = sync_task_payload(task)
+    task_type = normalize_text(task.task_type) or "store_sync"
+    if task_type == "product_replace":
+        return normalize_product_ids(
+            [
+                payload.get("targetProductId"),
+                payload.get("pendingProductId"),
+            ]
+        )
+    return normalize_product_ids(list(payload.get("productIds") or []))
+
+
+def sync_task_resource_scope(session: Any, task: SyncTaskModel) -> TaskResourceScope:
+    task_type = normalize_text(task.task_type) or "store_sync"
+    store_ids = frozenset({int(task.store_id)}) if task.store_id else frozenset()
+    product_ids = (
+        logical_product_ids(
+            session,
+            task.owner_username,
+            sync_task_resource_product_ids(task),
+        )
+        if task_type in PRODUCT_SCOPED_SYNC_TASK_TYPES
+        else set()
+    )
+    return TaskResourceScope(
+        owner_username=task.owner_username,
+        store_ids=store_ids,
+        product_ids=frozenset(product_ids),
+        store_wide=task_type not in PRODUCT_SCOPED_SYNC_TASK_TYPES,
+    )
+
+
+def listing_task_resource_scope(
+    session: Any,
+    task: ListingTaskModel,
+) -> TaskResourceScope:
+    payload = listing_task_product_ids_payload(task.product_ids_json)
+    store_ids = payload["storeIds"] or ([int(task.store_id)] if task.store_id else [])
+    product_ids = payload["retryIds"] or payload["productIds"]
+    return TaskResourceScope(
+        owner_username=task.owner_username,
+        store_ids=frozenset(store_ids),
+        product_ids=frozenset(
+            logical_product_ids(session, task.owner_username, product_ids)
+        ),
+    )
+
+
+def task_resource_scopes_conflict(
+    left: TaskResourceScope,
+    right: TaskResourceScope,
+) -> bool:
+    if left.owner_username != right.owner_username:
+        return False
+    if left.store_wide or right.store_wide:
+        return bool(left.store_ids & right.store_ids)
+    return bool(left.product_ids & right.product_ids)
+
+
+def task_scope_conflict_reason(
+    scope: TaskResourceScope,
+    active_scopes: list[TaskResourceScope],
+) -> str:
+    for active_scope in active_scopes:
+        if not task_resource_scopes_conflict(scope, active_scope):
+            continue
+        if scope.store_wide or active_scope.store_wide:
+            return "排队中，等待同店铺整店任务完成"
+        return "排队中，等待同一商品当前任务完成"
+    return ""
+
+
+def partition_product_ids_by_active_task_conflicts(
+    session: Any,
+    owner_username: str,
+    store_ids: list[int],
+    product_ids: list[int],
+) -> tuple[list[int], list[int]]:
+    normalized_ids = normalize_product_ids(product_ids)
+    if not normalized_ids:
+        return [], []
+    active_scopes = [
+        sync_task_resource_scope(session, task)
+        for task in session.scalars(
+            select(SyncTaskModel).where(
+                SyncTaskModel.owner_username == owner_username,
+                SyncTaskModel.status.in_(("queued", "running")),
+                SyncTaskModel.task_type.notin_(IMAGE_CLEANUP_TASK_TYPES),
+            )
+        ).all()
+    ]
+    active_scopes.extend(
+        listing_task_resource_scope(session, task)
+        for task in session.scalars(
+            select(ListingTaskModel).where(
+                ListingTaskModel.owner_username == owner_username,
+                ListingTaskModel.status.in_(("queued", "running")),
+            )
+        ).all()
+    )
+    roots_by_id: dict[int, int] = {}
+    rows = session.execute(
+        select(ProductModel.id, ProductModel.parent_product_id).where(
+            ProductModel.owner_username == owner_username,
+            ProductModel.id.in_(normalized_ids),
+        )
+    ).all()
+    for row in rows:
+        roots_by_id[int(row.id)] = int(row.parent_product_id or row.id)
+    ready_ids: list[int] = []
+    blocked_ids: list[int] = []
+    normalized_store_ids = frozenset(normalize_listing_task_store_ids(store_ids))
+    for product_id in normalized_ids:
+        scope = TaskResourceScope(
+            owner_username=owner_username,
+            store_ids=normalized_store_ids,
+            product_ids=frozenset({roots_by_id.get(product_id, product_id)}),
+        )
+        if task_scope_conflict_reason(scope, active_scopes):
+            blocked_ids.append(product_id)
+        else:
+            ready_ids.append(product_id)
+    return ready_ids, blocked_ids
+
+
+def conflict_aware_product_chunks(
+    ready_ids: list[int],
+    blocked_ids: list[int],
+) -> list[tuple[list[int], bool]]:
+    result: list[tuple[list[int], bool]] = []
+    for product_ids, blocked in ((ready_ids, False), (blocked_ids, True)):
+        for chunk_ids in chunk_product_ids(product_ids):
+            if chunk_ids:
+                result.append((chunk_ids, blocked))
+    return result
+
+
 def sync_task_action_label(row: SyncTaskModel) -> str:
     task_type = row.task_type or "store_sync"
     if task_type == "title_optimization":
@@ -5002,13 +5244,6 @@ def specialized_sync_task_wait_reason(
         if running_task_id is not None:
             return "排队中，等待该店铺当前图片清理任务完成"
     if task_type in LISTING_IMAGE_UPLOAD_TASK_TYPES and task.store_id is not None:
-        active_listing_rows = session.scalars(
-            select(ListingTaskModel).where(
-                ListingTaskModel.status.in_(("queued", "running")),
-            )
-        ).all()
-        if any(int(task.store_id) in listing_task_store_ids(row) for row in active_listing_rows):
-            return "排队中，优先等待该店铺基础上架任务完成"
         running_task_id = session.scalar(
             select(SyncTaskModel.id)
             .where(
@@ -5022,6 +5257,29 @@ def specialized_sync_task_wait_reason(
         )
         if running_task_id is not None:
             return "排队中，等待该店铺当前图片完善任务完成"
+    if task_type in PRODUCT_SCOPED_SYNC_TASK_TYPES:
+        scope = sync_task_resource_scope(session, task)
+        active_scopes = [
+            sync_task_resource_scope(session, row)
+            for row in session.scalars(
+                select(SyncTaskModel).where(
+                    SyncTaskModel.status == "running",
+                    SyncTaskModel.id != task.id,
+                    SyncTaskModel.task_type.notin_(IMAGE_CLEANUP_TASK_TYPES),
+                )
+            ).all()
+        ]
+        active_scopes.extend(
+            listing_task_resource_scope(session, row)
+            for row in session.scalars(
+                select(ListingTaskModel).where(
+                    ListingTaskModel.status.in_(("queued", "running")),
+                )
+            ).all()
+        )
+        wait_reason = task_scope_conflict_reason(scope, active_scopes)
+        if wait_reason:
+            return wait_reason
     return ""
 
 
@@ -5076,16 +5334,46 @@ def sync_task_start_wait_reason(session: Any, task_id: str, store_id: int | None
     finalize_stale_cancel_requested_tasks(session, SyncTaskModel, action_label="同步")
     finalize_stale_store_cancel_requested_tasks(session, store_id)
     reconcile_interrupted_running_tasks(session, SyncTaskModel)
-    if running_sync_task_count(session, exclude_task_id=task_id) > 0:
-        return "排队中，等待当前同步任务完成"
-    store_running_count = running_store_task_count(
+    task = session.get(SyncTaskModel, task_id)
+    if task is None:
+        return "同步任务不存在"
+    session.execute(
+        select(UserAccountModel.username)
+        .where(UserAccountModel.username == task.owner_username)
+        .with_for_update()
+    ).first()
+    if running_sync_task_count(
         session,
-        store_id,
-        exclude_sync_task_id=task_id,
+        exclude_task_id=task_id,
+    ) >= int(settings.max_running_sync_tasks_global):
+        return "排队中，等待全局同步并发额度"
+    if running_user_task_count(
+        session,
+        SyncTaskModel,
+        task.owner_username,
+        exclude_task_id=task_id,
+    ) >= int(settings.max_running_sync_tasks_per_user):
+        return "排队中，等待该用户当前同步任务释放并发额度"
+    scope = sync_task_resource_scope(session, task)
+    active_scopes = [
+        sync_task_resource_scope(session, row)
+        for row in session.scalars(
+            select(SyncTaskModel).where(
+                SyncTaskModel.status == "running",
+                SyncTaskModel.id != task_id,
+                SyncTaskModel.task_type.notin_(SPECIALIZED_SYNC_TASK_TYPES),
+            )
+        ).all()
+    ]
+    active_scopes.extend(
+        listing_task_resource_scope(session, row)
+        for row in session.scalars(
+            select(ListingTaskModel).where(
+                ListingTaskModel.status == "running",
+            )
+        ).all()
     )
-    if store_running_count > 0:
-        return "排队中，等待该店铺当前同步、上架、上下架或删除任务完成"
-    return ""
+    return task_scope_conflict_reason(scope, active_scopes)
 
 
 def listing_task_start_wait_reason(session: Any, task: ListingTaskModel) -> str:
@@ -5116,15 +5404,23 @@ def listing_task_start_wait_reason(session: Any, task: ListingTaskModel) -> str:
     ) >= int(settings.max_running_listing_tasks_per_user):
         return "排队中，等待该用户当前上架任务释放并发额度"
     for store_id in store_ids:
-        if running_store_sync_task_count(session, store_id) > 0:
-            return "排队中，等待该店铺当前同步、上下架或删除任务完成"
         if running_store_listing_task_count(
             session,
             store_id,
             exclude_task_id=task_id,
         ) >= int(settings.max_running_listing_tasks_per_store):
             return "排队中，等待该店铺当前上架任务释放并发额度"
-    return ""
+    scope = listing_task_resource_scope(session, task)
+    active_sync_scopes = [
+        sync_task_resource_scope(session, row)
+        for row in session.scalars(
+            select(SyncTaskModel).where(
+                SyncTaskModel.status == "running",
+                SyncTaskModel.task_type.notin_(IMAGE_CLEANUP_TASK_TYPES),
+            )
+        ).all()
+    ]
+    return task_scope_conflict_reason(scope, active_sync_scopes)
 
 
 def running_store_task_count(
@@ -11233,17 +11529,28 @@ def create_product_listing_status_sync_task(owner_username: str, product_ids: li
         raise RuntimeError("请先选择商品。")
     action_label = "批量上架" if listing_status == "listed" else "批量下架"
     store_id = validate_sync_task_products(owner_username, normalized_ids)
-    chunks = chunk_product_ids(normalized_ids)
+    with session_scope() as session:
+        ready_ids, blocked_ids = partition_product_ids_by_active_task_conflicts(
+            session,
+            owner_username,
+            [store_id],
+            normalized_ids,
+        )
+    chunks = conflict_aware_product_chunks(ready_ids, blocked_ids)
     task_group_id = uuid.uuid4().hex if len(chunks) > 1 else None
     task_ids: list[str] = []
-    for index, chunk_ids in enumerate(chunks, start=1):
+    for index, (chunk_ids, blocked) in enumerate(chunks, start=1):
         task_name_prefix = action_label if len(chunks) == 1 else f"{action_label} {index}/{len(chunks)}"
         task_id = create_sync_task_record(
             owner_username,
             store_id,
             task_type="product_listing_status",
             task_name_prefix=task_name_prefix,
-            message=f"等待执行{action_label}",
+            message=(
+                "排队中，等待同一商品当前任务完成"
+                if blocked
+                else f"等待执行{action_label}"
+            ),
             payload={"listingStatus": listing_status, "productIds": chunk_ids},
             total_count=len(chunk_ids),
             task_group_id=task_group_id,
@@ -11260,17 +11567,45 @@ def create_product_delete_sync_task(owner_username: str, product_ids: list[int])
     if not normalized_ids:
         raise RuntimeError("请先选择商品。")
     store_id = validate_sync_task_products(owner_username, normalized_ids)
-    chunks = chunk_product_ids(normalized_ids)
+    with session_scope() as session:
+        active_delete_tasks = active_product_delete_task_ids(
+            session,
+            owner_username,
+            normalized_ids,
+        )
+        existing_task_ids = list(dict.fromkeys(active_delete_tasks.values()))
+        pending_ids = [
+            product_id
+            for product_id in normalized_ids
+            if product_id not in active_delete_tasks
+        ]
+        ready_ids, blocked_ids = partition_product_ids_by_active_task_conflicts(
+            session,
+            owner_username,
+            [store_id],
+            pending_ids,
+        )
+    chunks = conflict_aware_product_chunks(ready_ids, blocked_ids)
+    if not chunks and existing_task_ids:
+        return created_sync_tasks_response(
+            existing_task_ids,
+            message="所选商品已有删除任务，已继续跟踪原任务",
+            total=len(normalized_ids),
+        )
     task_group_id = uuid.uuid4().hex if len(chunks) > 1 else None
-    task_ids: list[str] = []
-    for index, chunk_ids in enumerate(chunks, start=1):
+    task_ids: list[str] = list(existing_task_ids)
+    for index, (chunk_ids, blocked) in enumerate(chunks, start=1):
         task_name_prefix = "批量删除" if len(chunks) == 1 else f"批量删除 {index}/{len(chunks)}"
         task_id = create_sync_task_record(
             owner_username,
             store_id,
             task_type="product_delete",
             task_name_prefix=task_name_prefix,
-            message="等待执行批量删除",
+            message=(
+                "排队中，等待同一商品当前任务完成"
+                if blocked
+                else "等待执行批量删除"
+            ),
             payload={"productIds": chunk_ids},
             total_count=len(chunk_ids),
             task_group_id=task_group_id,
@@ -11279,7 +11614,12 @@ def create_product_delete_sync_task(owner_username: str, product_ids: list[int])
         )
         task_ids.append(task_id)
     dispatch_next_sync_task()
-    return created_sync_tasks_response(task_ids, message="批量删除任务已创建", total=len(normalized_ids))
+    message = (
+        "批量删除任务已创建"
+        if not existing_task_ids
+        else "批量删除任务已创建，重复商品继续跟踪原删除任务"
+    )
+    return created_sync_tasks_response(task_ids, message=message, total=len(normalized_ids))
 
 
 def create_product_title_optimization_task(
@@ -11423,13 +11763,6 @@ def validate_sync_task_products(owner_username: str, product_ids: list[int]) -> 
             raise RuntimeError("商品关联店铺不存在。")
         if not store.enabled:
             raise RuntimeError("商品关联店铺已停用，不能创建同步任务。")
-        active_delete_task_ids = active_product_delete_task_ids(
-            session,
-            owner_username,
-            product_ids,
-        )
-        if active_delete_task_ids:
-            raise RuntimeError("所选商品中有删除任务正在执行，请等待任务完成后再试。")
         return store_id
 
 
@@ -20423,15 +20756,19 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
             raise RuntimeError(f"上架前体检未通过：{detail}{suffix}")
         product_by_id = {int(product.id): product for product in products}
         ordered_products = [product_by_id[product_id] for product_id in product_ids]
-        product_chunks = [
-            ordered_products[index : index + BATCH_TASK_PRODUCT_LIMIT]
-            for index in range(0, len(ordered_products), BATCH_TASK_PRODUCT_LIMIT)
-        ]
+        ready_ids, blocked_ids = partition_product_ids_by_active_task_conflicts(
+            session,
+            owner_username,
+            store_ids,
+            product_ids,
+        )
+        product_chunks = conflict_aware_product_chunks(ready_ids, blocked_ids)
         task_group_id = uuid.uuid4().hex if len(product_chunks) > 1 else None
         base_task_name = task_name or f"上架任务 {datetime.now():%Y-%m-%d %H:%M}"
         task_ids: list[str] = []
-        for index, product_chunk in enumerate(product_chunks, start=1):
+        for index, (chunk_ids, blocked) in enumerate(product_chunks, start=1):
             task_id = uuid.uuid4().hex
+            product_chunk = [product_by_id[product_id] for product_id in chunk_ids]
             chunk_product_ids = [int(product.id) for product in product_chunk]
             for product in product_chunk:
                 product.listing_task_id = task_id
@@ -20457,7 +20794,11 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
                     ),
                     ensure_ascii=False,
                 ),
-                message="等待同步到乐天",
+                message=(
+                    "排队中，等待同一商品当前任务完成"
+                    if blocked
+                    else "等待同步到乐天"
+                ),
             )
             session.add(task)
             task_ids.append(task_id)

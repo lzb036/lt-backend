@@ -78,6 +78,7 @@ class Settings(BaseModel):
     max_running_manual_crawl_tasks_per_user: int = 2
     max_running_scheduled_crawl_tasks_per_user: int = 1
     max_running_sync_tasks_per_user: int = 2
+    max_running_sync_tasks_global: int = 3
     max_running_listing_tasks_global: int = 8
     max_running_listing_tasks_per_user: int = 1
     max_running_listing_tasks_per_store: int = 1
@@ -226,6 +227,7 @@ def build_settings() -> Settings:
             _env_int("LT_MAX_RUNNING_SCHEDULED_CRAWL_TASKS_PER_USER", 1),
         ),
         max_running_sync_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_SYNC_TASKS_PER_USER", 2)),
+        max_running_sync_tasks_global=max(1, _env_int("LT_MAX_RUNNING_SYNC_TASKS_GLOBAL", 3)),
         max_running_listing_tasks_global=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_GLOBAL", 8)),
         max_running_listing_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_USER", 1)),
         max_running_listing_tasks_per_store=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_STORE", 1)),

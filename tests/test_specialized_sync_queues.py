@@ -269,11 +269,14 @@ def test_product_delete_creation_stays_on_normal_dispatcher(
         for product in listed_products
     )
 
-    with pytest.raises(RuntimeError, match="删除任务正在执行"):
-        crawler_service.create_product_delete_sync_task(
-            "alice",
-            product_ids,
-        )
+    repeated = crawler_service.create_product_delete_sync_task(
+        "alice",
+        product_ids,
+    )
+    assert [task["id"] for task in repeated["syncTasks"]] == [
+        task["id"] for task in result["syncTasks"]
+    ]
+    assert normal_dispatches == [True]
 
 
 def test_normal_dispatcher_skips_specialized_tasks(

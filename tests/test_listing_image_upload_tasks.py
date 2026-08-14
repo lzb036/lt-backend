@@ -234,7 +234,7 @@ def test_create_listing_image_upload_task_is_persisted_and_dispatched(
     ]
 
 
-def test_image_upload_waits_while_same_store_listing_is_active(
+def test_image_upload_waits_while_same_product_listing_is_active(
     session_factory,
     local_session_scope,
 ) -> None:
@@ -272,7 +272,7 @@ def test_image_upload_waits_while_same_store_listing_is_active(
         image_task = session.get(SyncTaskModel, "image-task")
         reason = crawler_service.specialized_sync_task_wait_reason(session, image_task)
 
-    assert "优先等待" in reason
+    assert "同一商品" in reason
 
 
 def test_running_image_upload_pauses_when_new_listing_arrives(monkeypatch) -> None:
