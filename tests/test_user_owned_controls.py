@@ -217,7 +217,7 @@ def test_order_sync_settings_are_independent(
     )
     bob = sales_order_sync_history_service.get_user_settings("bob")
 
-    assert alice["enabled"] is False
+    assert alice["enabled"] is True
     assert alice["intervalMinutes"] == 60
     assert bob["enabled"] is True
     assert bob["intervalMinutes"] == 30

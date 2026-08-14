@@ -1398,6 +1398,7 @@ def product_to_public(
     period_sales_count: int | None = None,
     title_optimization_count: int = 0,
     title_optimization_task_id: str | None = None,
+    product_delete_task_id: str | None = None,
 ) -> dict[str, Any]:
     listed_at = product_listed_at_text(row)
     raw_payload = product_raw_payload(row)
@@ -1440,6 +1441,7 @@ def product_to_public(
         "periodSalesCount": period_sales_count,
         "titleOptimizationCount": title_optimization_count,
         "titleOptimizationTaskId": title_optimization_task_id,
+        "productDeleteTaskId": product_delete_task_id,
         "genreId": row.genre_id,
         "genrePath": rakuten_genre_path(row.genre_id),
         "genrePathZh": rakuten_genre_zh_path(rakuten_genre_path(row.genre_id)),
@@ -10171,11 +10173,17 @@ def _products_to_public_with_period_sales(
         owner_username,
         [int(row.id) for row in rows],
     )
+    product_delete_task_ids = active_product_delete_task_ids(
+        session,
+        owner_username,
+        [int(row.id) for row in rows],
+    )
     if sales_period_range is None and period_sales_counts is None:
         return [
             product_to_public(
                 row,
                 title_optimization_task_id=title_optimization_task_ids.get(int(row.id)),
+                product_delete_task_id=product_delete_task_ids.get(int(row.id)),
             )
             for row in rows
         ]
@@ -10274,6 +10282,7 @@ def _products_to_public_with_period_sales(
             ),
             title_optimization_count=title_optimization_counts.get(int(row.id), 0),
             title_optimization_task_id=title_optimization_task_ids.get(int(row.id)),
+            product_delete_task_id=product_delete_task_ids.get(int(row.id)),
         )
         for row in rows
     ]
@@ -10421,6 +10430,30 @@ def active_title_optimization_task_ids(
         select(SyncTaskModel).where(
             SyncTaskModel.owner_username == owner_username,
             SyncTaskModel.task_type == "title_optimization",
+            SyncTaskModel.status.in_(("queued", "running")),
+        )
+    ).all()
+    for task in rows:
+        payload = sync_task_payload(task)
+        for product_id in normalize_product_ids(list(payload.get("productIds") or [])):
+            if product_id in normalized_ids:
+                result.setdefault(product_id, task.id)
+    return result
+
+
+def active_product_delete_task_ids(
+    session: Any,
+    owner_username: str,
+    product_ids: list[int],
+) -> dict[int, str]:
+    normalized_ids = set(normalize_product_ids(product_ids))
+    if not normalized_ids:
+        return {}
+    result: dict[int, str] = {}
+    rows = session.scalars(
+        select(SyncTaskModel).where(
+            SyncTaskModel.owner_username == owner_username,
+            SyncTaskModel.task_type == "product_delete",
             SyncTaskModel.status.in_(("queued", "running")),
         )
     ).all()
@@ -11390,6 +11423,13 @@ def validate_sync_task_products(owner_username: str, product_ids: list[int]) -> 
             raise RuntimeError("商品关联店铺不存在。")
         if not store.enabled:
             raise RuntimeError("商品关联店铺已停用，不能创建同步任务。")
+        active_delete_task_ids = active_product_delete_task_ids(
+            session,
+            owner_username,
+            product_ids,
+        )
+        if active_delete_task_ids:
+            raise RuntimeError("所选商品中有删除任务正在执行，请等待任务完成后再试。")
         return store_id
 
 
@@ -14323,8 +14363,6 @@ def run_due_sales_order_syncs_once() -> int:
             user_settings = (
                 sales_order_sync_history_service.get_user_settings(owner)
             )
-            if not user_settings["enabled"]:
-                continue
             interval = timedelta(
                 minutes=int(user_settings["intervalMinutes"])
             )

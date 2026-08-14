@@ -144,7 +144,6 @@ def test_save_global_settings_rejects_out_of_range_values(
     value: int,
 ) -> None:
     payload = SimpleNamespace(
-        enabled=True,
         intervalMinutes=30,
         successRetentionDays=30,
     )
@@ -172,7 +171,7 @@ def test_save_global_settings_persists_complete_payload(
     )
 
     assert saved == {
-        "enabled": False,
+        "enabled": True,
         "intervalMinutes": 75,
         "successRetentionDays": 45,
     }

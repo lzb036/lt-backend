@@ -50,9 +50,6 @@ SUCCESS_CLEANUP_LAST_RUN_AT: dict[str, datetime] = {}
 
 
 def _validated_settings(payload: Any) -> dict[str, Any]:
-    enabled = getattr(payload, "enabled", None)
-    if not isinstance(enabled, bool):
-        raise ValueError("自动同步启用状态必须是布尔值。")
     interval_minutes = getattr(payload, "intervalMinutes", None)
     if (
         not isinstance(interval_minutes, int)
@@ -68,7 +65,7 @@ def _validated_settings(payload: Any) -> dict[str, Any]:
     ):
         raise ValueError("成功记录保留天数必须在 1 至 365 天之间。")
     return {
-        "enabled": enabled,
+        "enabled": True,
         "intervalMinutes": interval_minutes,
         "successRetentionDays": retention_days,
     }
@@ -83,7 +80,6 @@ def _settings_from_row(row: SystemSettingModel | None) -> dict[str, Any]:
             raise ValueError
         return _validated_settings(
             SimpleNamespace(
-                enabled=raw.get("enabled"),
                 intervalMinutes=raw.get("intervalMinutes"),
                 successRetentionDays=raw.get("successRetentionDays"),
             )
@@ -171,9 +167,9 @@ def migrate_user_settings_to_owner_scope(session: Session) -> int:
         if session.get(SystemSettingModel, setting_key) is not None:
             continue
         settings = (
-            global_settings
+            {**global_settings, "enabled": True}
             if role == "superadmin"
-            else DEFAULT_GLOBAL_SETTINGS
+            else {**DEFAULT_GLOBAL_SETTINGS, "enabled": True}
         )
         session.add(
             SystemSettingModel(

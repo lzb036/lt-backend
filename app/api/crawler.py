@@ -282,7 +282,6 @@ class AiTitleVersionSavePayload(BaseModel):
 
 
 class SalesOrderSyncGlobalSettingsPayload(BaseModel):
-    enabled: bool
     intervalMinutes: int = Field(ge=5, le=1440)
     successRetentionDays: int = Field(ge=1, le=365)
 
