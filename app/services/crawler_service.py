@@ -20029,12 +20029,18 @@ def sanitize_rakuten_sp_description_soup(soup: BeautifulSoup) -> None:
     for element in list(soup.find_all(True)):
         tag_name = normalize_text(element.name).lower()
         if tag_name in RAKUTEN_SP_DESCRIPTION_DROP_TAGS:
-            element.decompose()
+            try:
+                element.decompose()
+            except ValueError:
+                continue
             continue
         if tag_name in {"html", "body"}:
             continue
         if tag_name not in RAKUTEN_SP_DESCRIPTION_ALLOWED_TAGS:
-            element.unwrap()
+            try:
+                element.unwrap()
+            except ValueError:
+                continue
             continue
         allowed_attributes = set(RAKUTEN_SP_DESCRIPTION_ALLOWED_ATTRIBUTES.get("*", set()))
         allowed_attributes.update(RAKUTEN_SP_DESCRIPTION_ALLOWED_ATTRIBUTES.get(tag_name, set()))
