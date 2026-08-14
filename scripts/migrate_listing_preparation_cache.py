@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
         description="Move listing preparation caches out of lt_products.raw_payload_json.",
     )
     parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--disable-binlog", action="store_true")
     parser.add_argument(
         "--state-file",
         type=Path,
@@ -63,6 +64,8 @@ def run() -> int:
     migrated = 0
     while True:
         with session_scope() as session:
+            if args.disable_binlog:
+                session.execute(text("SET SESSION sql_log_bin = 0"))
             rows = session.scalars(
                 select(ProductModel)
                 .where(ProductModel.id > last_id)
