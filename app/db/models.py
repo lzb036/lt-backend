@@ -456,6 +456,21 @@ class ProductModel(TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
+class ProductListingPreparationModel(TimestampMixin, Base):
+    __tablename__ = "lt_product_listing_preparations"
+
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("lt_products.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    cache_json: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=False,
+        default="{}",
+    )
+
+
 class AiTitleSettingsModel(TimestampMixin, Base):
     __tablename__ = "lt_ai_title_settings"
 

@@ -55,6 +55,7 @@ from app.db.models import (
     ListingTaskModel,
     ProductSalesDailyModel,
     ProductModel,
+    ProductListingPreparationModel,
     ProductTitleVersionModel,
     RoleModel,
     SalesOrderModel,
@@ -9578,6 +9579,21 @@ def listing_preparation_cache(
 ) -> dict[str, Any]:
     payload = raw_payload if isinstance(raw_payload, dict) else product_raw_payload(product)
     cache = payload.get(LISTING_PREPARATION_CACHE_KEY)
+    if not isinstance(cache, dict) and isinstance(product, ProductModel):
+        cached_payload = getattr(product, "_listing_preparation_cache_payload", _TASK_DETAIL_UNSET)
+        if cached_payload is _TASK_DETAIL_UNSET:
+            with session_scope() as session:
+                row = session.get(ProductListingPreparationModel, int(product.id))
+                cached_payload = {}
+                if row is not None:
+                    try:
+                        parsed = json.loads(row.cache_json or "{}")
+                    except (TypeError, ValueError):
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        cached_payload = parsed
+            setattr(product, "_listing_preparation_cache_payload", cached_payload)
+        cache = cached_payload
     if not isinstance(cache, dict):
         return {}
     if int(cache.get("version") or 0) != LISTING_PREPARATION_CACHE_VERSION:
@@ -18597,9 +18613,23 @@ def prepare_collected_product_for_listing(owner_username: str | None, product_id
             "missingImageCount": 0,
             "removedImageCount": len(missing_images),
         }
-        raw_payload[LISTING_PREPARATION_CACHE_KEY] = cache_payload
-        product.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
-        referenced_local_urls = collect_local_product_image_urls(raw_payload)
+        preparation_row = session.get(ProductListingPreparationModel, int(product.id))
+        if preparation_row is None:
+            preparation_row = ProductListingPreparationModel(product_id=int(product.id))
+            session.add(preparation_row)
+        preparation_row.source_fingerprint = final_fingerprint
+        preparation_row.cache_json = json.dumps(cache_payload, ensure_ascii=False)
+        setattr(product, "_listing_preparation_cache_payload", cache_payload)
+        if missing_images:
+            product.raw_payload_json = json.dumps(raw_payload, ensure_ascii=False)
+        referenced_local_urls = unique_texts([
+            *collect_local_product_image_urls(raw_payload),
+            *[
+                normalize_text(row.get("preparedUrl"))
+                for row in cached_images
+                if isinstance(row, dict) and normalize_text(row.get("preparedUrl"))
+            ],
+        ])
         session.flush()
     remove_unused_local_product_images(product_id, referenced_local_urls)
     return cache_payload

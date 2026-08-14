@@ -452,11 +452,16 @@ def test_collected_product_preparation_persists_preflight_and_image_cache(monkey
         item_number="",
         raw_payload_json=json.dumps({"descriptions": []}),
     )
+    preparation = SimpleNamespace(source_fingerprint="", cache_json="{}")
 
     @contextmanager
     def local_session_scope():
         yield SimpleNamespace(
-            get=lambda _model, _product_id: product,
+            get=lambda model, _product_id: (
+                preparation
+                if model is crawler_service.ProductListingPreparationModel
+                else product
+            ),
             flush=lambda: None,
         )
 
@@ -498,8 +503,7 @@ def test_collected_product_preparation_persists_preflight_and_image_cache(monkey
     )
 
     result = crawler_service.prepare_collected_product_for_listing(None, 123)
-    saved_payload = json.loads(product.raw_payload_json)
-    saved_cache = saved_payload[crawler_service.LISTING_PREPARATION_CACHE_KEY]
+    saved_cache = json.loads(preparation.cache_json)
 
     assert result["preflight"]["status"] == "passed"
     assert saved_cache["images"] == [
@@ -523,11 +527,16 @@ def test_collected_product_preparation_removes_unreadable_images(monkeypatch):
         item_number="",
         raw_payload_json=json.dumps({"images": [first_image, broken_image]}),
     )
+    preparation = SimpleNamespace(source_fingerprint="", cache_json="{}")
 
     @contextmanager
     def local_session_scope():
         yield SimpleNamespace(
-            get=lambda _model, _product_id: product,
+            get=lambda model, _product_id: (
+                preparation
+                if model is crawler_service.ProductListingPreparationModel
+                else product
+            ),
             flush=lambda: None,
         )
 
