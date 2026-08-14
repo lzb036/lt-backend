@@ -18486,15 +18486,18 @@ def store_prepared_rakuten_listing_image(
     if not isinstance(content, bytes) or not content:
         raise RuntimeError("预处理图片内容为空。")
     suffix = normalize_product_image_suffix(image_data.get("suffix"))
-    if suffix != ".jpg":
+    if suffix not in {".jpg", ".png"}:
         raise RuntimeError("预处理图片格式不正确。")
+    source_url = normalize_text(image_data.get("sourceUrl"))
+    if bool(image_data.get("sourceReusable")) and is_local_product_image_url(source_url):
+        return source_url
     digest = hashlib.sha256(content).hexdigest()[:24]
-    filename = f"rakuten-prepared-{digest}.jpg"
+    filename = f"rakuten-prepared-{digest}{suffix}"
     image_url = local_product_image_url(product_id, filename)
     store_product_image_content(
         image_url,
         content,
-        "image/jpeg",
+        "image/jpeg" if suffix == ".jpg" else "image/png",
         LOCAL_PRODUCT_IMAGE_DIR / str(int(product_id)) / filename,
     )
     return image_url
@@ -19397,6 +19400,23 @@ def prepare_rakuten_cabinet_image(image_data: dict[str, Any]) -> dict[str, Any]:
 
     try:
         with Image.open(BytesIO(content)) as source:
+            source.load()
+            source_format = normalize_text(source.format).upper()
+            source_orientation = int(source.getexif().get(274) or 1)
+            if (
+                suffix in {".jpg", ".png"}
+                and source_format in {"JPEG", "PNG"}
+                and source_orientation == 1
+                and len(content) <= RAKUTEN_CABINET_MAX_IMAGE_BYTES
+                and source.width <= RAKUTEN_CABINET_MAX_IMAGE_DIMENSION
+                and source.height <= RAKUTEN_CABINET_MAX_IMAGE_DIMENSION
+            ):
+                return {
+                    "content": content,
+                    "suffix": suffix,
+                    "contentType": "image/jpeg" if suffix == ".jpg" else "image/png",
+                    "sourceReusable": True,
+                }
             image = ImageOps.exif_transpose(source)
             image.load()
     except UnidentifiedImageError as exc:
@@ -19427,7 +19447,12 @@ def prepare_rakuten_cabinet_image(image_data: dict[str, Any]) -> dict[str, Any]:
             current.save(output, format="JPEG", quality=quality, optimize=True, progressive=True)
             normalized_content = output.getvalue()
             if len(normalized_content) <= RAKUTEN_CABINET_MAX_IMAGE_BYTES:
-                return {"content": normalized_content, "suffix": ".jpg", "contentType": "image/jpeg"}
+                return {
+                    "content": normalized_content,
+                    "suffix": ".jpg",
+                    "contentType": "image/jpeg",
+                    "sourceReusable": False,
+                }
     raise RuntimeError("图片压缩后仍超过 R-Cabinet 2MB 限制，请替换为更小的图片。")
 
 

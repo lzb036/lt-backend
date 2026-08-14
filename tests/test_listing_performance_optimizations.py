@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import json
 import threading
 import time
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
@@ -338,6 +339,49 @@ def test_listing_image_preparation_reuses_prepared_cache(monkeypatch):
             "sourceUrl": "source-image",
         }
     ]
+
+
+def test_cabinet_preparation_reuses_compliant_source_image():
+    from PIL import Image
+
+    output = BytesIO()
+    Image.new("RGB", (100, 100), (255, 255, 255)).save(output, format="JPEG")
+    content = output.getvalue()
+
+    prepared = crawler_service.prepare_rakuten_cabinet_image(
+        {
+            "content": content,
+            "suffix": ".jpg",
+            "contentType": "image/jpeg",
+        }
+    )
+
+    assert prepared["content"] == content
+    assert prepared["sourceReusable"] is True
+
+
+def test_prepared_cache_reuses_local_source_url(monkeypatch):
+    source_url = crawler_service.local_product_image_url(123, "source.jpg")
+    monkeypatch.setattr(
+        crawler_service,
+        "store_product_image_content",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("compliant local image must not be duplicated")
+        ),
+    )
+
+    prepared_url = crawler_service.store_prepared_rakuten_listing_image(
+        123,
+        {
+            "sourceUrl": source_url,
+            "content": b"image",
+            "suffix": ".jpg",
+            "contentType": "image/jpeg",
+            "sourceReusable": True,
+        },
+    )
+
+    assert prepared_url == source_url
 
 
 def test_listing_preparation_cache_invalidates_after_product_change():
