@@ -240,7 +240,8 @@ def resume_all_tasks(*, operated_by: str) -> dict[str, Any]:
     errors: list[str] = []
 
     try:
-        restored_counts = _prepare_snapshot_for_resume(snapshot)
+        restored_counts, prepare_errors = _prepare_snapshot_for_resume(snapshot)
+        errors.extend(prepare_errors)
     except Exception as exc:
         errors.append(str(exc))
         with SessionLocal() as session:
@@ -594,10 +595,11 @@ def _stop_schedule_rows(session: Any, model: Any, items: list[dict[str, Any]]) -
 
 def _prepare_snapshot_for_resume(
     snapshot: dict[str, Any],
-) -> dict[str, int]:
+) -> tuple[dict[str, int], list[str]]:
     from app.services import crawler_service
 
     counts = _empty_stop_counts()
+    errors: list[str] = []
     with SessionLocal() as session:
         for model, key in (
             (ScheduledCrawlModel, "scheduledCrawls"),
@@ -607,7 +609,8 @@ def _prepare_snapshot_for_resume(
             for item in snapshot.get("schedules", {}).get(key, []):
                 row = session.get(model, int(item.get("id") or 0))
                 if row is None:
-                    raise RuntimeError(f"{key} 计划 {item.get('id')} 已不存在。")
+                    errors.append(f"{key} 计划 {item.get('id')} 已不存在，已跳过。")
+                    continue
                 row.status = "idle" if bool(item.get("enabled")) else "disabled"
                 counts[key] += 1
 
@@ -617,7 +620,8 @@ def _prepare_snapshot_for_resume(
                 int(item.get("id") or 0),
             )
             if row is None or row.status != "cancelled":
-                raise RuntimeError(f"图片清理记录 {item.get('id')} 状态已变化。")
+                errors.append(f"图片清理记录 {item.get('id')} 状态已变化，已跳过。")
+                continue
             original_status = str(item.get("status") or "pending")
             row.status = "queued" if original_status == "queued" else "pending"
             row.sync_task_id = (
@@ -631,7 +635,8 @@ def _prepare_snapshot_for_resume(
         for item in snapshot.get("tasks", {}).get("crawl", []):
             row = session.get(CrawlTaskModel, str(item.get("id") or ""))
             if row is None or row.status != "cancelled":
-                raise RuntimeError(f"采集任务 {item.get('id')} 状态已变化。")
+                errors.append(f"采集任务 {item.get('id')} 状态已变化，已跳过。")
+                continue
             row.status = "queued"
             row.queue_job_id = None
             row.message = "系统维护结束，等待继续执行"
@@ -645,7 +650,8 @@ def _prepare_snapshot_for_resume(
             task_id = str(item.get("id") or "")
             row = session.get(ListingTaskModel, task_id)
             if row is None or row.status != "cancelled":
-                raise RuntimeError(f"上架任务 {task_id} 状态已变化。")
+                errors.append(f"上架任务 {task_id} 状态已变化，已跳过。")
+                continue
             product_ids_payload = crawler_service.listing_task_product_ids_payload(
                 row.product_ids_json
             )
@@ -659,7 +665,8 @@ def _prepare_snapshot_for_resume(
                 ]
             )
             if not retry_product_ids:
-                raise RuntimeError(f"上架任务 {task_id} 没有可恢复商品。")
+                errors.append(f"上架任务 {task_id} 没有可恢复商品，已跳过。")
+                continue
             task_product_ids = (
                 product_ids_payload["productIds"] or retry_product_ids
             )
@@ -710,7 +717,8 @@ def _prepare_snapshot_for_resume(
             task_id = str(item.get("id") or "")
             row = session.get(SyncTaskModel, task_id)
             if row is None or row.status != "cancelled":
-                raise RuntimeError(f"同步任务 {task_id} 状态已变化。")
+                errors.append(f"同步任务 {task_id} 状态已变化，已跳过。")
+                continue
             payload = crawler_service.sync_task_payload(row)
             payload.pop("result", None)
             row.status = "queued"
@@ -727,7 +735,8 @@ def _prepare_snapshot_for_resume(
             run_id = str(item.get("id") or "")
             row = session.get(SalesOrderSyncRunModel, run_id)
             if row is None or row.status != "cancelled" or row.store_id is None:
-                raise RuntimeError(f"订单同步 {run_id} 状态已变化或店铺不存在。")
+                errors.append(f"订单同步 {run_id} 状态已变化或店铺不存在，已跳过。")
+                continue
             row.status = "queued"
             row.message = "系统维护结束，等待继续同步订单。"
             row.error_detail = None
@@ -745,7 +754,7 @@ def _prepare_snapshot_for_resume(
                 state.last_error = None
             counts["salesOrderSync"] += 1
         session.commit()
-    return counts
+    return counts, errors
 
 
 def _dispatch_restored_snapshot(
