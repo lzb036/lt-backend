@@ -89,7 +89,7 @@ def test_product_sync_does_not_queue_when_disabled_or_not_due(
     with session_factory() as session:
         session.add(
             SystemSettingModel(
-                key=crawler_service.SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
+                key=crawler_service.user_time_settings_key("alice"),
                 value_json=json.dumps(payload),
             )
         )
@@ -156,7 +156,7 @@ def test_due_product_sync_queues_only_enabled_stores_with_credentials(
         payload["productSyncNextAt"] = "2026-07-18 20:59:00"
         session.add(
             SystemSettingModel(
-                key=crawler_service.SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
+                key=crawler_service.user_time_settings_key("alice"),
                 value_json=json.dumps(payload),
             )
         )

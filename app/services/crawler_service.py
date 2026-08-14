@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit,
 
 import requests
 from bs4 import BeautifulSoup, Comment
-from sqlalchemy import and_, case, exists, func, or_, select, update
+from sqlalchemy import and_, case, exists, func, inspect, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import aliased
 
@@ -582,6 +582,7 @@ SCHEDULE_FALLBACK_TARGET_PREFIX = "__LT_FALLBACK_SHOP_URL__:"
 SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY = "scheduledCrawlTaskCleanup"
 USER_TIME_SETTINGS_PREFIX = "userTimeSettings:"
 DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX = "deletedProductImageCleanup:"
+USER_TIME_SETTINGS_OWNER_SCOPE_MIGRATION_KEY = "migration:userTimeSettingsOwnerScopeV2"
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_WEEKDAY = 6
 SCHEDULED_CRAWL_TASK_CLEANUP_DEFAULT_TIME = "09:00"
 SCHEDULED_CRAWL_TASK_CLEANUP_RETENTION_DAYS = 7
@@ -8019,11 +8020,7 @@ def initial_user_time_settings_payload(
     *,
     now: datetime,
 ) -> dict[str, Any]:
-    legacy_row = session.get(
-        SystemSettingModel,
-        SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
-    )
-    payload = load_time_settings_payload(legacy_row, now=now)
+    payload = default_time_settings_value(now=now)
     deleted_row = session.get(
         SystemSettingModel,
         deleted_product_image_cleanup_user_setting_key(owner_username),
@@ -8037,6 +8034,120 @@ def initial_user_time_settings_payload(
             )
         )
     return payload
+
+
+def migrate_user_time_settings_to_owner_scope(
+    session: Any,
+    *,
+    now: datetime | None = None,
+) -> int:
+    if not hasattr(session, "get") or not hasattr(session, "scalars"):
+        return 0
+    bind = session.get_bind()
+    user_columns = {
+        column["name"]
+        for column in inspect(bind).get_columns(UserAccountModel.__tablename__)
+    }
+    if "username" not in user_columns:
+        return 0
+    if session.get(
+        SystemSettingModel,
+        USER_TIME_SETTINGS_OWNER_SCOPE_MIGRATION_KEY,
+    ) is not None:
+        return 0
+    reference = now or datetime.now()
+    migrated_count = 0
+    owner_usernames = session.scalars(
+        select(UserAccountModel.username).order_by(UserAccountModel.username.asc())
+    ).all()
+    for owner_username_value in owner_usernames:
+        owner_username = str(owner_username_value)
+        time_row = session.get(
+            SystemSettingModel,
+            user_time_settings_key(owner_username),
+        )
+        existing = (
+            load_time_settings_payload(time_row, now=reference)
+            if time_row is not None
+            else default_time_settings_value(now=reference)
+        )
+        migrated = default_time_settings_value(now=reference)
+        migrated.update(
+            {
+                "cleanupWeekday": existing["cleanupWeekday"],
+                "cleanupTime": existing["cleanupTime"],
+                "cleanupEnabled": existing["cleanupEnabled"],
+                "nextCleanupAt": datetime_to_public(
+                    next_weekly_run_at(
+                        existing["cleanupWeekday"],
+                        existing["cleanupTime"],
+                        now=reference,
+                    )
+                ),
+                "productSyncEnabled": existing["productSyncEnabled"],
+                "productSyncWeekday": existing["productSyncWeekday"],
+                "productSyncTime": existing["productSyncTime"],
+                "productSyncNextAt": datetime_to_public(
+                    next_weekly_run_at(
+                        existing["productSyncWeekday"],
+                        existing["productSyncTime"],
+                        now=reference,
+                    )
+                ),
+                "unlistedCleanupEnabled": existing["unlistedCleanupEnabled"],
+                "unlistedNextCleanupAt": datetime_to_public(
+                    next_monthly_run_at(
+                        existing["unlistedCleanupMonthDay"],
+                        existing["unlistedCleanupTime"],
+                        now=reference,
+                    )
+                ),
+                "deletedImageCleanupEnabled": existing["deletedImageCleanupEnabled"],
+                "deletedImageCleanupWeekday": existing["deletedImageCleanupWeekday"],
+                "deletedImageCleanupTime": existing["deletedImageCleanupTime"],
+                "deletedImageCleanupNextAt": datetime_to_public(
+                    next_weekly_run_at(
+                        existing["deletedImageCleanupWeekday"],
+                        existing["deletedImageCleanupTime"],
+                        now=reference,
+                    )
+                ),
+            }
+        )
+        upsert_time_settings_row(session, migrated, owner_username)
+
+        deleted_key = deleted_product_image_cleanup_user_setting_key(owner_username)
+        deleted_row = session.get(SystemSettingModel, deleted_key)
+        if deleted_row is None:
+            deleted_row = SystemSettingModel(key=deleted_key)
+            session.add(deleted_row)
+        deleted_row.value_json = json.dumps(
+            {
+                "deletedImageCleanupEnabled": migrated["deletedImageCleanupEnabled"],
+                "deletedImageCleanupWeekday": migrated["deletedImageCleanupWeekday"],
+                "deletedImageCleanupTime": migrated["deletedImageCleanupTime"],
+                "deletedImageCleanupNextAt": migrated["deletedImageCleanupNextAt"],
+                "deletedImageCleanupLastAt": None,
+                "deletedImageCleanupLastProductCount": 0,
+                "deletedImageCleanupLastTaskCount": 0,
+            },
+            ensure_ascii=False,
+        )
+        migrated_count += 1
+
+    session.add(
+        SystemSettingModel(
+            key=USER_TIME_SETTINGS_OWNER_SCOPE_MIGRATION_KEY,
+            value_json=json.dumps(
+                {
+                    "migratedAt": datetime_to_public(reference),
+                    "migratedUsers": migrated_count,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    return migrated_count
 
 
 def upsert_time_settings_row(
@@ -8661,11 +8772,7 @@ def get_deleted_product_image_cleanup_settings(
         include_queue_health=False,
     )
     with session_scope() as session:
-        global_row = session.get(
-            SystemSettingModel,
-            SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
-        )
-        fallback_payload = load_time_settings_payload(global_row, now=now)
+        fallback_payload = default_time_settings_value(now=now)
         setting_key = deleted_product_image_cleanup_user_setting_key(owner_username)
         row = session.get(SystemSettingModel, setting_key)
         personal_payload = load_deleted_product_image_cleanup_user_payload(
@@ -8715,11 +8822,7 @@ def save_deleted_product_image_cleanup_settings(
         )
     )
     with session_scope() as session:
-        global_row = session.get(
-            SystemSettingModel,
-            SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
-        )
-        fallback_payload = load_time_settings_payload(global_row, now=now)
+        fallback_payload = default_time_settings_value(now=now)
         setting_key = deleted_product_image_cleanup_user_setting_key(owner_username)
         row = session.get(SystemSettingModel, setting_key)
         personal_payload = load_deleted_product_image_cleanup_user_payload(
@@ -8892,11 +8995,7 @@ def cleanup_deleted_product_images_scope(
 ) -> tuple[dict[str, int], list[tuple[str, str]]]:
     now = datetime.now()
     with session_scope() as session:
-        global_row = session.get(
-            SystemSettingModel,
-            SCHEDULED_CRAWL_TASK_CLEANUP_SETTING_KEY,
-        )
-        global_payload = load_time_settings_payload(global_row, now=now)
+        global_payload = default_time_settings_value(now=now)
         if owner_username is None:
             settings_row = upsert_time_settings_row(session, global_payload)
             payload = global_payload
@@ -8954,7 +9053,7 @@ def cleanup_deleted_product_images(
     try:
         summaries: list[dict[str, int]] = []
         task_refs: list[tuple[str, str]] = []
-        if owner_username is not None or force:
+        if owner_username is not None:
             summary, scoped_refs = cleanup_deleted_product_images_scope(
                 force=force,
                 owner_username=owner_username,
@@ -8964,32 +9063,16 @@ def cleanup_deleted_product_images(
         else:
             paused_owners = system_task_paused_usernames()
             with session_scope() as session:
-                setting_keys = session.scalars(
-                    select(SystemSettingModel.key).where(
-                        SystemSettingModel.key.like(
-                            f"{DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX}%"
-                        )
+                owners = session.scalars(
+                    select(UserAccountModel.username).where(
+                        UserAccountModel.enabled.is_(True)
                     )
                 ).all()
-            personal_owners = {
-                str(key)[len(DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX):]
-                for key in setting_keys
-                if str(key).startswith(
-                    DELETED_PRODUCT_IMAGE_CLEANUP_USER_SETTING_PREFIX
-                )
-            }
-            summary, scoped_refs = cleanup_deleted_product_images_scope(
-                force=False,
-                owner_username=None,
-                excluded_owner_usernames=personal_owners | paused_owners,
-            )
-            summaries.append(summary)
-            task_refs.extend(scoped_refs)
-            for personal_owner in sorted(personal_owners):
+            for personal_owner in sorted(str(owner) for owner in owners):
                 if personal_owner in paused_owners:
                     continue
                 summary, scoped_refs = cleanup_deleted_product_images_scope(
-                    force=False,
+                    force=force,
                     owner_username=personal_owner,
                 )
                 summaries.append(summary)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,12 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import CrawlTaskModel, StoreModel, UserAccountModel
+from app.db.models import (
+    CrawlTaskModel,
+    StoreModel,
+    SystemSettingModel,
+    UserAccountModel,
+)
 from app.services import crawler_service, sales_order_sync_history_service
 
 
@@ -51,12 +57,15 @@ def seed_user_and_store(
     session_factory,
     username: str,
     store_code: str,
+    *,
+    role: str = "operator",
 ) -> int:
     with session_factory() as session:
         session.add(
             UserAccountModel(
                 username=username,
                 display_name=username.title(),
+                role=role,
                 password_salt_b64="salt",
                 password_hash_b64="hash",
             )
@@ -212,3 +221,121 @@ def test_order_sync_settings_are_independent(
     assert alice["intervalMinutes"] == 60
     assert bob["enabled"] is True
     assert bob["intervalMinutes"] == 30
+
+
+def test_time_settings_migration_resets_copied_global_history(
+    session_factory,
+) -> None:
+    seed_user_and_store(session_factory, "alice", "alice-shop")
+    seed_user_and_store(session_factory, "bob", "bob-shop")
+    legacy_payload = {
+        **crawler_service.default_time_settings_value(
+            now=datetime(2026, 8, 14, 10, 0, 0)
+        ),
+        "cleanupWeekday": 2,
+        "cleanupTime": "04:00",
+        "lastCleanupAt": "2026-08-13 01:38:16",
+        "lastCleanupDeletedCount": 1288,
+        "productSyncLastAt": "2026-08-09 21:00:54",
+        "productSyncLastTaskCount": 2,
+        "unlistedLastCleanupAt": "2026-08-01 01:00:35",
+        "unlistedLastDeletedCount": 9,
+        "unlistedLastTaskCount": 2,
+        "deletedImageCleanupLastAt": "2026-08-08 00:00:33",
+        "deletedImageCleanupLastProductCount": 62,
+        "deletedImageCleanupLastTaskCount": 3,
+    }
+    with session_factory() as session:
+        for owner_username in ("alice", "bob"):
+            session.add(
+                SystemSettingModel(
+                    key=crawler_service.user_time_settings_key(owner_username),
+                    value_json=json.dumps(legacy_payload),
+                )
+            )
+        migrated = crawler_service.migrate_user_time_settings_to_owner_scope(
+            session,
+            now=datetime(2026, 8, 14, 10, 0, 0),
+        )
+        session.commit()
+
+    assert migrated == 2
+    for owner_username in ("alice", "bob"):
+        settings = crawler_service.get_time_settings(
+            owner_username,
+            include_queue_health=False,
+        )
+        assert settings["cleanupWeekday"] == 2
+        assert settings["cleanupTime"] == "04:00"
+        assert settings["lastCleanupAt"] is None
+        assert settings["lastCleanupDeletedCount"] == 0
+        assert settings["productSyncLastAt"] is None
+        assert settings["productSyncLastTaskCount"] == 0
+        assert settings["unlistedLastCleanupAt"] is None
+        assert settings["unlistedLastDeletedCount"] == 0
+        assert settings["unlistedLastTaskCount"] == 0
+        assert settings["deletedImageCleanupLastAt"] is None
+        assert settings["deletedImageCleanupLastProductCount"] == 0
+        assert settings["deletedImageCleanupLastTaskCount"] == 0
+
+    with session_factory() as session:
+        assert session.get(
+            SystemSettingModel,
+            crawler_service.USER_TIME_SETTINGS_OWNER_SCOPE_MIGRATION_KEY,
+        ) is not None
+        assert session.get(
+            SystemSettingModel,
+            crawler_service.deleted_product_image_cleanup_user_setting_key("alice"),
+        ) is not None
+
+
+def test_order_sync_settings_migration_gives_each_user_a_personal_row(
+    session_factory,
+) -> None:
+    seed_user_and_store(
+        session_factory,
+        "superadmin",
+        "superadmin-shop",
+        role="superadmin",
+    )
+    seed_user_and_store(session_factory, "alice", "alice-shop")
+    with session_factory() as session:
+        session.add(
+            SystemSettingModel(
+                key=sales_order_sync_history_service.GLOBAL_SETTINGS_KEY,
+                value_json=json.dumps(
+                    {
+                        "enabled": True,
+                        "intervalMinutes": 720,
+                        "successRetentionDays": 7,
+                    }
+                ),
+            )
+        )
+        migrated = (
+            sales_order_sync_history_service
+            .migrate_user_settings_to_owner_scope(session)
+        )
+        session.commit()
+
+    assert migrated == 2
+    superadmin = sales_order_sync_history_service.get_user_settings("superadmin")
+    alice = sales_order_sync_history_service.get_user_settings("alice")
+    assert superadmin["intervalMinutes"] == 720
+    assert superadmin["successRetentionDays"] == 7
+    assert alice["intervalMinutes"] == 30
+    assert alice["successRetentionDays"] == 30
+
+    with session_factory() as session:
+        assert session.get(
+            SystemSettingModel,
+            sales_order_sync_history_service.user_settings_key("superadmin"),
+        ) is not None
+        assert session.get(
+            SystemSettingModel,
+            sales_order_sync_history_service.user_settings_key("alice"),
+        ) is not None
+        assert session.get(
+            SystemSettingModel,
+            sales_order_sync_history_service.USER_SETTINGS_OWNER_SCOPE_MIGRATION_KEY,
+        ) is not None

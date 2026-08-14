@@ -8,6 +8,7 @@ from typing import Any
 import uuid
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
 from app.db.database import session_scope
@@ -16,12 +17,16 @@ from app.db.models import (
     SalesOrderSyncRunModel,
     StoreModel,
     SystemSettingModel,
+    UserAccountModel,
 )
 from app.services.sales_time import sales_now_naive
 
 
 GLOBAL_SETTINGS_KEY = "sales_order_sync_settings"
 USER_SETTINGS_PREFIX = "sales_order_sync_settings:"
+USER_SETTINGS_OWNER_SCOPE_MIGRATION_KEY = (
+    "migration:salesOrderSyncSettingsOwnerScopeV2"
+)
 DEFAULT_GLOBAL_SETTINGS = {
     "enabled": True,
     "intervalMinutes": 30,
@@ -113,12 +118,18 @@ def user_settings_key(owner_username: str) -> str:
 def get_user_settings(owner_username: str) -> dict[str, Any]:
     normalized_owner = str(owner_username or "").strip()
     with session_scope() as session:
-        row = session.get(
-            SystemSettingModel,
-            user_settings_key(normalized_owner),
-        )
+        setting_key = user_settings_key(normalized_owner)
+        row = session.get(SystemSettingModel, setting_key)
         if row is None:
-            row = session.get(SystemSettingModel, GLOBAL_SETTINGS_KEY)
+            row = SystemSettingModel(
+                key=setting_key,
+                value_json=json.dumps(
+                    DEFAULT_GLOBAL_SETTINGS,
+                    ensure_ascii=False,
+                ),
+            )
+            session.add(row)
+            session.flush()
         settings = _settings_from_row(row)
         return {
             **settings,
@@ -128,6 +139,62 @@ def get_user_settings(owner_username: str) -> dict[str, Any]:
                 else None
             ),
         }
+
+
+def migrate_user_settings_to_owner_scope(session: Session) -> int:
+    if not hasattr(session, "get_bind") or not hasattr(session, "get"):
+        return 0
+    bind = session.get_bind()
+    user_columns = {
+        column["name"]
+        for column in inspect(bind).get_columns(UserAccountModel.__tablename__)
+    }
+    if not {"username", "role"}.issubset(user_columns):
+        return 0
+    if session.get(
+        SystemSettingModel,
+        USER_SETTINGS_OWNER_SCOPE_MIGRATION_KEY,
+    ) is not None:
+        return 0
+    global_settings = _settings_from_row(
+        session.get(SystemSettingModel, GLOBAL_SETTINGS_KEY)
+    )
+    migrated_count = 0
+    accounts = session.execute(
+        select(
+            UserAccountModel.username,
+            UserAccountModel.role,
+        ).order_by(UserAccountModel.username.asc())
+    ).all()
+    for username, role in accounts:
+        setting_key = user_settings_key(username)
+        if session.get(SystemSettingModel, setting_key) is not None:
+            continue
+        settings = (
+            global_settings
+            if role == "superadmin"
+            else DEFAULT_GLOBAL_SETTINGS
+        )
+        session.add(
+            SystemSettingModel(
+                key=setting_key,
+                value_json=json.dumps(settings, ensure_ascii=False),
+            )
+        )
+        migrated_count += 1
+    session.add(
+        SystemSettingModel(
+            key=USER_SETTINGS_OWNER_SCOPE_MIGRATION_KEY,
+            value_json=json.dumps(
+                {
+                    "migratedAt": sales_now_naive().isoformat(sep=" "),
+                    "migratedUsers": migrated_count,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    return migrated_count
 
 
 def save_user_settings(

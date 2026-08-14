@@ -1659,7 +1659,13 @@ def init_database() -> None:
         ensure_mysql_database_exists()
     from app.db import models  # noqa: F401
     from app.services.announcement_service import ensure_default_manual_announcement
-    from app.services.crawler_service import ensure_default_roles
+    from app.services.crawler_service import (
+        ensure_default_roles,
+        migrate_user_time_settings_to_owner_scope,
+    )
+    from app.services.sales_order_sync_history_service import (
+        migrate_user_settings_to_owner_scope,
+    )
     from app.services.sensitive_word_service import seed_default_sensitive_words
     from app.services.user_service import ensure_initial_superadmin
 
@@ -1671,6 +1677,8 @@ def init_database() -> None:
         ensure_default_roles()
         session = SessionLocal()
         try:
+            migrate_user_time_settings_to_owner_scope(session)
+            migrate_user_settings_to_owner_scope(session)
             ensure_default_manual_announcement(session)
             seed_default_sensitive_words(session)
             session.commit()
