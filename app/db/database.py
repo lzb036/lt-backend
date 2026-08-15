@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     UniqueConstraint,
     and_,
+    bindparam,
     create_engine,
     exists,
     func,
@@ -914,6 +915,47 @@ def ensure_sales_parent_keys_before_create_all(bind=None) -> None:
             ) from exc
 
 
+def _backfill_listed_product_dates(connection: Connection) -> None:
+    """回填已上架商品(店铺商品行与已上架主商品)的 listed_at。
+
+    先只按普通列条件挑出候选 id(整表扫描但只比较整型/字符串列),
+    再按主键分块对候选行执行 JSON 函数更新。此前每次启动都对全表
+    约 190KB 的 raw_payload_json 逐行做 JSON 解析,商品量上去后
+    启动会卡数分钟,并长时间阻塞采集写入。
+    """
+    candidate_ids = list(
+        connection.execute(
+            text(
+                """
+                SELECT id
+                FROM lt_products
+                WHERE listed_at IS NULL
+                  AND review_status IN ('listed', 'listed_master')
+                """
+            )
+        ).scalars()
+    )
+    update_statement = text(
+        """
+        UPDATE lt_products
+        SET listed_at = STR_TO_DATE(
+            LEFT(REPLACE(JSON_UNQUOTE(JSON_EXTRACT(raw_payload_json, '$.created')), 'T', ' '), 19),
+            '%Y-%m-%d %H:%i:%s'
+        )
+        WHERE id IN :ids
+          AND listed_at IS NULL
+          AND JSON_VALID(raw_payload_json)
+          AND JSON_UNQUOTE(JSON_EXTRACT(raw_payload_json, '$.created')) IS NOT NULL
+        """
+    ).bindparams(bindparam("ids", expanding=True))
+    chunk_size = 500
+    for start in range(0, len(candidate_ids), chunk_size):
+        connection.execute(
+            update_statement,
+            {"ids": list(candidate_ids[start : start + chunk_size])},
+        )
+
+
 def ensure_schema_compatibility() -> None:
     url = make_url(settings.database_url)
     if not url.drivername.startswith("mysql"):
@@ -1186,20 +1228,7 @@ def ensure_schema_compatibility() -> None:
                 """
             )
         )
-        connection.execute(
-            text(
-                """
-                UPDATE lt_products
-                SET listed_at = STR_TO_DATE(
-                    LEFT(REPLACE(JSON_UNQUOTE(JSON_EXTRACT(raw_payload_json, '$.created')), 'T', ' '), 19),
-                    '%Y-%m-%d %H:%i:%s'
-                )
-                WHERE listed_at IS NULL
-                  AND JSON_VALID(raw_payload_json)
-                  AND JSON_UNQUOTE(JSON_EXTRACT(raw_payload_json, '$.created')) IS NOT NULL
-                """
-            )
-        )
+        _backfill_listed_product_dates(connection)
 
         raw_payload_type = connection.execute(
             text(

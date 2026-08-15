@@ -61,3 +61,62 @@ def test_wait_for_database_ready_times_out_without_required_table(
             timeout_seconds=1,
             retry_interval_seconds=0.01,
         )
+
+
+class _ScalarResultStub:
+    def __init__(self, values: list[int]) -> None:
+        self._values = list(values)
+
+    def scalars(self):
+        return iter(self._values)
+
+
+class _BackfillConnection:
+    def __init__(self, candidate_ids: list[int]) -> None:
+        self._candidate_ids = list(candidate_ids)
+        self.statements: list[tuple[str, object]] = []
+
+    def execute(self, statement, params=None):
+        self.statements.append((str(statement), params))
+        if str(statement).lstrip().startswith("SELECT"):
+            return _ScalarResultStub(self._candidate_ids)
+        return None
+
+
+def test_backfill_listed_dates_prefilters_candidates_without_json_scan() -> None:
+    candidate_ids = list(range(1, 1201))
+    connection = _BackfillConnection(candidate_ids)
+
+    database._backfill_listed_product_dates(connection)
+
+    select_statement, _params = connection.statements[0]
+    assert select_statement.lstrip().startswith("SELECT")
+    assert "review_status IN ('listed', 'listed_master')" in select_statement
+    assert "JSON_VALID" not in select_statement
+    assert "JSON_EXTRACT" not in select_statement
+
+    update_statements = connection.statements[1:]
+    assert len(update_statements) == 3
+    for index, (statement, params) in enumerate(update_statements):
+        assert "JSON_VALID" in statement
+        assert "STR_TO_DATE" in statement
+        assert params == {"ids": candidate_ids[index * 500 : (index + 1) * 500]}
+
+
+def test_backfill_listed_dates_skips_update_without_candidates() -> None:
+    connection = _BackfillConnection([])
+
+    database._backfill_listed_product_dates(connection)
+
+    assert len(connection.statements) == 1
+    assert connection.statements[0][0].lstrip().startswith("SELECT")
+
+
+def test_backfill_listed_dates_uses_single_chunk_up_to_limit() -> None:
+    connection = _BackfillConnection([7, 8, 9])
+
+    database._backfill_listed_product_dates(connection)
+
+    assert len(connection.statements) == 2
+    _statement, params = connection.statements[1]
+    assert params == {"ids": [7, 8, 9]}
