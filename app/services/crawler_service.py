@@ -9645,11 +9645,20 @@ def listing_preparation_expected_image_urls(
 def listing_preparation_ready(
     product: ProductModel,
     raw_payload: dict[str, Any] | None = None,
+    prepared_cache: dict[str, Any] | None = None,
 ) -> bool:
     payload = raw_payload if isinstance(raw_payload, dict) else product_raw_payload(product)
-    cache = listing_preparation_cache(product, payload)
+    cache = prepared_cache if isinstance(prepared_cache, dict) else listing_preparation_cache(product, payload)
     if not cache or int(cache.get("missingImageCount") or 0) > 0:
         return False
+    # 缓存已通过版本与源指纹校验,且预处理时已确认全部预期图片
+    # 都生成了 prepared 图(missingImageCount=0),直接信任缓存,
+    # 不再逐张向 OSS/本地磁盘发起存在性校验(此前是创建大批量
+    # 上架任务耗时十几分钟的主因)。
+    # 若 prepared 文件事后被清理任务删除,上架执行阶段仍会通过
+    # recover_missing_local_product_images 从原始图兜底重建。
+    if isinstance(cache.get("images"), list):
+        return True
     expected_urls = listing_preparation_expected_image_urls(product, payload)
     prepared_map = listing_prepared_image_map(product, payload)
     return len(prepared_map) == len(expected_urls) and all(
@@ -9791,7 +9800,7 @@ def listing_preflight_product_check(product: ProductModel, store: StoreModel | N
         result["productTitle"] = product.title
     else:
         result = _listing_preflight_product_check_uncached(product, store)
-    if not listing_preparation_ready(product, raw_payload):
+    if not listing_preparation_ready(product, raw_payload, prepared_cache=cached):
         preparation_issue = listing_preflight_issue(
             "blocker",
             "listing_preparation_required",
@@ -15000,7 +15009,7 @@ def auto_listing_candidate_product_ids(
     owner_username: str,
     store_id: int,
     quantity: int,
-) -> list[int]:
+) -> tuple[list[int], dict[int, dict[str, Any]]]:
     with session_scope() as session:
         store = session.get(StoreModel, store_id)
         if store is None or store.owner_username != owner_username:
@@ -15014,7 +15023,29 @@ def auto_listing_candidate_product_ids(
             )
             .order_by(ProductModel.created_at.asc(), ProductModel.id.asc())
         ).all()
+        # 批量预读预处理缓存行并挂到商品对象上,避免循环内逐商品
+        # 新开 session 查库(2000 件商品即 2000 次 session_scope)。
+        candidate_ids = [int(product.id) for product in products]
+        if candidate_ids:
+            preparation_rows = session.scalars(
+                select(ProductListingPreparationModel).where(
+                    ProductListingPreparationModel.product_id.in_(candidate_ids)
+                )
+            ).all()
+            preparation_by_id = {int(row.product_id): row for row in preparation_rows}
+            for product in products:
+                row = preparation_by_id.get(int(product.id))
+                parsed_cache: dict[str, Any] = {}
+                if row is not None:
+                    try:
+                        parsed_value = json.loads(row.cache_json or "{}")
+                    except (TypeError, ValueError):
+                        parsed_value = {}
+                    if isinstance(parsed_value, dict):
+                        parsed_cache = parsed_value
+                setattr(product, "_listing_preparation_cache_payload", parsed_cache)
         selected_ids: list[int] = []
+        preflight_by_id: dict[int, dict[str, Any]] = {}
         for product in products:
             listed_store_ids = {
                 int(item.get("storeId") or 0)
@@ -15022,14 +15053,14 @@ def auto_listing_candidate_product_ids(
             }
             if store_id in listed_store_ids:
                 continue
-            if listing_preflight_blocking_messages(
-                [listing_preflight_product_check(product, store)]
-            ):
+            check = listing_preflight_product_check(product, store)
+            if listing_preflight_blocking_messages([check]):
                 continue
             selected_ids.append(int(product.id))
+            preflight_by_id[int(product.id)] = check
             if len(selected_ids) >= quantity:
                 break
-        return selected_ids
+        return selected_ids, preflight_by_id
 
 
 def execute_auto_listing_schedule(
@@ -15072,7 +15103,7 @@ def execute_auto_listing_schedule(
                 )
 
     try:
-        product_ids = auto_listing_candidate_product_ids(
+        product_ids, candidate_preflight = auto_listing_candidate_product_ids(
             resolved_owner_username,
             store_id,
             quantity,
@@ -15103,6 +15134,7 @@ def execute_auto_listing_schedule(
                     else f"自动上架 {now:%Y-%m-%d %H:%M}"
                 ),
             ),
+            preflight_by_id=candidate_preflight,
         )
         task_rows = result.get("listingTasks") or []
         task_ids = [
@@ -21034,7 +21066,12 @@ def delete_listing_tasks(owner_username: str, task_ids: list[str]) -> dict[str, 
         }
 
 
-def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
+def create_listing_task(
+    owner_username: str,
+    payload: Any,
+    *,
+    preflight_by_id: dict[int, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     ensure_system_task_dispatch_allowed(owner_username)
     product_ids = normalize_product_ids([int(value) for value in (getattr(payload, "productIds", None) or [])])
     store_ids = listing_task_payload_store_ids(payload)
@@ -21074,28 +21111,35 @@ def create_listing_task(owner_username: str, payload: Any) -> dict[str, Any]:
         if invalid_products:
             names = "、".join(productCodeForError(product) for product in invalid_products[:5])
             raise RuntimeError(f"只有已审核或已上架管理商品可以创建上架任务，且商品不能正在上架中。异常商品：{names}")
-        duplicated_messages: list[str] = []
-        for product in products:
-            listed_store_ids = {int(item.get("storeId") or 0) for item in product_listed_stores(product_raw_payload(product))}
-            duplicated_store_names = [
-                stores_by_id[store_id].alias_name or stores_by_id[store_id].store_name
-                for store_id in store_ids
-                if store_id in listed_store_ids
+        prechecked_products = preflight_by_id is not None and all(
+            product_id in preflight_by_id for product_id in product_ids
+        )
+        if not prechecked_products:
+            duplicated_messages: list[str] = []
+            for product in products:
+                listed_store_ids = {int(item.get("storeId") or 0) for item in product_listed_stores(product_raw_payload(product))}
+                duplicated_store_names = [
+                    stores_by_id[store_id].alias_name or stores_by_id[store_id].store_name
+                    for store_id in store_ids
+                    if store_id in listed_store_ids
+                ]
+                if duplicated_store_names:
+                    duplicated_messages.append(f"{productCodeForError(product)} 已上架过：{'、'.join(duplicated_store_names[:5])}")
+            if duplicated_messages:
+                raise RuntimeError(f"以下商品已上架过所选店铺，请调整店铺选择：{'；'.join(duplicated_messages[:5])}")
+            preflight_checks = [
+                listing_preflight_product_check(product, store)
+                for store in ordered_stores
+                for product in products
             ]
-            if duplicated_store_names:
-                duplicated_messages.append(f"{productCodeForError(product)} 已上架过：{'、'.join(duplicated_store_names[:5])}")
-        if duplicated_messages:
-            raise RuntimeError(f"以下商品已上架过所选店铺，请调整店铺选择：{'；'.join(duplicated_messages[:5])}")
-        preflight_checks = [
-            listing_preflight_product_check(product, store)
-            for store in ordered_stores
-            for product in products
-        ]
-        preflight_blockers = listing_preflight_blocking_messages(preflight_checks)
-        if preflight_blockers:
-            detail = "；".join(preflight_blockers[:5])
-            suffix = "；更多问题请先执行上架前体检。" if len(preflight_blockers) > 5 else ""
-            raise RuntimeError(f"上架前体检未通过：{detail}{suffix}")
+            preflight_blockers = listing_preflight_blocking_messages(preflight_checks)
+            if preflight_blockers:
+                detail = "；".join(preflight_blockers[:5])
+                suffix = "；更多问题请先执行上架前体检。" if len(preflight_blockers) > 5 else ""
+                raise RuntimeError(f"上架前体检未通过：{detail}{suffix}")
+        # 自动上架路径会传入候选筛选阶段已完成的体检结果
+        # (同一店铺、同一批商品,刚检查过),此处不再重复逐商品体检,
+        # 其余动态校验(审核状态、上架锁、并发冲突)保持原样。
         product_by_id = {int(product.id): product for product in products}
         ordered_products = [product_by_id[product_id] for product_id in product_ids]
         ready_ids, blocked_ids = partition_product_ids_by_active_task_conflicts(

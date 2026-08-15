@@ -165,7 +165,7 @@ def test_due_schedule_uses_actual_available_quantity(database, monkeypatch) -> N
         lambda product, store: {"productId": product.id, "issues": []},
     )
 
-    def fake_create_listing_task(owner_username, payload):
+    def fake_create_listing_task(owner_username, payload, *, preflight_by_id=None):
         captured["owner"] = owner_username
         captured["productIds"] = payload.productIds
         captured["storeIds"] = payload.storeIds
@@ -249,7 +249,7 @@ def test_run_schedule_now_keeps_disabled_schedule_disabled(database, monkeypatch
     monkeypatch.setattr(
         crawler_service,
         "create_listing_task",
-        lambda owner_username, payload: {
+        lambda owner_username, payload, **_kwargs: {
             "listingTask": {"id": "manual-task"},
             "listingTasks": [{"id": "manual-task"}],
             "summary": {"total": len(payload.productIds), "taskCount": 1},
@@ -438,7 +438,7 @@ def test_scheduled_manual_listing_task_runs_once_when_due(
     monkeypatch.setattr(
         crawler_service,
         "auto_listing_candidate_product_ids",
-        lambda owner_username, store_id, quantity: [],
+        lambda owner_username, store_id, quantity: ([], {}),
     )
 
     assert crawler_service.run_due_auto_listing_schedules_once() == 1

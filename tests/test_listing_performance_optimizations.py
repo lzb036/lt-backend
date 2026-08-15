@@ -12,7 +12,13 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import ListingTaskModel, ProductModel, StoreModel, UserAccountModel
+from app.db.models import (
+    ListingTaskModel,
+    ProductListingPreparationModel,
+    ProductModel,
+    StoreModel,
+    UserAccountModel,
+)
 from app.services import crawler_service
 
 
@@ -415,6 +421,7 @@ def test_listing_preparation_cache_invalidates_after_product_change():
 
 def test_listing_preflight_blocks_when_preparation_cache_is_missing(monkeypatch):
     product, store = listing_product_and_store()
+    monkeypatch.setattr(crawler_service, "listing_preparation_cache", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         crawler_service,
         "_listing_preflight_product_check_uncached",
@@ -430,7 +437,7 @@ def test_listing_preflight_blocks_when_preparation_cache_is_missing(monkeypatch)
             "preview": {},
         },
     )
-    monkeypatch.setattr(crawler_service, "listing_preparation_ready", lambda *_args: False)
+    monkeypatch.setattr(crawler_service, "listing_preparation_ready", lambda *_args, **_kwargs: False)
 
     result = crawler_service.listing_preflight_product_check(product, store)
 
@@ -670,6 +677,385 @@ def test_listing_description_image_upload_rejects_incomplete_preparation(monkeyp
         )
 
     assert rollback_calls == [[]]
+
+
+def test_preparation_ready_trusts_valid_cache_without_storage_checks(monkeypatch):
+    product = SimpleNamespace(
+        id=123,
+        title="Listing product",
+        genre_id="123456",
+        price=1000,
+        image_url="source-image",
+        raw_payload_json="{}",
+        source_url="https://example.com/item",
+        item_number="",
+    )
+    base_payload = {"images": ["source-image"]}
+    fingerprint = crawler_service.listing_preparation_source_fingerprint(product, base_payload)
+    payload = {
+        **base_payload,
+        crawler_service.LISTING_PREPARATION_CACHE_KEY: {
+            "version": crawler_service.LISTING_PREPARATION_CACHE_VERSION,
+            "sourceFingerprint": fingerprint,
+            "missingImageCount": 0,
+            "images": [
+                {"sourceUrl": "source-image", "preparedUrl": "prepared-image"}
+            ],
+        },
+    }
+
+    def fail_if_storage_checked(*_args, **_kwargs):
+        raise AssertionError("valid cache must not trigger per-image storage checks")
+
+    monkeypatch.setattr(crawler_service, "listing_prepared_image_map", fail_if_storage_checked)
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_preparation_expected_image_urls",
+        fail_if_storage_checked,
+    )
+
+    assert crawler_service.listing_preparation_ready(product, payload) is True
+
+
+def test_preparation_ready_rejects_cache_with_missing_images(monkeypatch):
+    product = SimpleNamespace(
+        id=123,
+        title="Listing product",
+        genre_id="123456",
+        price=1000,
+        image_url="source-image",
+        raw_payload_json="{}",
+        source_url="https://example.com/item",
+        item_number="",
+    )
+    base_payload = {"images": ["source-image"]}
+    fingerprint = crawler_service.listing_preparation_source_fingerprint(product, base_payload)
+    payload = {
+        **base_payload,
+        crawler_service.LISTING_PREPARATION_CACHE_KEY: {
+            "version": crawler_service.LISTING_PREPARATION_CACHE_VERSION,
+            "sourceFingerprint": fingerprint,
+            "missingImageCount": 2,
+            "images": [],
+        },
+    }
+
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_prepared_image_map",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("storage must not be checked when cache reports missing images")
+        ),
+    )
+
+    assert crawler_service.listing_preparation_ready(product, payload) is False
+
+
+def test_preparation_ready_falls_back_to_full_check_without_image_list(monkeypatch):
+    product = SimpleNamespace(
+        id=123,
+        title="Listing product",
+        genre_id="123456",
+        price=1000,
+        image_url="source-image",
+        raw_payload_json="{}",
+        source_url="https://example.com/item",
+        item_number="",
+    )
+    base_payload = {"images": ["source-image"]}
+    fingerprint = crawler_service.listing_preparation_source_fingerprint(product, base_payload)
+    payload = {
+        **base_payload,
+        crawler_service.LISTING_PREPARATION_CACHE_KEY: {
+            "version": crawler_service.LISTING_PREPARATION_CACHE_VERSION,
+            "sourceFingerprint": fingerprint,
+            "missingImageCount": 0,
+        },
+    }
+
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_preparation_expected_image_urls",
+        lambda *_args, **_kwargs: ["source-image"],
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_prepared_image_map",
+        lambda *_args, **_kwargs: {"source-image": "prepared-image"},
+    )
+
+    assert crawler_service.listing_preparation_ready(product, payload) is True
+
+
+def test_listing_preflight_passes_fetched_cache_into_ready(monkeypatch):
+    product = SimpleNamespace(
+        id=123,
+        title="Listing product",
+        source_url="https://item.rakuten.co.jp/source-shop/item-1/",
+        image_url="https://example.com/source.jpg",
+        raw_payload_json="{}",
+        review_status="approved",
+        rakuten_manage_number=None,
+        item_number="",
+        genre_id="123456",
+        price=1000,
+    )
+    store = SimpleNamespace(id=7, store_code="shop-code", store_name="Store", alias_name="Store 7")
+    base_payload: dict = {}
+    fingerprint = crawler_service.listing_preparation_source_fingerprint(product, base_payload)
+    cached = {
+        "version": crawler_service.LISTING_PREPARATION_CACHE_VERSION,
+        "sourceFingerprint": fingerprint,
+        "preflight": {
+            "status": "passed",
+            "issues": [],
+            "issueCount": 0,
+            "blockerCount": 0,
+            "warningCount": 0,
+        },
+    }
+    product.raw_payload_json = json.dumps(
+        {crawler_service.LISTING_PREPARATION_CACHE_KEY: cached}
+    )
+    seen: dict[str, object] = {}
+
+    def fake_ready(_product, _raw_payload, prepared_cache=None):
+        seen["prepared_cache"] = prepared_cache
+        return True
+
+    monkeypatch.setattr(crawler_service, "listing_preparation_ready", fake_ready)
+
+    result = crawler_service.listing_preflight_product_check(product, store)
+
+    assert result["status"] == "passed"
+    assert seen["prepared_cache"] == cached
+
+
+def test_auto_listing_candidates_preload_preparation_caches(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        store = StoreModel(
+            owner_username="alice",
+            store_code="shop-a",
+            store_name="店铺 A",
+            enabled=True,
+        )
+        session.add(store)
+        session.flush()
+        products = [
+            ProductModel(
+                owner_username="alice",
+                title=f"商品 {index}",
+                source_url=f"https://example.com/{index}",
+                source_url_hash=f"hash-{index}",
+                review_status="approved",
+                raw_payload_json="{}",
+            )
+            for index in range(1, 4)
+        ]
+        session.add_all(products)
+        session.flush()
+        products[0].raw_payload_json = json.dumps(
+            {"listedStores": [{"storeId": store.id}]}
+        )
+        session.add(
+            ProductListingPreparationModel(
+                product_id=products[1].id,
+                source_fingerprint="fp",
+                cache_json=json.dumps(
+                    {"version": 1, "preflight": {"status": "passed"}}
+                ),
+            )
+        )
+        session.commit()
+        store_id = store.id
+        product_ids = [int(product.id) for product in products]
+
+    seen_checks: list[tuple[int, object]] = []
+
+    def fake_check(product, _store):
+        seen_checks.append(
+            (int(product.id), getattr(product, "_listing_preparation_cache_payload", None))
+        )
+        return {"productId": product.id, "issues": []}
+
+    monkeypatch.setattr(crawler_service, "listing_preflight_product_check", fake_check)
+
+    selected, preflight_by_id = crawler_service.auto_listing_candidate_product_ids(
+        "alice",
+        store_id,
+        2,
+    )
+
+    assert selected == [product_ids[1], product_ids[2]]
+    assert set(preflight_by_id) == set(selected)
+    assert [product_id for product_id, _cache in seen_checks] == [
+        product_ids[1],
+        product_ids[2],
+    ]
+    assert seen_checks[0][1] == {"version": 1, "preflight": {"status": "passed"}}
+    assert seen_checks[1][1] == {}
+
+
+def _seed_listing_products_and_store(session):
+    session.add(
+        UserAccountModel(
+            username="alice",
+            display_name="alice",
+            password_salt_b64="salt",
+            password_hash_b64="hash",
+        )
+    )
+    store = StoreModel(
+        owner_username="alice",
+        store_code="shop-a",
+        store_name="店铺 A",
+        alias_name="A 店",
+        enabled=True,
+        rakuten_service_secret_encrypted="secret",
+        rakuten_license_key_encrypted="key",
+    )
+    session.add(store)
+    session.flush()
+    products = [
+        ProductModel(
+            owner_username="alice",
+            title=f"商品 {index}",
+            source_url=f"https://example.com/{index}",
+            source_url_hash=f"hash-{index}",
+            review_status="approved",
+            raw_payload_json="{}",
+        )
+        for index in range(1, 4)
+    ]
+    session.add_all(products)
+    session.flush()
+    return store, products
+
+
+def test_create_listing_task_skips_redundant_checks_when_prechecked(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    with session_factory() as session:
+        store, products = _seed_listing_products_and_store(session)
+        product_ids = [int(product.id) for product in products]
+        store_id = store.id
+        session.commit()
+
+    monkeypatch.setattr(
+        crawler_service,
+        "ensure_system_task_dispatch_allowed",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value or "")
+    monkeypatch.setattr(crawler_service, "dispatch_next_listing_task", lambda: None)
+    monkeypatch.setattr(
+        crawler_service,
+        "partition_product_ids_by_active_task_conflicts",
+        lambda _session, _owner, _store_ids, ids: (list(ids), []),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_task_to_public",
+        lambda row: {"id": row.id, "status": row.status},
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_preflight_product_check",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preflight must be skipped when prechecked")
+        ),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "product_raw_payload",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("payload must not be parsed when prechecked")
+        ),
+    )
+
+    result = crawler_service.create_listing_task(
+        "alice",
+        SimpleNamespace(
+            productIds=product_ids,
+            storeIds=[store_id],
+            taskName="批量上架",
+        ),
+        preflight_by_id={
+            product_id: {"productId": product_id, "issues": []}
+            for product_id in product_ids
+        },
+    )
+
+    assert result["summary"]["total"] == 3
+    assert result["summary"]["taskCount"] == 1
+    assert result["listingTask"]["status"] == "queued"
+    with session_factory() as session:
+        tasks = session.scalars(select(ListingTaskModel)).all()
+        assert len(tasks) == 1
+        assert tasks[0].total_count == 3
+
+
+def test_create_listing_task_still_preflights_without_prechecked(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    with session_factory() as session:
+        store, products = _seed_listing_products_and_store(session)
+        product_ids = [int(product.id) for product in products]
+        store_id = store.id
+        session.commit()
+
+    monkeypatch.setattr(
+        crawler_service,
+        "ensure_system_task_dispatch_allowed",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value or "")
+    monkeypatch.setattr(crawler_service, "dispatch_next_listing_task", lambda: None)
+    monkeypatch.setattr(
+        crawler_service,
+        "partition_product_ids_by_active_task_conflicts",
+        lambda _session, _owner, _store_ids, ids: (list(ids), []),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_task_to_public",
+        lambda row: {"id": row.id, "status": row.status},
+    )
+    checked: list[int] = []
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_preflight_product_check",
+        lambda product, _store: checked.append(int(product.id))
+        or {"productId": product.id, "issues": []},
+    )
+
+    result = crawler_service.create_listing_task(
+        "alice",
+        SimpleNamespace(
+            productIds=product_ids,
+            storeIds=[store_id],
+            taskName="批量上架",
+        ),
+    )
+
+    assert result["summary"]["taskCount"] == 1
+    assert checked == sorted(product_ids)
 
 
 def test_listing_task_limit_remains_fifty():
