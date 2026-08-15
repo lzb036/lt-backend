@@ -798,7 +798,7 @@ async def import_manual_tasks(file: UploadFile = File(...), user: dict = Depends
 @router.post("/tasks/{task_id}/restart")
 def restart_task(task_id: str, user: dict = Depends(require_crawler_permission)) -> dict:
     try:
-        task = crawler_service.run_existing_task(user["username"], task_id)
+        task = crawler_service.recreate_crawl_task(user["username"], task_id)
         return {"task": task}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

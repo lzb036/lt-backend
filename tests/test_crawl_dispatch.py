@@ -319,6 +319,39 @@ class CrawlDispatcherTests(CrawlDispatchDatabaseTestCase):
         self.assertEqual(task.status, "queued")
         self.assertIsNone(task.queue_job_id)
 
+    def test_recreate_crawl_task_creates_new_row_and_keeps_original(self):
+        self.add_task("retry", status="success", finished_at=datetime.now())
+        capacity_dispatch = Mock(return_value=1)
+        direct_dispatch = Mock()
+
+        with (
+            patch.object(crawler_service, "session_scope", self.session_scope),
+            patch.object(crawler_service.settings, "task_queue_mode", "redis"),
+            patch.object(
+                crawler_service,
+                "dispatch_queued_crawl_tasks_safely",
+                capacity_dispatch,
+            ),
+            patch.object(crawler_service, "dispatch_crawl_task", direct_dispatch),
+        ):
+            result = crawler_service.recreate_crawl_task("owner", "retry")
+
+        capacity_dispatch.assert_called_once_with("owner")
+        direct_dispatch.assert_not_called()
+        new_id = result["id"]
+        self.assertNotEqual(new_id, "retry")
+        original = self.get_task("retry")
+        self.assertEqual(original.status, "success")
+        self.assertEqual(original.success_count, 0)
+        self.assertEqual(original.failed_count, 0)
+        self.assertIsNotNone(original.finished_at)
+        new_task = self.get_task(new_id)
+        self.assertIsNotNone(new_task)
+        self.assertEqual(new_task.status, "queued")
+        self.assertEqual(new_task.target, original.target)
+        self.assertEqual(new_task.source_type, original.source_type)
+        self.assertEqual(new_task.mode, original.mode)
+
 
 class CrawlWorkerDispatchTests(CrawlDispatchDatabaseTestCase):
     def test_concurrency_rejected_task_is_not_requeued(self):

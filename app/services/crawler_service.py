@@ -21822,6 +21822,44 @@ def create_task(owner_username: str, payload: Any) -> dict[str, Any]:
     return task_public
 
 
+def recreate_crawl_task(owner_username: str, task_id: str) -> dict[str, Any]:
+    """重新采集:复制原任务参数创建一条全新的采集任务并执行,原任务记录保持不变。"""
+    ensure_system_task_dispatch_allowed(owner_username)
+    with session_scope() as session:
+        task = session.get(CrawlTaskModel, task_id)
+        if task is None:
+            raise RuntimeError("采集任务不存在。")
+        if task.owner_username != owner_username:
+            raise RuntimeError("不能重新采集其他用户的采集任务。")
+        if task.source_type == "product_replace":
+            raise RuntimeError("商品替换采集请从店铺商品中重新发起。")
+        if task.status in {"queued", "running"}:
+            raise RuntimeError("采集任务正在执行中，不能重新采集。")
+        new_task = CrawlTaskModel(
+            id=uuid.uuid4().hex,
+            owner_username=task.owner_username,
+            source_id=task.source_id,
+            scheduled_crawl_id=task.scheduled_crawl_id,
+            source_type=task.source_type,
+            target=task.target,
+            crawl_price_rule_json=task.crawl_price_rule_json,
+            mode=task.mode or "manual",
+            status="queued",
+            total_count=initial_crawl_task_total_count(task.source_type, task.target),
+            message="等待执行",
+        )
+        session.add(new_task)
+        session.flush()
+        new_task_id = new_task.id
+        task_public = task_to_public(new_task)
+
+    if should_use_redis_task_queue():
+        dispatch_queued_crawl_tasks_safely(owner_username)
+    else:
+        dispatch_crawl_task(new_task_id)
+    return task_public
+
+
 def run_existing_task(owner_username: str, task_id: str) -> dict[str, Any]:
     ensure_system_task_dispatch_allowed(owner_username)
     with session_scope() as session:
