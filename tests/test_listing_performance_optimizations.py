@@ -908,6 +908,63 @@ def test_auto_listing_candidates_preload_preparation_caches(
     assert seen_checks[1][1] == {}
 
 
+def test_auto_listing_candidates_paginate_in_created_order(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    monkeypatch.setattr(crawler_service, "AUTO_LISTING_CANDIDATE_PAGE_SIZE", 2)
+    from datetime import datetime as dt
+
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        store = StoreModel(owner_username="alice", store_code="shop-a", store_name="店铺 A", enabled=True)
+        session.add(store)
+        session.flush()
+        created_bases = [dt(2026, 1, index + 1, 8, 0, 0) for index in range(6)]
+        products = [
+            ProductModel(
+                owner_username="alice",
+                title=f"商品 {index}",
+                source_url=f"https://example.com/{index}",
+                source_url_hash=f"hash-{index}",
+                review_status="approved",
+                raw_payload_json="{}",
+                created_at=created_bases[index],
+            )
+            for index in range(6)
+        ]
+        session.add_all(products)
+        session.flush()
+        # 第 3 个商品正在上架中,应当被跳过
+        products[2].listing_task_id = "busy-task"
+        session.commit()
+        store_id = store.id
+        expected_ids = [int(products[0].id), int(products[1].id), int(products[3].id), int(products[4].id)]
+
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_preflight_product_check",
+        lambda product, _store: {"productId": product.id, "issues": []},
+    )
+
+    selected, preflight_by_id = crawler_service.auto_listing_candidate_product_ids(
+        "alice",
+        store_id,
+        4,
+    )
+
+    assert selected == expected_ids
+    assert set(preflight_by_id) == set(selected)
+
+
 def _seed_listing_products_and_store(session):
     session.add(
         UserAccountModel(

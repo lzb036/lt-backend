@@ -408,6 +408,65 @@ def test_auto_listing_model_uses_nullable_automatic_store_unique_key() -> None:
     assert AutoListingScheduleModel.__table__.columns["automatic_store_id"].nullable
 
 
+def _add_orphan_manual_schedule(database, *, minutes_ago: int) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+        session.add(
+            AutoListingScheduleModel(
+                owner_username="alice",
+                store_id=store_id,
+                task_type="manual",
+                schedule_type="",
+                schedule_time="",
+                quantity=2000,
+                enabled=False,
+                status="running",
+                last_run_at=datetime.now() - timedelta(minutes=minutes_ago),
+            )
+        )
+
+
+def test_run_due_recovers_orphan_running_manual_schedule(database, monkeypatch) -> None:
+    _add_orphan_manual_schedule(database, minutes_ago=20)
+    monkeypatch.setattr(
+        crawler_service,
+        "auto_listing_schedule_job_active",
+        lambda _schedule_id: False,
+    )
+
+    crawler_service.run_due_auto_listing_schedules_once()
+
+    with database() as session:
+        row = session.scalar(select(AutoListingScheduleModel))
+        assert row.status == "failed"
+        assert "内存不足" in (row.last_error or "")
+
+
+def test_run_due_keeps_running_schedule_with_active_job(database, monkeypatch) -> None:
+    _add_orphan_manual_schedule(database, minutes_ago=20)
+    monkeypatch.setattr(
+        crawler_service,
+        "auto_listing_schedule_job_active",
+        lambda _schedule_id: True,
+    )
+
+    crawler_service.run_due_auto_listing_schedules_once()
+
+    with database() as session:
+        row = session.scalar(select(AutoListingScheduleModel))
+        assert row.status == "running"
+
+
+def test_run_due_keeps_recent_running_schedule(database) -> None:
+    _add_orphan_manual_schedule(database, minutes_ago=1)
+
+    crawler_service.run_due_auto_listing_schedules_once()
+
+    with database() as session:
+        row = session.scalar(select(AutoListingScheduleModel))
+        assert row.status == "running"
+
+
 def test_scheduled_manual_listing_task_runs_once_when_due(
     database,
     monkeypatch,

@@ -15005,28 +15005,53 @@ def run_due_scheduled_crawls_once() -> int:
         SCHEDULE_RUN_LOCK.release()
 
 
+AUTO_LISTING_CANDIDATE_PAGE_SIZE = 500
+
+
 def auto_listing_candidate_product_ids(
     owner_username: str,
     store_id: int,
     quantity: int,
 ) -> tuple[list[int], dict[int, dict[str, Any]]]:
+    """按创建顺序筛选 quantity 个可上架候选商品。
+
+    分页(键集游标)读取商品,选满即停,避免把全量已审核商品的
+    ~190KB JSON 一次性载入内存(曾导致服务器 OOM、创建任务被系统杀死)。
+    """
     with session_scope() as session:
         store = session.get(StoreModel, store_id)
         if store is None or store.owner_username != owner_username:
             raise RuntimeError("自动上架店铺不存在或不属于当前用户。")
-        products = session.scalars(
-            select(ProductModel).where(
+        selected_ids: list[int] = []
+        preflight_by_id: dict[int, dict[str, Any]] = {}
+        last_created_at: datetime | None = None
+        last_product_id = 0
+        while len(selected_ids) < quantity:
+            query = select(ProductModel).where(
                 ProductModel.owner_username == owner_username,
                 ProductModel.review_status == "approved",
                 ProductModel.parent_product_id.is_(None),
                 ProductModel.listing_task_id.is_(None),
             )
-            .order_by(ProductModel.created_at.asc(), ProductModel.id.asc())
-        ).all()
-        # 批量预读预处理缓存行并挂到商品对象上,避免循环内逐商品
-        # 新开 session 查库(2000 件商品即 2000 次 session_scope)。
-        candidate_ids = [int(product.id) for product in products]
-        if candidate_ids:
+            if last_created_at is not None:
+                query = query.where(
+                    or_(
+                        ProductModel.created_at > last_created_at,
+                        and_(
+                            ProductModel.created_at == last_created_at,
+                            ProductModel.id > last_product_id,
+                        ),
+                    )
+                )
+            products = session.scalars(
+                query
+                .order_by(ProductModel.created_at.asc(), ProductModel.id.asc())
+                .limit(AUTO_LISTING_CANDIDATE_PAGE_SIZE)
+            ).all()
+            if not products:
+                break
+            # 批量预读本页商品的预处理缓存行,避免循环内逐商品开 session 查库
+            candidate_ids = [int(product.id) for product in products]
             preparation_rows = session.scalars(
                 select(ProductListingPreparationModel).where(
                     ProductListingPreparationModel.product_id.in_(candidate_ids)
@@ -15044,22 +15069,24 @@ def auto_listing_candidate_product_ids(
                     if isinstance(parsed_value, dict):
                         parsed_cache = parsed_value
                 setattr(product, "_listing_preparation_cache_payload", parsed_cache)
-        selected_ids: list[int] = []
-        preflight_by_id: dict[int, dict[str, Any]] = {}
-        for product in products:
-            listed_store_ids = {
-                int(item.get("storeId") or 0)
-                for item in product_listed_stores(product_raw_payload(product))
-            }
-            if store_id in listed_store_ids:
-                continue
-            check = listing_preflight_product_check(product, store)
-            if listing_preflight_blocking_messages([check]):
-                continue
-            selected_ids.append(int(product.id))
-            preflight_by_id[int(product.id)] = check
+            for product in products:
+                listed_store_ids = {
+                    int(item.get("storeId") or 0)
+                    for item in product_listed_stores(product_raw_payload(product))
+                }
+                if store_id in listed_store_ids:
+                    continue
+                check = listing_preflight_product_check(product, store)
+                if listing_preflight_blocking_messages([check]):
+                    continue
+                selected_ids.append(int(product.id))
+                preflight_by_id[int(product.id)] = check
+                if len(selected_ids) >= quantity:
+                    break
             if len(selected_ids) >= quantity:
                 break
+            last_created_at = products[-1].created_at
+            last_product_id = int(products[-1].id)
         return selected_ids, preflight_by_id
 
 
@@ -15188,12 +15215,69 @@ def run_auto_listing_schedule_now(
     )
 
 
+ORPHAN_AUTO_LISTING_RECOVER_AFTER_SECONDS = 5 * 60
+
+
+def auto_listing_schedule_job_active(schedule_id: int) -> bool:
+    """RQ 中是否还有该自动上架任务的活跃 job。
+
+    线程任务模式无法确认外部状态,保守返回 True(不判定为孤儿)。
+    Redis 异常时同样保守返回 True,避免误杀正在执行的任务。
+    """
+    if not should_use_redis_task_queue():
+        return True
+    try:
+        job = redis_connection().hgetall(
+            f"rq:job:auto-listing-schedule-{schedule_id}"
+        )
+    except Exception:
+        return True
+    if not job:
+        return False
+    status_bytes = job.get(b"status")
+    status = (
+        status_bytes.decode("utf-8", errors="replace")
+        if isinstance(status_bytes, (bytes, bytearray))
+        else str(status_bytes or "")
+    )
+    return status in {"queued", "started", "deferred", "scheduled"}
+
+
+def recover_orphan_auto_listing_schedules(session: Any) -> int:
+    """把「创建中但进程已被终止」的孤儿自动上架任务标记为 failed。
+
+    覆盖两类:立即执行的手动任务与定时自动任务。条件:status=running、
+    已运行超过宽限期、且 RQ 中不存在活跃 job(说明执行进程已死)。
+    """
+    now = datetime.now()
+    rows = session.scalars(
+        select(AutoListingScheduleModel).where(
+            AutoListingScheduleModel.status == "running",
+            AutoListingScheduleModel.last_run_at.is_not(None),
+        )
+    ).all()
+    recovered = 0
+    for row in rows:
+        elapsed_seconds = (now - row.last_run_at).total_seconds()
+        if elapsed_seconds < ORPHAN_AUTO_LISTING_RECOVER_AFTER_SECONDS:
+            continue
+        if auto_listing_schedule_job_active(int(row.id)):
+            continue
+        row.status = "failed"
+        row.last_error = "创建过程被中断(进程终止或内存不足),请重试。"
+        row.last_message = "本次自动上架任务创建失败。"
+        row.last_task_ids_json = "[]"
+        recovered += 1
+    return recovered
+
+
 def run_due_auto_listing_schedules_once() -> int:
     if not AUTO_LISTING_SCHEDULE_LOCK.acquire(blocking=False):
         return 0
     try:
         now = datetime.now()
         with session_scope() as session:
+            recover_orphan_auto_listing_schedules(session)
             schedule_rows = session.scalars(
                 select(AutoListingScheduleModel).where(
                     AutoListingScheduleModel.enabled.is_(True),
