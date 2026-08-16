@@ -1177,11 +1177,15 @@ def run_auto_listing_schedule_job(
     owner_username: str | None = None,
     advance_next_run: bool = False,
 ) -> None:
-    execute_auto_listing_schedule(
-        schedule_id,
-        owner_username=owner_username,
-        advance_next_run=advance_next_run,
-    )
+    try:
+        execute_auto_listing_schedule(
+            schedule_id,
+            owner_username=owner_username,
+            advance_next_run=advance_next_run,
+        )
+    finally:
+        # 当前任务结束后立即把该店铺(及其他店铺)排队中的手动上架任务派发出去
+        dispatch_next_queued_manual_listing_tasks()
 
 
 def mark_auto_listing_schedule_dispatch_failed(schedule_id: int, exc: Exception) -> None:
@@ -1229,11 +1233,15 @@ def run_auto_deletion_task_job(
     owner_username: str | None = None,
     advance_next_run: bool = False,
 ) -> None:
-    execute_auto_deletion_task(
-        task_id,
-        owner_username=owner_username,
-        advance_next_run=advance_next_run,
-    )
+    try:
+        execute_auto_deletion_task(
+            task_id,
+            owner_username=owner_username,
+            advance_next_run=advance_next_run,
+        )
+    finally:
+        # 当前任务结束后立即把该店铺(及其他店铺)排队中的手动删除任务派发出去
+        dispatch_next_queued_manual_deletion_tasks()
 
 
 def mark_auto_deletion_task_dispatch_failed(task_id: int, exc: Exception) -> None:
@@ -3134,6 +3142,7 @@ def create_manual_listing_task(owner_username: str, payload: Any) -> dict[str, A
     )
     if quantity < 1 or quantity > 10000:
         raise RuntimeError("上架数量只能设置为 1 到 10000。")
+    immediate = execution_mode == "immediate"
     with session_scope() as session:
         store = session.scalar(
             select(StoreModel)
@@ -3149,52 +3158,34 @@ def create_manual_listing_task(owner_username: str, payload: Any) -> dict[str, A
             or not decrypt_text(store.rakuten_license_key_encrypted)
         ):
             raise RuntimeError(f"上架店铺「{store.alias_name or store.store_name}」缺少乐天 Secret 或乐天 Key。")
-        if execution_mode == "immediate":
-            active_manual_task_id = session.scalar(
-                select(AutoListingScheduleModel.id)
-                .where(
-                    AutoListingScheduleModel.owner_username == owner_username,
-                    AutoListingScheduleModel.store_id == store_id,
-                    AutoListingScheduleModel.task_type == "manual",
-                    AutoListingScheduleModel.schedule_type == "",
-                    AutoListingScheduleModel.status.in_(("idle", "running")),
-                )
-                .order_by(AutoListingScheduleModel.id.asc())
-                .limit(1)
-            )
-            if active_manual_task_id is not None:
-                raise RuntimeError("该店铺已有正在创建或执行的手动上架任务，请勿重复提交。")
+        # 同店铺多个手动任务排队:全部进入 queued,由派发器按顺序逐个执行
         row = AutoListingScheduleModel(
             owner_username=owner_username,
             store_id=store_id,
             automatic_store_id=None,
             task_type="manual",
-            schedule_type="once" if execution_mode == "scheduled" else "",
+            schedule_type="once" if not immediate else "",
             schedule_time=execute_at.strftime("%H:%M") if execute_at else "",
             quantity=quantity,
-            enabled=execution_mode == "scheduled",
-            status="idle",
-            next_run_at=execute_at,
+            enabled=not immediate,
+            status="queued",
+            next_run_at=execute_at or datetime.now(),
             last_message=(
                 f"任务将在 {datetime_to_public(execute_at)} 到期执行。"
                 if execute_at
-                else "任务已受理，后台正在创建上架任务。"
+                else "排队中，等待该店铺当前手动上架任务完成后自动执行。"
             ),
         )
         session.add(row)
         session.flush()
         schedule_id = int(row.id)
-        if execution_mode == "scheduled":
-            return auto_listing_schedule_to_public(row, store)
         created = auto_listing_schedule_to_public(row, store)
-    try:
-        dispatch_auto_listing_schedule(
-            schedule_id,
-            owner_username=owner_username,
-            advance_next_run=False,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"上架任务投递失败：{exc}") from exc
+    if immediate:
+        dispatch_next_queued_manual_listing_tasks()
+        with session_scope() as session:
+            refreshed = session.get(AutoListingScheduleModel, schedule_id)
+            store = session.get(StoreModel, store_id)
+            return auto_listing_schedule_to_public(refreshed, store)
     return created
 
 
@@ -15248,17 +15239,27 @@ def recover_orphan_auto_listing_schedules(session: Any) -> int:
 
     覆盖两类:立即执行的手动任务与定时自动任务。条件:status=running、
     已运行超过宽限期、且 RQ 中不存在活跃 job(说明执行进程已死)。
+    手动任务额外覆盖已派发但 worker 始终未接单的 idle 行(以 updated_at 为时间锚点),
+    避免排队链被一条僵尸行卡死。
     """
     now = datetime.now()
     rows = session.scalars(
         select(AutoListingScheduleModel).where(
-            AutoListingScheduleModel.status == "running",
-            AutoListingScheduleModel.last_run_at.is_not(None),
+            or_(
+                AutoListingScheduleModel.status == "running",
+                and_(
+                    AutoListingScheduleModel.status == "idle",
+                    AutoListingScheduleModel.task_type == "manual",
+                ),
+            )
         )
     ).all()
     recovered = 0
     for row in rows:
-        elapsed_seconds = (now - row.last_run_at).total_seconds()
+        anchor = row.last_run_at or row.updated_at
+        if anchor is None:
+            continue
+        elapsed_seconds = (now - anchor).total_seconds()
         if elapsed_seconds < ORPHAN_AUTO_LISTING_RECOVER_AFTER_SECONDS:
             continue
         if auto_listing_schedule_job_active(int(row.id)):
@@ -15269,6 +15270,113 @@ def recover_orphan_auto_listing_schedules(session: Any) -> int:
         row.last_task_ids_json = "[]"
         recovered += 1
     return recovered
+
+
+MANUAL_TASK_IN_FLIGHT_STATUSES = ("idle", "running")
+
+
+def _manual_listing_queue_busy(
+    session: Any,
+    owner_username: str,
+    store_id: int,
+) -> bool:
+    return (
+        session.scalar(
+            select(AutoListingScheduleModel.id)
+            .where(
+                AutoListingScheduleModel.owner_username == owner_username,
+                AutoListingScheduleModel.store_id == store_id,
+                AutoListingScheduleModel.task_type == "manual",
+                AutoListingScheduleModel.status.in_(MANUAL_TASK_IN_FLIGHT_STATUSES),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def dispatch_next_queued_manual_listing_tasks() -> int:
+    """按店铺派发排队中的手动上架任务:每个店铺同一时间只执行一个。
+
+    排队规则:同店铺的手动任务(立即执行与到期执行)按 next_run_at、创建时间
+    先后顺序逐个执行;前一个完成/失败后,由执行结束回调、到期调度或本派发器
+    把下一个派发出去。派发 = 置为 idle 并投递到 RQ 调度队列。
+    """
+    now = datetime.now()
+    dispatch_rows: list[tuple[int, str, bool]] = []
+    with session_scope() as session:
+        busy_store_ids = set(
+            session.scalars(
+                select(AutoListingScheduleModel.store_id)
+                .where(
+                    AutoListingScheduleModel.task_type == "manual",
+                    AutoListingScheduleModel.status.in_(MANUAL_TASK_IN_FLIGHT_STATUSES),
+                )
+                .distinct()
+            ).all()
+        )
+        queued_rows = session.scalars(
+            select(AutoListingScheduleModel)
+            .where(
+                AutoListingScheduleModel.task_type == "manual",
+                AutoListingScheduleModel.status == "queued",
+                AutoListingScheduleModel.next_run_at.is_not(None),
+                AutoListingScheduleModel.next_run_at <= now,
+            )
+            .order_by(
+                AutoListingScheduleModel.next_run_at.asc(),
+                AutoListingScheduleModel.created_at.asc(),
+                AutoListingScheduleModel.id.asc(),
+            )
+        ).all()
+        locked_store_ids: set[int] = set()
+        for row in queued_rows:
+            store_id = int(row.store_id)
+            if store_id in busy_store_ids or store_id in locked_store_ids:
+                continue
+            if system_task_dispatch_paused(row.owner_username):
+                continue
+            store = session.get(StoreModel, store_id, with_for_update=True)
+            if store is None:
+                continue
+            # 锁定店铺行后复查,防止与另一个派发器(创建请求/执行结束回调)竞争
+            if _manual_listing_queue_busy(session, row.owner_username, store_id):
+                busy_store_ids.add(store_id)
+                continue
+            locked_row = session.scalar(
+                select(AutoListingScheduleModel)
+                .where(AutoListingScheduleModel.id == row.id)
+                .with_for_update()
+            )
+            if locked_row is None or locked_row.status != "queued":
+                continue
+            locked_row.status = "idle"
+            locked_row.last_message = "任务已受理，后台正在创建上架任务。"
+            locked_row.last_error = None
+            session.flush()
+            locked_store_ids.add(store_id)
+            dispatch_rows.append(
+                (
+                    int(locked_row.id),
+                    locked_row.owner_username,
+                    locked_row.schedule_type == "once",
+                )
+            )
+    dispatched = 0
+    for schedule_id, owner_username, is_once in dispatch_rows:
+        try:
+            dispatch_auto_listing_schedule(
+                schedule_id,
+                owner_username=owner_username,
+                advance_next_run=is_once,
+            )
+            dispatched += 1
+        except Exception:
+            logger.exception(
+                "Manual listing queue dispatch failed: %s",
+                schedule_id,
+            )
+    return dispatched
 
 
 def run_due_auto_listing_schedules_once() -> int:
@@ -15283,17 +15391,8 @@ def run_due_auto_listing_schedules_once() -> int:
                     AutoListingScheduleModel.enabled.is_(True),
                     AutoListingScheduleModel.next_run_at.is_not(None),
                     AutoListingScheduleModel.next_run_at <= now,
-                    or_(
-                        and_(
-                            AutoListingScheduleModel.task_type == "automatic",
-                            AutoListingScheduleModel.status != "running",
-                        ),
-                        and_(
-                            AutoListingScheduleModel.task_type == "manual",
-                            AutoListingScheduleModel.schedule_type == "once",
-                            AutoListingScheduleModel.status == "idle",
-                        ),
-                    ),
+                    AutoListingScheduleModel.task_type == "automatic",
+                    AutoListingScheduleModel.status != "running",
                 )
                 .order_by(
                     AutoListingScheduleModel.next_run_at.asc(),
@@ -15308,15 +15407,19 @@ def run_due_auto_listing_schedules_once() -> int:
             for row in schedule_rows
             if not system_task_dispatch_paused(row.owner_username)
         ]
+        executed = 0
         for schedule_row in runnable_rows:
             try:
                 execute_auto_listing_schedule(
                     int(schedule_row.id),
                     advance_next_run=True,
                 )
+                executed += 1
             except RuntimeError:
                 continue
-        return len(runnable_rows)
+        # 到期执行的手动任务与排队中的手动任务统一走店铺级排队派发
+        dispatched = dispatch_next_queued_manual_listing_tasks()
+        return executed + dispatched
     finally:
         AUTO_LISTING_SCHEDULE_LOCK.release()
 
@@ -15429,6 +15532,7 @@ def create_manual_deletion_task(owner_username: str, payload: Any) -> dict[str, 
     )
     if quantity < 1 or quantity > 10000:
         raise RuntimeError("删除数量只能设置为 1 到 10000。")
+    immediate = execution_mode == "immediate"
     with session_scope() as session:
         store = _validate_deletion_store(
             session,
@@ -15436,74 +15540,212 @@ def create_manual_deletion_task(owner_username: str, payload: Any) -> dict[str, 
             store_id,
             for_update=True,
         )
-        if execution_mode == "immediate":
-            active_manual_task_id = session.scalar(
-                select(AutoDeletionTaskModel.id)
-                .where(
-                    AutoDeletionTaskModel.owner_username == owner_username,
-                    AutoDeletionTaskModel.store_id == store_id,
-                    AutoDeletionTaskModel.task_type == "manual",
-                    AutoDeletionTaskModel.schedule_type == "",
-                    AutoDeletionTaskModel.status.in_(("idle", "running")),
-                )
-                .order_by(AutoDeletionTaskModel.id.asc())
-                .limit(1)
-            )
-            if active_manual_task_id is not None:
-                raise RuntimeError("该店铺已有正在创建或执行的手动删除任务，请勿重复提交。")
+        # 同店铺多个手动任务排队:全部进入 queued,由派发器按顺序逐个执行
         row = AutoDeletionTaskModel(
             owner_username=owner_username,
             store_id=store_id,
             automatic_store_id=None,
             task_type="manual",
-            schedule_type="once" if execution_mode == "scheduled" else "",
+            schedule_type="once" if not immediate else "",
             schedule_time=execute_at.strftime("%H:%M") if execute_at else "",
             quantity=quantity,
-            enabled=execution_mode == "scheduled",
-            status="idle",
-            next_run_at=execute_at,
+            enabled=not immediate,
+            status="queued",
+            next_run_at=execute_at or datetime.now(),
             last_message=(
                 f"任务将在 {datetime_to_public(execute_at)} 到期执行。"
                 if execute_at
-                else "任务已受理，后台正在创建删除任务。"
+                else "排队中，等待该店铺当前手动删除任务完成后自动执行。"
             ),
         )
         session.add(row)
         session.flush()
         task_id = int(row.id)
-        if execution_mode == "scheduled":
-            return auto_deletion_task_to_public(row, store)
         created = auto_deletion_task_to_public(row, store)
-    try:
-        dispatch_auto_deletion_task(
-            task_id,
-            owner_username=owner_username,
-            advance_next_run=False,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"删除任务投递失败：{exc}") from exc
+    if immediate:
+        dispatch_next_queued_manual_deletion_tasks()
+        with session_scope() as session:
+            refreshed = session.get(AutoDeletionTaskModel, task_id)
+            store = session.get(StoreModel, store_id)
+            return auto_deletion_task_to_public(refreshed, store)
     return created
+
+
+def auto_deletion_task_job_active(task_id: int) -> bool:
+    """RQ 中是否还有该自动删除任务的活跃 job。
+
+    线程任务模式无法确认外部状态,保守返回 True(不判定为孤儿)。
+    Redis 异常时同样保守返回 True,避免误杀正在执行的任务。
+    """
+    if not should_use_redis_task_queue():
+        return True
+    try:
+        job = redis_connection().hgetall(
+            f"rq:job:auto-deletion-task-{task_id}"
+        )
+    except Exception:
+        return True
+    if not job:
+        return False
+    status_bytes = job.get(b"status")
+    status = (
+        status_bytes.decode("utf-8", errors="replace")
+        if isinstance(status_bytes, (bytes, bytearray))
+        else str(status_bytes or "")
+    )
+    return status in {"queued", "started", "deferred", "scheduled"}
+
+
+def recover_orphan_auto_deletion_tasks(session: Any) -> int:
+    """把「创建中但进程已被终止」的孤儿自动删除任务标记为 failed。
+
+    条件与上架侧一致:status=running(或已派发的 manual idle 行)、超过宽限期、
+    且 RQ 中不存在活跃 job。避免排队链被一条僵尸行卡死。
+    """
+    now = datetime.now()
+    rows = session.scalars(
+        select(AutoDeletionTaskModel).where(
+            or_(
+                AutoDeletionTaskModel.status == "running",
+                and_(
+                    AutoDeletionTaskModel.status == "idle",
+                    AutoDeletionTaskModel.task_type == "manual",
+                ),
+            )
+        )
+    ).all()
+    recovered = 0
+    for row in rows:
+        anchor = row.last_run_at or row.updated_at
+        if anchor is None:
+            continue
+        elapsed_seconds = (now - anchor).total_seconds()
+        if elapsed_seconds < ORPHAN_AUTO_LISTING_RECOVER_AFTER_SECONDS:
+            continue
+        if auto_deletion_task_job_active(int(row.id)):
+            continue
+        row.status = "failed"
+        row.last_error = "创建过程被中断(进程终止或内存不足),请重试。"
+        row.last_message = "本次自动删除任务创建失败。"
+        row.last_task_ids_json = "[]"
+        recovered += 1
+    return recovered
+
+
+def _manual_deletion_queue_busy(
+    session: Any,
+    owner_username: str,
+    store_id: int,
+) -> bool:
+    return (
+        session.scalar(
+            select(AutoDeletionTaskModel.id)
+            .where(
+                AutoDeletionTaskModel.owner_username == owner_username,
+                AutoDeletionTaskModel.store_id == store_id,
+                AutoDeletionTaskModel.task_type == "manual",
+                AutoDeletionTaskModel.status.in_(MANUAL_TASK_IN_FLIGHT_STATUSES),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def dispatch_next_queued_manual_deletion_tasks() -> int:
+    """按店铺派发排队中的手动删除任务:每个店铺同一时间只执行一个。
+
+    排队规则与手动上架一致:按 next_run_at、创建时间先后顺序逐个执行,
+    前一个完成/失败后由执行结束回调、到期调度或本派发器派发下一个。
+    """
+    now = datetime.now()
+    dispatch_rows: list[tuple[int, str, bool]] = []
+    with session_scope() as session:
+        busy_store_ids = set(
+            session.scalars(
+                select(AutoDeletionTaskModel.store_id)
+                .where(
+                    AutoDeletionTaskModel.task_type == "manual",
+                    AutoDeletionTaskModel.status.in_(MANUAL_TASK_IN_FLIGHT_STATUSES),
+                )
+                .distinct()
+            ).all()
+        )
+        queued_rows = session.scalars(
+            select(AutoDeletionTaskModel)
+            .where(
+                AutoDeletionTaskModel.task_type == "manual",
+                AutoDeletionTaskModel.status == "queued",
+                AutoDeletionTaskModel.next_run_at.is_not(None),
+                AutoDeletionTaskModel.next_run_at <= now,
+            )
+            .order_by(
+                AutoDeletionTaskModel.next_run_at.asc(),
+                AutoDeletionTaskModel.created_at.asc(),
+                AutoDeletionTaskModel.id.asc(),
+            )
+        ).all()
+        locked_store_ids: set[int] = set()
+        for row in queued_rows:
+            store_id = int(row.store_id)
+            if store_id in busy_store_ids or store_id in locked_store_ids:
+                continue
+            if system_task_dispatch_paused(row.owner_username):
+                continue
+            store = session.get(StoreModel, store_id, with_for_update=True)
+            if store is None:
+                continue
+            # 锁定店铺行后复查,防止与另一个派发器(创建请求/执行结束回调)竞争
+            if _manual_deletion_queue_busy(session, row.owner_username, store_id):
+                busy_store_ids.add(store_id)
+                continue
+            locked_row = session.scalar(
+                select(AutoDeletionTaskModel)
+                .where(AutoDeletionTaskModel.id == row.id)
+                .with_for_update()
+            )
+            if locked_row is None or locked_row.status != "queued":
+                continue
+            locked_row.status = "idle"
+            locked_row.last_message = "任务已受理，后台正在创建删除任务。"
+            locked_row.last_error = None
+            session.flush()
+            locked_store_ids.add(store_id)
+            dispatch_rows.append(
+                (
+                    int(locked_row.id),
+                    locked_row.owner_username,
+                    locked_row.schedule_type == "once",
+                )
+            )
+    dispatched = 0
+    for task_id, owner_username, is_once in dispatch_rows:
+        try:
+            dispatch_auto_deletion_task(
+                task_id,
+                owner_username=owner_username,
+                advance_next_run=is_once,
+            )
+            dispatched += 1
+        except Exception:
+            logger.exception(
+                "Manual deletion queue dispatch failed: %s",
+                task_id,
+            )
+    return dispatched
 
 
 def run_due_auto_deletion_tasks_once() -> int:
     now = datetime.now()
     with session_scope() as session:
+        recover_orphan_auto_deletion_tasks(session)
         task_rows = session.scalars(
             select(AutoDeletionTaskModel).where(
                 AutoDeletionTaskModel.enabled.is_(True),
                 AutoDeletionTaskModel.next_run_at.is_not(None),
                 AutoDeletionTaskModel.next_run_at <= now,
-                or_(
-                    and_(
-                        AutoDeletionTaskModel.task_type == "automatic",
-                        AutoDeletionTaskModel.status != "running",
-                    ),
-                    and_(
-                        AutoDeletionTaskModel.task_type == "manual",
-                        AutoDeletionTaskModel.schedule_type == "once",
-                        AutoDeletionTaskModel.status == "idle",
-                    ),
-                ),
+                AutoDeletionTaskModel.task_type == "automatic",
+                AutoDeletionTaskModel.status != "running",
             ).order_by(AutoDeletionTaskModel.next_run_at.asc(), AutoDeletionTaskModel.id.asc()).limit(max(1, int(settings.scheduled_crawl_dispatch_batch_size)))
         ).all()
     runnable_rows = [
@@ -15511,15 +15753,19 @@ def run_due_auto_deletion_tasks_once() -> int:
         for row in task_rows
         if not system_task_dispatch_paused(row.owner_username)
     ]
+    executed = 0
     for task_row in runnable_rows:
         try:
             execute_auto_deletion_task(
                 int(task_row.id),
                 advance_next_run=True,
             )
+            executed += 1
         except RuntimeError:
             continue
-    return len(runnable_rows)
+    # 到期执行的手动任务与排队中的手动任务统一走店铺级排队派发
+    dispatched = dispatch_next_queued_manual_deletion_tasks()
+    return executed + dispatched
 
 
 def run_periodic_maintenance_once() -> None:

@@ -284,7 +284,7 @@ def test_run_schedule_now_is_owner_scoped(database) -> None:
         crawler_service.run_auto_listing_schedule_now("bob", 1)
 
 
-def test_manual_tasks_reject_repeated_active_store_and_allow_after_completion(
+def test_manual_tasks_queue_when_store_busy_and_unlock_in_order(
     database,
 ) -> None:
     with database() as session:
@@ -305,27 +305,40 @@ def test_manual_tasks_reject_repeated_active_store_and_allow_after_completion(
         "alice",
         SimpleNamespace(storeId=store_id, quantity=10),
     )
-    with pytest.raises(RuntimeError, match="请勿重复提交"):
-        crawler_service.create_manual_listing_task(
-            "alice",
-            SimpleNamespace(storeId=store_id, quantity=20),
-        )
-
-    with database() as session:
-        row = session.get(AutoListingScheduleModel, first_manual["id"])
-        row.status = "completed"
-
     second_manual = crawler_service.create_manual_listing_task(
         "alice",
         SimpleNamespace(storeId=store_id, quantity=20),
     )
+    third_manual = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=30),
+    )
 
     assert automatic["taskType"] == "automatic"
+    # 店铺空闲时第一条立即派发;后续任务进入排队,不再报"请勿重复提交"
     assert first_manual["taskType"] == "manual"
     assert first_manual["status"] == "idle"
-    assert first_manual["lastMessage"] == "任务已受理，后台正在创建上架任务。"
-    assert second_manual["taskType"] == "manual"
-    assert first_manual["id"] != second_manual["id"]
+    assert second_manual["status"] == "queued"
+    assert "排队中" in second_manual["lastMessage"]
+    assert third_manual["status"] == "queued"
+
+    # 第一条完成后,派发器只放行第二条
+    with database() as session:
+        row = session.get(AutoListingScheduleModel, first_manual["id"])
+        row.status = "completed"
+
+    assert crawler_service.dispatch_next_queued_manual_listing_tasks() == 1
+    with database() as session:
+        assert session.get(AutoListingScheduleModel, second_manual["id"]).status == "idle"
+        assert session.get(AutoListingScheduleModel, third_manual["id"]).status == "queued"
+
+    with database() as session:
+        row = session.get(AutoListingScheduleModel, second_manual["id"])
+        row.status = "completed"
+
+    assert crawler_service.dispatch_next_queued_manual_listing_tasks() == 1
+    with database() as session:
+        assert session.get(AutoListingScheduleModel, third_manual["id"]).status == "idle"
 
     all_tasks = crawler_service.list_auto_listing_schedules("alice")
     manual_tasks = crawler_service.list_auto_listing_schedules(
@@ -334,14 +347,16 @@ def test_manual_tasks_reject_repeated_active_store_and_allow_after_completion(
         task_type="manual",
     )
 
-    assert [task["taskType"] for task in all_tasks] == [
-        "manual",
+    assert sorted(task["taskType"] for task in all_tasks) == [
         "automatic",
+        "manual",
+        "manual",
         "manual",
     ]
     assert {task["id"] for task in manual_tasks} == {
         first_manual["id"],
         second_manual["id"],
+        third_manual["id"],
     }
 
 
@@ -467,6 +482,83 @@ def test_run_due_keeps_recent_running_schedule(database) -> None:
         assert row.status == "running"
 
 
+def _add_orphan_idle_manual_schedule(database, *, minutes_ago: int) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+        session.add(
+            AutoListingScheduleModel(
+                owner_username="alice",
+                store_id=store_id,
+                task_type="manual",
+                schedule_type="",
+                schedule_time="",
+                quantity=100,
+                enabled=False,
+                status="idle",
+                last_run_at=datetime.now() - timedelta(minutes=minutes_ago),
+                next_run_at=datetime.now() - timedelta(minutes=minutes_ago),
+            )
+        )
+
+
+def test_run_due_recovers_orphan_idle_manual_schedule(database, monkeypatch) -> None:
+    _add_orphan_idle_manual_schedule(database, minutes_ago=20)
+    monkeypatch.setattr(
+        crawler_service,
+        "auto_listing_schedule_job_active",
+        lambda _schedule_id: False,
+    )
+
+    crawler_service.run_due_auto_listing_schedules_once()
+
+    with database() as session:
+        row = session.scalar(select(AutoListingScheduleModel))
+        assert row.status == "failed"
+
+
+def test_run_due_dispatches_queued_task_after_orphan_recovery(
+    database,
+    monkeypatch,
+) -> None:
+    _add_orphan_idle_manual_schedule(database, minutes_ago=20)
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    queued = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=5),
+    )
+    # 孤儿 idle 行占用店铺,新任务只能排队
+    assert queued["status"] == "queued"
+
+    monkeypatch.setattr(
+        crawler_service,
+        "auto_listing_schedule_job_active",
+        lambda _schedule_id: False,
+    )
+    dispatched: list[int] = []
+
+    def fake_dispatch(schedule_id: int, **kwargs: object) -> None:
+        dispatched.append(schedule_id)
+
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_auto_listing_schedule",
+        fake_dispatch,
+    )
+
+    crawler_service.run_due_auto_listing_schedules_once()
+
+    with database() as session:
+        rows = {
+            row.id: row.status
+            for row in session.scalars(select(AutoListingScheduleModel)).all()
+        }
+        assert "failed" in rows.values()
+        assert rows[queued["id"]] == "idle"
+    assert dispatched == [queued["id"]]
+
+
 def test_scheduled_manual_listing_task_runs_once_when_due(
     database,
     monkeypatch,
@@ -486,7 +578,7 @@ def test_scheduled_manual_listing_task_runs_once_when_due(
 
     assert created["taskType"] == "manual"
     assert created["executionMode"] == "scheduled"
-    assert created["status"] == "idle"
+    assert created["status"] == "queued"
     assert created["enabled"] is True
 
     with database() as session:
@@ -498,6 +590,16 @@ def test_scheduled_manual_listing_task_runs_once_when_due(
         crawler_service,
         "auto_listing_candidate_product_ids",
         lambda owner_username, store_id, quantity: ([], {}),
+    )
+    # 模拟调度队列 worker 同步接单执行
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_auto_listing_schedule",
+        lambda schedule_id, owner_username=None, advance_next_run=False: crawler_service.execute_auto_listing_schedule(
+            schedule_id,
+            owner_username=owner_username,
+            advance_next_run=advance_next_run,
+        ),
     )
 
     assert crawler_service.run_due_auto_listing_schedules_once() == 1
@@ -531,7 +633,7 @@ def test_scheduled_manual_deletion_task_runs_once_when_due(
 
     assert created["taskType"] == "manual"
     assert created["executionMode"] == "scheduled"
-    assert created["status"] == "idle"
+    assert created["status"] == "queued"
 
     with database() as session:
         row = session.get(AutoDeletionTaskModel, created["id"])
@@ -542,6 +644,16 @@ def test_scheduled_manual_deletion_task_runs_once_when_due(
         crawler_service,
         "auto_deletion_candidate_product_ids",
         lambda owner_username, store_id, quantity: [],
+    )
+    # 模拟调度队列 worker 同步接单执行
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_auto_deletion_task",
+        lambda task_id, owner_username=None, advance_next_run=False: crawler_service.execute_auto_deletion_task(
+            task_id,
+            owner_username=owner_username,
+            advance_next_run=advance_next_run,
+        ),
     )
 
     assert crawler_service.run_due_auto_deletion_tasks_once() == 1
@@ -556,7 +668,7 @@ def test_scheduled_manual_deletion_task_runs_once_when_due(
         assert row.next_run_at == scheduled_at
 
 
-def test_immediate_manual_deletion_task_dispatches_and_rejects_duplicate(
+def test_immediate_manual_deletion_tasks_queue_when_store_busy(
     database,
     monkeypatch,
 ) -> None:
@@ -588,28 +700,54 @@ def test_immediate_manual_deletion_task_dispatches_and_rejects_duplicate(
     assert created["lastMessage"] == "任务已受理，后台正在创建删除任务。"
     assert calls == [(created["id"], "alice", False)]
 
-    with pytest.raises(RuntimeError, match="请勿重复提交"):
-        crawler_service.create_manual_deletion_task(
-            "alice",
-            SimpleNamespace(storeId=store_id, quantity=20),
-        )
+    # 店铺已有进行中的手动删除任务,后续任务排队而不是报错
+    queued = crawler_service.create_manual_deletion_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=20),
+    )
+    assert queued["status"] == "queued"
+    assert "排队中" in queued["lastMessage"]
+    assert len(calls) == 1
 
+    # 进行中的任务不可删除;排队中的任务可以删除(取消排队)
     with pytest.raises(RuntimeError, match="暂时不能删除"):
         crawler_service.delete_auto_deletion_task("alice", created["id"])
+    crawler_service.delete_auto_deletion_task("alice", queued["id"])
+    with database() as session:
+        assert session.get(AutoDeletionTaskModel, queued["id"]) is None
 
     with database() as session:
         row = session.get(AutoDeletionTaskModel, created["id"])
         row.status = "completed"
 
-    second = crawler_service.create_manual_deletion_task(
-        "alice",
-        SimpleNamespace(storeId=store_id, quantity=20),
-    )
-    assert second["id"] != created["id"]
-
     crawler_service.delete_auto_deletion_task("alice", created["id"])
     with database() as session:
         assert session.get(AutoDeletionTaskModel, created["id"]) is None
+
+
+def test_queued_manual_listing_task_can_be_deleted(database) -> None:
+    with database() as session:
+        store_id = session.scalar(select(StoreModel.id))
+
+    first = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=10),
+    )
+    second = crawler_service.create_manual_listing_task(
+        "alice",
+        SimpleNamespace(storeId=store_id, quantity=20),
+    )
+    assert first["status"] == "idle"
+    assert second["status"] == "queued"
+
+    with pytest.raises(RuntimeError, match="暂时不能删除"):
+        crawler_service.delete_auto_listing_schedule("alice", first["id"])
+
+    # 排队中的任务允许删除,不影响前序任务
+    crawler_service.delete_auto_listing_schedule("alice", second["id"])
+    with database() as session:
+        assert session.get(AutoListingScheduleModel, second["id"]) is None
+        assert session.get(AutoListingScheduleModel, first["id"]) is not None
 
 
 def test_scheduled_manual_task_requires_future_execute_at(database) -> None:
