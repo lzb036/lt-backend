@@ -22109,8 +22109,8 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             else []
         )
         task.total_count = len(task_product_ids) * len(task_store_ids)
-        task.success_count = len(base_success_ids)
-        task.failed_count = (len(product_ids) * len(task_store_ids)) if retry_product_ids else 0
+        task.success_count = 0
+        task.failed_count = 0
         task.message = f"上架中，已处理 0 / {len(product_ids) * len(task_store_ids)} 条"
         session.flush()
         total_count = len(task_product_ids) * len(task_store_ids)
@@ -22411,8 +22411,8 @@ def _prepare_listing_task_retry(
             product.last_error = None
     task.status = "queued"
     task.total_count = len(task_product_ids) * max(1, len(task_store_ids))
-    task.success_count = len(base_success_ids)
-    task.failed_count = len(retry_product_ids) * max(1, len(task_store_ids))
+    task.success_count = 0
+    task.failed_count = 0
     task.message = "等待重新上架"
     task.error_detail = None
     task.product_ids_json = json.dumps(

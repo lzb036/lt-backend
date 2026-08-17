@@ -1214,11 +1214,14 @@ def test_retry_listing_task_group_retries_failed_children_only(
         assert success_task.status == "success"
         assert partial_task is not None
         assert partial_task.status == "queued"
-        assert partial_task.success_count == 1
-        assert partial_task.failed_count == 1
+        assert partial_task.total_count == 2
+        assert partial_task.success_count == 0
+        assert partial_task.failed_count == 0
         assert failed_task is not None
         assert failed_task.status == "queued"
-        assert failed_task.failed_count == 1
+        assert failed_task.total_count == 1
+        assert failed_task.success_count == 0
+        assert failed_task.failed_count == 0
 
         retry_product = session.get(ProductModel, product_ids[2])
         failed_product = session.get(ProductModel, product_ids[3])
