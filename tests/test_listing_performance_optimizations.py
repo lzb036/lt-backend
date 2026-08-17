@@ -72,6 +72,7 @@ def install_direct_listing_mocks(
     monkeypatch,
     *,
     inventory_error: Exception | None = None,
+    item_error: Exception | None = None,
     visibility_error: Exception | None = None,
 ):
     calls: list[tuple[str, object]] = []
@@ -113,6 +114,8 @@ def install_direct_listing_mocks(
 
     def put_item(_secret, _key, manage_number, payload):
         calls.append(("put", {"manageNumber": manage_number, "hideItem": payload["hideItem"]}))
+        if item_error is not None:
+            raise item_error
         return payload
 
     monkeypatch.setattr(crawler_service, "put_rakuten_item_with_attribute_retry", put_item)
@@ -153,7 +156,7 @@ def install_direct_listing_mocks(
     return calls
 
 
-def test_listing_creates_hidden_complete_item_then_publishes(monkeypatch):
+def test_listing_creates_public_complete_item_without_visibility_patch(monkeypatch):
     product, store = listing_product_and_store()
     calls = install_direct_listing_mocks(monkeypatch)
 
@@ -167,12 +170,12 @@ def test_listing_creates_hidden_complete_item_then_publishes(monkeypatch):
     assert result["manageNumber"] == "manage-1"
     assert [name for name, _payload in calls].count("put") == 1
     assert [name for name, _payload in calls].count("inventory") == 1
-    assert ("build", {"manageNumber": "manage-1", "hideItem": True}) in calls
+    assert ("build", {"manageNumber": "manage-1", "hideItem": False}) in calls
     assert ("main_images", ["https://example.com/source.jpg"]) in calls
     assert ("main_require_complete", True) in calls
     assert ("description_images", None) in calls
     assert ("description_require_complete", True) in calls
-    assert ("visibility", False) in calls
+    assert "visibility" not in [name for name, _payload in calls]
     assert result["payload"]["hideItem"] is False
     assert result["payload"]["listingImageCompletion"]["status"] == "success"
 
@@ -208,7 +211,7 @@ def test_listing_creation_uploads_all_main_and_description_images(monkeypatch):
     assert result["payload"]["listingImageCompletion"]["remainingMainImageCount"] == 0
 
 
-def test_listing_inventory_failure_deletes_hidden_item_and_rolls_back_all_images(monkeypatch):
+def test_listing_inventory_failure_deletes_public_item_and_rolls_back_all_images(monkeypatch):
     product, store = listing_product_and_store()
     calls = install_direct_listing_mocks(
         monkeypatch,
@@ -232,14 +235,14 @@ def test_listing_inventory_failure_deletes_hidden_item_and_rolls_back_all_images
     assert len(rollback_payload) == 2
 
 
-def test_listing_publish_failure_deletes_hidden_item_and_rolls_back_all_images(monkeypatch):
+def test_listing_item_write_failure_deletes_public_item_and_rolls_back_all_images(monkeypatch):
     product, store = listing_product_and_store()
     calls = install_direct_listing_mocks(
         monkeypatch,
-        visibility_error=RuntimeError("publish failed"),
+        item_error=RuntimeError("item write failed"),
     )
 
-    with pytest.raises(RuntimeError, match="publish failed"):
+    with pytest.raises(RuntimeError, match="item write failed"):
         crawler_service.create_store_product_on_rakuten(
             "secret",
             "key",
@@ -249,9 +252,9 @@ def test_listing_publish_failure_deletes_hidden_item_and_rolls_back_all_images(m
 
     names = [name for name, _payload in calls]
     assert names.count("put") == 1
-    assert names.count("inventory") == 1
-    assert names.count("visibility") == 1
-    assert names.count("delete") == 1
+    assert "inventory" not in names
+    assert "visibility" not in names
+    assert "delete" not in names
     assert names.count("rollback") == 1
     rollback_payload = next(payload for name, payload in calls if name == "rollback")
     assert len(rollback_payload) == 2

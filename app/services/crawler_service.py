@@ -18552,7 +18552,7 @@ def create_store_product_on_rakuten(
             raw_payload,
             uploaded_product_images,
             manage_number=manage_number,
-            hide_item=True,
+            hide_item=False,
         )
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
@@ -18567,12 +18567,6 @@ def create_store_product_on_rakuten(
         bulk_upsert_rakuten_inventories(service_secret, license_key, inventory_payloads)
         if cancel_check and cancel_check():
             raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-        patch_rakuten_item_visibility(
-            service_secret,
-            license_key,
-            manage_number,
-            hide_item=False,
-        )
         payload["hideItem"] = False
     except TaskCancelled:
         if item_write_started:
