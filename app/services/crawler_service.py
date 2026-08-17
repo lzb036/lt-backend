@@ -195,7 +195,10 @@ RAKUTEN_CABINET_FOLDERS_GET_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/
 RAKUTEN_CABINET_FOLDER_INSERT_URL = "https://api.rms.rakuten.co.jp/es/1.0/cabinet/folder/insert"
 RAKUTEN_INVENTORY_BULK_UPSERT_URL = "https://api.rms.rakuten.co.jp/es/2.1/inventories/bulk-upsert"
 RAKUTEN_ITEM_SEARCH_HITS = 100
+RAKUTEN_ITEM_SEARCH_MAX_OFFSET = 10000
 RAKUTEN_ITEM_SEARCH_MAX_RETRIES = 4
+RAKUTEN_ITEM_SEARCH_SHARD_YEAR_LOOKBACK = 5
+RAKUTEN_ITEM_SEARCH_SHARD_YEAR_LOOKAHEAD = 1
 RAKUTEN_WRITE_MAX_RETRIES = 5
 RAKUTEN_WRITE_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 RAKUTEN_WRITE_QPS_BACKOFF_SECONDS = (1.5, 3.0, 5.0, 8.0)
@@ -6578,6 +6581,137 @@ def fetch_rakuten_store_items(service_secret: str, license_key: str) -> list[dic
     return items
 
 
+def _merge_rakuten_item_candidates(
+    target: list[dict[str, Any]],
+    seen: set[str],
+    page_items: list[dict[str, Any]],
+) -> None:
+    for item in page_items:
+        item_key = normalize_text(
+            first_text_from_keys(
+                item,
+                ("manageNumber", "itemNumber", "itemUrl", "itemPageUrl"),
+            )
+        )
+        if not item_key or item_key in seen:
+            continue
+        seen.add(item_key)
+        target.append(item)
+
+
+def _fetch_rakuten_item_pages(
+    headers: dict[str, str],
+    first_payload: dict[str, Any],
+    *,
+    manage_number: str = "",
+) -> tuple[list[dict[str, Any]], int | None]:
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    offset = int(first_payload.get("offset") or 0)
+    reported_total_count = parse_rakuten_total_count(first_payload)
+    payload = first_payload
+    while True:
+        page_items = extract_rakuten_item_candidates(payload)
+        _merge_rakuten_item_candidates(items, seen, page_items)
+        raw_results = payload.get("results")
+        raw_page_count = len(raw_results) if isinstance(raw_results, list) else len(page_items)
+        next_offset = offset + RAKUTEN_ITEM_SEARCH_HITS
+        if raw_page_count == 0:
+            break
+        if reported_total_count is not None and next_offset >= reported_total_count:
+            break
+        if reported_total_count is None and raw_page_count < RAKUTEN_ITEM_SEARCH_HITS:
+            break
+        if next_offset > RAKUTEN_ITEM_SEARCH_MAX_OFFSET:
+            raise RuntimeError(
+                "乐天商品检索结果超过单次分页上限，未完成分片同步。"
+            )
+        offset = next_offset
+        payload = (
+            request_rakuten_items_page(
+                headers,
+                offset,
+                manage_number=manage_number,
+            )
+            if manage_number
+            else request_rakuten_items_page(headers, offset)
+        )
+    return items, reported_total_count
+
+
+def _rakuten_manage_number_shard_years(seed_items: list[dict[str, Any]]) -> list[int]:
+    current_year = datetime.now().year
+    years = set(
+        range(
+            current_year - RAKUTEN_ITEM_SEARCH_SHARD_YEAR_LOOKBACK,
+            current_year + RAKUTEN_ITEM_SEARCH_SHARD_YEAR_LOOKAHEAD + 1,
+        )
+    )
+    for item in seed_items:
+        for key in ("manageNumber", "itemNumber"):
+            value = normalize_text(item.get(key))
+            years.update(
+                int(match)
+                for match in re.findall(r"(?:19|20)\d{2}", value)
+            )
+    return sorted(years)
+
+
+def _fetch_rakuten_manage_number_shard(
+    headers: dict[str, str],
+    manage_number: str,
+    *,
+    depth: int = 0,
+) -> list[dict[str, Any]]:
+    first_payload = request_rakuten_items_page(
+        headers,
+        0,
+        manage_number=manage_number,
+    )
+    reported_total_count = parse_rakuten_total_count(first_payload)
+    if reported_total_count is None:
+        raise RuntimeError(
+            f"乐天商品分片「{manage_number}」未返回总数，无法确认同步是否完整。"
+        )
+    max_window = RAKUTEN_ITEM_SEARCH_MAX_OFFSET + RAKUTEN_ITEM_SEARCH_HITS
+    if reported_total_count <= max_window:
+        items, _ = _fetch_rakuten_item_pages(
+            headers,
+            first_payload,
+            manage_number=manage_number,
+        )
+        return items
+
+    if depth == 0 and re.fullmatch(r"\d{4}", manage_number):
+        child_shards = [
+            f"{manage_number}{month:02d}"
+            for month in range(1, 13)
+        ]
+    elif depth == 1 and re.fullmatch(r"\d{6}", manage_number):
+        year = int(manage_number[:4])
+        month = int(manage_number[4:6])
+        days_in_month = calendar.monthrange(year, month)[1]
+        child_shards = [
+            f"{manage_number}{day:02d}"
+            for day in range(1, days_in_month + 1)
+        ]
+    else:
+        raise RuntimeError(
+            f"乐天商品分片「{manage_number}」仍超过分页上限，无法继续安全拆分。"
+        )
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for child_shard in child_shards:
+        child_items = _fetch_rakuten_manage_number_shard(
+            headers,
+            child_shard,
+            depth=depth + 1,
+        )
+        _merge_rakuten_item_candidates(items, seen, child_items)
+    return items
+
+
 def fetch_rakuten_store_items_with_total(
     service_secret: str,
     license_key: str,
@@ -6588,53 +6722,50 @@ def fetch_rakuten_store_items_with_total(
         "Authorization": build_rakuten_authorization_header(service_secret, license_key),
         "Accept": "application/json",
     }
+    first_payload = request_rakuten_items_page(headers, 0)
+    reported_total_count = parse_rakuten_total_count(first_payload)
+    max_window = RAKUTEN_ITEM_SEARCH_MAX_OFFSET + RAKUTEN_ITEM_SEARCH_HITS
+    if reported_total_count is None or reported_total_count <= max_window:
+        items, _ = _fetch_rakuten_item_pages(headers, first_payload)
+        # Search results can temporarily contain manage-number-only entries
+        # for recently deleted products. They must not inflate local totals.
+        return items, len(items)
+
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
-    offset = 0
-    reported_total_count: int | None = None
-    while True:
-        payload = request_rakuten_items_page(headers, offset)
-        reported_total_count = (
-            reported_total_count
-            if reported_total_count is not None
-            else parse_rakuten_total_count(payload)
+    for year in _rakuten_manage_number_shard_years(
+        extract_rakuten_item_candidates(first_payload)
+    ):
+        shard_items = _fetch_rakuten_manage_number_shard(headers, str(year))
+        _merge_rakuten_item_candidates(items, seen, shard_items)
+    if len(items) < reported_total_count:
+        raise RuntimeError(
+            f"乐天商品总数为 {reported_total_count} 条，但分片只读取到 {len(items)} 条；"
+            "为避免误删本地商品，已停止同步。"
         )
-
-        page_items = extract_rakuten_item_candidates(payload)
-        for item in page_items:
-            item_key = normalize_text(
-                first_text_from_keys(item, ("manageNumber", "itemNumber", "itemUrl", "itemPageUrl"))
-            )
-            if not item_key or item_key in seen:
-                continue
-            seen.add(item_key)
-            items.append(item)
-
-        raw_results = payload.get("results")
-        raw_page_count = len(raw_results) if isinstance(raw_results, list) else len(page_items)
-        offset += RAKUTEN_ITEM_SEARCH_HITS
-        if raw_page_count == 0:
-            break
-        if reported_total_count is not None and offset >= reported_total_count:
-            break
-        if reported_total_count is None and raw_page_count < RAKUTEN_ITEM_SEARCH_HITS:
-            break
-
-    # Search results can temporarily contain manage-number-only entries for
-    # recently deleted products. They are not readable products and must not
-    # inflate store totals or prevent a complete local reconciliation.
     return items, len(items)
 
 
-def request_rakuten_items_page(headers: dict[str, str], offset: int) -> dict[str, Any]:
+def request_rakuten_items_page(
+    headers: dict[str, str],
+    offset: int,
+    *,
+    manage_number: str = "",
+) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(RAKUTEN_ITEM_SEARCH_MAX_RETRIES):
         try:
+            params: dict[str, Any] = {
+                "hits": RAKUTEN_ITEM_SEARCH_HITS,
+                "offset": offset,
+            }
+            if manage_number:
+                params["manageNumber"] = manage_number
             response = requests.get(
                 RAKUTEN_ITEM_SEARCH_URL,
                 timeout=settings.crawler_timeout_seconds,
                 headers=headers,
-                params={"hits": RAKUTEN_ITEM_SEARCH_HITS, "offset": offset},
+                params=params,
             )
             if response.status_code == 429 and attempt < RAKUTEN_ITEM_SEARCH_MAX_RETRIES - 1:
                 retry_after = response.headers.get("Retry-After")
@@ -6653,7 +6784,12 @@ def request_rakuten_items_page(headers: dict[str, str], offset: int) -> dict[str
             if attempt < RAKUTEN_ITEM_SEARCH_MAX_RETRIES - 1:
                 time.sleep(1.5 * (attempt + 1))
                 continue
-            raise RuntimeError(f"乐天商品更新失败，读取 offset={offset} 分页时失败，请检查店铺密钥权限或稍后重试。") from exc
+            detail = normalize_text(response.text)
+            detail_suffix = f"：{detail[:500]}" if detail else ""
+            raise RuntimeError(
+                f"乐天商品更新失败，读取 offset={offset} 分页时失败"
+                f"（HTTP {response.status_code}）{detail_suffix}"
+            ) from exc
     raise RuntimeError(f"乐天商品更新失败，读取 offset={offset} 分页时失败：{last_error}")
 
 
