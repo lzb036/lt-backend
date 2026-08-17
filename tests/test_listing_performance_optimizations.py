@@ -1077,6 +1077,163 @@ def _seed_listing_products_and_store(session):
     return store, products
 
 
+def test_retry_listing_task_group_retries_failed_children_only(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    monkeypatch.setattr(
+        crawler_service,
+        "ensure_system_task_dispatch_allowed",
+        lambda *_args, **_kwargs: None,
+    )
+    dispatched: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_next_listing_task",
+        lambda: dispatched.append(("dispatch", "listing")),
+    )
+
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        store = StoreModel(
+            owner_username="alice",
+            store_code="shop-a",
+            store_name="店铺 A",
+            enabled=True,
+        )
+        session.add(store)
+        session.flush()
+        products = [
+            ProductModel(
+                owner_username="alice",
+                title=f"商品 {index}",
+                source_url=f"https://example.com/retry/{index}",
+                source_url_hash=f"retry-hash-{index}",
+                review_status="approved",
+                raw_payload_json="{}",
+            )
+            for index in range(1, 5)
+        ]
+        session.add_all(products)
+        session.flush()
+        product_ids = [int(product.id) for product in products]
+        store_ids = [int(store.id)]
+        session.add_all(
+            [
+                ListingTaskModel(
+                    id="group-success",
+                    owner_username="alice",
+                    store_id=store.id,
+                    task_group_id="retry-group",
+                    task_group_index=1,
+                    task_group_size=3,
+                    task_name="批量上架 1/3",
+                    status="success",
+                    total_count=1,
+                    success_count=1,
+                    product_ids_json=json.dumps(
+                        {
+                            "productIds": [product_ids[0]],
+                            "successIds": [product_ids[0]],
+                            "failedIds": [],
+                            "storeIds": store_ids,
+                        }
+                    ),
+                ),
+                ListingTaskModel(
+                    id="group-partial",
+                    owner_username="alice",
+                    store_id=store.id,
+                    task_group_id="retry-group",
+                    task_group_index=2,
+                    task_group_size=3,
+                    task_name="批量上架 2/3",
+                    status="partial",
+                    total_count=2,
+                    success_count=1,
+                    failed_count=1,
+                    product_ids_json=json.dumps(
+                        {
+                            "productIds": product_ids[1:3],
+                            "successIds": [product_ids[1]],
+                            "failedIds": [product_ids[2]],
+                            "storeIds": store_ids,
+                        }
+                    ),
+                ),
+                ListingTaskModel(
+                    id="group-failed",
+                    owner_username="alice",
+                    store_id=store.id,
+                    task_group_id="retry-group",
+                    task_group_index=3,
+                    task_group_size=3,
+                    task_name="批量上架 3/3",
+                    status="failed",
+                    total_count=1,
+                    failed_count=1,
+                    product_ids_json=json.dumps(
+                        {
+                            "productIds": [product_ids[3]],
+                            "successIds": [],
+                            "failedIds": [product_ids[3]],
+                            "storeIds": store_ids,
+                        }
+                    ),
+                ),
+            ]
+        )
+        session.commit()
+
+    result = crawler_service.retry_listing_task_group(
+        "alice",
+        ["group-success", "group-partial", "group-failed"],
+    )
+
+    assert result == {
+        "taskIds": ["group-success", "group-partial", "group-failed"],
+        "retryTaskIds": ["group-partial", "group-failed"],
+        "retryTaskCount": 2,
+        "retryProductCount": 2,
+    }
+    assert dispatched == [("dispatch", "listing")]
+
+    with session_factory() as session:
+        success_task = session.get(ListingTaskModel, "group-success")
+        partial_task = session.get(ListingTaskModel, "group-partial")
+        failed_task = session.get(ListingTaskModel, "group-failed")
+        assert success_task is not None
+        assert success_task.status == "success"
+        assert partial_task is not None
+        assert partial_task.status == "queued"
+        assert partial_task.success_count == 1
+        assert partial_task.failed_count == 1
+        assert failed_task is not None
+        assert failed_task.status == "queued"
+        assert failed_task.failed_count == 1
+
+        retry_product = session.get(ProductModel, product_ids[2])
+        failed_product = session.get(ProductModel, product_ids[3])
+        success_product = session.get(ProductModel, product_ids[0])
+        assert retry_product is not None
+        assert retry_product.listing_task_id == "group-partial"
+        assert failed_product is not None
+        assert failed_product.listing_task_id == "group-failed"
+        assert success_product is not None
+        assert success_product.listing_task_id is None
+
+    with pytest.raises(RuntimeError, match="只有失败、部分成功或已终止任务可以重试"):
+        crawler_service.retry_listing_task("alice", "group-success")
+
+
 def test_create_listing_task_skips_redundant_checks_when_prechecked(
     monkeypatch,
     session_factory,

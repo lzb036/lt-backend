@@ -98,6 +98,10 @@ class TaskDeletePayload(BaseModel):
     taskIds: list[str] = Field(default_factory=list)
 
 
+class ListingTaskGroupRetryPayload(BaseModel):
+    taskIds: list[str] = Field(default_factory=list, min_length=2, max_length=100)
+
+
 class ScheduleDeletePayload(BaseModel):
     scheduleIds: list[int] = Field(default_factory=list)
     deleteCollectedProducts: bool = False
@@ -2185,6 +2189,18 @@ def create_listing_task(payload: ListingTaskPayload, user: dict = Depends(requir
         if isinstance(result, dict) and "listingTask" in result:
             return result
         return {"listingTask": result}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/listing-tasks/retry-group")
+def retry_listing_task_group(
+    payload: ListingTaskGroupRetryPayload,
+    user: dict = Depends(require_products_permission),
+) -> dict:
+    try:
+        result = crawler_service.retry_listing_task_group(user["username"], payload.taskIds)
+        return {"listingTaskGroup": result}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -22377,6 +22377,59 @@ def fail_listing_task_unexpectedly(owner_username: str, task_id: str, exc: Excep
     log_event(owner_username, task_id, "error", message)
 
 
+def _prepare_listing_task_retry(
+    session: Any,
+    owner_username: str,
+    task: ListingTaskModel,
+) -> int:
+    if task.status in {"queued", "running"}:
+        raise RuntimeError("上架任务正在执行中，不能重试。")
+    if task.status not in {"partial", "failed", "cancelled"}:
+        raise RuntimeError("只有失败、部分成功或已终止任务可以重试。")
+
+    product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
+    retry_product_ids = listing_task_retry_product_ids(task)
+    if not retry_product_ids:
+        raise RuntimeError("没有可重试的商品。")
+    task_product_ids = product_ids_payload["productIds"] or retry_product_ids
+    task_store_ids = product_ids_payload["storeIds"] or ([int(task.store_id)] if task.store_id else [])
+    retry_product_id_set = set(retry_product_ids)
+    base_success_ids = (
+        [product_id for product_id in product_ids_payload["successIds"] if product_id not in retry_product_id_set]
+        if task.status in {"partial", "failed"} and product_ids_payload["failedIds"]
+        else []
+    )
+    products = session.scalars(
+        select(ProductModel).where(
+            ProductModel.owner_username == owner_username,
+            ProductModel.id.in_(retry_product_ids or [-1]),
+        )
+    ).all()
+    for product in products:
+        if product.review_status in {"approved", "listed_master"} and not product.listing_task_id:
+            product.listing_task_id = task.id
+            product.last_error = None
+    task.status = "queued"
+    task.total_count = len(task_product_ids) * max(1, len(task_store_ids))
+    task.success_count = len(base_success_ids)
+    task.failed_count = len(retry_product_ids) * max(1, len(task_store_ids))
+    task.message = "等待重新上架"
+    task.error_detail = None
+    task.product_ids_json = json.dumps(
+        listing_task_result_payload(
+            task_product_ids,
+            base_success_ids,
+            retry_product_ids,
+            retry_ids=retry_product_ids,
+            store_ids=task_store_ids,
+        ),
+        ensure_ascii=False,
+    )
+    task.started_at = None
+    task.finished_at = None
+    return len(retry_product_ids)
+
+
 def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
     ensure_system_task_dispatch_allowed(owner_username)
     with session_scope() as session:
@@ -22385,52 +22438,51 @@ def retry_listing_task(owner_username: str, task_id: str) -> dict[str, Any]:
             raise RuntimeError("上架任务不存在。")
         if task.owner_username != owner_username:
             raise RuntimeError("不能重试其他用户的上架任务。")
-        if task.status in {"queued", "running"}:
-            raise RuntimeError("上架任务正在执行中，不能重试。")
-        product_ids_payload = listing_task_product_ids_payload(task.product_ids_json)
-        retry_product_ids = listing_task_retry_product_ids(task)
-        if not retry_product_ids:
-            raise RuntimeError("没有可重试的商品。")
-        task_product_ids = product_ids_payload["productIds"] or retry_product_ids
-        task_store_ids = product_ids_payload["storeIds"] or ([int(task.store_id)] if task.store_id else [])
-        retry_product_id_set = set(retry_product_ids)
-        base_success_ids = (
-            [product_id for product_id in product_ids_payload["successIds"] if product_id not in retry_product_id_set]
-            if task.status in {"partial", "failed"} and product_ids_payload["failedIds"]
-            else []
-        )
-        products = session.scalars(
-            select(ProductModel).where(
-                ProductModel.owner_username == owner_username,
-                ProductModel.id.in_(retry_product_ids or [-1]),
-            )
-        ).all()
-        for product in products:
-            if product.review_status in {"approved", "listed_master"} and not product.listing_task_id:
-                product.listing_task_id = task_id
-                product.last_error = None
-        task.status = "queued"
-        task.total_count = len(task_product_ids) * max(1, len(task_store_ids))
-        task.success_count = len(base_success_ids)
-        task.failed_count = len(retry_product_ids) * max(1, len(task_store_ids))
-        task.message = "等待重新上架"
-        task.error_detail = None
-        task.product_ids_json = json.dumps(
-            listing_task_result_payload(
-                task_product_ids,
-                base_success_ids,
-                retry_product_ids,
-                retry_ids=retry_product_ids,
-                store_ids=task_store_ids,
-            ),
-            ensure_ascii=False,
-        )
-        task.started_at = None
-        task.finished_at = None
+        _prepare_listing_task_retry(session, owner_username, task)
     dispatch_next_listing_task()
     with session_scope() as session:
         task = session.get(ListingTaskModel, task_id)
         return listing_task_to_public(task) if task else {"id": task_id}
+
+
+def retry_listing_task_group(owner_username: str, task_ids: list[str]) -> dict[str, Any]:
+    ensure_system_task_dispatch_allowed(owner_username)
+    normalized_task_ids = normalize_task_ids(task_ids)
+    if len(normalized_task_ids) < 2:
+        raise RuntimeError("总任务至少需要两个分任务。")
+
+    retry_task_ids: list[str] = []
+    retry_product_count = 0
+    with session_scope() as session:
+        tasks = session.scalars(
+            select(ListingTaskModel)
+            .where(
+                ListingTaskModel.owner_username == owner_username,
+                ListingTaskModel.id.in_(normalized_task_ids),
+            )
+            .order_by(ListingTaskModel.task_group_index, ListingTaskModel.id)
+        ).all()
+        if len(tasks) != len(normalized_task_ids):
+            raise RuntimeError("部分上架分任务不存在或无权操作。")
+        if any(task.status in {"queued", "running"} for task in tasks):
+            raise RuntimeError("总任务中仍有分任务正在执行，不能重试。")
+
+        for task in tasks:
+            if task.status == "success":
+                continue
+            retry_product_count += _prepare_listing_task_retry(session, owner_username, task)
+            retry_task_ids.append(task.id)
+
+        if not retry_task_ids:
+            raise RuntimeError("总任务没有可重试的异常商品。")
+
+    dispatch_next_listing_task()
+    return {
+        "taskIds": normalized_task_ids,
+        "retryTaskIds": retry_task_ids,
+        "retryTaskCount": len(retry_task_ids),
+        "retryProductCount": retry_product_count,
+    }
 
 
 def ensure_default_roles() -> None:
