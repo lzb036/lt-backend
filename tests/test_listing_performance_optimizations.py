@@ -892,7 +892,7 @@ def test_auto_listing_candidates_preload_preparation_caches(
 
     monkeypatch.setattr(crawler_service, "listing_preflight_product_check", fake_check)
 
-    selected, preflight_by_id = crawler_service.auto_listing_candidate_product_ids(
+    selected, preflight_by_id, cleanup_result = crawler_service.auto_listing_candidate_product_ids(
         "alice",
         store_id,
         2,
@@ -900,6 +900,7 @@ def test_auto_listing_candidates_preload_preparation_caches(
 
     assert selected == [product_ids[1], product_ids[2]]
     assert set(preflight_by_id) == set(selected)
+    assert cleanup_result["deletedIds"] == []
     assert [product_id for product_id, _cache in seen_checks] == [
         product_ids[1],
         product_ids[2],
@@ -955,7 +956,7 @@ def test_auto_listing_candidates_paginate_in_created_order(
         lambda product, _store: {"productId": product.id, "issues": []},
     )
 
-    selected, preflight_by_id = crawler_service.auto_listing_candidate_product_ids(
+    selected, preflight_by_id, cleanup_result = crawler_service.auto_listing_candidate_product_ids(
         "alice",
         store_id,
         4,
@@ -963,6 +964,78 @@ def test_auto_listing_candidates_paginate_in_created_order(
 
     assert selected == expected_ids
     assert set(preflight_by_id) == set(selected)
+    assert cleanup_result["deletedIds"] == []
+
+
+def test_auto_listing_candidates_delete_image_blocked_approved_products(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    monkeypatch.setattr(crawler_service, "cleanup_product_image_ids", lambda _ids: None)
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        store = StoreModel(
+            owner_username="alice",
+            store_code="shop-a",
+            store_name="店铺 A",
+            enabled=True,
+        )
+        session.add(store)
+        session.flush()
+        products = [
+            ProductModel(
+                owner_username="alice",
+                title=f"商品 {index}",
+                source_url=f"https://example.com/{index}",
+                source_url_hash=f"image-cleanup-{index}",
+                review_status="approved",
+                raw_payload_json="{}",
+            )
+            for index in range(1, 4)
+        ]
+        session.add_all(products)
+        session.flush()
+        store_id = int(store.id)
+        blocked_id = int(products[0].id)
+        valid_ids = [int(product.id) for product in products[1:]]
+        session.commit()
+
+    def fake_check(product, _store):
+        if int(product.id) == blocked_id:
+            return {
+                "productId": product.id,
+                "issues": [
+                    {
+                        "severity": "blocker",
+                        "code": "missing_image",
+                        "message": "商品缺少图片，不能上架。",
+                    }
+                ],
+            }
+        return {"productId": product.id, "issues": []}
+
+    monkeypatch.setattr(crawler_service, "listing_preflight_product_check", fake_check)
+
+    selected, preflight_by_id, cleanup_result = crawler_service.auto_listing_candidate_product_ids(
+        "alice",
+        store_id,
+        2,
+    )
+
+    assert selected == valid_ids
+    assert set(preflight_by_id) == set(valid_ids)
+    assert cleanup_result["deletedIds"] == [blocked_id]
+    with session_factory() as session:
+        assert session.get(ProductModel, blocked_id) is None
+        assert {int(row.id) for row in session.scalars(select(ProductModel)).all()} == set(valid_ids)
 
 
 def _seed_listing_products_and_store(session):
@@ -1115,6 +1188,132 @@ def test_create_listing_task_still_preflights_without_prechecked(
     assert checked == sorted(product_ids)
 
 
+def test_create_listing_task_deletes_image_blocked_approved_products_and_keeps_valid(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    monkeypatch.setattr(crawler_service, "cleanup_product_image_ids", lambda _ids: None)
+    with session_factory() as session:
+        store, products = _seed_listing_products_and_store(session)
+        product_ids = [int(product.id) for product in products]
+        store_id = int(store.id)
+        blocked_id = product_ids[0]
+        valid_ids = product_ids[1:]
+        session.commit()
+
+    monkeypatch.setattr(
+        crawler_service,
+        "ensure_system_task_dispatch_allowed",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value or "")
+    monkeypatch.setattr(crawler_service, "dispatch_next_listing_task", lambda: None)
+    monkeypatch.setattr(
+        crawler_service,
+        "partition_product_ids_by_active_task_conflicts",
+        lambda _session, _owner, _store_ids, ids: (list(ids), []),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_task_to_public",
+        lambda row: {"id": row.id, "status": row.status},
+    )
+
+    def fake_check(product, _store):
+        if int(product.id) == blocked_id:
+            return {
+                "productId": product.id,
+                "issues": [
+                    {
+                        "severity": "blocker",
+                        "code": "missing_local_image",
+                        "message": "商品本地图片文件不存在或已失效。",
+                    }
+                ],
+            }
+        return {"productId": product.id, "issues": []}
+
+    monkeypatch.setattr(crawler_service, "listing_preflight_product_check", fake_check)
+
+    result = crawler_service.create_listing_task(
+        "alice",
+        SimpleNamespace(
+            productIds=product_ids,
+            storeIds=[store_id],
+            taskName="批量上架",
+        ),
+    )
+
+    assert result["summary"]["total"] == len(valid_ids)
+    assert result["summary"]["requestedTotal"] == len(product_ids)
+    assert result["summary"]["acceptedProductIds"] == valid_ids
+    assert result["summary"]["deletedProductIds"] == [blocked_id]
+    assert result["summary"]["deletedCount"] == 1
+    assert result["summary"]["taskCount"] == 1
+    with session_factory() as session:
+        assert session.get(ProductModel, blocked_id) is None
+        remaining = {
+            int(row.id): row
+            for row in session.scalars(select(ProductModel)).all()
+        }
+        assert set(remaining) == set(valid_ids)
+        assert all(remaining[product_id].listing_task_id for product_id in valid_ids)
+        tasks = session.scalars(select(ListingTaskModel)).all()
+        assert len(tasks) == 1
+        assert tasks[0].total_count == len(valid_ids)
+
+
+def test_create_listing_task_does_not_delete_listed_master_image_blocker(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    with session_factory() as session:
+        store, products = _seed_listing_products_and_store(session)
+        product = products[0]
+        product.review_status = "listed_master"
+        product_id = int(product.id)
+        store_id = int(store.id)
+        session.commit()
+
+    monkeypatch.setattr(
+        crawler_service,
+        "ensure_system_task_dispatch_allowed",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(crawler_service, "decrypt_text", lambda value: value or "")
+    monkeypatch.setattr(
+        crawler_service,
+        "listing_preflight_product_check",
+        lambda current_product, _store: {
+            "productId": current_product.id,
+            "issues": [
+                {
+                    "severity": "blocker",
+                    "code": "missing_image",
+                    "message": "商品缺少图片，不能上架。",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="商品缺少图片"):
+        crawler_service.create_listing_task(
+            "alice",
+            SimpleNamespace(
+                productIds=[product_id],
+                storeIds=[store_id],
+                taskName="重新上架",
+            ),
+        )
+
+    with session_factory() as session:
+        remaining = session.get(ProductModel, product_id)
+        assert remaining is not None
+        assert remaining.review_status == "listed_master"
+
+
 def test_listing_task_limit_remains_fifty():
     assert crawler_service.BATCH_TASK_PRODUCT_LIMIT == 50
     assert [len(chunk) for chunk in crawler_service.chunk_product_ids(list(range(1, 102)))] == [50, 50, 1]
@@ -1230,6 +1429,242 @@ def test_listing_dispatch_uses_global_user_and_store_capacity(
             delayed = session.get(ListingTaskModel, task_id)
             assert delayed is not None
             assert "并发额度" in delayed.message
+
+
+def test_listing_dispatch_allows_five_children_of_same_group(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    monkeypatch.setattr(crawler_service, "finalize_stale_cancel_requested_tasks", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(crawler_service, "reconcile_interrupted_running_tasks", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(crawler_service, "should_use_redis_task_queue", lambda: False)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_global", 8)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_user", 1)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_store", 1)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_group", 5)
+    dispatched: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_listing_task",
+        lambda owner, task_id: dispatched.append((owner, task_id)),
+    )
+
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        store = StoreModel(
+            owner_username="alice",
+            store_code="alice-store",
+            store_name="Alice Store",
+        )
+        session.add(store)
+        session.flush()
+        session.add_all(
+            [
+                ListingTaskModel(
+                    id=f"group-{index}",
+                    owner_username="alice",
+                    store_id=store.id,
+                    task_group_id="listing-group-1",
+                    task_group_index=index,
+                    task_group_size=6,
+                    task_name=f"分任务 {index}/6",
+                    status="queued",
+                    product_ids_json=json.dumps(
+                        {
+                            "productIds": [index],
+                            "storeIds": [store.id],
+                        }
+                    ),
+                )
+                for index in range(1, 7)
+            ]
+        )
+        session.commit()
+
+    crawler_service.dispatch_next_listing_task()
+
+    assert dispatched == [
+        ("alice", f"group-{index}")
+        for index in range(1, 6)
+    ]
+    with session_factory() as session:
+        delayed = session.get(ListingTaskModel, "group-6")
+        assert delayed is not None
+        assert delayed.message == "排队中，等待同一总任务并发额度"
+
+
+def test_listing_dispatch_keeps_different_groups_store_serial(
+    monkeypatch,
+    session_factory,
+):
+    from datetime import datetime as dt
+
+    install_session_scope(monkeypatch, session_factory)
+    monkeypatch.setattr(crawler_service, "finalize_stale_cancel_requested_tasks", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(crawler_service, "reconcile_interrupted_running_tasks", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(crawler_service, "should_use_redis_task_queue", lambda: False)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_global", 8)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_user", 5)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_store", 1)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_group", 5)
+    dispatched: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        crawler_service,
+        "dispatch_listing_task",
+        lambda owner, task_id: dispatched.append((owner, task_id)),
+    )
+
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        store = StoreModel(
+            owner_username="alice",
+            store_code="alice-store",
+            store_name="Alice Store",
+        )
+        session.add(store)
+        session.flush()
+        session.add_all(
+            [
+                ListingTaskModel(
+                    id="group-a-running",
+                    owner_username="alice",
+                    store_id=store.id,
+                    task_group_id="listing-group-a",
+                    task_group_index=1,
+                    task_group_size=2,
+                    task_name="A 1/2",
+                    status="running",
+                    created_at=dt(2026, 1, 1, 8, 0),
+                    product_ids_json=json.dumps(
+                        {"productIds": [1], "storeIds": [store.id]}
+                    ),
+                ),
+                ListingTaskModel(
+                    id="group-a-queued",
+                    owner_username="alice",
+                    store_id=store.id,
+                    task_group_id="listing-group-a",
+                    task_group_index=2,
+                    task_group_size=2,
+                    task_name="A 2/2",
+                    status="queued",
+                    created_at=dt(2026, 1, 1, 8, 1),
+                    product_ids_json=json.dumps(
+                        {"productIds": [2], "storeIds": [store.id]}
+                    ),
+                ),
+                ListingTaskModel(
+                    id="group-b-queued",
+                    owner_username="alice",
+                    store_id=store.id,
+                    task_group_id="listing-group-b",
+                    task_group_index=1,
+                    task_group_size=2,
+                    task_name="B 1/2",
+                    status="queued",
+                    created_at=dt(2026, 1, 1, 8, 2),
+                    product_ids_json=json.dumps(
+                        {"productIds": [3], "storeIds": [store.id]}
+                    ),
+                ),
+            ]
+        )
+        session.commit()
+
+    crawler_service.dispatch_next_listing_task()
+
+    assert dispatched == [("alice", "group-a-queued")]
+    with session_factory() as session:
+        delayed = session.get(ListingTaskModel, "group-b-queued")
+        assert delayed is not None
+        assert delayed.message == "排队中，等待该店铺当前上架任务释放并发额度"
+
+
+def test_listing_task_start_wait_allows_same_group_until_group_limit(
+    monkeypatch,
+    session_factory,
+):
+    install_session_scope(monkeypatch, session_factory)
+    monkeypatch.setattr(crawler_service, "finalize_stale_cancel_requested_tasks", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(crawler_service, "reconcile_interrupted_running_tasks", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(crawler_service, "finalize_stale_store_cancel_requested_tasks", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_global", 8)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_user", 1)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_store", 1)
+    monkeypatch.setattr(crawler_service.settings, "max_running_listing_tasks_per_group", 5)
+
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+        store = StoreModel(
+            owner_username="alice",
+            store_code="alice-store",
+            store_name="Alice Store",
+        )
+        session.add(store)
+        session.flush()
+        session.add_all(
+            [
+                ListingTaskModel(
+                    id=f"running-{index}",
+                    owner_username="alice",
+                    store_id=store.id,
+                    task_group_id="listing-group",
+                    task_group_index=index,
+                    task_group_size=6,
+                    task_name=f"分任务 {index}/6",
+                    status="running",
+                    product_ids_json=json.dumps(
+                        {"productIds": [index], "storeIds": [store.id]}
+                    ),
+                )
+                for index in range(1, 6)
+            ]
+        )
+        candidate = ListingTaskModel(
+            id="candidate",
+            owner_username="alice",
+            store_id=store.id,
+            task_group_id="listing-group",
+            task_group_index=6,
+            task_group_size=6,
+            task_name="分任务 6/6",
+            status="queued",
+            product_ids_json=json.dumps(
+                {"productIds": [6], "storeIds": [store.id]}
+            ),
+        )
+        session.add(candidate)
+        session.flush()
+
+        assert crawler_service.listing_task_start_wait_reason(session, candidate) == (
+            "排队中，等待同一总任务并发额度"
+        )
+
+        session.delete(session.get(ListingTaskModel, "running-5"))
+        session.flush()
+        assert crawler_service.listing_task_start_wait_reason(session, candidate) == ""
 
 
 def test_listing_dispatch_gives_eight_users_one_slot_each(

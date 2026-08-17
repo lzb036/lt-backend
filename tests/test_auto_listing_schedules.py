@@ -589,7 +589,11 @@ def test_scheduled_manual_listing_task_runs_once_when_due(
     monkeypatch.setattr(
         crawler_service,
         "auto_listing_candidate_product_ids",
-        lambda owner_username, store_id, quantity: ([], {}),
+        lambda owner_username, store_id, quantity: (
+            [],
+            {},
+            {"deletedIds": [], "failedIds": []},
+        ),
     )
     # 模拟调度队列 worker 同步接单执行
     monkeypatch.setattr(

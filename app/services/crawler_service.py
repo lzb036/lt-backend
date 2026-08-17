@@ -1062,6 +1062,40 @@ def listing_task_store_ids(task: ListingTaskModel) -> list[int]:
     return [int(task.store_id)] if task.store_id else []
 
 
+def listing_task_group_key(task: ListingTaskModel) -> tuple[str, str] | None:
+    group_id = normalize_text(task.task_group_id)
+    if not group_id:
+        return None
+    return normalize_text(task.owner_username), group_id
+
+
+def listing_task_capacity_counts(
+    active_tasks: Iterable[ListingTaskModel],
+    candidate: ListingTaskModel,
+) -> tuple[int, int, int]:
+    """Return (same-group, other-user, other-store) active counts for a candidate."""
+    candidate_group = listing_task_group_key(candidate)
+    candidate_store_ids = set(listing_task_store_ids(candidate))
+    same_group_count = 0
+    user_count = 0
+    store_count = 0
+    for active_task in active_tasks:
+        if str(active_task.id) == str(candidate.id):
+            continue
+        same_group = (
+            candidate_group is not None
+            and listing_task_group_key(active_task) == candidate_group
+        )
+        if same_group:
+            same_group_count += 1
+            continue
+        if active_task.owner_username == candidate.owner_username:
+            user_count += 1
+        if candidate_store_ids.intersection(listing_task_store_ids(active_task)):
+            store_count += 1
+    return same_group_count, user_count, store_count
+
+
 def dispatch_next_listing_task() -> None:
     next_tasks: list[tuple[str, str]] = []
     with session_scope() as session:
@@ -1101,13 +1135,9 @@ def dispatch_next_listing_task() -> None:
             for task in queued_rows
             if str(task.id) in active_job_ids
         })
-        owner_counts: dict[str, int] = {}
-        store_counts: dict[int, int] = {}
+        capacity_rows = list(active_rows_by_id.values())
         active_scopes: list[TaskResourceScope] = []
         for task in active_rows_by_id.values():
-            owner_counts[task.owner_username] = owner_counts.get(task.owner_username, 0) + 1
-            for store_id in listing_task_store_ids(task):
-                store_counts[store_id] = store_counts.get(store_id, 0) + 1
             active_scopes.append(listing_task_resource_scope(session, task))
         active_sync_rows = session.scalars(
             select(SyncTaskModel).where(
@@ -1140,14 +1170,20 @@ def dispatch_next_listing_task() -> None:
                 continue
             if str(task.id) in active_job_ids:
                 continue
-            if owner_counts.get(task.owner_username, 0) >= int(settings.max_running_listing_tasks_per_user):
+            same_group_count, user_count, store_count = listing_task_capacity_counts(
+                capacity_rows,
+                task,
+            )
+            if (
+                listing_task_group_key(task) is not None
+                and same_group_count >= int(settings.max_running_listing_tasks_per_group)
+            ):
+                task.message = "排队中，等待同一总任务并发额度"
+                continue
+            if user_count >= int(settings.max_running_listing_tasks_per_user):
                 task.message = "排队中，等待该用户当前上架任务释放并发额度"
                 continue
-            task_store_ids = listing_task_store_ids(task)
-            if any(
-                store_counts.get(store_id, 0) >= int(settings.max_running_listing_tasks_per_store)
-                for store_id in task_store_ids
-            ):
+            if store_count >= int(settings.max_running_listing_tasks_per_store):
                 task.message = "排队中，等待该店铺当前上架任务释放并发额度"
                 continue
             scope = listing_task_resource_scope(session, task)
@@ -1156,9 +1192,7 @@ def dispatch_next_listing_task() -> None:
                 task.message = wait_reason
                 continue
             next_tasks.append((task.owner_username, task.id))
-            owner_counts[task.owner_username] = owner_counts.get(task.owner_username, 0) + 1
-            for store_id in task_store_ids:
-                store_counts[store_id] = store_counts.get(store_id, 0) + 1
+            capacity_rows.append(task)
             active_scopes.append(scope)
             available_slots -= 1
     for owner_username, task_id in next_tasks:
@@ -5371,7 +5405,6 @@ def sync_task_start_wait_reason(session: Any, task_id: str, store_id: int | None
 
 
 def listing_task_start_wait_reason(session: Any, task: ListingTaskModel) -> str:
-    task_id = str(task.id)
     finalize_stale_cancel_requested_tasks(session, ListingTaskModel, action_label="上架")
     reconcile_interrupted_running_tasks(session, ListingTaskModel)
     session.execute(
@@ -5389,21 +5422,26 @@ def listing_task_start_wait_reason(session: Any, task: ListingTaskModel) -> str:
         ).all()
     for store_id in store_ids:
         finalize_stale_store_cancel_requested_tasks(session, store_id)
-    if running_listing_task_count(session, exclude_task_id=task_id) >= int(settings.max_running_listing_tasks_global):
+    running_rows = session.scalars(
+        select(ListingTaskModel).where(
+            ListingTaskModel.status == "running",
+        )
+    ).all()
+    if len(running_rows) >= int(settings.max_running_listing_tasks_global):
         return "排队中，等待全局上架并发额度"
-    if running_user_listing_task_count(
-        session,
-        task.owner_username,
-        exclude_task_id=task_id,
-    ) >= int(settings.max_running_listing_tasks_per_user):
+    same_group_count, user_count, store_count = listing_task_capacity_counts(
+        running_rows,
+        task,
+    )
+    if (
+        listing_task_group_key(task) is not None
+        and same_group_count >= int(settings.max_running_listing_tasks_per_group)
+    ):
+        return "排队中，等待同一总任务并发额度"
+    if user_count >= int(settings.max_running_listing_tasks_per_user):
         return "排队中，等待该用户当前上架任务释放并发额度"
-    for store_id in store_ids:
-        if running_store_listing_task_count(
-            session,
-            store_id,
-            exclude_task_id=task_id,
-        ) >= int(settings.max_running_listing_tasks_per_store):
-            return "排队中，等待该店铺当前上架任务释放并发额度"
+    if store_count >= int(settings.max_running_listing_tasks_per_store):
+        return "排队中，等待该店铺当前上架任务释放并发额度"
     scope = listing_task_resource_scope(session, task)
     active_sync_scopes = [
         sync_task_resource_scope(session, row)
@@ -9502,6 +9540,25 @@ def cleanup_queued_local_image_urls(product_id: int, image_urls: list[str]) -> N
 
 def cancel_crawl_task(owner_username: str, task_id: str) -> dict[str, Any]:
     return request_task_cancel(CrawlTaskModel, owner_username, task_id, serializer=task_to_public)
+
+
+LISTING_DISCARDABLE_IMAGE_ISSUE_CODES = frozenset(
+    {"missing_image", "missing_local_image"}
+)
+
+
+def listing_preflight_discardable_image_issue(
+    check: dict[str, Any],
+) -> dict[str, Any] | None:
+    for issue in check.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        if (
+            issue.get("severity") == "blocker"
+            and issue.get("code") in LISTING_DISCARDABLE_IMAGE_ISSUE_CODES
+        ):
+            return issue
+    return None
 
 
 def listing_preflight_issue(
@@ -14999,11 +15056,22 @@ def run_due_scheduled_crawls_once() -> int:
 AUTO_LISTING_CANDIDATE_PAGE_SIZE = 500
 
 
+def listing_image_cleanup_summary_message(cleanup_result: dict[str, Any]) -> str:
+    parts: list[str] = []
+    deleted_count = len(cleanup_result.get("deletedIds") or [])
+    failed_count = len(cleanup_result.get("failedIds") or [])
+    if deleted_count:
+        parts.append(f"已自动删除 {deleted_count} 个图片失效商品")
+    if failed_count:
+        parts.append(f"另有 {failed_count} 个图片失效商品未能自动删除")
+    return "；".join(parts)
+
+
 def auto_listing_candidate_product_ids(
     owner_username: str,
     store_id: int,
     quantity: int,
-) -> tuple[list[int], dict[int, dict[str, Any]]]:
+) -> tuple[list[int], dict[int, dict[str, Any]], dict[str, Any]]:
     """按创建顺序筛选 quantity 个可上架候选商品。
 
     分页(键集游标)读取商品,选满即停,避免把全量已审核商品的
@@ -15015,6 +15083,7 @@ def auto_listing_candidate_product_ids(
             raise RuntimeError("自动上架店铺不存在或不属于当前用户。")
         selected_ids: list[int] = []
         preflight_by_id: dict[int, dict[str, Any]] = {}
+        discard_reasons_by_id: dict[int, str] = {}
         last_created_at: datetime | None = None
         last_product_id = 0
         while len(selected_ids) < quantity:
@@ -15068,6 +15137,13 @@ def auto_listing_candidate_product_ids(
                 if store_id in listed_store_ids:
                     continue
                 check = listing_preflight_product_check(product, store)
+                image_issue = listing_preflight_discardable_image_issue(check)
+                if image_issue is not None:
+                    discard_reasons_by_id[int(product.id)] = (
+                        normalize_text(image_issue.get("message"))
+                        or "图片失效，不能上架。"
+                    )
+                    continue
                 if listing_preflight_blocking_messages([check]):
                     continue
                 selected_ids.append(int(product.id))
@@ -15078,7 +15154,12 @@ def auto_listing_candidate_product_ids(
                 break
             last_created_at = products[-1].created_at
             last_product_id = int(products[-1].id)
-        return selected_ids, preflight_by_id
+    cleanup_result = delete_approved_products_for_listing_cleanup(
+        owner_username,
+        list(discard_reasons_by_id),
+        reason_by_id=discard_reasons_by_id,
+    )
+    return selected_ids, preflight_by_id, cleanup_result
 
 
 def execute_auto_listing_schedule(
@@ -15121,11 +15202,12 @@ def execute_auto_listing_schedule(
                 )
 
     try:
-        product_ids, candidate_preflight = auto_listing_candidate_product_ids(
+        product_ids, candidate_preflight, candidate_cleanup = auto_listing_candidate_product_ids(
             resolved_owner_username,
             store_id,
             quantity,
         )
+        candidate_cleanup_message = listing_image_cleanup_summary_message(candidate_cleanup)
         if not product_ids:
             with session_scope() as session:
                 row = session.get(AutoListingScheduleModel, schedule_id)
@@ -15138,7 +15220,14 @@ def execute_auto_listing_schedule(
                     else ("idle" if row.enabled else "disabled")
                 )
                 row.last_task_ids_json = "[]"
-                row.last_message = "当前没有可自动上架的已审核商品。"
+                row.last_message = "；".join(
+                    item
+                    for item in (
+                        candidate_cleanup_message,
+                        "当前没有可自动上架的已审核商品。",
+                    )
+                    if item
+                )
                 return auto_listing_schedule_to_public(row, store)
 
         result = create_listing_task(
@@ -15164,7 +15253,23 @@ def execute_auto_listing_schedule(
             first_task_id = str(result["listingTask"].get("id") or "")
             if first_task_id:
                 task_ids.append(first_task_id)
-        actual_count = int((result.get("summary") or {}).get("total") or len(product_ids))
+        result_summary = result.get("summary") or {}
+        actual_count = (
+            int(result_summary["total"])
+            if "total" in result_summary
+            else len(product_ids)
+        )
+        combined_cleanup = {
+            "deletedIds": [
+                *(candidate_cleanup.get("deletedIds") or []),
+                *(result_summary.get("deletedProductIds") or []),
+            ],
+            "failedIds": [
+                *(candidate_cleanup.get("failedIds") or []),
+                *(result_summary.get("cleanupFailedProductIds") or []),
+            ],
+        }
+        cleanup_message = listing_image_cleanup_summary_message(combined_cleanup)
         with session_scope() as session:
             row = session.get(AutoListingScheduleModel, schedule_id)
             if row is None:
@@ -15176,9 +15281,16 @@ def execute_auto_listing_schedule(
                 else ("idle" if row.enabled else "disabled")
             )
             row.last_task_ids_json = json.dumps(task_ids, ensure_ascii=False)
-            row.last_message = (
-                f"计划上架 {quantity} 件，实际已创建 {actual_count} 件商品的上架任务"
-                f"，共 {len(task_ids)} 个任务。"
+            row.last_message = "；".join(
+                item
+                for item in (
+                    cleanup_message,
+                    (
+                        f"计划上架 {quantity} 件，实际已创建 {actual_count} 件商品的上架任务"
+                        f"，共 {len(task_ids)} 个任务。"
+                    ),
+                )
+                if item
             )
             row.last_error = None
             return auto_listing_schedule_to_public(row, store)
@@ -16045,6 +16157,111 @@ def update_pending_product_genres(owner_username: str, products: list[Any]) -> l
         return [product_to_public(rows_by_id[product_id]) for product_id in normalized]
 
 
+def _cancel_product_replacement_task_before_delete(
+    session: Any,
+    owner_username: str,
+    row: ProductModel,
+) -> None:
+    replacement = product_replacement_metadata(product_raw_payload(row))
+    replacement_task_id = normalize_text(replacement.get("taskId"))
+    if not replacement_task_id:
+        return
+    replacement_task = session.get(SyncTaskModel, replacement_task_id)
+    if (
+        replacement_task is not None
+        and replacement_task.owner_username == owner_username
+        and replacement_task.task_type == "product_replace"
+        and replacement_task.status in {"preview_ready", "failed"}
+    ):
+        replacement_task.status = "cancelled"
+        replacement_task.message = "待审核替换商品已删除"
+        replacement_task.finished_at = datetime.now()
+
+
+def _delete_approved_products_for_listing_cleanup_in_session(
+    session: Any,
+    owner_username: str,
+    product_ids: list[int],
+    *,
+    reason_by_id: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    normalized_ids = normalize_product_ids(product_ids)
+    if not normalized_ids:
+        return {
+            "deletedIds": [],
+            "deletedCodes": [],
+            "failedIds": [],
+            "errors": [],
+        }
+    rows = session.scalars(
+        select(ProductModel).where(
+            ProductModel.owner_username == owner_username,
+            ProductModel.id.in_(normalized_ids),
+        )
+    ).all()
+    rows_by_id = {int(row.id): row for row in rows}
+    deleted_ids: list[int] = []
+    deleted_codes: list[str] = []
+    failed_ids: list[int] = []
+    errors: list[str] = []
+    for product_id in normalized_ids:
+        row = rows_by_id.get(product_id)
+        if row is None:
+            failed_ids.append(product_id)
+            errors.append(f"{product_id}: 商品不存在或不属于当前用户。")
+            continue
+        if (
+            row.review_status != "approved"
+            or row.parent_product_id is not None
+            or row.listing_task_id
+        ):
+            failed_ids.append(product_id)
+            errors.append(
+                f"{productCodeForError(row)}: 商品状态已变化，未执行图片失效自动删除。"
+            )
+            continue
+        product_code = productCodeForError(row)
+        reason = normalize_text((reason_by_id or {}).get(product_id))
+        logger.warning(
+            "Auto-delete approved product blocked by listing image check: "
+            "owner=%s product_id=%s product_code=%s reason=%s",
+            owner_username,
+            product_id,
+            product_code,
+            reason or "image blocker",
+        )
+        _cancel_product_replacement_task_before_delete(session, owner_username, row)
+        session.delete(row)
+        deleted_ids.append(product_id)
+        deleted_codes.append(product_code)
+    if deleted_ids:
+        session.flush()
+    return {
+        "deletedIds": deleted_ids,
+        "deletedCodes": deleted_codes,
+        "failedIds": failed_ids,
+        "errors": errors[:20],
+    }
+
+
+def delete_approved_products_for_listing_cleanup(
+    owner_username: str,
+    product_ids: list[int],
+    *,
+    reason_by_id: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any]
+    with session_scope() as session:
+        result = _delete_approved_products_for_listing_cleanup_in_session(
+            session,
+            owner_username,
+            product_ids,
+            reason_by_id=reason_by_id,
+        )
+    cleanup_product_image_ids(result["deletedIds"])
+    return result
+
+
 def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, Any]:
     normalized_ids = [int(value) for value in (product_ids or [])]
     if not normalized_ids:
@@ -16105,19 +16322,7 @@ def delete_products(owner_username: str, product_ids: list[int]) -> dict[str, An
                 ).all()
                 for child in child_rows:
                     child.parent_product_id = None
-            replacement = product_replacement_metadata(product_raw_payload(row))
-            replacement_task_id = normalize_text(replacement.get("taskId"))
-            if replacement_task_id:
-                replacement_task = session.get(SyncTaskModel, replacement_task_id)
-                if (
-                    replacement_task is not None
-                    and replacement_task.owner_username == owner_username
-                    and replacement_task.task_type == "product_replace"
-                    and replacement_task.status in {"preview_ready", "failed"}
-                ):
-                    replacement_task.status = "cancelled"
-                    replacement_task.message = "待审核替换商品已删除"
-                    replacement_task.finished_at = datetime.now()
+            _cancel_product_replacement_task_before_delete(session, owner_username, row)
             deleted_ids.append(row.id)
             session.delete(row)
             success_count += 1
@@ -21410,6 +21615,12 @@ def create_listing_task(
         raise RuntimeError("请选择要上架的商品。")
     if not store_ids:
         raise RuntimeError("请选择上架店铺。")
+    requested_product_ids = list(product_ids)
+    task_ids: list[str] = []
+    deleted_product_ids: list[int] = []
+    deleted_product_codes: list[str] = []
+    cleanup_failed_product_ids: list[int] = []
+    preflight_error = ""
     with session_scope() as session:
         stores = session.scalars(select(StoreModel).where(StoreModel.id.in_(store_ids))).all()
         stores_by_id = {int(store.id): store for store in stores}
@@ -21462,64 +21673,150 @@ def create_listing_task(
                 for store in ordered_stores
                 for product in products
             ]
-            preflight_blockers = listing_preflight_blocking_messages(preflight_checks)
-            if preflight_blockers:
-                detail = "；".join(preflight_blockers[:5])
-                suffix = "；更多问题请先执行上架前体检。" if len(preflight_blockers) > 5 else ""
-                raise RuntimeError(f"上架前体检未通过：{detail}{suffix}")
+        else:
+            preflight_checks = [
+                check
+                for product_id in product_ids
+                for check in [preflight_by_id.get(product_id)]
+                if isinstance(check, dict)
+            ]
+
+        product_by_id = {int(product.id): product for product in products}
+        discard_reasons_by_id: dict[int, str] = {}
+        for check in preflight_checks:
+            image_issue = listing_preflight_discardable_image_issue(check)
+            if image_issue is None:
+                continue
+            product_id = int(check.get("productId") or 0)
+            product = product_by_id.get(product_id)
+            if (
+                product is not None
+                and product.review_status == "approved"
+                and product.parent_product_id is None
+                and not product.listing_task_id
+            ):
+                discard_reasons_by_id[product_id] = (
+                    normalize_text(image_issue.get("message"))
+                    or "图片失效，不能上架。"
+                )
+
+        if discard_reasons_by_id:
+            cleanup_result = _delete_approved_products_for_listing_cleanup_in_session(
+                session,
+                owner_username,
+                list(discard_reasons_by_id),
+                reason_by_id=discard_reasons_by_id,
+            )
+            deleted_product_ids = list(cleanup_result["deletedIds"])
+            deleted_product_codes = list(cleanup_result["deletedCodes"])
+            cleanup_failed_product_ids = list(cleanup_result["failedIds"])
+            deleted_id_set = set(deleted_product_ids)
+            product_ids = [
+                product_id
+                for product_id in product_ids
+                if product_id not in deleted_id_set
+            ]
+            products = [
+                product
+                for product in products
+                if int(product.id) not in deleted_id_set
+            ]
+            preflight_checks = [
+                check
+                for check in preflight_checks
+                if int(check.get("productId") or 0) not in deleted_id_set
+            ]
+
+        preflight_blockers = listing_preflight_blocking_messages(preflight_checks)
+        if preflight_blockers:
+            detail = "；".join(preflight_blockers[:5])
+            suffix = "；更多问题请先执行上架前体检。" if len(preflight_blockers) > 5 else ""
+            preflight_error = f"上架前体检未通过：{detail}{suffix}"
+
         # 自动上架路径会传入候选筛选阶段已完成的体检结果
         # (同一店铺、同一批商品,刚检查过),此处不再重复逐商品体检,
         # 其余动态校验(审核状态、上架锁、并发冲突)保持原样。
-        product_by_id = {int(product.id): product for product in products}
-        ordered_products = [product_by_id[product_id] for product_id in product_ids]
-        ready_ids, blocked_ids = partition_product_ids_by_active_task_conflicts(
-            session,
-            owner_username,
-            store_ids,
-            product_ids,
-        )
-        product_chunks = conflict_aware_product_chunks(ready_ids, blocked_ids)
-        task_group_id = uuid.uuid4().hex if len(product_chunks) > 1 else None
-        base_task_name = task_name or f"上架任务 {datetime.now():%Y-%m-%d %H:%M}"
-        task_ids: list[str] = []
-        for index, (chunk_ids, blocked) in enumerate(product_chunks, start=1):
-            task_id = uuid.uuid4().hex
-            product_chunk = [product_by_id[product_id] for product_id in chunk_ids]
-            chunk_product_ids = [int(product.id) for product in product_chunk]
-            for product in product_chunk:
-                product.listing_task_id = task_id
-                product.last_error = None
-            task = ListingTaskModel(
-                id=task_id,
-                owner_username=owner_username,
-                store_id=ordered_stores[0].id,
-                task_group_id=task_group_id,
-                task_group_index=index if task_group_id else None,
-                task_group_size=len(product_chunks) if task_group_id else None,
-                task_name=base_task_name if len(product_chunks) == 1 else f"{base_task_name} {index}/{len(product_chunks)}",
-                status="queued",
-                total_count=len(product_chunk) * len(ordered_stores),
-                success_count=0,
-                failed_count=0,
-                product_ids_json=json.dumps(
-                    listing_task_result_payload(
-                        chunk_product_ids,
-                        [],
-                        [],
-                        store_ids=store_ids,
-                    ),
-                    ensure_ascii=False,
-                ),
-                message=(
-                    "排队中，等待同一商品当前任务完成"
-                    if blocked
-                    else "等待同步到乐天"
-                ),
+        if product_ids and not preflight_error:
+            ready_ids, blocked_ids = partition_product_ids_by_active_task_conflicts(
+                session,
+                owner_username,
+                store_ids,
+                product_ids,
             )
-            session.add(task)
-            task_ids.append(task_id)
-        session.flush()
+            product_chunks = conflict_aware_product_chunks(ready_ids, blocked_ids)
+            task_group_id = uuid.uuid4().hex if len(product_chunks) > 1 else None
+            base_task_name = task_name or f"上架任务 {datetime.now():%Y-%m-%d %H:%M}"
+            for index, (chunk_ids, blocked) in enumerate(product_chunks, start=1):
+                task_id = uuid.uuid4().hex
+                product_chunk = [product_by_id[product_id] for product_id in chunk_ids]
+                chunk_product_ids = [int(product.id) for product in product_chunk]
+                for product in product_chunk:
+                    product.listing_task_id = task_id
+                    product.last_error = None
+                task = ListingTaskModel(
+                    id=task_id,
+                    owner_username=owner_username,
+                    store_id=ordered_stores[0].id,
+                    task_group_id=task_group_id,
+                    task_group_index=index if task_group_id else None,
+                    task_group_size=len(product_chunks) if task_group_id else None,
+                    task_name=base_task_name if len(product_chunks) == 1 else f"{base_task_name} {index}/{len(product_chunks)}",
+                    status="queued",
+                    total_count=len(product_chunk) * len(ordered_stores),
+                    success_count=0,
+                    failed_count=0,
+                    product_ids_json=json.dumps(
+                        listing_task_result_payload(
+                            chunk_product_ids,
+                            [],
+                            [],
+                            store_ids=store_ids,
+                        ),
+                        ensure_ascii=False,
+                    ),
+                    message=(
+                        "排队中，等待同一商品当前任务完成"
+                        if blocked
+                        else "等待同步到乐天"
+                    ),
+                )
+                session.add(task)
+                task_ids.append(task_id)
+            session.flush()
 
+    cleanup_product_image_ids(deleted_product_ids)
+    if preflight_error and not deleted_product_ids:
+        raise RuntimeError(preflight_error)
+    cleanup_message = listing_image_cleanup_summary_message(
+        {
+            "deletedIds": deleted_product_ids,
+            "failedIds": cleanup_failed_product_ids,
+        }
+    )
+    if not task_ids:
+        return {
+            "listingTask": None,
+            "listingTasks": [],
+            "summary": {
+                "requestedTotal": len(requested_product_ids),
+                "total": 0,
+                "taskCount": 0,
+                "acceptedProductIds": [],
+                "deletedCount": len(deleted_product_ids),
+                "deletedProductIds": deleted_product_ids,
+                "deletedProductCodes": deleted_product_codes,
+                "cleanupFailedProductIds": cleanup_failed_product_ids,
+                "message": "；".join(
+                    item
+                    for item in (
+                        cleanup_message,
+                        preflight_error,
+                        "没有可创建的上架任务。" if not preflight_error else "",
+                    )
+                    if item
+                ),
+            },
+        }
     dispatch_next_listing_task()
     with session_scope() as session:
         rows = session.scalars(
@@ -21529,13 +21826,24 @@ def create_listing_task(
         ).all()
         task_by_id = {row.id: row for row in rows}
         tasks = [listing_task_to_public(task_by_id[task_id]) for task_id in task_ids if task_id in task_by_id]
-        message = "上架任务已创建" if len(tasks) == 1 else f"上架任务已创建，已拆分为 {len(tasks)} 个任务，每个最多 {BATCH_TASK_PRODUCT_LIMIT} 条"
+        task_message = (
+            "上架任务已创建"
+            if len(tasks) == 1
+            else f"上架任务已创建，已拆分为 {len(tasks)} 个任务，每个最多 {BATCH_TASK_PRODUCT_LIMIT} 条"
+        )
+        message = "；".join(item for item in (cleanup_message, task_message) if item)
         return {
-            "listingTask": tasks[0] if tasks else {"id": task_ids[0]},
+            "listingTask": tasks[0] if tasks else None,
             "listingTasks": tasks,
             "summary": {
                 "total": len(product_ids),
+                "requestedTotal": len(requested_product_ids),
                 "taskCount": len(tasks),
+                "acceptedProductIds": product_ids,
+                "deletedCount": len(deleted_product_ids),
+                "deletedProductIds": deleted_product_ids,
+                "deletedProductCodes": deleted_product_codes,
+                "cleanupFailedProductIds": cleanup_failed_product_ids,
                 "message": message,
             },
         }
