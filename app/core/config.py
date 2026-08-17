@@ -83,7 +83,7 @@ class Settings(BaseModel):
     max_running_listing_tasks_per_user: int = 1
     max_running_listing_tasks_per_store: int = 1
     max_running_listing_tasks_per_group: int = 5
-    listing_product_workers: int = 3
+    listing_product_workers: int = 5
     listing_retry_product_workers: int = 1
     listing_image_prepare_workers: int = 2
     rakuten_cabinet_request_min_interval_seconds: float = 0.8
@@ -233,7 +233,7 @@ def build_settings() -> Settings:
         max_running_listing_tasks_per_user=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_USER", 1)),
         max_running_listing_tasks_per_store=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_STORE", 1)),
         max_running_listing_tasks_per_group=max(1, _env_int("LT_MAX_RUNNING_LISTING_TASKS_PER_GROUP", 5)),
-        listing_product_workers=max(1, _env_int("LT_LISTING_PRODUCT_WORKERS", 3)),
+        listing_product_workers=max(1, _env_int("LT_LISTING_PRODUCT_WORKERS", 5)),
         listing_retry_product_workers=max(1, _env_int("LT_LISTING_RETRY_PRODUCT_WORKERS", 1)),
         listing_image_prepare_workers=max(1, _env_int("LT_LISTING_IMAGE_PREPARE_WORKERS", 2)),
         rakuten_cabinet_request_min_interval_seconds=max(
