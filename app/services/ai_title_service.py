@@ -584,7 +584,10 @@ def stream_generate_version(owner_username: str, product_id: int, created_by: st
                 chunks.append(delta)
                 yield {"type": "delta", "content": delta}
         generated = parse_generated_result("".join(chunks))
-        active_words = sensitive_word_service.active_sensitive_words(session)
+        active_words = sensitive_word_service.active_sensitive_words(
+            session,
+            product.owner_username,
+        )
         cleaned, _ = sensitive_word_service.sanitize_product_payload(
             {"title": generated["title"], "subtitle": generated["subtitle"]},
             active_words,

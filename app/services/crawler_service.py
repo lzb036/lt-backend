@@ -11565,7 +11565,7 @@ def perform_store_sync(owner_username: str, store_id: int, *, task_id: str | Non
         verify_store_credentials(row, include_product_counts=False)
         items, rakuten_total_count = fetch_rakuten_store_items_with_total(service_secret, license_key)
         apply_store_product_counts(row, items)
-        active_words = active_sensitive_words(session)
+        active_words = active_sensitive_words(session, owner_username)
         local_rows = session.scalars(
             select(ProductModel).where(
                 ProductModel.owner_username == owner_username,
@@ -12336,7 +12336,10 @@ def create_product_replacement_preview(owner_username: str, product_id: int, sou
             )
             if active:
                 raise RuntimeError("当前商品已有进行中的替换任务。")
-            cleaned_raw, _ = sanitize_product_payload(draft.get("raw") or {}, active_sensitive_words(session))
+            cleaned_raw, _ = sanitize_product_payload(
+                draft.get("raw") or {},
+                active_sensitive_words(session, owner_username),
+            )
             draft["raw"] = cleaned_raw
             draft["title"] = first_text_from_keys(cleaned_raw, ("itemName", "title", "name")) or draft["title"]
             draft["tagline"] = product_tagline(cleaned_raw)
@@ -22785,7 +22788,7 @@ def run_task(task_id: str, reserved_job_id: str | None = None) -> None:
         collection_genre_policy = CollectionGenrePolicySnapshot()
         if total_count > 0:
             with session_scope() as session:
-                active_words = active_sensitive_words(session)
+                active_words = active_sensitive_words(session, owner_username)
                 collection_genre_policy = collection_genre_policy_snapshot(session, owner_username)
         for item in item_plan.items:
             raise_if_task_cancelled(CrawlTaskModel, task_id)
@@ -22998,7 +23001,12 @@ def save_collected_item(
                     f"{display_name}: 已存在于{status_label}，本次未重复入库。"
                 ),
             }
-        prepared_item = prepare_product_upsert_item(session, item, active_words=active_words)
+        prepared_item = prepare_product_upsert_item(
+            session,
+            item,
+            owner_username=owner_username,
+            active_words=active_words,
+        )
         saved = upsert_product(
             session,
             owner_username,
@@ -25587,7 +25595,12 @@ def upsert_product(
     prepared_item: PreparedProductUpsertItem | None = None,
     scheduled_crawl_id: int | None = None,
 ) -> bool:
-    prepared = prepared_item or prepare_product_upsert_item(session, item, active_words=active_words)
+    prepared = prepared_item or prepare_product_upsert_item(
+        session,
+        item,
+        owner_username=owner_username,
+        active_words=active_words,
+    )
     if prepared.error or not prepared.source_url or not prepared.title:
         return False
     source_url_hash = make_source_url_hash(prepared.source_url_hash_key)
@@ -25645,10 +25658,15 @@ def prepare_product_upsert_item(
     session: Any,
     item: dict[str, Any],
     *,
+    owner_username: str,
     active_words: list[str] | None = None,
 ) -> PreparedProductUpsertItem:
     original_title = str(item.get("title") or "").strip()
-    words = active_words if active_words is not None else active_sensitive_words(session)
+    words = (
+        active_words
+        if active_words is not None
+        else active_sensitive_words(session, owner_username)
+    )
     cleaned_item = item
     if words:
         cleaned_item, _ = sanitize_product_payload(item, words)

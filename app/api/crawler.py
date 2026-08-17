@@ -532,9 +532,14 @@ def list_sensitive_words(
     page: int | None = Query(default=None, ge=1),
     pageSize: int | None = Query(default=None, ge=1, le=500),
     keyword: str | None = Query(default=None),
-    _: dict = Depends(require_superadmin),
+    user: dict = Depends(require_authenticated_account),
 ) -> dict:
-    return sensitive_word_service.list_sensitive_words(page=page, page_size=pageSize, keyword=keyword or "")
+    return sensitive_word_service.list_sensitive_words(
+        user["username"],
+        page=page,
+        page_size=pageSize,
+        keyword=keyword or "",
+    )
 
 
 @router.get("/settings/collection-genres/config")
@@ -627,30 +632,55 @@ def get_collection_genre_pending_impact(
 
 
 @router.post("/settings/sensitive-words")
-def create_sensitive_word(payload: SensitiveWordPayload, _: dict = Depends(require_superadmin)) -> dict:
+def create_sensitive_word(
+    payload: SensitiveWordPayload,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
     try:
-        return {"sensitiveWord": sensitive_word_service.create_sensitive_word(payload.word, payload.enabled)}
+        return {
+            "sensitiveWord": sensitive_word_service.create_sensitive_word(
+                user["username"],
+                payload.word,
+                payload.enabled,
+            )
+        }
     except RuntimeError as exc:
         raise _sensitive_word_http_exception(exc) from exc
 
 
 @router.put("/settings/sensitive-words/{word_id}")
-def update_sensitive_word(word_id: int, payload: SensitiveWordPayload, _: dict = Depends(require_superadmin)) -> dict:
+def update_sensitive_word(
+    word_id: int,
+    payload: SensitiveWordPayload,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
     try:
-        return {"sensitiveWord": sensitive_word_service.update_sensitive_word(word_id, payload.word, payload.enabled)}
+        return {
+            "sensitiveWord": sensitive_word_service.update_sensitive_word(
+                user["username"],
+                word_id,
+                payload.word,
+                payload.enabled,
+            )
+        }
     except RuntimeError as exc:
         raise _sensitive_word_http_exception(exc) from exc
 
 
 @router.delete("/settings/sensitive-words/{word_id}")
-def delete_sensitive_word(word_id: int, _: dict = Depends(require_superadmin)) -> dict:
-    if sensitive_word_service.delete_sensitive_word(word_id):
+def delete_sensitive_word(
+    word_id: int,
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
+    if sensitive_word_service.delete_sensitive_word(user["username"], word_id):
         return {"deleted": True}
     raise HTTPException(status_code=404, detail="敏感词不存在。")
 
 
 @router.get("/settings/sensitive-words/template")
-def download_sensitive_word_template(_: dict = Depends(require_superadmin)) -> StreamingResponse:
+def download_sensitive_word_template(
+    _: dict = Depends(require_authenticated_account),
+) -> StreamingResponse:
     try:
         content = sensitive_word_service.build_sensitive_word_template()
     except RuntimeError as exc:
@@ -670,10 +700,17 @@ def download_sensitive_word_template(_: dict = Depends(require_superadmin)) -> S
 
 
 @router.post("/settings/sensitive-words/import")
-async def import_sensitive_words(file: UploadFile = File(...), _: dict = Depends(require_superadmin)) -> dict:
+async def import_sensitive_words(
+    file: UploadFile = File(...),
+    user: dict = Depends(require_authenticated_account),
+) -> dict:
     try:
         content = await file.read()
-        return sensitive_word_service.import_sensitive_words(content, file.filename or "")
+        return sensitive_word_service.import_sensitive_words(
+            user["username"],
+            content,
+            file.filename or "",
+        )
     except RuntimeError as exc:
         raise _sensitive_word_http_exception(exc) from exc
 

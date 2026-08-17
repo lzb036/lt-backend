@@ -23,12 +23,14 @@ class SensitiveWordModelTests(unittest.TestCase):
 
         id_column = SensitiveWordModel.__table__.columns["id"]
         enabled_column = SensitiveWordModel.__table__.columns["enabled"]
+        owner_column = SensitiveWordModel.__table__.columns["owner_username"]
         created_at_column = SensitiveWordModel.__table__.columns["created_at"]
         updated_at_column = SensitiveWordModel.__table__.columns["updated_at"]
 
         self.assertEqual(normalize_sensitive_word("  即納  "), "即納")
         self.assertEqual(SensitiveWordModel.__tablename__, "lt_sensitive_words")
         self.assertIn("id", SensitiveWordModel.__table__.columns)
+        self.assertIn("owner_username", SensitiveWordModel.__table__.columns)
         self.assertIn("word", SensitiveWordModel.__table__.columns)
         self.assertIn("enabled", SensitiveWordModel.__table__.columns)
         self.assertIn("created_at", SensitiveWordModel.__table__.columns)
@@ -38,6 +40,7 @@ class SensitiveWordModelTests(unittest.TestCase):
         self.assertEqual(SensitiveWordModel.__table__.columns["word"].type.length, 500)
         self.assertFalse(SensitiveWordModel.__table__.columns["word"].nullable)
         self.assertFalse(enabled_column.nullable)
+        self.assertFalse(owner_column.nullable)
         self.assertIsNotNone(enabled_column.default)
         self.assertTrue(enabled_column.default.arg)
         self.assertIsNotNone(enabled_column.server_default)
@@ -48,7 +51,10 @@ class SensitiveWordModelTests(unittest.TestCase):
         self.assertIsNotNone(updated_at_column.server_default)
         self.assertIsNotNone(updated_at_column.onupdate)
         self.assertTrue(
-            any(constraint.name == "uq_lt_sensitive_word" for constraint in SensitiveWordModel.__table__.constraints)
+            any(
+                constraint.name == "uq_lt_sensitive_word_owner_word"
+                for constraint in SensitiveWordModel.__table__.constraints
+            )
         )
 
 
@@ -148,6 +154,21 @@ class SensitiveWordDatabaseTestCase(unittest.TestCase):
             expire_on_commit=False,
             future=True,
         )
+        from app.db.models import UserAccountModel
+
+        with Session(self.engine, future=True) as session:
+            session.add_all(
+                [
+                    UserAccountModel(
+                        username=username,
+                        display_name=username,
+                        password_salt_b64="salt",
+                        password_hash_b64="hash",
+                    )
+                    for username in ("alice", "bob")
+                ]
+            )
+            session.commit()
 
     def tearDown(self) -> None:
         self.engine.dispose()
@@ -164,12 +185,14 @@ class SensitiveWordDatabaseTestCase(unittest.TestCase):
         finally:
             session.close()
 
-    def list_words(self) -> list[str]:
+    def list_words(self, owner_username: str = "alice") -> list[str]:
         from app.db.models import SensitiveWordModel
 
         with Session(self.engine, future=True) as session:
             return session.scalars(
-                select(SensitiveWordModel.word).order_by(SensitiveWordModel.id.asc())
+                select(SensitiveWordModel.word)
+                .where(SensitiveWordModel.owner_username == owner_username)
+                .order_by(SensitiveWordModel.id.asc())
             ).all()
 
 
@@ -221,15 +244,61 @@ class SensitiveWordPersistenceTests(SensitiveWordDatabaseTestCase):
 
         with self.session_scope() as session:
             self.assertEqual(seed_default_sensitive_words(session), 0)
-            total = session.scalar(select(func.count()).select_from(SensitiveWordModel))
+            total = session.scalar(
+                select(func.count())
+                .select_from(SensitiveWordModel)
+                .where(SensitiveWordModel.owner_username == "alice")
+            )
 
         self.assertEqual(total, len(set(DEFAULT_SENSITIVE_WORDS)))
         self.assertEqual(len(DEFAULT_SENSITIVE_WORDS), len(set(DEFAULT_SENSITIVE_WORDS)))
         self.assertEqual(list(self.list_words()), list(expected_default_words))
+        self.assertEqual(list(self.list_words("bob")), list(expected_default_words))
         self.assertIn("【】", DEFAULT_SENSITIVE_WORDS)
         self.assertIn("即納", DEFAULT_SENSITIVE_WORDS)
         self.assertIn("楽天1位", DEFAULT_SENSITIVE_WORDS)
         self.assertIn("翌日配達", DEFAULT_SENSITIVE_WORDS)
+
+    def test_sensitive_word_crud_isolated_by_owner(self) -> None:
+        from app.services import sensitive_word_service
+
+        with patch.object(sensitive_word_service, "SessionLocal", self.session_factory):
+            alice_word = sensitive_word_service.create_sensitive_word("alice", "各自词")
+            bob_word = sensitive_word_service.create_sensitive_word("bob", "各自词")
+
+            self.assertNotEqual(alice_word["id"], bob_word["id"])
+            self.assertEqual(
+                sensitive_word_service.list_sensitive_words(
+                    "alice",
+                    page=1,
+                    page_size=10,
+                )["total"],
+                1,
+            )
+            self.assertEqual(
+                sensitive_word_service.list_sensitive_words(
+                    "bob",
+                    page=1,
+                    page_size=10,
+                )["total"],
+                1,
+            )
+            with self.assertRaisesRegex(RuntimeError, "不存在"):
+                sensitive_word_service.update_sensitive_word(
+                    "bob",
+                    alice_word["id"],
+                    "修改失败",
+                    True,
+                )
+            self.assertTrue(
+                sensitive_word_service.delete_sensitive_word("alice", alice_word["id"])
+            )
+            bob_words = sensitive_word_service.list_sensitive_words(
+                "bob",
+                page=1,
+                page_size=10,
+            )
+        self.assertEqual(bob_words["items"][0]["word"], "各自词")
 
     def test_init_database_seeds_defaults_without_breaking_existing_bootstrap_steps(self) -> None:
         import app.db.database as database_module
@@ -276,28 +345,28 @@ class SensitiveWordPersistenceTests(SensitiveWordDatabaseTestCase):
         from app.services import sensitive_word_service
 
         with patch.object(sensitive_word_service, "SessionLocal", self.session_factory):
-            created = sensitive_word_service.create_sensitive_word("  即納  ")
+            created = sensitive_word_service.create_sensitive_word("alice", "  即納  ")
 
             self.assertEqual(created["word"], "即納")
             self.assertEqual(created["ruleType"], "literal")
             self.assertTrue(created["enabled"])
 
             with self.assertRaisesRegex(RuntimeError, "已存在"):
-                sensitive_word_service.create_sensitive_word("即納")
+                sensitive_word_service.create_sensitive_word("alice", "即納")
 
             with self.assertRaisesRegex(RuntimeError, "不能为空"):
-                sensitive_word_service.create_sensitive_word("   ")
+                sensitive_word_service.create_sensitive_word("alice", "   ")
 
     def test_list_filters_and_paginates_sensitive_words(self) -> None:
         from app.services import sensitive_word_service
 
         with patch.object(sensitive_word_service, "SessionLocal", self.session_factory):
-            sensitive_word_service.create_sensitive_word("翌日配達")
-            sensitive_word_service.create_sensitive_word("即納")
-            sensitive_word_service.create_sensitive_word("【】")
+            sensitive_word_service.create_sensitive_word("alice", "翌日配達")
+            sensitive_word_service.create_sensitive_word("alice", "即納")
+            sensitive_word_service.create_sensitive_word("alice", "【】")
 
-            page_one = sensitive_word_service.list_sensitive_words(page=1, page_size=2)
-            filtered = sensitive_word_service.list_sensitive_words(page=1, page_size=10, keyword="即")
+            page_one = sensitive_word_service.list_sensitive_words("alice", page=1, page_size=2)
+            filtered = sensitive_word_service.list_sensitive_words("alice", page=1, page_size=10, keyword="即")
 
         self.assertEqual(page_one["total"], 3)
         self.assertEqual(page_one["page"], 1)
@@ -313,22 +382,22 @@ class SensitiveWordPersistenceTests(SensitiveWordDatabaseTestCase):
         from app.services import sensitive_word_service
 
         with patch.object(sensitive_word_service, "SessionLocal", self.session_factory):
-            created_bracket = sensitive_word_service.create_sensitive_word("【】")
-            created_short = sensitive_word_service.create_sensitive_word("即納")
-            created_long = sensitive_word_service.create_sensitive_word("期間限定")
+            created_bracket = sensitive_word_service.create_sensitive_word("alice", "【】")
+            created_short = sensitive_word_service.create_sensitive_word("alice", "即納")
+            created_long = sensitive_word_service.create_sensitive_word("alice", "期間限定")
 
-            updated = sensitive_word_service.update_sensitive_word(created_short["id"], "  翌日配達  ", False)
+            updated = sensitive_word_service.update_sensitive_word("alice", created_short["id"], "  翌日配達  ", False)
             self.assertEqual(updated["word"], "翌日配達")
             self.assertFalse(updated["enabled"])
 
             with self.assertRaisesRegex(RuntimeError, "已存在"):
-                sensitive_word_service.update_sensitive_word(created_long["id"], "【】", True)
+                sensitive_word_service.update_sensitive_word("alice", created_long["id"], "【】", True)
 
-            self.assertTrue(sensitive_word_service.delete_sensitive_word(created_bracket["id"]))
-            self.assertFalse(sensitive_word_service.delete_sensitive_word(created_bracket["id"]))
+            self.assertTrue(sensitive_word_service.delete_sensitive_word("alice", created_bracket["id"]))
+            self.assertFalse(sensitive_word_service.delete_sensitive_word("alice", created_bracket["id"]))
 
         with Session(self.engine, future=True) as session:
-            active_words = sensitive_word_service.active_sensitive_words(session)
+            active_words = sensitive_word_service.active_sensitive_words(session, "alice")
             rows = session.scalars(select(SensitiveWordModel).order_by(SensitiveWordModel.id.asc())).all()
 
         self.assertEqual(active_words, ["期間限定"])
@@ -368,8 +437,9 @@ class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
         workbook.save(buffer)
 
         with patch.object(sensitive_word_service, "SessionLocal", self.session_factory):
-            sensitive_word_service.create_sensitive_word("即納")
+            sensitive_word_service.create_sensitive_word("alice", "即納")
             result = sensitive_word_service.import_sensitive_words(
+                "alice",
                 content=buffer.getvalue(),
                 filename="sensitive-words.xlsx",
             )
@@ -388,7 +458,11 @@ class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
         from app.services.sensitive_word_service import import_sensitive_words
 
         with self.assertRaisesRegex(RuntimeError, r"\.xlsx"):
-            import_sensitive_words(content=b"not-an-excel-file", filename="sensitive-words.csv")
+            import_sensitive_words(
+                "alice",
+                content=b"not-an-excel-file",
+                filename="sensitive-words.csv",
+            )
 
     def test_import_rejects_valid_zip_that_is_not_a_real_xlsx_workbook(self) -> None:
         from app.services.sensitive_word_service import import_sensitive_words
@@ -398,7 +472,11 @@ class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
             archive.writestr("not-a-workbook.txt", "plain text")
 
         with self.assertRaisesRegex(RuntimeError, r"有效的 \.xlsx"):
-            import_sensitive_words(content=buffer.getvalue(), filename="sensitive-words.xlsx")
+            import_sensitive_words(
+                "alice",
+                content=buffer.getvalue(),
+                filename="sensitive-words.xlsx",
+            )
 
     def test_import_requires_sensitive_word_header(self) -> None:
         from openpyxl import Workbook
@@ -414,7 +492,11 @@ class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
         workbook.save(buffer)
 
         with self.assertRaisesRegex(RuntimeError, "表头"):
-            import_sensitive_words(content=buffer.getvalue(), filename="sensitive-words.xlsx")
+            import_sensitive_words(
+                "alice",
+                content=buffer.getvalue(),
+                filename="sensitive-words.xlsx",
+            )
 
     def test_import_counts_flush_time_uniqueness_race_as_duplicate_and_keeps_valid_rows(self) -> None:
         from openpyxl import Workbook
@@ -464,7 +546,13 @@ class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
 
                     session.info["race_injected"] = True
                     with race_session_factory() as competing_session:
-                        competing_session.add(SensitiveWordModel(word="競合語", enabled=True))
+                        competing_session.add(
+                            SensitiveWordModel(
+                                owner_username="alice",
+                                word="競合語",
+                                enabled=True,
+                            )
+                        )
                         competing_session.commit()
                     injected_words.append("競合語")
 
@@ -475,6 +563,7 @@ class SensitiveWordExcelImportTests(SensitiveWordDatabaseTestCase):
 
                 with patch.object(sensitive_word_service, "SessionLocal", flagged_session_local):
                     result = sensitive_word_service.import_sensitive_words(
+                        "alice",
                         content=buffer.getvalue(),
                         filename="sensitive-words.xlsx",
                     )
@@ -520,9 +609,9 @@ class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
         with self.session_scope() as session:
             session.add_all(
                 [
-                    SensitiveWordModel(word="【】", enabled=True),
-                    SensitiveWordModel(word="即納", enabled=True),
-                    SensitiveWordModel(word="翌日配達", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="【】", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="即納", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="翌日配達", enabled=True),
                 ]
             )
             session.flush()
@@ -565,8 +654,8 @@ class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
         with self.session_scope() as session:
             session.add_all(
                 [
-                    SensitiveWordModel(word="【】", enabled=True),
-                    SensitiveWordModel(word="即納", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="【】", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="即納", enabled=True),
                 ]
             )
             session.flush()
@@ -727,8 +816,8 @@ class SensitiveWordUpsertTests(SensitiveWordDatabaseTestCase):
             )
             session.add_all(
                 [
-                    SensitiveWordModel(word="【】", enabled=True),
-                    SensitiveWordModel(word="即納", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="【】", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="即納", enabled=True),
                 ]
             )
 
@@ -792,8 +881,8 @@ class SensitiveWordCleanupTests(SensitiveWordDatabaseTestCase):
         with self.session_scope() as session:
             session.add_all(
                 [
-                    SensitiveWordModel(word="【】", enabled=True),
-                    SensitiveWordModel(word="即納", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="【】", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="即納", enabled=True),
                 ]
             )
             session.flush()
@@ -905,7 +994,7 @@ class SensitiveWordCleanupTests(SensitiveWordDatabaseTestCase):
         row_ids = self.seed_pending_cleanup_rows()
 
         with self.session_scope() as session:
-            summary = cleanup_pending_products(session, apply=False)
+            summary = cleanup_pending_products(session, "alice", apply=False)
 
         self.assertEqual(
             summary,
@@ -949,7 +1038,7 @@ class SensitiveWordCleanupTests(SensitiveWordDatabaseTestCase):
         row_ids = self.seed_pending_cleanup_rows()
 
         with self.session_scope() as session:
-            summary = cleanup_pending_products(session, apply=True)
+            summary = cleanup_pending_products(session, "alice", apply=True)
             session.flush()
 
         self.assertEqual(
@@ -1016,8 +1105,8 @@ class SensitiveWordCleanupTests(SensitiveWordDatabaseTestCase):
         with self.session_scope() as session:
             session.add_all(
                 [
-                    SensitiveWordModel(word="【】", enabled=True),
-                    SensitiveWordModel(word="即納", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="【】", enabled=True),
+                    SensitiveWordModel(owner_username="alice", word="即納", enabled=True),
                 ]
             )
             session.flush()
@@ -1044,7 +1133,7 @@ class SensitiveWordCleanupTests(SensitiveWordDatabaseTestCase):
             malformed_id = malformed_row.id
             non_object_id = non_object_row.id
 
-            summary = cleanup_pending_products(session, apply=True)
+            summary = cleanup_pending_products(session, "alice", apply=True)
             session.flush()
 
         self.assertEqual(

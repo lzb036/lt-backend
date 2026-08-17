@@ -416,6 +416,9 @@ def create_user(username: str, password: str, display_name: str = "") -> dict[st
         session.add(row)
         session.add(UserSecretProfileModel(owner_username=username))
         session.flush()
+        from app.services.sensitive_word_service import seed_default_sensitive_words_for_user
+
+        seed_default_sensitive_words_for_user(session, username)
         return account_to_public(row)
 
 

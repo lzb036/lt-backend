@@ -9,7 +9,7 @@ from urllib.parse import quote
 from fastapi import HTTPException, UploadFile
 from fastapi.routing import APIRoute
 
-from app.core.auth import require_superadmin
+from app.core.auth import require_authenticated_account
 
 
 class SensitiveWordApiTests(unittest.TestCase):
@@ -18,8 +18,9 @@ class SensitiveWordApiTests(unittest.TestCase):
 
         self.crawler_api = crawler_api
         self.superadmin = {"username": "superadmin", "role": "superadmin"}
+        self.operator = {"username": "alice", "role": "operator"}
 
-    def test_sensitive_word_routes_require_superadmin(self) -> None:
+    def test_sensitive_word_routes_require_authenticated_account(self) -> None:
         expected_routes = {
             ("GET", "/crawler/settings/sensitive-words"),
             ("POST", "/crawler/settings/sensitive-words"),
@@ -46,7 +47,11 @@ class SensitiveWordApiTests(unittest.TestCase):
                 if isinstance(route, APIRoute) and route.path == path and method in route.methods
             )
             dependency_calls = [dependency.call for dependency in route.dependant.dependencies]
-            self.assertIn(require_superadmin, dependency_calls, f"{method} {path} should depend on require_superadmin")
+            self.assertIn(
+                require_authenticated_account,
+                dependency_calls,
+                f"{method} {path} should depend on require_authenticated_account",
+            )
 
     def test_list_sensitive_words_returns_service_result_and_query_params(self) -> None:
         service_result = {
@@ -66,10 +71,10 @@ class SensitiveWordApiTests(unittest.TestCase):
         }
 
         with patch.object(self.crawler_api.sensitive_word_service, "list_sensitive_words", return_value=service_result) as mock_list:
-            response = self.crawler_api.list_sensitive_words(page=2, pageSize=5, keyword="即", _=self.superadmin)
+            response = self.crawler_api.list_sensitive_words(page=2, pageSize=5, keyword="即", user=self.operator)
 
         self.assertEqual(response, service_result)
-        mock_list.assert_called_once_with(page=2, page_size=5, keyword="即")
+        mock_list.assert_called_once_with("alice", page=2, page_size=5, keyword="即")
 
     def test_create_sensitive_word_returns_wrapped_service_result(self) -> None:
         payload = self.crawler_api.SensitiveWordPayload(word="翌日配達", enabled=False)
@@ -83,10 +88,10 @@ class SensitiveWordApiTests(unittest.TestCase):
         }
 
         with patch.object(self.crawler_api.sensitive_word_service, "create_sensitive_word", return_value=created) as mock_create:
-            response = self.crawler_api.create_sensitive_word(payload, _=self.superadmin)
+            response = self.crawler_api.create_sensitive_word(payload, user=self.operator)
 
         self.assertEqual(response, {"sensitiveWord": created})
-        mock_create.assert_called_once_with("翌日配達", False)
+        mock_create.assert_called_once_with("alice", "翌日配達", False)
 
     def test_create_sensitive_word_maps_duplicate_to_conflict(self) -> None:
         payload = self.crawler_api.SensitiveWordPayload(word="即納", enabled=True)
@@ -97,7 +102,7 @@ class SensitiveWordApiTests(unittest.TestCase):
             side_effect=RuntimeError("敏感词已存在。"),
         ):
             with self.assertRaises(HTTPException) as context:
-                self.crawler_api.create_sensitive_word(payload, _=self.superadmin)
+                self.crawler_api.create_sensitive_word(payload, user=self.operator)
 
         self.assertEqual(context.exception.status_code, 409)
         self.assertEqual(context.exception.detail, "敏感词已存在。")
@@ -111,7 +116,7 @@ class SensitiveWordApiTests(unittest.TestCase):
             side_effect=RuntimeError("敏感词不能为空。"),
         ):
             with self.assertRaises(HTTPException) as context:
-                self.crawler_api.create_sensitive_word(payload, _=self.superadmin)
+                self.crawler_api.create_sensitive_word(payload, user=self.operator)
 
         self.assertEqual(context.exception.status_code, 400)
         self.assertEqual(context.exception.detail, "敏感词不能为空。")
@@ -128,10 +133,10 @@ class SensitiveWordApiTests(unittest.TestCase):
         }
 
         with patch.object(self.crawler_api.sensitive_word_service, "update_sensitive_word", return_value=updated) as mock_update:
-            response = self.crawler_api.update_sensitive_word(9, payload, _=self.superadmin)
+            response = self.crawler_api.update_sensitive_word(9, payload, user=self.operator)
 
         self.assertEqual(response, {"sensitiveWord": updated})
-        mock_update.assert_called_once_with(9, "【】", True)
+        mock_update.assert_called_once_with("alice", 9, "【】", True)
 
     def test_update_sensitive_word_maps_missing_to_not_found(self) -> None:
         payload = self.crawler_api.SensitiveWordPayload(word="即納", enabled=True)
@@ -142,22 +147,22 @@ class SensitiveWordApiTests(unittest.TestCase):
             side_effect=RuntimeError("敏感词不存在。"),
         ):
             with self.assertRaises(HTTPException) as context:
-                self.crawler_api.update_sensitive_word(123, payload, _=self.superadmin)
+                self.crawler_api.update_sensitive_word(123, payload, user=self.operator)
 
         self.assertEqual(context.exception.status_code, 404)
         self.assertEqual(context.exception.detail, "敏感词不存在。")
 
     def test_delete_sensitive_word_returns_deleted_flag(self) -> None:
         with patch.object(self.crawler_api.sensitive_word_service, "delete_sensitive_word", return_value=True) as mock_delete:
-            response = self.crawler_api.delete_sensitive_word(8, _=self.superadmin)
+            response = self.crawler_api.delete_sensitive_word(8, user=self.operator)
 
         self.assertEqual(response, {"deleted": True})
-        mock_delete.assert_called_once_with(8)
+        mock_delete.assert_called_once_with("alice", 8)
 
     def test_delete_sensitive_word_maps_missing_to_not_found(self) -> None:
         with patch.object(self.crawler_api.sensitive_word_service, "delete_sensitive_word", return_value=False):
             with self.assertRaises(HTTPException) as context:
-                self.crawler_api.delete_sensitive_word(8, _=self.superadmin)
+                self.crawler_api.delete_sensitive_word(8, user=self.operator)
 
         self.assertEqual(context.exception.status_code, 404)
         self.assertEqual(context.exception.detail, "敏感词不存在。")
@@ -172,7 +177,7 @@ class SensitiveWordApiTests(unittest.TestCase):
             "build_sensitive_word_template",
             return_value=content,
         ) as mock_template:
-            response = self.crawler_api.download_sensitive_word_template(_=self.superadmin)
+            response = self.crawler_api.download_sensitive_word_template(_=self.operator)
 
         body = asyncio.run(self._read_streaming_response(response))
 
@@ -196,10 +201,10 @@ class SensitiveWordApiTests(unittest.TestCase):
             "import_sensitive_words",
             return_value=import_result,
         ) as mock_import:
-            response = asyncio.run(self.crawler_api.import_sensitive_words(upload, _=self.superadmin))
+            response = asyncio.run(self.crawler_api.import_sensitive_words(upload, user=self.operator))
 
         self.assertEqual(response, import_result)
-        mock_import.assert_called_once_with(b"excel-content", "sensitive-words.xlsx")
+        mock_import.assert_called_once_with("alice", b"excel-content", "sensitive-words.xlsx")
 
     def test_import_sensitive_words_maps_runtime_errors_to_bad_request(self) -> None:
         upload = UploadFile(filename="sensitive-words.xlsx", file=BytesIO(b""))
@@ -210,7 +215,7 @@ class SensitiveWordApiTests(unittest.TestCase):
             side_effect=RuntimeError("导入文件为空。"),
         ):
             with self.assertRaises(HTTPException) as context:
-                asyncio.run(self.crawler_api.import_sensitive_words(upload, _=self.superadmin))
+                asyncio.run(self.crawler_api.import_sensitive_words(upload, user=self.operator))
 
         self.assertEqual(context.exception.status_code, 400)
         self.assertEqual(context.exception.detail, "导入文件为空。")

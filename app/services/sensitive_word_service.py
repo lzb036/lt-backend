@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.db.database import SessionLocal
-from app.db.models import ProductModel, SensitiveWordModel
+from app.db.models import ProductModel, SensitiveWordModel, UserAccountModel
 
 BRACKET_RULE = "【】"
 BRACKET_SEGMENT_RE = re.compile(r"【[^】]*】")
@@ -98,10 +98,17 @@ def sanitize_product_payload(payload: dict[str, Any], words: Iterable[str]) -> t
     return _sanitize_product_payload_with_prepared_words(payload, normalized_words, bracket_rule_enabled)
 
 
-def seed_default_sensitive_words(session: Any) -> int:
+def seed_default_sensitive_words_for_user(session: Any, owner_username: str) -> int:
+    normalized_owner = normalize_sensitive_word(owner_username)
+    if not normalized_owner:
+        return 0
     existing_words = {
         normalize_sensitive_word(word)
-        for word in session.scalars(select(SensitiveWordModel.word)).all()
+        for word in session.scalars(
+            select(SensitiveWordModel.word).where(
+                SensitiveWordModel.owner_username == normalized_owner,
+            )
+        ).all()
         if normalize_sensitive_word(word)
     }
     created_count = 0
@@ -109,7 +116,13 @@ def seed_default_sensitive_words(session: Any) -> int:
         normalized = normalize_sensitive_word(word)
         if not normalized or normalized in existing_words:
             continue
-        session.add(SensitiveWordModel(word=normalized, enabled=True))
+        session.add(
+            SensitiveWordModel(
+                owner_username=normalized_owner,
+                word=normalized,
+                enabled=True,
+            )
+        )
         existing_words.add(normalized)
         created_count += 1
     if created_count:
@@ -117,12 +130,27 @@ def seed_default_sensitive_words(session: Any) -> int:
     return created_count
 
 
-def list_sensitive_words(page: int, page_size: int, keyword: str = "") -> dict[str, Any]:
+def seed_default_sensitive_words(session: Any) -> int:
+    created_count = 0
+    for owner_username in session.scalars(select(UserAccountModel.username)).all():
+        created_count += seed_default_sensitive_words_for_user(session, owner_username)
+    return created_count
+
+
+def list_sensitive_words(
+    owner_username: str,
+    page: int,
+    page_size: int,
+    keyword: str = "",
+) -> dict[str, Any]:
     normalized_page, normalized_page_size = _normalize_page_params(page, page_size)
+    normalized_owner = normalize_sensitive_word(owner_username)
     normalized_keyword = normalize_sensitive_word(keyword)
 
     with SessionLocal() as session:
-        query = select(SensitiveWordModel)
+        query = select(SensitiveWordModel).where(
+            SensitiveWordModel.owner_username == normalized_owner,
+        )
         if normalized_keyword:
             query = query.where(SensitiveWordModel.word.like(f"%{normalized_keyword}%"))
         total = int(session.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0)
@@ -142,13 +170,20 @@ def list_sensitive_words(page: int, page_size: int, keyword: str = "") -> dict[s
         }
 
 
-def create_sensitive_word(word: str, enabled: bool = True) -> dict[str, Any]:
+def create_sensitive_word(owner_username: str, word: str, enabled: bool = True) -> dict[str, Any]:
+    normalized_owner = normalize_sensitive_word(owner_username)
     normalized_word = normalize_sensitive_word(word)
+    if not normalized_owner:
+        raise RuntimeError("用户信息无效。")
     if not normalized_word:
         raise RuntimeError("敏感词不能为空。")
 
     with SessionLocal() as session:
-        row = SensitiveWordModel(word=normalized_word, enabled=bool(enabled))
+        row = SensitiveWordModel(
+            owner_username=normalized_owner,
+            word=normalized_word,
+            enabled=bool(enabled),
+        )
         session.add(row)
         try:
             session.commit()
@@ -159,13 +194,26 @@ def create_sensitive_word(word: str, enabled: bool = True) -> dict[str, Any]:
         return _sensitive_word_to_public(row)
 
 
-def update_sensitive_word(word_id: int, word: str, enabled: bool) -> dict[str, Any]:
+def update_sensitive_word(
+    owner_username: str,
+    word_id: int,
+    word: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    normalized_owner = normalize_sensitive_word(owner_username)
     normalized_word = normalize_sensitive_word(word)
+    if not normalized_owner:
+        raise RuntimeError("用户信息无效。")
     if not normalized_word:
         raise RuntimeError("敏感词不能为空。")
 
     with SessionLocal() as session:
-        row = session.get(SensitiveWordModel, int(word_id))
+        row = session.scalar(
+            select(SensitiveWordModel).where(
+                SensitiveWordModel.id == int(word_id),
+                SensitiveWordModel.owner_username == normalized_owner,
+            )
+        )
         if row is None:
             raise RuntimeError("敏感词不存在。")
         row.word = normalized_word
@@ -179,9 +227,15 @@ def update_sensitive_word(word_id: int, word: str, enabled: bool) -> dict[str, A
         return _sensitive_word_to_public(row)
 
 
-def delete_sensitive_word(word_id: int) -> bool:
+def delete_sensitive_word(owner_username: str, word_id: int) -> bool:
+    normalized_owner = normalize_sensitive_word(owner_username)
     with SessionLocal() as session:
-        row = session.get(SensitiveWordModel, int(word_id))
+        row = session.scalar(
+            select(SensitiveWordModel).where(
+                SensitiveWordModel.id == int(word_id),
+                SensitiveWordModel.owner_username == normalized_owner,
+            )
+        )
         if row is None:
             return False
         session.delete(row)
@@ -189,12 +243,16 @@ def delete_sensitive_word(word_id: int) -> bool:
         return True
 
 
-def active_sensitive_words(session: Any) -> list[str]:
+def active_sensitive_words(session: Any, owner_username: str) -> list[str]:
+    normalized_owner = normalize_sensitive_word(owner_username)
     return [
         normalize_sensitive_word(word)
         for word in session.scalars(
             select(SensitiveWordModel.word)
-            .where(SensitiveWordModel.enabled.is_(True))
+            .where(
+                SensitiveWordModel.owner_username == normalized_owner,
+                SensitiveWordModel.enabled.is_(True),
+            )
             .order_by(func.length(SensitiveWordModel.word).desc(), SensitiveWordModel.word.asc(), SensitiveWordModel.id.asc())
         ).all()
         if normalize_sensitive_word(word)
@@ -217,7 +275,14 @@ def build_sensitive_word_template() -> bytes:
     return buffer.getvalue()
 
 
-def import_sensitive_words(content: bytes, filename: str) -> dict[str, int]:
+def import_sensitive_words(
+    owner_username: str,
+    content: bytes,
+    filename: str,
+) -> dict[str, int]:
+    normalized_owner = normalize_sensitive_word(owner_username)
+    if not normalized_owner:
+        raise RuntimeError("用户信息无效。")
     normalized_filename = normalize_sensitive_word(filename).lower()
     if not content:
         raise RuntimeError("导入文件为空。")
@@ -241,7 +306,11 @@ def import_sensitive_words(content: bytes, filename: str) -> dict[str, int]:
     with SessionLocal() as session:
         existing_words = {
             normalize_sensitive_word(word)
-            for word in session.scalars(select(SensitiveWordModel.word)).all()
+            for word in session.scalars(
+                select(SensitiveWordModel.word).where(
+                    SensitiveWordModel.owner_username == normalized_owner,
+                )
+            ).all()
             if normalize_sensitive_word(word)
         }
 
@@ -256,7 +325,13 @@ def import_sensitive_words(content: bytes, filename: str) -> dict[str, int]:
                 continue
             try:
                 with session.begin_nested():
-                    session.add(SensitiveWordModel(word=normalized_word, enabled=True))
+                    session.add(
+                        SensitiveWordModel(
+                            owner_username=normalized_owner,
+                            word=normalized_word,
+                            enabled=True,
+                        )
+                    )
                     session.flush()
             except IntegrityError as exc:
                 if _is_sensitive_word_unique_conflict(exc):
@@ -277,8 +352,13 @@ def import_sensitive_words(content: bytes, filename: str) -> dict[str, int]:
     }
 
 
-def cleanup_pending_products(session: Any, *, apply: bool = False) -> dict[str, int]:
-    active_words = active_sensitive_words(session)
+def cleanup_pending_products(
+    session: Any,
+    owner_username: str,
+    *,
+    apply: bool = False,
+) -> dict[str, int]:
+    active_words = active_sensitive_words(session, owner_username)
     bracket_rule_enabled, literal_words = _prepare_sensitive_words(active_words)
     scanned_count = 0
     matched_count = 0
@@ -287,7 +367,10 @@ def cleanup_pending_products(session: Any, *, apply: bool = False) -> dict[str, 
 
     pending_products = session.scalars(
         select(ProductModel)
-        .where(ProductModel.review_status == "pending")
+        .where(
+            ProductModel.owner_username == normalize_sensitive_word(owner_username),
+            ProductModel.review_status == "pending",
+        )
         .order_by(ProductModel.id.asc())
     ).all()
 

@@ -956,6 +956,122 @@ def _backfill_listed_product_dates(connection: Connection) -> None:
         )
 
 
+def _migrate_sensitive_word_owner_scope(connection: Connection, model_module) -> None:
+    table_name = model_module.SensitiveWordModel.__table__.name
+    if table_name not in _table_names(connection):
+        return
+
+    columns = set(_column_info(connection, table_name))
+    if "owner_username" not in columns:
+        connection.execute(
+            text(
+                f"ALTER TABLE {_quote_mysql_identifier(table_name)} "
+                "ADD COLUMN owner_username VARCHAR(255) NULL"
+            )
+        )
+
+    legacy_unique_names = {
+        str(item.get("name") or "")
+        for item in _unique_constraint_info(connection, table_name)
+    }
+    legacy_unique_names.update(_index_info(connection, table_name))
+    if "uq_lt_sensitive_word" in legacy_unique_names:
+        connection.execute(
+            text(
+                f"ALTER TABLE {_quote_mysql_identifier(table_name)} "
+                "DROP INDEX `uq_lt_sensitive_word`"
+            )
+        )
+
+    usernames = [
+        str(username)
+        for username in connection.execute(
+            text("SELECT username FROM lt_user_accounts")
+        ).scalars()
+        if str(username or "").strip()
+    ]
+    legacy_rows_exist = connection.execute(
+        text(
+            f"SELECT 1 FROM {_quote_mysql_identifier(table_name)} "
+            "WHERE owner_username IS NULL LIMIT 1"
+        )
+    ).first()
+    if legacy_rows_exist and not usernames:
+        raise _compatibility_error(
+            table_name,
+            "cannot migrate legacy sensitive words before users exist",
+        )
+
+    for username in usernames:
+        connection.execute(
+            text(
+                f"""
+                INSERT INTO {_quote_mysql_identifier(table_name)}
+                    (owner_username, word, enabled, created_at, updated_at)
+                SELECT
+                    :owner_username, legacy.word, legacy.enabled,
+                    legacy.created_at, legacy.updated_at
+                FROM {_quote_mysql_identifier(table_name)} AS legacy
+                WHERE legacy.owner_username IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {_quote_mysql_identifier(table_name)} AS existing
+                      WHERE existing.owner_username = :owner_username
+                        AND existing.word = legacy.word
+                  )
+                """
+            ),
+            {"owner_username": username},
+        )
+    connection.execute(
+        text(
+            f"DELETE FROM {_quote_mysql_identifier(table_name)} "
+            "WHERE owner_username IS NULL"
+        )
+    )
+
+    remaining_null = connection.execute(
+        text(
+            f"SELECT 1 FROM {_quote_mysql_identifier(table_name)} "
+            "WHERE owner_username IS NULL LIMIT 1"
+        )
+    ).first()
+    if remaining_null is not None:
+        raise _compatibility_error(
+            table_name,
+            "owner_username backfill is incomplete",
+        )
+    connection.execute(
+        text(
+            f"ALTER TABLE {_quote_mysql_identifier(table_name)} "
+            "MODIFY COLUMN owner_username VARCHAR(255) NOT NULL"
+        )
+    )
+
+    sensitive_table = model_module.SensitiveWordModel.__table__
+    unique_constraint = next(
+        constraint
+        for constraint in sensitive_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_lt_sensitive_word_owner_word"
+    )
+    foreign_key_constraint = next(
+        constraint
+        for constraint in sensitive_table.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+        and constraint.name == "fk_lt_sensitive_word_owner"
+    )
+    _ensure_constraint(connection, sensitive_table, unique_constraint)
+    _ensure_constraint(connection, sensitive_table, foreign_key_constraint)
+    if "ix_lt_sensitive_word_owner_enabled" not in _index_info(connection, table_name):
+        connection.execute(
+            text(
+                "CREATE INDEX `ix_lt_sensitive_word_owner_enabled` "
+                f"ON {_quote_mysql_identifier(table_name)} (`owner_username`, `enabled`)"
+            )
+        )
+
+
 def ensure_schema_compatibility() -> None:
     url = make_url(settings.database_url)
     if not url.drivername.startswith("mysql"):
@@ -1021,6 +1137,8 @@ def ensure_schema_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE lt_user_accounts MODIFY COLUMN pagination_preferences_json TEXT NOT NULL")
             )
+
+        _migrate_sensitive_word_owner_scope(connection, model_module)
 
         announcement_columns = set(
             connection.execute(

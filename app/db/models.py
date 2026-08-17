@@ -238,9 +238,25 @@ class SystemSettingModel(TimestampMixin, Base):
 
 class SensitiveWordModel(TimestampMixin, Base):
     __tablename__ = "lt_sensitive_words"
-    __table_args__ = (UniqueConstraint("word", name="uq_lt_sensitive_word"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_username",
+            "word",
+            name="uq_lt_sensitive_word_owner_word",
+        ),
+        Index("ix_lt_sensitive_word_owner_enabled", "owner_username", "enabled"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    owner_username: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey(
+            "lt_user_accounts.username",
+            ondelete="CASCADE",
+            name="fk_lt_sensitive_word_owner",
+        ),
+        nullable=False,
+    )
     word: Mapped[str] = mapped_column(String(500), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
 
