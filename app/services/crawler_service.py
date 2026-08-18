@@ -3053,6 +3053,10 @@ def scheduled_crawl_to_public(row: ScheduledCrawlModel) -> dict[str, Any]:
     }
 
 
+def _is_immediate_manual_task(task_type: str | None, schedule_type: str | None) -> bool:
+    return task_type == "manual" and schedule_type != "once"
+
+
 def auto_listing_schedule_to_public(
     row: AutoListingScheduleModel,
     store: StoreModel | None = None,
@@ -3063,6 +3067,7 @@ def auto_listing_schedule_to_public(
         last_task_ids = []
     if not isinstance(last_task_ids, list):
         last_task_ids = []
+    immediate_manual = _is_immediate_manual_task(row.task_type, row.schedule_type)
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -3083,7 +3088,7 @@ def auto_listing_schedule_to_public(
         "enabled": bool(row.enabled),
         "status": row.status,
         "lastRunAt": datetime_to_public(row.last_run_at),
-        "nextRunAt": datetime_to_public(row.next_run_at),
+        "nextRunAt": None if immediate_manual else datetime_to_public(row.next_run_at),
         "lastTaskIds": [str(value) for value in last_task_ids if str(value).strip()],
         "lastMessage": row.last_message,
         "lastError": row.last_error,
@@ -3337,6 +3342,7 @@ def auto_deletion_task_to_public(row: AutoDeletionTaskModel, store: StoreModel |
         task_ids = json.loads(row.last_task_ids_json or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         task_ids = []
+    immediate_manual = _is_immediate_manual_task(row.task_type, row.schedule_type)
     return {
         "id": row.id,
         "ownerUsername": row.owner_username,
@@ -3357,7 +3363,7 @@ def auto_deletion_task_to_public(row: AutoDeletionTaskModel, store: StoreModel |
         "enabled": bool(row.enabled),
         "status": row.status,
         "lastRunAt": datetime_to_public(row.last_run_at),
-        "nextRunAt": datetime_to_public(row.next_run_at),
+        "nextRunAt": None if immediate_manual else datetime_to_public(row.next_run_at),
         "lastTaskIds": task_ids if isinstance(task_ids, list) else [],
         "lastMessage": row.last_message,
         "lastError": row.last_error,

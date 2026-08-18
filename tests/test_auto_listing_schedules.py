@@ -389,6 +389,7 @@ def test_immediate_manual_listing_task_dispatches_after_commit(
     )
 
     assert created["status"] == "idle"
+    assert created["nextRunAt"] is None
     assert calls == [(created["id"], "alice", False)]
 
 
@@ -701,6 +702,7 @@ def test_immediate_manual_deletion_tasks_queue_when_store_busy(
     )
 
     assert created["status"] == "idle"
+    assert created["nextRunAt"] is None
     assert created["lastMessage"] == "任务已受理，后台正在创建删除任务。"
     assert calls == [(created["id"], "alice", False)]
 
@@ -723,6 +725,9 @@ def test_immediate_manual_deletion_tasks_queue_when_store_busy(
     with database() as session:
         row = session.get(AutoDeletionTaskModel, created["id"])
         row.status = "completed"
+
+    listed = crawler_service.list_auto_deletion_tasks("alice", task_type="manual")
+    assert next(task for task in listed if task["id"] == created["id"])["nextRunAt"] is None
 
     crawler_service.delete_auto_deletion_task("alice", created["id"])
     with database() as session:
