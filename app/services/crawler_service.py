@@ -272,7 +272,14 @@ RAKUTEN_CABINET_FOLDER_PAGE_SIZE = 100
 RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT = 500
 RAKUTEN_CABINET_FOLDER_CREATE_ATTEMPTS = 10
 RAKUTEN_CABINET_FOLDER_LOCK_TIMEOUT_SECONDS = 120
-RAKUTEN_CABINET_FOLDER_VISIBILITY_DELAYS_SECONDS = (1.0, 2.0, 3.0)
+RAKUTEN_CABINET_FOLDER_VISIBILITY_DELAYS_SECONDS = (
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    8.0,
+    13.0,
+)
 RAKUTEN_CABINET_QPS_COOLDOWN_SECONDS = 5 * 60
 RAKUTEN_CABINET_REQUEST_MAX_RETRIES = 6
 RAKUTEN_CABINET_QPS_BACKOFF_SECONDS = (1.5, 3.0, 5.0, 8.0, 13.0)
@@ -6428,7 +6435,13 @@ def ensure_listing_cabinet_folder_locked(
                 directory_name=directory_name,
             )
             folder["directoryName"] = directory_name
-            return folder
+            visible, folders = wait_for_visible_listing_cabinet_folder(
+                service_secret,
+                license_key,
+                directory_name,
+                required_slots,
+            )
+            return visible or folder
         except CabinetFolderAlreadyExistsError as exc:
             last_error = exc
             existing, folders = wait_for_visible_listing_cabinet_folder(
@@ -19416,7 +19429,6 @@ def upload_product_images_to_rakuten(
                     "fileUrl": result.get("fileUrl") or build_rakuten_cabinet_image_url(store.store_code, location),
                 }
             )
-            reserve_listing_cabinet_folder_slots(upload_cabinet_context, cabinet_folder, 1)
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
     except TaskCancelled:
@@ -19538,7 +19550,6 @@ def upload_product_description_images_to_rakuten(
                 }
             )
             replacement_map[image_url] = file_url
-            reserve_listing_cabinet_folder_slots(upload_cabinet_context, cabinet_folder, 1)
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
     except TaskCancelled:
@@ -19760,19 +19771,32 @@ def ensure_listing_cabinet_folder_for_upload(
     cabinet_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     context = cabinet_context if isinstance(cabinet_context, dict) else {}
-    cached_folder = context.get("currentFolder") if isinstance(context.get("currentFolder"), dict) else None
-    if cached_folder and cabinet_folder_remaining_slots(cached_folder) >= required_slots:
-        return cached_folder
-    folder = ensure_listing_cabinet_folder(
-        service_secret,
-        license_key,
-        store,
-        required_slots,
-        usage=context.get("usage") if isinstance(context.get("usage"), dict) else None,
-    )
-    if cabinet_context is not None:
-        cabinet_context["currentFolder"] = folder
-    return folder
+    context_lock = context.get("_lock")
+    if not hasattr(context_lock, "__enter__"):
+        context_lock = threading.RLock()
+        context["_lock"] = context_lock
+    with context_lock:
+        cached_folder = (
+            context.get("currentFolder")
+            if isinstance(context.get("currentFolder"), dict)
+            else None
+        )
+        if cached_folder and cabinet_folder_remaining_slots(cached_folder) >= required_slots:
+            folder = cached_folder
+        else:
+            folder = ensure_listing_cabinet_folder(
+                service_secret,
+                license_key,
+                store,
+                required_slots,
+                usage=context.get("usage") if isinstance(context.get("usage"), dict) else None,
+            )
+        folder["fileCount"] = int(folder.get("fileCount") or 0) + max(
+            0,
+            int(required_slots),
+        )
+        context["currentFolder"] = folder
+        return folder
 
 
 def reserve_listing_cabinet_folder_slots(
@@ -22001,7 +22025,7 @@ def run_listing_product_attempt(
     product_id: int,
     service_secret: str,
     license_key: str,
-    cabinet_usage: dict[str, Any] | None,
+    cabinet_context: dict[str, Any],
 ) -> ListingProductAttemptResult:
     with session_scope() as session:
         store = session.get(StoreModel, store_id)
@@ -22036,7 +22060,7 @@ def run_listing_product_attempt(
                 license_key,
                 store,
                 product,
-                cabinet_context={"usage": dict(cabinet_usage or {})},
+                cabinet_context=cabinet_context,
                 cancel_check=lambda: listing_task_cancel_requested(task_id),
             )
             listed_product = upsert_listed_store_product_from_listing_result(
@@ -22196,6 +22220,10 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
             len(ordered_product_ids),
             retry=bool(retry_product_ids),
         )
+        cabinet_context: dict[str, Any] = {
+            "usage": dict(cabinet_usage or {}),
+            "_lock": threading.RLock(),
+        }
         cancellation_error: TaskCancelled | None = None
         with ThreadPoolExecutor(
             max_workers=worker_count,
@@ -22210,7 +22238,7 @@ def _run_listing_task(owner_username: str, task_id: str) -> None:
                     product_id,
                     service_secret,
                     license_key,
-                    cabinet_usage,
+                    cabinet_context,
                 ): product_id
                 for product_id in ordered_product_ids
             }

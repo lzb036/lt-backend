@@ -163,6 +163,44 @@ def test_concurrently_created_folder_is_reused(monkeypatch):
     assert folder["directoryName"] == "yx20260730-1"
 
 
+def test_created_folder_waits_until_visible_before_releasing_lock(monkeypatch):
+    freeze_now(monkeypatch, datetime(2026, 7, 30, 12, 0, 0))
+    visible_folder = {
+        "folderId": 89,
+        "folderName": "YX20260730-1",
+        "directoryName": "yx20260730-1",
+        "fileCount": 0,
+    }
+    fetch_results = [[], [visible_folder]]
+    monkeypatch.setattr(
+        crawler_service,
+        "fetch_rakuten_cabinet_folders",
+        lambda *_: fetch_results.pop(0),
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "create_rakuten_cabinet_folder",
+        lambda *_args, **kwargs: {
+            "folderId": 89,
+            "folderName": kwargs["folder_name"],
+            "directoryName": kwargs["directory_name"],
+            "fileCount": 0,
+        },
+    )
+    monkeypatch.setattr(crawler_service.time, "sleep", lambda _seconds: None)
+
+    folder = crawler_service.ensure_listing_cabinet_folder(
+        "secret",
+        "key",
+        SimpleNamespace(id=2, store_code="japaneden"),
+        1,
+        usage={"remainingFolderCount": 10},
+    )
+
+    assert folder == visible_folder
+    assert fetch_results == []
+
+
 def test_folder_creation_uses_store_scoped_distributed_lock(monkeypatch):
     events = []
 

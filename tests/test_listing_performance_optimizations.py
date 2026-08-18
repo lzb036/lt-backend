@@ -1935,6 +1935,7 @@ def test_listing_task_processes_two_products_concurrently(
     max_active = 0
     active_lock = threading.Lock()
     all_workers_started = threading.Barrier(2)
+    cabinet_contexts = []
 
     def fake_attempt(
         _owner,
@@ -1943,9 +1944,10 @@ def test_listing_task_processes_two_products_concurrently(
         product_id,
         _secret,
         _key,
-        _cabinet_usage,
+        cabinet_context,
     ):
         nonlocal active, max_active
+        cabinet_contexts.append(cabinet_context)
         with active_lock:
             active += 1
             max_active = max(max_active, active)
@@ -2013,6 +2015,8 @@ def test_listing_task_processes_two_products_concurrently(
     crawler_service._run_listing_task("alice", "listing-task")
 
     assert max_active == 2
+    assert len({id(context) for context in cabinet_contexts}) == 1
+    assert cabinet_contexts[0]["usage"] == {}
     with session_factory() as session:
         task = session.get(ListingTaskModel, "listing-task")
         assert task is not None
