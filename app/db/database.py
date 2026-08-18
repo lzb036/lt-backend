@@ -10,6 +10,7 @@ from sqlalchemy import (
     and_,
     bindparam,
     create_engine,
+    event,
     exists,
     func,
     inspect,
@@ -29,6 +30,35 @@ from app.core.config import settings
 
 class Base(DeclarativeBase):
     pass
+
+
+TASK_FINISHED_AT_TABLES = frozenset(
+    {
+        "lt_crawl_tasks",
+        "lt_listing_tasks",
+        "lt_sync_tasks",
+        "lt_sales_order_sync_runs",
+    }
+)
+
+
+@event.listens_for(Session, "before_flush")
+def preserve_first_task_finished_at(
+    session: Session,
+    _flush_context: object,
+    _instances: object,
+) -> None:
+    for row in session.dirty:
+        state = inspect(row)
+        if state.mapper.local_table.name not in TASK_FINISHED_AT_TABLES:
+            continue
+        history = state.attrs.finished_at.history
+        original = next(
+            (value for value in history.deleted if value is not None),
+            None,
+        )
+        if original is not None and row.finished_at != original:
+            row.finished_at = original
 
 
 def _quote_mysql_identifier(value: str) -> str:
