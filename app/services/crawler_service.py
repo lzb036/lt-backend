@@ -17074,7 +17074,7 @@ def sanitize_rakuten_image_alt(value: Any, *, max_length: int = 255) -> str:
     text = soup.get_text(" ", strip=True)
     text = re.sub(r"<[^>]*>", " ", text)
     text = normalize_rakuten_machine_dependent_characters(normalize_text(text))
-    return truncate_text(text, max_length)
+    return truncate_utf8_bytes(text, max_length)
 
 
 def patch_payload_for_machine_dependent_character_errors(payload: dict[str, Any], error_text: str) -> dict[str, Any]:

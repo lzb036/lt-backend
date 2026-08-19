@@ -193,6 +193,31 @@ class ProductReplacementTests(unittest.TestCase):
         self.assertLessEqual(len(payload["title"].encode("utf-8")), 255)
         self.assertLessEqual(len(payload["tagline"].encode("utf-8")), 174)
 
+    def test_rakuten_payload_limits_image_alt_by_utf8_bytes(self) -> None:
+        product = SimpleNamespace(
+            id=9,
+            title="主" * 100,
+            genre_id="200002",
+            price=1880,
+            rakuten_manage_number="target-manage",
+        )
+        raw = {
+            "title": "主" * 100,
+            "genreId": "200002",
+            "price": "1880",
+            "variants": {},
+        }
+
+        payload = crawler_service.build_rakuten_item_upsert_payload(
+            product,
+            raw,
+            [{"location": "folder/image.jpg"}],
+            manage_number="target-manage",
+        )
+
+        self.assertEqual(len(payload["images"]), 1)
+        self.assertLessEqual(len(payload["images"][0]["alt"].encode("utf-8")), 255)
+
     def test_replacement_difference_marks_changed_sections(self) -> None:
         before = {
             "title": "旧标题",
