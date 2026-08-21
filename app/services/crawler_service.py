@@ -291,6 +291,8 @@ RAKUTEN_CABINET_UPSTREAM_ERROR_MARKERS = (
 )
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 500
+PRODUCT_LIST_MAX_PAGE_SIZE = 100
+PRODUCT_LIST_SERIALIZATION_LIMIT = threading.BoundedSemaphore(2)
 IGNORED_CABINET_IMAGE_FILENAMES = {"bg_logo.gif", "bg_logo2.gif", "bg_logo3.gif", "spacer.gif", "blank.gif"}
 RAKUTEN_ATTRIBUTE_PLACEHOLDER_VALUES = {"-", "ー", "－", "―", "なし", "無し", "無", "不明", "n/a", "N/A", "na", "NA"}
 RAKUTEN_ATTRIBUTE_ALLOW_PLACEHOLDER_NAMES = {"ブランド名", "シリーズ名", "メーカー型番", "原産国／製造国"}
@@ -10359,7 +10361,11 @@ def list_products(
         collected_at_from_value = parse_datetime_filter(collected_at_from)
         collected_at_to_value = parse_datetime_filter(collected_at_to)
         normalized_page = max(1, int(page or 1))
-        normalized_page_size = min(500, max(1, int(page_size or 0))) if page_size else None
+        normalized_page_size = (
+            min(PRODUCT_LIST_MAX_PAGE_SIZE, max(1, int(page_size or 0)))
+            if page_size
+            else None
+        )
         product_status = _product_status_filter(status)
         normalized_genre_status = normalize_text(genre_status).lower()
         normalized_genre_path = normalize_text(genre_path)
@@ -10732,7 +10738,7 @@ def list_products(
                 for identity, period_sales_count
                 in identities_with_sales
             }
-            public_rows = _products_to_public_with_period_sales(
+            public_rows = _serialize_products_with_memory_guard(
                 session,
                 rows,
                 owner_username,
@@ -10781,7 +10787,7 @@ def list_products(
                 if int(product_id) in rows_by_id
             ]
             return {
-                "products": _products_to_public_with_period_sales(
+                "products": _serialize_products_with_memory_guard(
                     session,
                     rows,
                     owner_username,
@@ -10793,11 +10799,29 @@ def list_products(
             }
 
         rows = session.scalars(query.order_by(*order_by)).all()
+        return _serialize_products_with_memory_guard(
+            session,
+            rows,
+            owner_username,
+            sales_period_range,
+        )
+
+
+def _serialize_products_with_memory_guard(
+    session: Any,
+    rows: list[ProductModel],
+    owner_username: str,
+    sales_period_range: tuple[date, date] | None,
+    *,
+    period_sales_counts: dict[int, int | None] | None = None,
+) -> list[dict[str, Any]]:
+    with PRODUCT_LIST_SERIALIZATION_LIMIT:
         return _products_to_public_with_period_sales(
             session,
             rows,
             owner_username,
             sales_period_range,
+            period_sales_counts=period_sales_counts,
         )
 
 

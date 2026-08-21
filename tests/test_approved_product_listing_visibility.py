@@ -103,3 +103,43 @@ def test_approved_list_hides_listing_products_and_restores_only_failed_products(
     assert [item["title"] for item in after_success["products"]] == ["普通已审核商品"]
 
     engine.dispose()
+
+
+def test_product_list_caps_large_page_size_to_memory_safe_limit(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+    @contextmanager
+    def local_session_scope():
+        session = factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    with local_session_scope() as session:
+        session.add(
+            UserAccountModel(
+                username="alice",
+                display_name="Alice",
+                password_salt_b64="salt",
+                password_hash_b64="hash",
+            )
+        )
+
+    monkeypatch.setattr(crawler_service, "session_scope", local_session_scope)
+
+    result = crawler_service.list_products(
+        "alice",
+        status="approved",
+        page=1,
+        page_size=500,
+    )
+
+    assert result["pageSize"] == crawler_service.PRODUCT_LIST_MAX_PAGE_SIZE
+    engine.dispose()
