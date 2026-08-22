@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
 from app.services import crawler_service
 
 
@@ -321,3 +323,178 @@ def test_product_images_fill_current_folder_before_switching(monkeypatch):
     ]
     assert first_folder["fileCount"] == 500
     assert second_folder["fileCount"] == 1
+
+
+def test_redis_slot_reservation_prevents_two_contexts_using_same_last_slot(monkeypatch):
+    class FakeLock:
+        def acquire(self, blocking=True):
+            return True
+
+        def release(self):
+            return None
+
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+
+        def lock(self, _name, **_kwargs):
+            return FakeLock()
+
+        def get(self, name):
+            return self.values.get(name)
+
+        def set(self, name, value, **_kwargs):
+            self.values[name] = value
+            return True
+
+    folders = [
+        {
+            "folderId": 1,
+            "folderName": "YX20260730-1",
+            "directoryName": "yx20260730-1",
+            "fileCount": 499,
+        },
+        {
+            "folderId": 2,
+            "folderName": "YX20260730-2",
+            "directoryName": "yx20260730-2",
+            "fileCount": 0,
+        },
+    ]
+    redis = FakeRedis()
+    monkeypatch.setattr(crawler_service, "should_use_redis_task_queue", lambda: True)
+    monkeypatch.setattr(crawler_service, "redis_connection", lambda: redis)
+    monkeypatch.setattr(crawler_service, "fetch_rakuten_cabinet_folders", lambda *_: folders)
+
+    first = crawler_service.ensure_listing_cabinet_folder_for_upload(
+        "secret",
+        "key",
+        SimpleNamespace(id=1, store_code="store"),
+        1,
+        cabinet_context={},
+    )
+    second = crawler_service.ensure_listing_cabinet_folder_for_upload(
+        "secret",
+        "key",
+        SimpleNamespace(id=1, store_code="store"),
+        1,
+        cabinet_context={},
+    )
+
+    assert first["folderId"] == 1
+    assert second["folderId"] == 2
+    assert first["_cabinetReservation"]["token"] != second["_cabinetReservation"]["token"]
+
+
+def test_cabinet_3006_refreshes_and_rotates_folder_before_retry(monkeypatch):
+    class FakeLock:
+        def acquire(self, blocking=True):
+            return True
+
+        def release(self):
+            return None
+
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+
+        def lock(self, _name, **_kwargs):
+            return FakeLock()
+
+        def get(self, name):
+            return self.values.get(name)
+
+        def set(self, name, value, **_kwargs):
+            self.values[name] = value
+            return True
+
+    folders = [
+        {
+            "folderId": 1,
+            "folderName": "YX20260730-1",
+            "directoryName": "yx20260730-1",
+            "fileCount": 0,
+        },
+        {
+            "folderId": 2,
+            "folderName": "YX20260730-2",
+            "directoryName": "yx20260730-2",
+            "fileCount": 0,
+        },
+    ]
+    redis = FakeRedis()
+    selected_folder_ids = []
+    monkeypatch.setattr(crawler_service, "should_use_redis_task_queue", lambda: True)
+    monkeypatch.setattr(crawler_service, "redis_connection", lambda: redis)
+    monkeypatch.setattr(crawler_service, "fetch_rakuten_cabinet_folders", lambda *_: folders)
+    monkeypatch.setattr(
+        crawler_service,
+        "recover_missing_local_product_images",
+        lambda _product, images: images,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "prepare_rakuten_listing_images",
+        lambda *_args, **_kwargs: [
+            {
+                "sourceUrl": "https://example.com/1.jpg",
+                "suffix": ".jpg",
+                "content": b"image",
+                "contentType": "image/jpeg",
+            }
+        ],
+    )
+
+    def insert_file(*_args, **kwargs):
+        selected_folder_ids.append(kwargs["folder_id"])
+        if len(selected_folder_ids) == 1:
+            raise crawler_service.RakutenCabinetFolderFullError(
+                "Number of files is upper limit，resultCode=3006",
+                folder_id=kwargs["folder_id"],
+            )
+        return {
+            "fileId": 2,
+            "filePath": kwargs["file_path"],
+        }
+
+    monkeypatch.setattr(crawler_service, "insert_rakuten_cabinet_file", insert_file)
+
+    uploaded = crawler_service.upload_product_images_to_rakuten(
+        "secret",
+        "key",
+        SimpleNamespace(store_code="store"),
+        SimpleNamespace(title="Product"),
+        "manage-number",
+        cabinet_context={},
+        source_images=["https://example.com/1.jpg"],
+    )
+
+    assert selected_folder_ids == [1, 2]
+    assert uploaded[0]["folderId"] == "2"
+    assert uploaded[0]["folderPath"] == "yx20260730-2"
+
+
+def test_insert_cabinet_file_raises_specific_error_for_result_code_3006(monkeypatch):
+    response = SimpleNamespace(
+        text=(
+            "<result><systemStatus>NG</systemStatus>"
+            "<message>Number of files is upper limit</message>"
+            "<resultCode>3006</resultCode></result>"
+        ),
+        status_code=200,
+    )
+    monkeypatch.setattr(crawler_service, "rakuten_cabinet_request", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(crawler_service.RakutenCabinetFolderFullError) as error:
+        crawler_service.insert_rakuten_cabinet_file(
+            "secret",
+            "key",
+            file_name="image",
+            file_path="image.jpg",
+            content=b"image",
+            content_type="image/jpeg",
+            folder_id=7,
+        )
+
+    assert error.value.folder_id == 7
+    assert "3006" in str(error.value)

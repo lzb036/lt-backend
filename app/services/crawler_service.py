@@ -280,6 +280,12 @@ RAKUTEN_CABINET_FOLDER_VISIBILITY_DELAYS_SECONDS = (
     8.0,
     13.0,
 )
+RAKUTEN_CABINET_FOLDER_REFRESH_INTERVAL_SECONDS = 30.0
+RAKUTEN_CABINET_FOLDER_SLOT_STATE_TTL_SECONDS = 24 * 60 * 60
+RAKUTEN_CABINET_FOLDER_SLOT_RESERVATION_TTL_SECONDS = 120
+RAKUTEN_CABINET_FOLDER_SLOT_VISIBILITY_TTL_SECONDS = 180
+RAKUTEN_CABINET_FOLDER_SATURATED_TTL_SECONDS = 10 * 60
+RAKUTEN_CABINET_FOLDER_SWITCH_RETRIES = 3
 RAKUTEN_CABINET_QPS_COOLDOWN_SECONDS = 5 * 60
 RAKUTEN_CABINET_REQUEST_MAX_RETRIES = 6
 RAKUTEN_CABINET_QPS_BACKOFF_SECONDS = (1.5, 3.0, 5.0, 8.0, 13.0)
@@ -6042,6 +6048,31 @@ def cabinet_xml_error_message(xml_text: str) -> str:
     return ""
 
 
+def cabinet_xml_result_code(xml_text: str) -> str:
+    text = normalize_text(xml_text)
+    if not text:
+        return ""
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return ""
+    for element in root.iter():
+        local_name = element.tag.split("}", 1)[-1].lower()
+        if local_name not in {"resultcode", "code"}:
+            continue
+        value = normalize_text(element.text)
+        if value:
+            return value
+    return ""
+
+
+def is_rakuten_cabinet_folder_full_xml(xml_text: str) -> bool:
+    result_code = cabinet_xml_result_code(xml_text)
+    if result_code == "3006":
+        return True
+    return "number of files is upper limit" in normalize_text(xml_text).lower()
+
+
 def fetch_rakuten_shop_meta(service_secret: str, license_key: str) -> dict[str, str]:
     if not service_secret or not license_key:
         raise RuntimeError("乐天 Secret 和乐天 Key 不能为空。")
@@ -6317,6 +6348,13 @@ class CabinetFolderAlreadyExistsError(RuntimeError):
         super().__init__(f"R-Cabinet 文件夹 {self.directory_name} 已存在。")
 
 
+class RakutenCabinetFolderFullError(RuntimeError):
+    def __init__(self, detail: str = "", *, folder_id: int = 0) -> None:
+        self.folder_id = int(folder_id or 0)
+        self.detail = normalize_text(detail) or "resultCode=3006，Number of files is upper limit"
+        super().__init__(f"R-Cabinet 文件夹文件数已达到上限：{self.detail}")
+
+
 def is_cabinet_same_folder_path_result(result: dict[str, Any]) -> bool:
     result_code = normalize_text(result.get("resultCode"))
     message = normalize_text(result.get("message") or result.get("detail")).lower()
@@ -6327,6 +6365,8 @@ def is_cabinet_same_folder_path_result(result: dict[str, Any]) -> bool:
 def rakuten_cabinet_folder_creation_lock(
     service_secret: str,
     license_key: str,
+    *,
+    require_distributed: bool = False,
 ) -> Iterator[None]:
     local_acquired = RAKUTEN_CABINET_FOLDER_CREATE_LOCK.acquire(
         timeout=RAKUTEN_CABINET_FOLDER_LOCK_TIMEOUT_SECONDS,
@@ -6357,6 +6397,8 @@ def rakuten_cabinet_folder_creation_lock(
             except RuntimeError:
                 raise
             except Exception:
+                if require_distributed:
+                    raise RuntimeError("R-Cabinet 店铺级分布式锁不可用，已停止继续分配图片文件夹。")
                 logger.warning("获取 R-Cabinet 文件夹分布式锁失败，使用本进程锁继续", exc_info=True)
                 distributed_lock = None
         yield
@@ -6392,6 +6434,7 @@ def ensure_listing_cabinet_folder(
     required_slots: int,
     *,
     usage: dict[str, int] | None = None,
+    exclude_folder_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     with rakuten_cabinet_folder_creation_lock(service_secret, license_key):
         return ensure_listing_cabinet_folder_locked(
@@ -6400,6 +6443,7 @@ def ensure_listing_cabinet_folder(
             store,
             required_slots,
             usage=usage,
+            exclude_folder_ids=exclude_folder_ids,
         )
 
 
@@ -6410,7 +6454,13 @@ def ensure_listing_cabinet_folder_locked(
     required_slots: int,
     *,
     usage: dict[str, int] | None = None,
+    exclude_folder_ids: set[int] | None = None,
 ) -> dict[str, Any]:
+    excluded_ids = {
+        int(folder_id)
+        for folder_id in (exclude_folder_ids or set())
+        if int(folder_id or 0) > 0
+    }
     folders = fetch_rakuten_cabinet_folders(service_secret, license_key)
     candidates = [
         folder
@@ -6418,6 +6468,8 @@ def ensure_listing_cabinet_folder_locked(
         if listing_cabinet_folder_identity(folder) is not None
     ]
     for folder in sorted(candidates, key=cabinet_listing_folder_sort_key):
+        if int(folder.get("folderId") or 0) in excluded_ids:
+            continue
         if cabinet_folder_remaining_slots(folder) > 0:
             return prepare_listing_cabinet_folder(folder)
 
@@ -6432,6 +6484,8 @@ def ensure_listing_cabinet_folder_locked(
         directory_name = listing_cabinet_directory_name(created_date, batch)
         existing = find_listing_cabinet_folder_by_directory(folders, directory_name)
         if existing:
+            if int(existing.get("folderId") or 0) in excluded_ids:
+                continue
             if cabinet_folder_remaining_slots(existing) > 0:
                 return prepare_listing_cabinet_folder(existing)
             continue
@@ -6458,7 +6512,7 @@ def ensure_listing_cabinet_folder_locked(
                 directory_name,
                 required_slots,
             )
-            if existing:
+            if existing and int(existing.get("folderId") or 0) not in excluded_ids:
                 return existing
             continue
         except Exception as exc:
@@ -6537,6 +6591,394 @@ def next_listing_cabinet_batch_number(folders: list[dict[str, Any]], created_dat
 
 def cabinet_folder_remaining_slots(folder: dict[str, Any]) -> int:
     return max(0, RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT - int(folder.get("fileCount") or 0))
+
+
+def listing_cabinet_slot_state_key(account_key: str, folder_id: int) -> str:
+    return f"lt:cabinet:folder-slots:{account_key}:{int(folder_id)}"
+
+
+def listing_cabinet_assignment_key(account_key: str) -> str:
+    return f"lt:cabinet:folder-assignment:{account_key}"
+
+
+def listing_cabinet_folder_account_key(service_secret: str, license_key: str) -> str:
+    return rakuten_request_account_key(
+        {
+            "Authorization": build_rakuten_authorization_header(
+                service_secret,
+                license_key,
+            )
+        }
+    )
+
+
+def _redis_json_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _listing_cabinet_slot_state(
+    connection: Any,
+    account_key: str,
+    folder: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    folder_id = int(folder.get("folderId") or 0)
+    if folder_id <= 0:
+        raise RuntimeError("R-Cabinet 文件夹缺少 folderId，不能预留图片槽位。")
+    key = listing_cabinet_slot_state_key(account_key, folder_id)
+    state = _redis_json_value(connection.get(key))
+    if not isinstance(state, dict):
+        state = {}
+    now = time.time()
+    reservations: dict[str, dict[str, Any]] = {}
+    raw_reservations = state.get("reservations")
+    if isinstance(raw_reservations, dict):
+        for token, raw_reservation in raw_reservations.items():
+            if not isinstance(raw_reservation, dict):
+                continue
+            try:
+                expires_at = float(raw_reservation.get("expiresAt") or 0)
+            except (TypeError, ValueError):
+                continue
+            if expires_at <= now:
+                continue
+            try:
+                slots = max(0, int(raw_reservation.get("slots") or 0))
+            except (TypeError, ValueError):
+                slots = 0
+            if slots <= 0:
+                continue
+            reservations[str(token)] = {
+                "slots": slots,
+                "expiresAt": expires_at,
+                "status": normalize_text(raw_reservation.get("status")) or "active",
+            }
+    remote_file_count = max(
+        0,
+        int(state.get("remoteFileCount") or 0),
+        int(folder.get("fileCount") or 0),
+    )
+    try:
+        saturated_until = float(state.get("saturatedUntil") or 0)
+    except (TypeError, ValueError):
+        saturated_until = 0.0
+    if saturated_until <= now:
+        saturated_until = 0.0
+    return key, {
+        "remoteFileCount": remote_file_count,
+        "reservations": reservations,
+        "saturatedUntil": saturated_until,
+    }
+
+
+def _save_listing_cabinet_slot_state(
+    connection: Any,
+    key: str,
+    state: dict[str, Any],
+) -> None:
+    connection.set(
+        key,
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+        ex=RAKUTEN_CABINET_FOLDER_SLOT_STATE_TTL_SECONDS,
+    )
+
+
+def _listing_cabinet_reserved_slot_count(state: dict[str, Any]) -> int:
+    reservations = state.get("reservations")
+    if not isinstance(reservations, dict):
+        return 0
+    return sum(
+        max(0, int(item.get("slots") or 0))
+        for item in reservations.values()
+        if isinstance(item, dict)
+    )
+
+
+def _try_reserve_listing_cabinet_folder_slot(
+    connection: Any,
+    account_key: str,
+    folder: dict[str, Any],
+    required_slots: int,
+    reservation_token: str,
+) -> bool:
+    normalized_slots = max(1, int(required_slots or 0))
+    if normalized_slots > RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT:
+        raise RuntimeError("单次预留的 R-Cabinet 图片槽位超过文件夹安全上限。")
+    key, state = _listing_cabinet_slot_state(connection, account_key, folder)
+    now = time.time()
+    if float(state.get("saturatedUntil") or 0) > now:
+        _save_listing_cabinet_slot_state(connection, key, state)
+        return False
+    used_slots = int(state.get("remoteFileCount") or 0)
+    reserved_slots = _listing_cabinet_reserved_slot_count(state)
+    if used_slots + reserved_slots + normalized_slots > RAKUTEN_CABINET_BATCH_FOLDER_IMAGE_LIMIT:
+        _save_listing_cabinet_slot_state(connection, key, state)
+        return False
+    state["reservations"][reservation_token] = {
+        "slots": normalized_slots,
+        "expiresAt": now + RAKUTEN_CABINET_FOLDER_SLOT_RESERVATION_TTL_SECONDS,
+        "status": "active",
+    }
+    _save_listing_cabinet_slot_state(connection, key, state)
+    connection.set(
+        listing_cabinet_assignment_key(account_key),
+        str(int(folder.get("folderId") or 0)),
+        ex=RAKUTEN_CABINET_FOLDER_SLOT_STATE_TTL_SECONDS,
+    )
+    return True
+
+
+def _listing_cabinet_reservation_metadata(
+    folder: dict[str, Any],
+    account_key: str,
+    reservation_token: str,
+    required_slots: int,
+) -> dict[str, Any]:
+    result = dict(folder)
+    result["_cabinetReservation"] = {
+        "accountKey": account_key,
+        "token": reservation_token,
+        "slots": max(1, int(required_slots or 0)),
+    }
+    return result
+
+
+def _listing_cabinet_assigned_folder_id(connection: Any, account_key: str) -> int:
+    raw_value = connection.get(listing_cabinet_assignment_key(account_key))
+    if isinstance(raw_value, bytes):
+        try:
+            raw_value = raw_value.decode("utf-8")
+        except UnicodeDecodeError:
+            return 0
+    try:
+        return max(0, int(raw_value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ordered_listing_cabinet_folders(
+    folders: list[dict[str, Any]],
+    *,
+    preferred_folder_id: int = 0,
+    assigned_folder_id: int = 0,
+) -> list[dict[str, Any]]:
+    def sort_key(folder: dict[str, Any]) -> tuple[int, int, str, int, int]:
+        folder_id = int(folder.get("folderId") or 0)
+        preferred_rank = 0 if folder_id == preferred_folder_id and folder_id > 0 else 1
+        assigned_rank = 0 if folder_id == assigned_folder_id and folder_id > 0 else 1
+        identity = listing_cabinet_folder_identity(folder)
+        if identity is None:
+            return (preferred_rank, assigned_rank, "99999999", 0, folder_id)
+        return (preferred_rank, assigned_rank, identity[0], identity[1], folder_id)
+
+    return sorted(folders, key=sort_key)
+
+
+def reserve_listing_cabinet_folder_slot(
+    service_secret: str,
+    license_key: str,
+    folder: dict[str, Any],
+    required_slots: int,
+) -> dict[str, Any] | None:
+    if not should_use_redis_task_queue():
+        return None
+    account_key = listing_cabinet_folder_account_key(service_secret, license_key)
+    reservation_token = uuid.uuid4().hex
+    try:
+        with rakuten_cabinet_folder_creation_lock(
+            service_secret,
+            license_key,
+            require_distributed=True,
+        ):
+            connection = redis_connection()
+            if not _try_reserve_listing_cabinet_folder_slot(
+                connection,
+                account_key,
+                folder,
+                required_slots,
+                reservation_token,
+            ):
+                return None
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"R-Cabinet 店铺级图片槽位预留失败：{exc}") from exc
+    return _listing_cabinet_reservation_metadata(
+        folder,
+        account_key,
+        reservation_token,
+        required_slots,
+    )
+
+
+def allocate_listing_cabinet_folder_slot(
+    service_secret: str,
+    license_key: str,
+    store: StoreModel,
+    required_slots: int,
+    *,
+    usage: dict[str, int] | None = None,
+    exclude_folder_ids: set[int] | None = None,
+    preferred_folder_id: int = 0,
+) -> dict[str, Any]:
+    normalized_slots = max(1, int(required_slots or 0))
+    excluded_ids = {
+        int(folder_id)
+        for folder_id in (exclude_folder_ids or set())
+        if int(folder_id or 0) > 0
+    }
+    if not should_use_redis_task_queue():
+        folder = ensure_listing_cabinet_folder(
+            service_secret,
+            license_key,
+            store,
+            normalized_slots,
+            usage=usage,
+            exclude_folder_ids=excluded_ids,
+        )
+        folder["fileCount"] = int(folder.get("fileCount") or 0) + normalized_slots
+        return folder
+
+    account_key = listing_cabinet_folder_account_key(service_secret, license_key)
+    reservation_token = uuid.uuid4().hex
+    with rakuten_cabinet_folder_creation_lock(
+        service_secret,
+        license_key,
+        require_distributed=True,
+    ):
+        connection = redis_connection()
+        folders = fetch_rakuten_cabinet_folders(service_secret, license_key)
+        candidates = [
+            folder
+            for folder in folders
+            if listing_cabinet_folder_identity(folder) is not None
+            and int(folder.get("folderId") or 0) not in excluded_ids
+        ]
+        assigned_folder_id = _listing_cabinet_assigned_folder_id(connection, account_key)
+        for folder in _ordered_listing_cabinet_folders(
+            candidates,
+            preferred_folder_id=preferred_folder_id,
+            assigned_folder_id=assigned_folder_id,
+        ):
+            if not _try_reserve_listing_cabinet_folder_slot(
+                connection,
+                account_key,
+                folder,
+                normalized_slots,
+                reservation_token,
+            ):
+                continue
+            return _listing_cabinet_reservation_metadata(
+                prepare_listing_cabinet_folder(folder),
+                account_key,
+                reservation_token,
+                normalized_slots,
+            )
+
+        all_existing_ids = {
+            int(folder.get("folderId") or 0)
+            for folder in candidates
+            if int(folder.get("folderId") or 0) > 0
+        }
+        folder = ensure_listing_cabinet_folder_locked(
+            service_secret,
+            license_key,
+            store,
+            normalized_slots,
+            usage=usage,
+            exclude_folder_ids=excluded_ids | all_existing_ids,
+        )
+        if not _try_reserve_listing_cabinet_folder_slot(
+            connection,
+            account_key,
+            folder,
+            normalized_slots,
+            reservation_token,
+        ):
+            raise RuntimeError("R-Cabinet 新文件夹无法预留图片槽位，请刷新后重试。")
+        return _listing_cabinet_reservation_metadata(
+            prepare_listing_cabinet_folder(folder),
+            account_key,
+            reservation_token,
+            normalized_slots,
+        )
+
+
+def settle_listing_cabinet_folder_slot(
+    service_secret: str,
+    license_key: str,
+    folder: dict[str, Any] | None,
+    *,
+    success: bool,
+    saturated: bool = False,
+) -> None:
+    if not isinstance(folder, dict) or not should_use_redis_task_queue():
+        return
+    metadata = folder.get("_cabinetReservation")
+    if not isinstance(metadata, dict):
+        return
+    account_key = normalize_text(metadata.get("accountKey"))
+    reservation_token = normalize_text(metadata.get("token"))
+    if not account_key or not reservation_token:
+        return
+    try:
+        with rakuten_cabinet_folder_creation_lock(
+            service_secret,
+            license_key,
+            require_distributed=True,
+        ):
+            connection = redis_connection()
+            key, state = _listing_cabinet_slot_state(connection, account_key, folder)
+            reservation = state["reservations"].pop(reservation_token, None)
+            if success:
+                reserved_slots = (
+                    int(reservation.get("slots") or 0)
+                    if isinstance(reservation, dict)
+                    else int(metadata.get("slots") or 0)
+                )
+                state["reservations"][reservation_token] = {
+                    "slots": max(1, reserved_slots),
+                    "expiresAt": time.time() + RAKUTEN_CABINET_FOLDER_SLOT_VISIBILITY_TTL_SECONDS,
+                    "status": "uploaded",
+                }
+            if saturated:
+                state["saturatedUntil"] = time.time() + RAKUTEN_CABINET_FOLDER_SATURATED_TTL_SECONDS
+            _save_listing_cabinet_slot_state(connection, key, state)
+    except Exception:
+        logger.warning("更新 R-Cabinet 店铺级图片槽位状态失败", exc_info=True)
+
+
+def mark_listing_cabinet_folder_for_rotation(
+    cabinet_context: dict[str, Any] | None,
+    folder: dict[str, Any] | None,
+) -> None:
+    if not isinstance(cabinet_context, dict) or not isinstance(folder, dict):
+        return
+    context_lock = cabinet_context.get("_lock")
+    if not hasattr(context_lock, "__enter__"):
+        context_lock = threading.RLock()
+        cabinet_context["_lock"] = context_lock
+    folder_id = int(folder.get("folderId") or 0)
+    if folder_id <= 0:
+        return
+    with context_lock:
+        excluded_ids = cabinet_context.setdefault("_excludedFolderIds", set())
+        if not isinstance(excluded_ids, set):
+            excluded_ids = set(excluded_ids or [])
+            cabinet_context["_excludedFolderIds"] = excluded_ids
+        excluded_ids.add(folder_id)
+        current_folder = cabinet_context.get("currentFolder")
+        if isinstance(current_folder, dict) and int(current_folder.get("folderId") or 0) == folder_id:
+            cabinet_context["currentFolder"] = None
 
 
 def normalize_cabinet_folder_name(value: str) -> str:
@@ -7292,6 +7734,9 @@ def insert_rakuten_cabinet_file(
         data={"xml": xml_body},
         files={"file": (normalized_file_path, content, content_type or "application/octet-stream")},
     )
+    if is_rakuten_cabinet_folder_full_xml(response.text):
+        detail = cabinet_xml_error_message(response.text) or normalize_text(response.text)[:500]
+        raise RakutenCabinetFolderFullError(detail, folder_id=folder_id)
     try:
         response.raise_for_status()
     except requests.RequestException as exc:
@@ -19415,36 +19860,27 @@ def upload_product_images_to_rakuten(
         for index, image_data in enumerate(prepared_images, start=max(1, int(start_index or 1))):
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-            if before_upload:
-                before_upload()
             image_url = normalize_text(image_data.get("sourceUrl"))
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="p")
             file_name = listing_cabinet_upload_file_name(file_path)
-            cabinet_folder = ensure_listing_cabinet_folder_for_upload(
+            result, cabinet_folder = upload_listing_cabinet_file_with_folder_rotation(
                 service_secret,
                 license_key,
                 store,
-                1,
+                file_name=file_name,
+                file_path=file_path,
+                content=image_data["content"],
+                content_type=image_data["contentType"],
                 cabinet_context=upload_cabinet_context,
+                cancel_check=cancel_check,
+                before_upload=before_upload,
             )
             folder_id = int(cabinet_folder.get("folderId") or 0)
             folder_path = normalize_text(
                 cabinet_folder.get("directoryName")
                 or cabinet_folder.get("folderPath")
                 or cabinet_folder.get("folderName")
-            )
-            if not folder_id or not folder_path:
-                raise RuntimeError("R-Cabinet 上架文件夹不可用。")
-            result = insert_rakuten_cabinet_file(
-                service_secret,
-                license_key,
-                file_name=file_name,
-                file_path=file_path,
-                content=image_data["content"],
-                content_type=image_data["contentType"],
-                folder_id=folder_id,
-                overwrite=True,
             )
             location = cabinet_image_location(folder_path, result.get("filePath") or file_path)
             uploaded_images.append(
@@ -19534,36 +19970,27 @@ def upload_product_description_images_to_rakuten(
         for index, image_data in enumerate(prepared_images, start=1):
             if cancel_check and cancel_check():
                 raise TaskCancelled(TASK_CANCELLED_MESSAGE)
-            if before_upload:
-                before_upload()
             image_url = normalize_text(image_data.get("sourceUrl"))
             suffix = image_data["suffix"]
             file_path = listing_cabinet_upload_file_path(manage_number, index, suffix, kind="d")
             file_name = listing_cabinet_upload_file_name(file_path)
-            cabinet_folder = ensure_listing_cabinet_folder_for_upload(
+            result, cabinet_folder = upload_listing_cabinet_file_with_folder_rotation(
                 service_secret,
                 license_key,
                 store,
-                1,
+                file_name=file_name,
+                file_path=file_path,
+                content=image_data["content"],
+                content_type=image_data["contentType"],
                 cabinet_context=upload_cabinet_context,
+                cancel_check=cancel_check,
+                before_upload=before_upload,
             )
             folder_id = int(cabinet_folder.get("folderId") or 0)
             folder_path = normalize_text(
                 cabinet_folder.get("directoryName")
                 or cabinet_folder.get("folderPath")
                 or cabinet_folder.get("folderName")
-            )
-            if not folder_id or not folder_path:
-                raise RuntimeError("R-Cabinet 上架说明图文件夹不可用。")
-            result = insert_rakuten_cabinet_file(
-                service_secret,
-                license_key,
-                file_name=file_name,
-                file_path=file_path,
-                content=image_data["content"],
-                content_type=image_data["contentType"],
-                folder_id=folder_id,
-                overwrite=True,
             )
             location = cabinet_image_location(folder_path, result.get("filePath") or file_path)
             file_url = result.get("fileUrl") or build_rakuten_cabinet_image_url(store.store_code, location)
@@ -19811,22 +20238,154 @@ def ensure_listing_cabinet_folder_for_upload(
             if isinstance(context.get("currentFolder"), dict)
             else None
         )
-        if cached_folder and cabinet_folder_remaining_slots(cached_folder) >= required_slots:
-            folder = cached_folder
-        else:
-            folder = ensure_listing_cabinet_folder(
+        excluded_ids = context.setdefault("_excludedFolderIds", set())
+        if not isinstance(excluded_ids, set):
+            excluded_ids = set(excluded_ids or [])
+            context["_excludedFolderIds"] = excluded_ids
+        if should_use_redis_task_queue():
+            refresh_due = (
+                time.time() - float(context.get("_lastFolderRefreshAt") or 0)
+                >= RAKUTEN_CABINET_FOLDER_REFRESH_INTERVAL_SECONDS
+            )
+            if cached_folder and not refresh_due:
+                reserved_folder = reserve_listing_cabinet_folder_slot(
+                    service_secret,
+                    license_key,
+                    cached_folder,
+                    required_slots,
+                )
+                if reserved_folder is not None:
+                    context["currentFolder"] = reserved_folder
+                    return reserved_folder
+                cached_folder_id = int(cached_folder.get("folderId") or 0)
+                if cached_folder_id > 0:
+                    excluded_ids.add(cached_folder_id)
+            folder = allocate_listing_cabinet_folder_slot(
                 service_secret,
                 license_key,
                 store,
                 required_slots,
                 usage=context.get("usage") if isinstance(context.get("usage"), dict) else None,
+                exclude_folder_ids=excluded_ids,
+                preferred_folder_id=int(cached_folder.get("folderId") or 0) if cached_folder else 0,
             )
-        folder["fileCount"] = int(folder.get("fileCount") or 0) + max(
-            0,
-            int(required_slots),
-        )
+            context["_lastFolderRefreshAt"] = time.time()
+        else:
+            if cached_folder and cabinet_folder_remaining_slots(cached_folder) >= required_slots:
+                folder = cached_folder
+            else:
+                folder = ensure_listing_cabinet_folder(
+                    service_secret,
+                    license_key,
+                    store,
+                    required_slots,
+                    usage=context.get("usage") if isinstance(context.get("usage"), dict) else None,
+                    exclude_folder_ids=excluded_ids,
+                )
+            folder["fileCount"] = int(folder.get("fileCount") or 0) + max(
+                0,
+                int(required_slots),
+            )
         context["currentFolder"] = folder
         return folder
+
+
+def upload_listing_cabinet_file_with_folder_rotation(
+    service_secret: str,
+    license_key: str,
+    store: StoreModel,
+    *,
+    file_name: str,
+    file_path: str,
+    content: bytes,
+    content_type: str,
+    cabinet_context: dict[str, Any] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    before_upload: Callable[[], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    last_folder_full_error: RakutenCabinetFolderFullError | None = None
+    for attempt in range(1, RAKUTEN_CABINET_FOLDER_SWITCH_RETRIES + 1):
+        if cancel_check and cancel_check():
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+        if before_upload:
+            before_upload()
+        cabinet_folder = ensure_listing_cabinet_folder_for_upload(
+            service_secret,
+            license_key,
+            store,
+            1,
+            cabinet_context=cabinet_context,
+        )
+        folder_id = int(cabinet_folder.get("folderId") or 0)
+        folder_path = normalize_text(
+            cabinet_folder.get("directoryName")
+            or cabinet_folder.get("folderPath")
+            or cabinet_folder.get("folderName")
+        )
+        if not folder_id or not folder_path:
+            settle_listing_cabinet_folder_slot(
+                service_secret,
+                license_key,
+                cabinet_folder,
+                success=False,
+            )
+            raise RuntimeError("R-Cabinet 上架文件夹不可用。")
+        if cancel_check and cancel_check():
+            settle_listing_cabinet_folder_slot(
+                service_secret,
+                license_key,
+                cabinet_folder,
+                success=False,
+            )
+            raise TaskCancelled(TASK_CANCELLED_MESSAGE)
+        try:
+            result = insert_rakuten_cabinet_file(
+                service_secret,
+                license_key,
+                file_name=file_name,
+                file_path=file_path,
+                content=content,
+                content_type=content_type,
+                folder_id=folder_id,
+                overwrite=True,
+            )
+        except RakutenCabinetFolderFullError as exc:
+            last_folder_full_error = exc
+            settle_listing_cabinet_folder_slot(
+                service_secret,
+                license_key,
+                cabinet_folder,
+                success=False,
+                saturated=True,
+            )
+            mark_listing_cabinet_folder_for_rotation(cabinet_context, cabinet_folder)
+            if attempt >= RAKUTEN_CABINET_FOLDER_SWITCH_RETRIES:
+                raise
+            logger.warning(
+                "R-Cabinet 文件夹 %s 返回 3006，刷新文件夹并切换后重试（第 %s/%s 次）",
+                folder_id,
+                attempt,
+                RAKUTEN_CABINET_FOLDER_SWITCH_RETRIES,
+            )
+            continue
+        except Exception:
+            settle_listing_cabinet_folder_slot(
+                service_secret,
+                license_key,
+                cabinet_folder,
+                success=False,
+            )
+            raise
+        settle_listing_cabinet_folder_slot(
+            service_secret,
+            license_key,
+            cabinet_folder,
+            success=True,
+        )
+        return result, cabinet_folder
+    if last_folder_full_error is not None:
+        raise last_folder_full_error
+    raise RuntimeError("R-Cabinet 图片上传失败，未能切换到可用文件夹。")
 
 
 def reserve_listing_cabinet_folder_slots(
