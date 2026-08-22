@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -201,6 +202,74 @@ def test_created_folder_waits_until_visible_before_releasing_lock(monkeypatch):
     assert fetch_results == []
 
 
+def test_created_folder_visibility_wait_happens_outside_creation_lock(monkeypatch):
+    events = []
+    lock_state = {"held": False}
+
+    @contextmanager
+    def fake_lock(*_args, **_kwargs):
+        events.append("acquire")
+        lock_state["held"] = True
+        try:
+            yield
+        finally:
+            lock_state["held"] = False
+            events.append("release")
+
+    visible_folder = {
+        "folderId": 90,
+        "folderName": "YX20260730-1",
+        "directoryName": "yx20260730-1",
+        "fileCount": 0,
+    }
+    monkeypatch.setattr(
+        crawler_service,
+        "rakuten_cabinet_folder_creation_lock",
+        fake_lock,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "fetch_rakuten_cabinet_folders",
+        lambda *_: [],
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "fetch_rakuten_cabinet_usage",
+        lambda *_: {"remainingFolderCount": 10},
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "create_rakuten_cabinet_folder",
+        lambda *_args, **kwargs: {
+            "folderId": 90,
+            "folderName": kwargs["folder_name"],
+            "directoryName": kwargs["directory_name"],
+            "fileCount": 0,
+        },
+    )
+
+    def wait_for_visibility(*_args, **_kwargs):
+        events.append(("wait", lock_state["held"]))
+        return visible_folder, [visible_folder]
+
+    monkeypatch.setattr(
+        crawler_service,
+        "wait_for_visible_listing_cabinet_folder",
+        wait_for_visibility,
+    )
+
+    folder = crawler_service.ensure_listing_cabinet_folder(
+        "secret",
+        "key",
+        SimpleNamespace(id=2, store_code="japaneden"),
+        1,
+        usage={"remainingFolderCount": 10},
+    )
+
+    assert folder == visible_folder
+    assert events == ["acquire", "release", ("wait", False)]
+
+
 def test_folder_creation_uses_store_scoped_distributed_lock(monkeypatch):
     events = []
 
@@ -321,3 +390,79 @@ def test_product_images_fill_current_folder_before_switching(monkeypatch):
     ]
     assert first_folder["fileCount"] == 500
     assert second_folder["fileCount"] == 1
+
+
+def test_result_code_3006_switches_folder_and_retries_current_image(monkeypatch):
+    first_folder = {
+        "folderId": 1,
+        "folderName": "YX20260717-1",
+        "directoryName": "yx20260717-1",
+        "fileCount": 0,
+    }
+    second_folder = {
+        "folderId": 2,
+        "folderName": "YX20260717-2",
+        "directoryName": "yx20260717-2",
+        "fileCount": 0,
+    }
+    context = {"currentFolder": first_folder}
+    selected_folder_ids = []
+
+    monkeypatch.setattr(
+        crawler_service,
+        "recover_missing_local_product_images",
+        lambda _product, images: images,
+    )
+    monkeypatch.setattr(
+        crawler_service,
+        "prepare_rakuten_listing_images",
+        lambda *_args, **_kwargs: [
+            {
+                "sourceUrl": "https://example.com/1.jpg",
+                "suffix": ".jpg",
+                "content": b"image",
+                "contentType": "image/jpeg",
+            }
+        ],
+    )
+
+    def ensure_folder(*_args, **kwargs):
+        cabinet_context = kwargs["cabinet_context"]
+        excluded_ids = cabinet_context.get("_excludedFolderIds") or set()
+        return second_folder if 1 in excluded_ids else first_folder
+
+    monkeypatch.setattr(
+        crawler_service,
+        "ensure_listing_cabinet_folder_for_upload",
+        ensure_folder,
+    )
+
+    def insert_file(*_args, **kwargs):
+        selected_folder_ids.append(kwargs["folder_id"])
+        if len(selected_folder_ids) == 1:
+            raise RuntimeError(
+                "R-Cabinet 图片上传失败：resultCode=3006，Number of files is upper limit"
+            )
+        return {
+            "fileId": 2,
+            "filePath": kwargs["file_path"],
+        }
+
+    monkeypatch.setattr(
+        crawler_service,
+        "insert_rakuten_cabinet_file",
+        insert_file,
+    )
+
+    uploaded = crawler_service.upload_product_images_to_rakuten(
+        "secret",
+        "key",
+        SimpleNamespace(store_code="store"),
+        SimpleNamespace(title="Product"),
+        "manage-number",
+        cabinet_context=context,
+        source_images=["https://example.com/1.jpg"],
+    )
+
+    assert selected_folder_ids == [1, 2]
+    assert uploaded[0]["folderId"] == "2"
