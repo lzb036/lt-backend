@@ -834,7 +834,7 @@ def test_listing_preflight_passes_fetched_cache_into_ready(monkeypatch):
     assert seen["prepared_cache"] == cached
 
 
-def test_auto_listing_candidates_preload_preparation_caches(
+def test_auto_listing_candidates_take_first_products_without_preflight(
     monkeypatch,
     session_factory,
 ):
@@ -885,31 +885,15 @@ def test_auto_listing_candidates_preload_preparation_caches(
         store_id = store.id
         product_ids = [int(product.id) for product in products]
 
-    seen_checks: list[tuple[int, object]] = []
-
-    def fake_check(product, _store):
-        seen_checks.append(
-            (int(product.id), getattr(product, "_listing_preparation_cache_payload", None))
-        )
-        return {"productId": product.id, "issues": []}
-
-    monkeypatch.setattr(crawler_service, "listing_preflight_product_check", fake_check)
-
     selected, preflight_by_id, cleanup_result = crawler_service.auto_listing_candidate_product_ids(
         "alice",
         store_id,
         2,
     )
 
-    assert selected == [product_ids[1], product_ids[2]]
-    assert set(preflight_by_id) == set(selected)
+    assert selected == [product_ids[0], product_ids[1]]
+    assert preflight_by_id == {}
     assert cleanup_result["deletedIds"] == []
-    assert [product_id for product_id, _cache in seen_checks] == [
-        product_ids[1],
-        product_ids[2],
-    ]
-    assert seen_checks[0][1] == {"version": 1, "preflight": {"status": "passed"}}
-    assert seen_checks[1][1] == {}
 
 
 def test_auto_listing_candidates_paginate_in_created_order(
@@ -953,12 +937,6 @@ def test_auto_listing_candidates_paginate_in_created_order(
         store_id = store.id
         expected_ids = [int(products[0].id), int(products[1].id), int(products[3].id), int(products[4].id)]
 
-    monkeypatch.setattr(
-        crawler_service,
-        "listing_preflight_product_check",
-        lambda product, _store: {"productId": product.id, "issues": []},
-    )
-
     selected, preflight_by_id, cleanup_result = crawler_service.auto_listing_candidate_product_ids(
         "alice",
         store_id,
@@ -966,16 +944,15 @@ def test_auto_listing_candidates_paginate_in_created_order(
     )
 
     assert selected == expected_ids
-    assert set(preflight_by_id) == set(selected)
+    assert preflight_by_id == {}
     assert cleanup_result["deletedIds"] == []
 
 
-def test_auto_listing_candidates_delete_image_blocked_approved_products(
+def test_auto_listing_candidates_do_not_preflight_or_cleanup_blocked_products(
     monkeypatch,
     session_factory,
 ):
     install_session_scope(monkeypatch, session_factory)
-    monkeypatch.setattr(crawler_service, "cleanup_product_image_ids", lambda _ids: None)
     with session_factory() as session:
         session.add(
             UserAccountModel(
@@ -1008,24 +985,7 @@ def test_auto_listing_candidates_delete_image_blocked_approved_products(
         session.flush()
         store_id = int(store.id)
         blocked_id = int(products[0].id)
-        valid_ids = [int(product.id) for product in products[1:]]
         session.commit()
-
-    def fake_check(product, _store):
-        if int(product.id) == blocked_id:
-            return {
-                "productId": product.id,
-                "issues": [
-                    {
-                        "severity": "blocker",
-                        "code": "missing_image",
-                        "message": "商品缺少图片，不能上架。",
-                    }
-                ],
-            }
-        return {"productId": product.id, "issues": []}
-
-    monkeypatch.setattr(crawler_service, "listing_preflight_product_check", fake_check)
 
     selected, preflight_by_id, cleanup_result = crawler_service.auto_listing_candidate_product_ids(
         "alice",
@@ -1033,12 +993,12 @@ def test_auto_listing_candidates_delete_image_blocked_approved_products(
         2,
     )
 
-    assert selected == valid_ids
-    assert set(preflight_by_id) == set(valid_ids)
-    assert cleanup_result["deletedIds"] == [blocked_id]
+    assert selected == [blocked_id, int(products[1].id)]
+    assert preflight_by_id == {}
+    assert cleanup_result["deletedIds"] == []
     with session_factory() as session:
-        assert session.get(ProductModel, blocked_id) is None
-        assert {int(row.id) for row in session.scalars(select(ProductModel)).all()} == set(valid_ids)
+        assert session.get(ProductModel, blocked_id) is not None
+        assert len(session.scalars(select(ProductModel)).all()) == 3
 
 
 def _seed_listing_products_and_store(session):

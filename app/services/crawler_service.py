@@ -15291,94 +15291,33 @@ def auto_listing_candidate_product_ids(
     store_id: int,
     quantity: int,
 ) -> tuple[list[int], dict[int, dict[str, Any]], dict[str, Any]]:
-    """按创建顺序筛选 quantity 个可上架候选商品。
+    """按创建顺序直接取 quantity 个已审核候选商品。
 
-    分页(键集游标)读取商品,选满即停,避免把全量已审核商品的
-    ~190KB JSON 一次性载入内存(曾导致服务器 OOM、创建任务被系统杀死)。
+    自动上架优先快速创建任务，商品的完整校验交给实际的上架过程处理。
     """
+    normalized_quantity = max(0, int(quantity or 0))
+    if normalized_quantity <= 0:
+        return [], {}, {"deletedIds": [], "failedIds": []}
     with session_scope() as session:
         store = session.get(StoreModel, store_id)
         if store is None or store.owner_username != owner_username:
             raise RuntimeError("自动上架店铺不存在或不属于当前用户。")
-        selected_ids: list[int] = []
-        preflight_by_id: dict[int, dict[str, Any]] = {}
-        discard_reasons_by_id: dict[int, str] = {}
-        last_created_at: datetime | None = None
-        last_product_id = 0
-        while len(selected_ids) < quantity:
-            query = select(ProductModel).where(
+        products = session.scalars(
+            select(ProductModel)
+            .where(
                 ProductModel.owner_username == owner_username,
                 ProductModel.review_status == "approved",
                 ProductModel.parent_product_id.is_(None),
                 ProductModel.listing_task_id.is_(None),
             )
-            if last_created_at is not None:
-                query = query.where(
-                    or_(
-                        ProductModel.created_at > last_created_at,
-                        and_(
-                            ProductModel.created_at == last_created_at,
-                            ProductModel.id > last_product_id,
-                        ),
-                    )
-                )
-            products = session.scalars(
-                query
-                .order_by(ProductModel.created_at.asc(), ProductModel.id.asc())
-                .limit(AUTO_LISTING_CANDIDATE_PAGE_SIZE)
-            ).all()
-            if not products:
-                break
-            # 批量预读本页商品的预处理缓存行,避免循环内逐商品开 session 查库
-            candidate_ids = [int(product.id) for product in products]
-            preparation_rows = session.scalars(
-                select(ProductListingPreparationModel).where(
-                    ProductListingPreparationModel.product_id.in_(candidate_ids)
-                )
-            ).all()
-            preparation_by_id = {int(row.product_id): row for row in preparation_rows}
-            for product in products:
-                row = preparation_by_id.get(int(product.id))
-                parsed_cache: dict[str, Any] = {}
-                if row is not None:
-                    try:
-                        parsed_value = json.loads(row.cache_json or "{}")
-                    except (TypeError, ValueError):
-                        parsed_value = {}
-                    if isinstance(parsed_value, dict):
-                        parsed_cache = parsed_value
-                setattr(product, "_listing_preparation_cache_payload", parsed_cache)
-            for product in products:
-                listed_store_ids = {
-                    int(item.get("storeId") or 0)
-                    for item in product_listed_stores(product_raw_payload(product))
-                }
-                if store_id in listed_store_ids:
-                    continue
-                check = listing_preflight_product_check(product, store)
-                image_issue = listing_preflight_discardable_image_issue(check)
-                if image_issue is not None:
-                    discard_reasons_by_id[int(product.id)] = (
-                        normalize_text(image_issue.get("message"))
-                        or "图片失效，不能上架。"
-                    )
-                    continue
-                if listing_preflight_blocking_messages([check]):
-                    continue
-                selected_ids.append(int(product.id))
-                preflight_by_id[int(product.id)] = check
-                if len(selected_ids) >= quantity:
-                    break
-            if len(selected_ids) >= quantity:
-                break
-            last_created_at = products[-1].created_at
-            last_product_id = int(products[-1].id)
-    cleanup_result = delete_approved_products_for_listing_cleanup(
-        owner_username,
-        list(discard_reasons_by_id),
-        reason_by_id=discard_reasons_by_id,
-    )
-    return selected_ids, preflight_by_id, cleanup_result
+            .order_by(ProductModel.created_at.asc(), ProductModel.id.asc())
+            .limit(normalized_quantity)
+        ).all()
+        return (
+            [int(product.id) for product in products],
+            {},
+            {"deletedIds": [], "failedIds": []},
+        )
 
 
 def execute_auto_listing_schedule(
@@ -15461,6 +15400,7 @@ def execute_auto_listing_schedule(
                 ),
             ),
             preflight_by_id=candidate_preflight,
+            skip_preflight=True,
         )
         task_rows = result.get("listingTasks") or []
         task_ids = [
@@ -21923,6 +21863,7 @@ def create_listing_task(
     payload: Any,
     *,
     preflight_by_id: dict[int, dict[str, Any]] | None = None,
+    skip_preflight: bool = False,
 ) -> dict[str, Any]:
     ensure_system_task_dispatch_allowed(owner_username)
     product_ids = normalize_product_ids([int(value) for value in (getattr(payload, "productIds", None) or [])])
@@ -21972,7 +21913,9 @@ def create_listing_task(
         prechecked_products = preflight_by_id is not None and all(
             product_id in preflight_by_id for product_id in product_ids
         )
-        if not prechecked_products:
+        if skip_preflight:
+            preflight_checks = []
+        elif not prechecked_products:
             duplicated_messages: list[str] = []
             for product in products:
                 listed_store_ids = {int(item.get("storeId") or 0) for item in product_listed_stores(product_raw_payload(product))}
@@ -22050,7 +21993,8 @@ def create_listing_task(
             suffix = "；更多问题请先执行上架前体检。" if len(preflight_blockers) > 5 else ""
             preflight_error = f"上架前体检未通过：{detail}{suffix}"
 
-        # 自动上架路径会传入候选筛选阶段已完成的体检结果
+        # 自动上架快速路径可明确跳过完整体检；普通手动上架仍执行体检。
+        # 自动上架路径也可以传入候选筛选阶段已完成的体检结果
         # (同一店铺、同一批商品,刚检查过),此处不再重复逐商品体检,
         # 其余动态校验(审核状态、上架锁、并发冲突)保持原样。
         if product_ids and not preflight_error:

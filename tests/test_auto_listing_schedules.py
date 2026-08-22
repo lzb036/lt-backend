@@ -165,10 +165,11 @@ def test_due_schedule_uses_actual_available_quantity(database, monkeypatch) -> N
         lambda product, store: {"productId": product.id, "issues": []},
     )
 
-    def fake_create_listing_task(owner_username, payload, *, preflight_by_id=None):
+    def fake_create_listing_task(owner_username, payload, *, preflight_by_id=None, skip_preflight=False):
         captured["owner"] = owner_username
         captured["productIds"] = payload.productIds
         captured["storeIds"] = payload.storeIds
+        captured["skipPreflight"] = skip_preflight
         return {
             "listingTask": {"id": "task-1"},
             "listingTasks": [{"id": "task-1"}],
@@ -179,14 +180,15 @@ def test_due_schedule_uses_actual_available_quantity(database, monkeypatch) -> N
 
     assert crawler_service.run_due_auto_listing_schedules_once() == 1
     assert captured["owner"] == "alice"
-    assert len(captured["productIds"]) == 3
+    assert len(captured["productIds"]) == 4
     assert captured["storeIds"] == [store_id]
+    assert captured["skipPreflight"] is True
 
     with database() as session:
         schedule = session.scalar(select(AutoListingScheduleModel))
         assert schedule.status == "idle"
         assert json.loads(schedule.last_task_ids_json) == ["task-1"]
-        assert "计划上架 5 件，实际已创建 3 件" in schedule.last_message
+        assert "计划上架 5 件，实际已创建 4 件" in schedule.last_message
         assert schedule.next_run_at > datetime(2026, 1, 1, 9, 0)
 
 
